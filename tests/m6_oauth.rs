@@ -341,6 +341,92 @@ async fn confidential_client_metadata_is_published() {
     assert!(!metadata["jwks"]["keys"].as_array().unwrap().is_empty());
 }
 
+#[test]
+fn loopback_oauth_metadata_uses_the_public_localhost_client() {
+    let listen = "127.0.0.1:3000".parse().unwrap();
+    let public = OAuthPublic::new_loopback(listen).unwrap();
+    let metadata = public.metadata();
+    let client_id = reqwest::Url::parse(metadata["client_id"].as_str().unwrap()).unwrap();
+
+    assert_eq!(client_id.scheme(), "http");
+    assert_eq!(client_id.host_str(), Some("localhost"));
+    assert_eq!(client_id.port(), None);
+    let parameters = client_id.query_pairs().collect::<Vec<_>>();
+    assert!(parameters.contains(&(
+        "redirect_uri".into(),
+        "http://127.0.0.1:3000/oauth/callback".into()
+    )));
+    assert!(parameters.contains(&("scope".into(), "atproto".into())));
+    assert_eq!(metadata["token_endpoint_auth_method"], "none");
+    assert_eq!(metadata["dpop_bound_access_tokens"], true);
+    assert!(metadata.get("jwks").is_none());
+    assert!(metadata.get("jwks_uri").is_none());
+    assert_eq!(
+        metadata["redirect_uris"][0],
+        "http://127.0.0.1:3000/oauth/callback"
+    );
+}
+
+#[tokio::test]
+async fn loopback_login_cookies_use_http_and_preserve_origin_checks() {
+    let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+    let app = public.router_with_flow(FakeOAuthFlow::default(), Arc::new(MemoryStorage::default()));
+
+    let rejected = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/authorize")
+                .header("origin", "http://attacker.example")
+                .header("sec-fetch-site", "cross-site")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("handle=alice.test"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+
+    let authorization = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/authorize")
+                .header("origin", "http://127.0.0.1:3000")
+                .header("sec-fetch-site", "same-origin")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("handle=alice.test"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authorization.status(), StatusCode::SEE_OTHER);
+    let login_cookie = authorization.headers()["set-cookie"].to_str().unwrap();
+    assert!(login_cookie.contains("HttpOnly"));
+    assert!(login_cookie.contains("SameSite=Lax"));
+    assert!(!login_cookie.contains("Secure"));
+
+    let callback = app
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?code=valid-code&state=valid-state&scope=atproto")
+                .header("cookie", login_cookie.split(';').next().unwrap())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(callback.status(), StatusCode::SEE_OTHER);
+    for cookie in callback.headers().get_all("set-cookie") {
+        let cookie = cookie.to_str().unwrap();
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Lax"));
+        assert!(!cookie.contains("Secure"));
+    }
+}
+
 #[tokio::test]
 async fn login_page_accepts_an_atproto_handle_or_did() {
     let response = router()
