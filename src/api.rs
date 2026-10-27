@@ -191,7 +191,7 @@ async fn get_author_feed<S: Storage, B: IdentityBackend>(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, ApiError> {
-    let _ = authorize(&state, &headers, "app.bsky.feed.getAuthorFeed", false).await?;
+    let claims = authorize(&state, &headers, "app.bsky.feed.getAuthorFeed", false).await?;
     let actor = actor_to_did(&state, required(&query, "actor")?)?;
     let limit = query_limit(&query, 50);
     let before = query
@@ -211,8 +211,15 @@ async fn get_author_feed<S: Storage, B: IdentityBackend>(
     };
     let feed = page_records
         .iter()
-        .map(|record| json!({"post":post_view(&state, record, &records)}))
-        .collect::<Vec<_>>();
+        .map(|record| {
+            post_view(
+                &state,
+                record,
+                claims.as_ref().map(|claims| claims.iss.as_str()),
+            )
+            .map(|post| json!({"post":post}))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut result = json!({"feed":feed});
     if let Some(next_cursor) = next_cursor {
         result["cursor"] = json!(next_cursor);
@@ -225,7 +232,7 @@ async fn get_posts<S: Storage, B: IdentityBackend>(
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
-    let _ = authorize(&state, &headers, "app.bsky.feed.getPosts", false).await?;
+    let claims = authorize(&state, &headers, "app.bsky.feed.getPosts", false).await?;
     let uris = repeated_query_values(raw_query.as_deref(), "uris");
     if uris.is_empty() {
         return Err(ApiError::bad_request("missing query parameter uris"));
@@ -239,8 +246,14 @@ async fn get_posts<S: Storage, B: IdentityBackend>(
                 .iter()
                 .find(|record| record.collection == POST && record.uri == uri.as_str())
         })
-        .map(|record| post_view(&state, record, &records))
-        .collect::<Vec<_>>();
+        .map(|record| {
+            post_view(
+                &state,
+                record,
+                claims.as_ref().map(|claims| claims.iss.as_str()),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(json!({"posts":posts})))
 }
 
@@ -249,14 +262,14 @@ async fn get_post_thread<S: Storage, B: IdentityBackend>(
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, ApiError> {
-    let _ = authorize(&state, &headers, "app.bsky.feed.getPostThread", false).await?;
+    let claims = authorize(&state, &headers, "app.bsky.feed.getPostThread", false).await?;
     let uri = required(&query, "uri")?;
     let records = state.storage.records().map_err(|_| ApiError::internal())?;
     let post = records
         .iter()
         .find(|record| record.collection == POST && record.uri == uri)
         .ok_or_else(|| ApiError::not_found("post not found"))?;
-    let parent = post
+    let parent_record = post
         .record
         .pointer("/reply/parent/uri")
         .and_then(Value::as_str)
@@ -264,23 +277,24 @@ async fn get_post_thread<S: Storage, B: IdentityBackend>(
             records
                 .iter()
                 .find(|record| record.collection == POST && record.uri == parent_uri)
+        });
+    let parent = if let Some(parent) = parent_record {
+        json!({
+            "$type":"app.bsky.feed.defs#threadViewPost",
+            "post":post_view(&state, parent, claims.as_ref().map(|claims| claims.iss.as_str()))?,
+            "parent":null,
+            "replies":[],
+            "threadContext":null
         })
-        .map(|parent| {
-            json!({
-                "$type":"app.bsky.feed.defs#threadViewPost",
-                "post":post_view(&state, parent, &records),
-                "parent":null,
-                "replies":[],
-                "threadContext":null
-            })
-        })
-        .unwrap_or(Value::Null);
+    } else {
+        Value::Null
+    };
     let replies = records.iter().filter(|record| record.collection == POST
         && record.record.pointer("/reply/parent/uri").and_then(Value::as_str) == Some(uri))
-        .map(|record| json!({"$type":"app.bsky.feed.defs#threadViewPost","post":post_view(&state, record, &records),"parent":null,"replies":[],"threadContext":null}))
-        .collect::<Vec<_>>();
+        .map(|record| post_view(&state, record, claims.as_ref().map(|claims| claims.iss.as_str())).map(|post| json!({"$type":"app.bsky.feed.defs#threadViewPost","post":post,"parent":null,"replies":[],"threadContext":null})))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(
-        json!({"thread":{"$type":"app.bsky.feed.defs#threadViewPost","post":post_view(&state, post, &records),"parent":parent,"replies":replies,"threadContext":null}}),
+        json!({"thread":{"$type":"app.bsky.feed.defs#threadViewPost","post":post_view(&state, post, claims.as_ref().map(|claims| claims.iss.as_str()))?,"parent":parent,"replies":replies,"threadContext":null}}),
     ))
 }
 
@@ -296,8 +310,8 @@ async fn get_timeline<S: Storage, B: IdentityBackend>(
     let records = state.storage.records().map_err(|_| ApiError::internal())?;
     let feed = timeline_records(&records, &actor, query_limit(&query, 50))
         .into_iter()
-        .map(|record| json!({"post":post_view(&state, record, &records)}))
-        .collect::<Vec<_>>();
+        .map(|record| post_view(&state, record, Some(&actor)).map(|post| json!({"post":post})))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(json!({"feed":feed})))
 }
 
@@ -587,41 +601,34 @@ fn blob_url(did: &str, blob: &Value, kind: &str) -> Option<String> {
 fn post_view<S: Storage, B: IdentityBackend>(
     state: &ApiState<S, B>,
     record: &IndexedRecord,
-    all: &[IndexedRecord],
-) -> Value {
-    let likes = all
-        .iter()
-        .filter(|entry| entry.collection == LIKE && subject_uri(entry) == Some(record.uri.as_str()))
-        .count();
-    let reposts = all
-        .iter()
-        .filter(|entry| {
-            entry.collection == REPOST && subject_uri(entry) == Some(record.uri.as_str())
-        })
-        .count();
-    let replies = all
-        .iter()
-        .filter(|entry| {
-            entry.collection == POST
-                && entry
-                    .record
-                    .pointer("/reply/parent/uri")
-                    .and_then(Value::as_str)
-                    == Some(record.uri.as_str())
-        })
-        .count();
+    viewer_did: Option<&str>,
+) -> Result<Value, ApiError> {
+    let interactions = state
+        .storage
+        .post_interaction_summary(&record.uri, viewer_did)
+        .map_err(|_| ApiError::internal())?;
     let mut post = json!({
         "uri":record.uri,"cid":record.cid,"author":profile_view(state, &record.did).unwrap_or_else(|_| json!({"did":record.did,"handle":"handle.invalid"})),
         "record":record.record,
-        "replyCount":replies,"repostCount":reposts,"likeCount":likes,"quoteCount":0,"bookmarkCount":0,"labels":[]
+        "replyCount":interactions.reply_count,"repostCount":interactions.repost_count,"likeCount":interactions.like_count,"quoteCount":0,"bookmarkCount":0,"labels":[]
     });
+    if viewer_did.is_some() {
+        let mut viewer = json!({});
+        if let Some(like) = interactions.viewer_like {
+            viewer["like"] = json!(like);
+        }
+        if let Some(repost) = interactions.viewer_repost {
+            viewer["repost"] = json!(repost);
+        }
+        post["viewer"] = viewer;
+    }
     if let Some(created_at) = record.record.get("createdAt") {
         post["indexedAt"] = created_at.clone();
     }
     if let Some(embed) = record.record.get("embed") {
         post["embed"] = embed.clone();
     }
-    post
+    Ok(post)
 }
 
 fn subject_uri(record: &IndexedRecord) -> Option<&str> {

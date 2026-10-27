@@ -65,6 +65,15 @@ pub struct IndexedRecord {
     pub record: Value,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PostInteractionSummary {
+    pub like_count: usize,
+    pub repost_count: usize,
+    pub reply_count: usize,
+    pub viewer_like: Option<String>,
+    pub viewer_repost: Option<String>,
+}
+
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("SQLite error: {0}")]
@@ -92,6 +101,11 @@ pub trait Storage: Send + Sync {
         collection: &str,
         rkey: &str,
     ) -> Result<Option<IndexedRecord>, StorageError>;
+    fn post_interaction_summary(
+        &self,
+        uri: &str,
+        viewer_did: Option<&str>,
+    ) -> Result<PostInteractionSummary, StorageError>;
     fn records(&self) -> Result<Vec<IndexedRecord>, StorageError>;
     fn cursor(&self) -> Result<Option<u64>, StorageError>;
     fn set_cursor(&self, cursor: u64) -> Result<(), StorageError>;
@@ -247,6 +261,48 @@ impl Storage for MemoryStorage {
             .records
             .get(&(did.to_owned(), collection.to_owned(), rkey.to_owned()))
             .cloned())
+    }
+
+    fn post_interaction_summary(
+        &self,
+        uri: &str,
+        viewer_did: Option<&str>,
+    ) -> Result<PostInteractionSummary, StorageError> {
+        let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut summary = PostInteractionSummary::default();
+        for record in inner.records.values() {
+            let subject_uri = record
+                .record
+                .pointer("/subject/uri")
+                .and_then(Value::as_str);
+            if subject_uri == Some(uri) {
+                match record.collection.as_str() {
+                    "app.bsky.feed.like" => {
+                        summary.like_count += 1;
+                        if viewer_did == Some(record.did.as_str()) {
+                            summary.viewer_like = Some(record.uri.clone());
+                        }
+                    }
+                    "app.bsky.feed.repost" => {
+                        summary.repost_count += 1;
+                        if viewer_did == Some(record.did.as_str()) {
+                            summary.viewer_repost = Some(record.uri.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if record.collection == "app.bsky.feed.post"
+                && record
+                    .record
+                    .pointer("/reply/parent/uri")
+                    .and_then(Value::as_str)
+                    == Some(uri)
+            {
+                summary.reply_count += 1;
+            }
+        }
+        Ok(summary)
     }
 
     fn records(&self) -> Result<Vec<IndexedRecord>, StorageError> {
@@ -519,6 +575,12 @@ impl SqliteStorage {
                  PRIMARY KEY (did, collection, rkey)
              );
              CREATE INDEX IF NOT EXISTS records_collection_time ON records(collection, time_us DESC);
+             CREATE INDEX IF NOT EXISTS records_collection_subject_uri
+                 ON records(collection, json_extract(record_json, '$.subject.uri'), time_us DESC);
+             CREATE INDEX IF NOT EXISTS records_collection_parent_uri
+                 ON records(collection, json_extract(record_json, '$.reply.parent.uri'), time_us DESC);
+             CREATE INDEX IF NOT EXISTS records_author_subject_uri
+                 ON records(collection, did, json_extract(record_json, '$.subject.uri'));
              CREATE TABLE IF NOT EXISTS appview_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS registered_users (did TEXT PRIMARY KEY);
              CREATE TABLE IF NOT EXISTS web_session_generations (
@@ -668,6 +730,40 @@ impl Storage for SqliteStorage {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    fn post_interaction_summary(
+        &self,
+        uri: &str,
+        viewer_did: Option<&str>,
+    ) -> Result<PostInteractionSummary, StorageError> {
+        let conn = self.conn()?;
+        let count = |collection: &str, path: &str| -> Result<usize, rusqlite::Error> {
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM records WHERE collection=?1 AND json_extract(record_json, '{path}')=?2"),
+                params![collection, uri],
+                |row| row.get(0),
+            )
+        };
+        let mut summary = PostInteractionSummary {
+            like_count: count("app.bsky.feed.like", "$.subject.uri")?,
+            repost_count: count("app.bsky.feed.repost", "$.subject.uri")?,
+            reply_count: count("app.bsky.feed.post", "$.reply.parent.uri")?,
+            ..PostInteractionSummary::default()
+        };
+        if let Some(viewer_did) = viewer_did {
+            summary.viewer_like = conn.query_row(
+                "SELECT uri FROM records WHERE collection='app.bsky.feed.like' AND did=?1 AND json_extract(record_json, '$.subject.uri')=?2 ORDER BY time_us DESC LIMIT 1",
+                params![viewer_did, uri],
+                |row| row.get(0),
+            ).optional()?;
+            summary.viewer_repost = conn.query_row(
+                "SELECT uri FROM records WHERE collection='app.bsky.feed.repost' AND did=?1 AND json_extract(record_json, '$.subject.uri')=?2 ORDER BY time_us DESC LIMIT 1",
+                params![viewer_did, uri],
+                |row| row.get(0),
+            ).optional()?;
+        }
+        Ok(summary)
     }
 
     fn records(&self) -> Result<Vec<IndexedRecord>, StorageError> {

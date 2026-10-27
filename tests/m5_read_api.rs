@@ -417,7 +417,7 @@ async fn author_feed_cursor_advances_between_pages() {
 
 #[tokio::test]
 async fn post_views_count_indexed_interactions_and_include_the_viewers_own_records() {
-    let storage = Arc::new(MemoryStorage::default());
+    let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
     let post_uri = format!("at://{ALICE}/app.bsky.feed.post/p1");
     for (did, collection, rkey, record) in [
         (
