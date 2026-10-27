@@ -1350,6 +1350,68 @@ async fn web_posts_show_local_counts_and_liked_state_and_submit_unlike() {
 }
 
 #[tokio::test]
+async fn timeline_replies_name_the_parent_author_and_link_to_the_thread() {
+    let storage = Arc::new(MemoryStorage::default());
+    storage
+        .set_verified_handle("did:plc:friend", "friend.test")
+        .unwrap();
+    let parent_uri = "at://did:plc:friend/app.bsky.feed.post/parent";
+    for record in [
+        IndexedRecord {
+            did: "did:plc:friend".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "parent".into(),
+            uri: parent_uri.into(),
+            cid: Some("cid-parent".into()),
+            time_us: 20,
+            record: serde_json::json!({"text":"parent post"}),
+        },
+        IndexedRecord {
+            did: "did:plc:alice".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "reply".into(),
+            uri: "at://did:plc:alice/app.bsky.feed.post/reply".into(),
+            cid: Some("cid-reply".into()),
+            time_us: 10,
+            record: serde_json::json!({"text":"reply post","reply":{"parent":{"uri":parent_uri,"cid":"cid-parent"},"root":{"uri":parent_uri,"cid":"cid-parent"}}}),
+        },
+    ] {
+        storage.put_record(&record).unwrap();
+    }
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage);
+    let cookie = finish_login(&app).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("replying to @friend.test"), "{html}");
+    assert!(
+        html.contains(
+            "href=\"/thread?uri=at%3A%2F%2Fdid%3Aplc%3Aalice%2Fapp.bsky.feed.post%2Freply\""
+        ),
+        "{html}"
+    );
+}
+
+#[tokio::test]
 async fn web_posts_show_hydrated_authors_and_times_on_timeline_profile_and_thread() {
     let storage = Arc::new(MemoryStorage::default());
     storage.register_user("did:plc:alice").unwrap();
