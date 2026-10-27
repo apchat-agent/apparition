@@ -137,7 +137,7 @@ fn api_for_storage(storage: Arc<MemoryStorage>) -> (axum::Router, P256Keypair) {
 
 fn token(key: &P256Keypair, aud: &str, lxm: &str, exp: u64, sub: Option<&str>) -> String {
     let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","typ":"JWT"}"#);
-    let payload = json!({"iss":ISSUER,"aud":aud,"exp":exp,"lxm":lxm,"sub":sub});
+    let payload = json!({"iss":ISSUER,"aud":aud,"exp":exp,"iat":expiry(0),"lxm":lxm,"sub":sub});
     let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
     let message = format!("{header}.{payload}");
     let signature = key.sign(message.as_bytes()).unwrap();
@@ -382,4 +382,36 @@ async fn profile_handles_are_taken_from_verified_identity_data() {
     assert_eq!(status, StatusCode::OK, "{profile}");
     assert_eq!(profile["did"], ALICE);
     assert_eq!(profile["handle"], "alice.test");
+}
+
+#[tokio::test]
+async fn profile_records_cannot_claim_unverified_handles() {
+    let storage = Arc::new(MemoryStorage::default());
+    storage
+        .put_record(&IndexedRecord {
+            did: ALICE.into(),
+            collection: "app.bsky.actor.profile".into(),
+            rkey: "self".into(),
+            uri: format!("at://{ALICE}/app.bsky.actor.profile/self"),
+            cid: Some("profile-cid".into()),
+            time_us: 1,
+            record: json!({"handle":"attacker.example","displayName":"Alice"}),
+        })
+        .unwrap();
+    let (router, _) = api_for_storage(storage);
+    let (status, profile) = request(
+        router.clone(),
+        "/xrpc/app.bsky.actor.getProfile?actor=did%3Aplc%3Aalice",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(profile["handle"], "handle.invalid");
+    let (status, _) = request(
+        router,
+        "/xrpc/app.bsky.actor.getProfile?actor=attacker.example",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
