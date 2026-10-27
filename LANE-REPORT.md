@@ -225,3 +225,22 @@ The app-side root cause of the observed stall was that `JetstreamConsumer::consu
 - `cargo clippy --locked --offline --all-targets -- -D warnings`: passed.
 - `cargo deny check licenses`: passed (`licenses ok`).
 - All fixtures are local. No live-data or server access occurred, and nothing was pushed.
+
+## av11 handles and scoped interaction counts (2026-10-27)
+
+| Item | Status | Evidence |
+| --- | --- | --- |
+| Stale verified handles | Fixed | `verified_handle` and reverse handle lookup keep the last verified value past its 30-minute refresh age. `HandleRefreshWorker` periodically refreshes stale handles for registered, followed, and indexed DIDs; transient backend errors keep the old value queued, while a completed failed verification or missing DID document marks it invalid. `stale_sqlite_handle_remains_available_until_refresh_verifies_a_change`, `stale_handle_refresh_updates_after_bidirectional_verification`, `failed_bidirectional_verification_clears_the_last_handle`, and `missing_did_document_invalidates_that_handle_and_does_not_block_the_batch`. |
+| Identity and account events | Fixed | Jetstream identity/account events enqueue re-verification when their DID is registered, followed, or already represented in indexed records. A profile request with no prior verification queues a lookup and shows the DID while pending. `tracked_identity_event_queues_handle_reverification` and `profile_shows_the_did_while_initial_handle_verification_is_pending`. The legacy Jetstream subscribe endpoint delivers these event kinds despite the collection filter ([Jetstream documentation](https://github.com/bluesky-social/jetstream-legacy)). |
+| Scoped interaction records | Fixed | Scoped ingest stores likes and reposts on registered or followed authors' posts, and posts whose reply parent/root, quote, or facet mention points at one of those DIDs. The target DID is parsed before record-key lookup; previously stored out-of-scope delete events still remove their records and counts. `scoped_ingest_indexes_interactions_and_post_references_on_followed_accounts`. |
+| Historical interaction counts | Not backfilled | Scoped mode sees interactions from its current Jetstream cursor onward. Existing older likes, reposts, and replies are not reconstructed. A possible future design is to enqueue rate-limited paginated `getLikes`, `getRepostedBy`, and thread snapshots per tracked post, store snapshot count baselines, and reconcile them with Jetstream create/delete events using a captured cursor and record URI deduplication. No count-backfill code was added. |
+| Synthetic ingest and SQLite growth | Measured | A release build processed 25,000 serialized fake `app.bsky.feed.post` commit events through `Ingestor::process_json` into SQLite in 3.019 seconds: 496,874 stored events/minute. The checkpointed database grew by 29,649,184 bytes, about 1,186 bytes per unique stored post. That projects to about 11.3 MiB/day at 10,000 newly stored records/day, before retention; the WAL plus database reached 34,193,656 bytes during the run. This is a local synthetic full-scope run, not a live-stream or network benchmark. |
+
+### av11 verification
+
+- Red/green commits cover handle refresh, scoped interaction capture, pending profile identity, and missing-DID refresh handling; every av11 commit subject ends in `(codex av11)`.
+- `cargo test --locked --offline`: passed, 97 tests (unit: 4, M1: 2, M2: 5, M3: 13, M4: 8, M5 config: 5, M5 read API: 17, M6 web OAuth: 34, M6 protocol: 4).
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy --locked --offline --all-targets -- -D warnings`: passed.
+- `cargo deny check licenses`: passed (`licenses ok`).
+- Refresh and interaction regressions use local fake backends and local events. The throughput sample used a generated local event stream and SQLite under this repository's `target/`; no live server or live data was touched. Nothing was pushed.

@@ -57,6 +57,12 @@ Open [http://127.0.0.1:3000/login](http://127.0.0.1:3000/login), enter an AT Pro
 
 Use `scoped` for a small self-hosted instance. It indexes registered users, their follows, and interactions on their posts. `full` indexes every supported account and will use substantially more disk as the firehose continues. Neither mode currently has a retention or compaction policy.
 
+In scoped mode, incoming likes and reposts are indexed when their subject is a registered or followed DID's post. Replies, quotes, and facet mentions are also indexed when they point to a registered or followed DID. This makes counts and notifications accurate for events seen from the current Jetstream cursor onward; older likes, reposts, and replies are not backfilled.
+
+A future count backfill could enqueue rate-limited, paginated `getLikes`, `getRepostedBy`, and thread snapshots for each tracked post, store those as count baselines, and reconcile the snapshots against Jetstream create/delete events using a captured cursor and record URI deduplication. That backfill is not implemented.
+
+Verified handles stay visible after their 30-minute freshness window while a background worker rechecks them. It refreshes stale handles for registered, followed, and indexed DIDs, and queues checks when Jetstream reports an identity or account change for a tracked or displayed DID. A new profile without a verified handle shows its DID while the first check is pending. A definitive verification failure changes the profile to `handle.invalid`; transient lookup errors leave the last verified handle in place. Jetstream's legacy subscribe contract sends identity and account events even when `wantedCollections` is set ([Jetstream documentation](https://github.com/bluesky-social/jetstream-legacy)).
+
 ## Point a client at the AppView
 
 An XRPC client that allows a configurable service URL can use the AppView origin directly for public reads. For example:
