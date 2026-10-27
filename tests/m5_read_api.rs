@@ -236,7 +236,7 @@ async fn posts_threads_graph_notifications_and_appview_did_are_served() {
     let (router, signing_key) = api();
     let endpoints = [
         (
-            "/xrpc/app.bsky.actor.getProfiles?actors=did%3Aplc%3Aalice,did%3Aplc%3Afriend",
+            "/xrpc/app.bsky.actor.getProfiles?actors=did%3Aplc%3Aalice&actors=did%3Aplc%3Afriend",
             "profiles",
         ),
         (
@@ -323,6 +323,28 @@ async fn posts_threads_graph_notifications_and_appview_did_are_served() {
     .await;
     assert_eq!(status, StatusCode::OK, "{unread}");
     assert!(unread["count"].is_number());
+}
+
+#[tokio::test]
+async fn repeated_xrpc_array_parameters_return_all_values() {
+    let (router, _) = api();
+    let (status, profiles) = request(
+        router.clone(),
+        "/xrpc/app.bsky.actor.getProfiles?actors=did%3Aplc%3Aalice&actors=did%3Aplc%3Afriend",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(profiles["profiles"].as_array().unwrap().len(), 2);
+
+    let (status, posts) = request(
+        router,
+        "/xrpc/app.bsky.feed.getPosts?uris=at%3A%2F%2Fdid%3Aplc%3Aalice%2Fapp.bsky.feed.post%2Fp1&uris=at%3A%2F%2Fdid%3Aplc%3Afriend%2Fapp.bsky.feed.post%2Fp2",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(posts["posts"].as_array().unwrap().len(), 2);
 }
 
 #[tokio::test]
