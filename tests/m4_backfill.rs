@@ -661,3 +661,22 @@ async fn backfill_worker_backs_off_after_a_failed_repository_fetch() {
     assert_eq!(storage.backfill_progress(did).unwrap(), (1, 0));
     assert_eq!(storage.backfill_failure_count(did).unwrap(), 1);
 }
+
+#[test]
+fn failed_repository_retry_delay_doubles_and_caps_at_one_hour() {
+    fn check(storage: &impl Storage) {
+        for failures in 1..=20 {
+            let expected = (5_u64 * 2_u64.pow(failures - 1)).min(60 * 60);
+            assert_eq!(
+                storage
+                    .record_backfill_failure("did:plc:retry-policy")
+                    .unwrap(),
+                Duration::from_secs(expected),
+                "failure {failures}"
+            );
+        }
+    }
+
+    check(&MemoryStorage::default());
+    check(&appview_rs::ingest::SqliteStorage::open(":memory:").unwrap());
+}
