@@ -323,6 +323,40 @@ async fn login_page_accepts_an_atproto_handle_or_did() {
     let html = String::from_utf8(body.to_vec()).unwrap();
     assert!(html.contains("name=\"handle\""));
     assert!(html.contains("/oauth/authorize"));
+    assert!(html.contains("method=\"post\""));
+}
+
+#[tokio::test]
+async fn authorize_rejects_cross_origin_and_cross_site_requests() {
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(AcceptingOAuthFlow, Arc::new(MemoryStorage::default()));
+    for headers in [
+        vec![
+            ("origin", "https://attacker.example"),
+            ("sec-fetch-site", "cross-site"),
+        ],
+        vec![
+            ("origin", "https://other.appview.example"),
+            ("sec-fetch-site", "same-site"),
+        ],
+        vec![("sec-fetch-site", "same-origin")],
+    ] {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/oauth/authorize")
+            .header("content-type", "application/x-www-form-urlencoded");
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::from("handle=alice.test")).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(!response.headers().contains_key("set-cookie"));
+    }
 }
 
 #[tokio::test]
