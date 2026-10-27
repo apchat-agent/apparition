@@ -8,7 +8,7 @@ use appview_rs::{
     ingest::{Ingestor, JetstreamConsumer, SqliteStorage},
     init_tracing,
     jwt::ServiceJwtVerifier,
-    oauth::OAuthPublic,
+    oauth::{OAuthPublic, SqliteOAuthStore},
     router_with_oauth_flow,
 };
 use std::{error::Error, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
@@ -20,9 +20,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let config = Config::load()?;
     init_tracing(&config.log_filter)?;
     let address: SocketAddr = config.listen.parse()?;
-    let storage = Arc::new(SqliteStorage::open(
-        PathBuf::from(&config.data_dir).join("appview.db"),
-    )?);
+    let database_path = PathBuf::from(&config.data_dir).join("appview.db");
+    let storage = Arc::new(SqliteStorage::open(&database_path)?);
+    let oauth_store = SqliteOAuthStore::open(&database_path)?;
     let oauth = OAuthPublic::load_or_create(
         &config.public_url,
         PathBuf::from(&config.data_dir).join("oauth-client-key.json"),
@@ -32,7 +32,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Duration::from_secs(1800),
     ));
     let oauth_flow = oauth
-        .atrium_flow(oauth_identity_resolver)
+        .atrium_flow(oauth_identity_resolver, oauth_store)
         .map_err(std::io::Error::other)?;
     let ingestor = Ingestor::new(storage.clone(), config.scope_mode);
     let consumer = JetstreamConsumer::new(ingestor, Duration::from_secs(1));

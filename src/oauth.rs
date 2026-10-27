@@ -1,6 +1,7 @@
 use crate::identity::{HttpIdentityBackend, IdentityResolver};
 use crate::ingest::{MemoryStorage, Storage};
 use atrium_api::{agent::SessionManager, types::string::Did};
+use atrium_common::store::Store;
 use atrium_identity::{
     did::{CommonDidResolver, CommonDidResolverConfig, DEFAULT_PLC_DIRECTORY_URL},
     handle::{AtprotoHandleResolver, AtprotoHandleResolverConfig, DnsTxtResolver},
@@ -8,7 +9,10 @@ use atrium_identity::{
 use atrium_oauth::{
     AtprotoClientMetadata, AuthMethod, AuthorizeOptions, DefaultHttpClient, GrantType, KnownScope,
     OAuthClient, OAuthClientConfig, OAuthResolverConfig, Scope,
-    store::{session::MemorySessionStore, state::MemoryStateStore},
+    store::{
+        session::{Session, SessionStore},
+        state::{InternalStateData, StateStore},
+    },
 };
 use axum::{
     Json, Router,
@@ -22,11 +26,20 @@ use hmac::{Hmac, Mac};
 use jose_jwk::{Ec, EcCurves, Jwk, Key, Parameters};
 use p256::{SecretKey, elliptic_curve::sec1::ToEncodedPoint};
 use rand::thread_rng;
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::{collections::HashMap, fs, future::Future, io::Write, path::Path, pin::Pin, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs,
+    future::Future,
+    io::Write,
+    path::Path,
+    pin::Pin,
+    sync::{Arc, Mutex},
+};
 use thiserror::Error;
 
 const METADATA_PATH: &str = "/.well-known/oauth-client-metadata.json";
@@ -165,8 +178,9 @@ impl OAuthPublic {
     pub fn atrium_flow(
         &self,
         identity_resolver: Arc<IdentityResolver<HttpIdentityBackend>>,
+        store: SqliteOAuthStore,
     ) -> Result<AtriumOAuthFlow, String> {
-        AtriumOAuthFlow::new(self, identity_resolver)
+        AtriumOAuthFlow::new(self, identity_resolver, store)
     }
 
     pub fn router(&self) -> Router {
@@ -276,7 +290,7 @@ impl OAuthPublic {
 type OAuthDidResolver = CommonDidResolver<DefaultHttpClient>;
 type OAuthHandleResolver = AtprotoHandleResolver<CloudflareDnsTxtResolver, DefaultHttpClient>;
 type AppOAuthClient =
-    OAuthClient<MemoryStateStore, MemorySessionStore, OAuthDidResolver, OAuthHandleResolver>;
+    OAuthClient<SqliteOAuthStore, SqliteOAuthStore, OAuthDidResolver, OAuthHandleResolver>;
 
 #[derive(Clone)]
 pub struct AtriumOAuthFlow {
@@ -290,10 +304,169 @@ struct ExpectedOAuthIdentity {
     handle: Option<String>,
 }
 
+#[derive(Debug, Error)]
+pub enum OAuthStoreError {
+    #[error("OAuth session database error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("OAuth session data encoding error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("OAuth session database lock was poisoned")]
+    Poisoned,
+    #[error("OAuth session database I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+#[derive(Clone)]
+pub struct SqliteOAuthStore {
+    connection: Arc<Mutex<Connection>>,
+}
+
+impl SqliteOAuthStore {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, OAuthStoreError> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let connection = Connection::open(path)?;
+        connection.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             CREATE TABLE IF NOT EXISTS oauth_states (
+                 state TEXT PRIMARY KEY,
+                 value_json TEXT NOT NULL,
+                 created_at INTEGER NOT NULL DEFAULT (unixepoch())
+             );
+             CREATE TABLE IF NOT EXISTS oauth_sessions (
+                 did TEXT PRIMARY KEY,
+                 value_json TEXT NOT NULL
+             );",
+        )?;
+        Ok(Self {
+            connection: Arc::new(Mutex::new(connection)),
+        })
+    }
+
+    fn get_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        table: &'static str,
+        key_column: &'static str,
+        key: &str,
+        state_ttl: bool,
+    ) -> Result<Option<T>, OAuthStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| OAuthStoreError::Poisoned)?;
+        let sql = if state_ttl {
+            format!(
+                "SELECT value_json FROM {table} WHERE {key_column}=?1 AND created_at>=unixepoch()-600"
+            )
+        } else {
+            format!("SELECT value_json FROM {table} WHERE {key_column}=?1")
+        };
+        connection
+            .query_row(&sql, [key], |row| row.get::<_, String>(0))
+            .optional()?
+            .map(|json| serde_json::from_str(&json).map_err(Into::into))
+            .transpose()
+    }
+
+    fn set_json<T: serde::Serialize>(
+        &self,
+        table: &'static str,
+        key_column: &'static str,
+        key: &str,
+        value: &T,
+        update_timestamp: bool,
+    ) -> Result<(), OAuthStoreError> {
+        let value_json = serde_json::to_string(value)?;
+        let sql = if update_timestamp {
+            format!(
+                "INSERT INTO {table}({key_column},value_json,created_at) VALUES(?1,?2,unixepoch()) ON CONFLICT({key_column}) DO UPDATE SET value_json=excluded.value_json,created_at=unixepoch()"
+            )
+        } else {
+            format!(
+                "INSERT INTO {table}({key_column},value_json) VALUES(?1,?2) ON CONFLICT({key_column}) DO UPDATE SET value_json=excluded.value_json"
+            )
+        };
+        self.connection
+            .lock()
+            .map_err(|_| OAuthStoreError::Poisoned)?
+            .execute(&sql, params![key, value_json])?;
+        Ok(())
+    }
+
+    fn delete_key(
+        &self,
+        table: &'static str,
+        key_column: &'static str,
+        key: &str,
+    ) -> Result<(), OAuthStoreError> {
+        let sql = format!("DELETE FROM {table} WHERE {key_column}=?1");
+        self.connection
+            .lock()
+            .map_err(|_| OAuthStoreError::Poisoned)?
+            .execute(&sql, [key])?;
+        Ok(())
+    }
+
+    fn clear_table(&self, table: &'static str) -> Result<(), OAuthStoreError> {
+        self.connection
+            .lock()
+            .map_err(|_| OAuthStoreError::Poisoned)?
+            .execute(&format!("DELETE FROM {table}"), [])?;
+        Ok(())
+    }
+}
+
+impl Store<String, InternalStateData> for SqliteOAuthStore {
+    type Error = OAuthStoreError;
+
+    async fn get(&self, key: &String) -> Result<Option<InternalStateData>, Self::Error> {
+        self.get_json("oauth_states", "state", key, true)
+    }
+
+    async fn set(&self, key: String, value: InternalStateData) -> Result<(), Self::Error> {
+        self.set_json("oauth_states", "state", &key, &value, true)
+    }
+
+    async fn del(&self, key: &String) -> Result<(), Self::Error> {
+        self.delete_key("oauth_states", "state", key)
+    }
+
+    async fn clear(&self) -> Result<(), Self::Error> {
+        self.clear_table("oauth_states")
+    }
+}
+
+impl StateStore for SqliteOAuthStore {}
+
+impl Store<Did, Session> for SqliteOAuthStore {
+    type Error = OAuthStoreError;
+
+    async fn get(&self, key: &Did) -> Result<Option<Session>, Self::Error> {
+        self.get_json("oauth_sessions", "did", key.as_ref(), false)
+    }
+
+    async fn set(&self, key: Did, value: Session) -> Result<(), Self::Error> {
+        self.set_json("oauth_sessions", "did", key.as_ref(), &value, false)
+    }
+
+    async fn del(&self, key: &Did) -> Result<(), Self::Error> {
+        self.delete_key("oauth_sessions", "did", key.as_ref())
+    }
+
+    async fn clear(&self) -> Result<(), Self::Error> {
+        self.clear_table("oauth_sessions")
+    }
+}
+
+impl SessionStore for SqliteOAuthStore {}
+
 impl AtriumOAuthFlow {
     fn new(
         public: &OAuthPublic,
         identity_resolver: Arc<IdentityResolver<HttpIdentityBackend>>,
+        store: SqliteOAuthStore,
     ) -> Result<Self, String> {
         let http_client = Arc::new(DefaultHttpClient::default());
         let did_resolver = CommonDidResolver::new(CommonDidResolverConfig {
@@ -325,8 +498,8 @@ impl AtriumOAuthFlow {
         let client = OAuthClient::new(OAuthClientConfig {
             client_metadata: metadata,
             keys: Some(vec![public.private_key.clone()]),
-            state_store: MemoryStateStore::default(),
-            session_store: MemorySessionStore::default(),
+            state_store: store.clone(),
+            session_store: store,
             resolver: OAuthResolverConfig {
                 did_resolver,
                 handle_resolver,
