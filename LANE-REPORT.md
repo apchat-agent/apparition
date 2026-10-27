@@ -176,3 +176,23 @@ F7 and F9–F13 were not addressed in av2: write-route CSRF, DID-document cachin
 - `cargo clippy --locked --offline --all-targets -- -D warnings`: passed.
 - `cargo deny check licenses`: passed (`licenses ok`).
 - Tests use local indexed records and in-memory storage. No live account or network check was made; nothing was pushed.
+
+## av9 Jetstream silent-read recovery (2026-10-27)
+
+The app-side root cause of the observed stall was an unbounded wait in `JetstreamConsumer::consume_connection`: after the TLS/WebSocket handshake, `websocket.next().await` had no idle deadline (`src/ingest.rs:1200–1215`). If the peer left the connection open but stopped sending frames, ingestion waited forever; metrics were also triggered only by processed events, so the same silence produced no metrics line. The blocking path did not require a lock held across `.await`: SQLite and OAuth locks are used for synchronous operations, and the backfill worker releases them before awaiting network work. The exact upstream reason the live peer stopped delivering was not determined; this lane reproduced the app failure mode with a local silent WebSocket and did not access the live server or `live-data`.
+
+| Item | Status | Evidence |
+| --- | --- | --- |
+| Silent connection watchdog and failover | Fixed | Reads now time out after 60 seconds by default, configurable with `jetstream_idle_timeout_secs` / `APPVIEW_JETSTREAM_IDLE_TIMEOUT_SECS`; the consumer drops the connection and rotates through configured URLs. Each reconnect builds its URL from the persisted cursor. `consumer_reconnects_after_a_silent_websocket_and_rotates_urls` uses two local fake servers and confirms the second endpoint's event is ingested. |
+| Single-event processing deadline | Fixed | Synchronous event processing runs on Tokio's blocking pool and is bounded by 60 seconds by default, configurable with `jetstream_event_timeout_secs` / `APPVIEW_JETSTREAM_EVENT_TIMEOUT_SECS`. A timeout logs the event DID, collection, and rkey and closes the connection. `event_processing_timeout_releases_connection_and_logs_event_identity` holds a local SQLite write transaction to reproduce a stalled storage write, then releases it and checks recovery. |
+| Ingestion observability | Complete | Connection and disconnection are logged at INFO. A 10-second timer emits metrics even with `events=0`, including event rate, bytes on disk, and cursor lag in seconds. `metrics_are_emitted_during_idle_periods_with_zero_events_and_cursor_lag` and `websocket_connection_lifecycle_is_logged_at_info` cover these signals. |
+| Configuration and docs | Complete | Both timeout settings are available in TOML and environment variables and appear in the example config and README. |
+
+### av9 verification
+
+- Strict red/green commits: `c452037` / `dcc3d3b` for silent-peer recovery and URL rotation, then `8d2cfa7` / `7e249ae` for event deadlines, timeout configuration, and idle metrics. `eb1ac48` is a style refactor.
+- `cargo test --locked --offline`: passed, 80 tests (unit: 4, M1: 2, M2: 5, M3: 12, M4: 8, M5 config: 5, M5 read API: 11, M6 web OAuth: 29, M6 protocol: 4).
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy --locked --offline --all-targets -- -D warnings`: passed.
+- `cargo deny check licenses`: passed (`licenses ok`).
+- All new regression tests use local fake WebSockets and a SQLite file under `target/`; no live server or external account was used. Changes are committed locally; nothing was pushed.
