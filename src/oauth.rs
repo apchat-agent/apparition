@@ -10,8 +10,8 @@ use atrium_identity::{
     handle::{AtprotoHandleResolver, AtprotoHandleResolverConfig, DnsTxtResolver},
 };
 use atrium_oauth::{
-    AtprotoClientMetadata, AuthMethod, AuthorizeOptions, DefaultHttpClient, GrantType, KnownScope,
-    OAuthClient, OAuthClientConfig, OAuthResolverConfig, Scope,
+    AtprotoClientMetadata, AuthMethod, AuthorizeOptions, DefaultHttpClient, GrantType,
+    KnownScope, OAuthClient, OAuthClientConfig, OAuthResolverConfig, Scope,
     store::{
         session::{Session, SessionStore},
         state::{InternalStateData, StateStore},
@@ -41,6 +41,7 @@ use std::{
     fs,
     future::Future,
     io::Write,
+    net::SocketAddr,
     path::Path,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -65,6 +66,14 @@ pub enum OAuthConfigError {
     InvalidPublicUrl,
     #[error("OAuth private key file does not contain a P-256 signing key")]
     InvalidPrivateKey,
+    #[error("loopback OAuth requires a loopback listen address")]
+    InvalidLoopbackAddress,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OAuthClientMode {
+    Confidential,
+    Loopback,
 }
 
 #[derive(Clone)]
@@ -72,6 +81,7 @@ pub struct OAuthPublic {
     public_url: String,
     private_key: Jwk,
     metadata: Value,
+    mode: OAuthClientMode,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -181,27 +191,23 @@ impl OAuthPublic {
         key_path: impl AsRef<Path>,
     ) -> Result<Self, OAuthConfigError> {
         validate_origin(public_url)?;
-        let key_path = key_path.as_ref();
-        let key = match fs::read(key_path) {
-            Ok(contents) => serde_json::from_slice(&contents)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if let Some(parent) = key_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                let key = create_key();
-                let contents = serde_json::to_vec(&key)?;
-                match create_key_file(key_path) {
-                    Ok(mut file) => file.write_all(&contents)?,
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                        return Self::load_or_create(public_url, key_path);
-                    }
-                    Err(error) => return Err(error.into()),
-                }
-                key
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let key = load_or_create_key(key_path.as_ref())?;
         Self::from_key(public_url, key)
+    }
+
+    /// Construct the public localhost OAuth client for a loopback listener.
+    pub fn new_loopback(listen: SocketAddr) -> Result<Self, OAuthConfigError> {
+        Self::from_loopback(listen, create_key())
+    }
+
+    /// Load the persistent local cookie-signing key for loopback OAuth.
+    /// The key is not published or used for OAuth client authentication.
+    pub fn load_or_create_loopback(
+        listen: SocketAddr,
+        key_path: impl AsRef<Path>,
+    ) -> Result<Self, OAuthConfigError> {
+        let key = load_or_create_key(key_path.as_ref())?;
+        Self::from_loopback(listen, key)
     }
 
     pub fn metadata(&self) -> &Value {
@@ -265,16 +271,7 @@ impl OAuthPublic {
 
     fn from_key(public_url: &str, private_key: Jwk) -> Result<Self, OAuthConfigError> {
         validate_origin(public_url)?;
-        if !matches!(
-            &private_key.key,
-            Key::Ec(Ec {
-                crv: EcCurves::P256,
-                d: Some(_),
-                ..
-            })
-        ) {
-            return Err(OAuthConfigError::InvalidPrivateKey);
-        }
+        validate_private_key(&private_key)?;
         let mut public_key = private_key.clone();
         if let Key::Ec(ec) = &mut public_key.key {
             ec.d = None;
@@ -297,7 +294,46 @@ impl OAuthPublic {
             public_url: public_url.to_owned(),
             private_key,
             metadata,
+            mode: OAuthClientMode::Confidential,
         })
+    }
+
+    fn from_loopback(
+        listen: SocketAddr,
+        private_key: Jwk,
+    ) -> Result<Self, OAuthConfigError> {
+        if !listen.ip().is_loopback() {
+            return Err(OAuthConfigError::InvalidLoopbackAddress);
+        }
+        validate_private_key(&private_key)?;
+        let origin = format!("http://{listen}");
+        let redirect_uri = format!("{origin}{CALLBACK_PATH}");
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("redirect_uri", &redirect_uri)
+            .append_pair("scope", "atproto")
+            .finish();
+        let client_id = format!("http://localhost?{query}");
+        let metadata = json!({
+            "client_id": client_id,
+            "client_name": "Development client",
+            "application_type": "native",
+            "redirect_uris": [redirect_uri],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "scope": "atproto",
+            "token_endpoint_auth_method": "none",
+            "dpop_bound_access_tokens": true
+        });
+        Ok(Self {
+            public_url: origin,
+            private_key,
+            metadata,
+            mode: OAuthClientMode::Loopback,
+        })
+    }
+
+    fn secure_cookies(&self) -> bool {
+        self.mode == OAuthClientMode::Confidential && self.public_url.starts_with("https://")
     }
 
     fn issue_session_cookie(&self, did: &str, session_id: &str, generation: u64) -> String {
@@ -955,7 +991,7 @@ where
             let cookie = format!(
                 "{LOGIN_COOKIE}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={LOGIN_COOKIE_TTL_SECONDS}{}",
                 state.public.issue_login_cookie(&browser_binding),
-                if state.public.public_url.starts_with("https://") {
+                if state.public.secure_cookies() {
                     "; Secure"
                 } else {
                     ""
@@ -1055,7 +1091,7 @@ where
         state
             .public
             .issue_session_cookie(&account.did, &session_id, generation),
-        if state.public.public_url.starts_with("https://") {
+        if state.public.secure_cookies() {
             "; Secure"
         } else {
             ""
@@ -1363,7 +1399,7 @@ fn cookie_value_named<'a>(headers: &'a HeaderMap, expected_name: &str) -> Option
 fn clear_login_cookie(public: &OAuthPublic) -> String {
     format!(
         "{LOGIN_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{}",
-        if public.public_url.starts_with("https://") {
+        if public.secure_cookies() {
             "; Secure"
         } else {
             ""
@@ -1426,6 +1462,43 @@ fn unix_time() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn load_or_create_key(path: &Path) -> Result<Jwk, OAuthConfigError> {
+    match fs::read(path) {
+        Ok(contents) => Ok(serde_json::from_slice(&contents)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let key = create_key();
+            let contents = serde_json::to_vec(&key)?;
+            match create_key_file(path) {
+                Ok(mut file) => file.write_all(&contents)?,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return load_or_create_key(path);
+                }
+                Err(error) => return Err(error.into()),
+            }
+            Ok(key)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn validate_private_key(private_key: &Jwk) -> Result<(), OAuthConfigError> {
+    if matches!(
+        &private_key.key,
+        Key::Ec(Ec {
+            crv: EcCurves::P256,
+            d: Some(_),
+            ..
+        })
+    ) {
+        Ok(())
+    } else {
+        Err(OAuthConfigError::InvalidPrivateKey)
+    }
 }
 
 fn create_key() -> Jwk {
