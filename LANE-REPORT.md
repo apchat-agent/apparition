@@ -64,3 +64,24 @@ F7 and F9–F13 were not addressed in av2: write-route CSRF, DID-document cachin
 - `cargo deny check licenses`: passed (`licenses ok`).
 - Mutation checks for the JWT signature, cookie HMAC, production OAuth subject-DID check, and production token-scope check each made their corresponding test fail; temporary mutations were restored.
 - All changes are committed locally. Nothing was pushed and no remote was used.
+
+## av3 follow-ups (2026-10-27)
+
+| # | Status | Tests | Mutations / red evidence |
+| --- | --- | --- | --- |
+| 1. Browser binding controls | Done | `production_oauth_flow_rejects_a_foreign_browser_binding`, `web_callback_requires_a_login_cookie_independently_of_the_flow`, `web_callback_rejects_a_forged_login_cookie_independently_of_the_flow` | M10 removed the production binding comparison and the production-flow test accepted the foreign binding. M11 accepted a callback without the pre-login cookie and returned 303. M12 skipped login-cookie MAC validation and the forged-cookie test returned 303. Restored all checks. |
+| 2. Clean up exchanged tokens on binding mismatch | Done | `production_oauth_flow_rejects_a_foreign_browser_binding` also checks that the stored session is deleted and the fake server receives `/revoke`. | The new assertions failed before the cleanup change: the exchanged session remained stored. |
+| 3. Catch `/oauth/authorize` panic | Done | `authorize_turns_an_upstream_panic_into_an_error_page` | The test failed before the catch was added because the simulated panic escaped the route. The route now returns a 502 HTML page. |
+| 4. Protect forced login | Done | `login_page_accepts_an_atproto_handle_or_did`, `authorize_rejects_cross_origin_and_cross_site_requests` | Removing the authorization-start origin check let the cross-origin POST start OAuth and return 303; the test expected 403. Login initiation is now a same-origin POST. |
+| 5. Protect write routes and logout | Done | `web_post_actions_and_logout_reject_same_site_cross_origin_requests` | Removed the guard from `/post`, `/like`, `/repost`, and `/logout` one at a time; each mutation made the test fail on that route. Restored every guard. |
+| 6. Cookie expiry and JWT algorithm checks | Done | `expired_login_cookie_is_rejected`, `expired_session_cookie_is_rejected`, `proxy_jwt_rejects_an_algorithm_that_does_not_match_the_issuer_key` | M17 ignored login-cookie expiry and its test failed. M16 ignored session-cookie expiry and its test failed. M3 ignored the JWT algorithm check and the validly signed mismatched-algorithm token returned 200. Restored all checks. |
+| 7. Independent sessions per device | Done | `logging_in_on_another_device_keeps_the_first_session_valid` runs against both memory and SQLite storage. | The red test returned 303 for the first device after a second login under the old per-DID counter. |
+| 8. Private-address fetch policy and indexed read queries | Not done (optional in the brief) | — | DID-document/handle fetch address restrictions and indexed replacements for whole-database read scans remain follow-ups. No mutations were run. |
+
+### av3 verification
+
+- `cargo fmt --check`: passed.
+- `cargo test --locked --offline`: passed, 56 tests (unit: 3, M1: 2, M2: 4, M3: 7, M4: 3, M5: 12, M6: 25).
+- `cargo clippy --locked --offline -- -D warnings`: passed.
+- `cargo deny check licenses`: passed (`licenses ok`).
+- Changes were committed locally in red/green steps. Nothing was pushed; no remote is configured.
