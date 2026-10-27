@@ -258,3 +258,24 @@ fn full_scope_accepts_supported_collections_and_updates_existing_records() {
         );
     }
 }
+
+#[test]
+fn scope_mode_defaults_to_scoped_and_can_be_configured() {
+    use appview_rs::config::Config;
+    assert_eq!(
+        Config::from_toml_and_env("", []).unwrap().scope_mode,
+        ScopeMode::Scoped
+    );
+    assert_eq!(
+        Config::from_toml_and_env("scope_mode = 'full'", [])
+            .unwrap()
+            .scope_mode,
+        ScopeMode::Full
+    );
+    assert_eq!(
+        Config::from_toml_and_env("", [("APPVIEW_SCOPE", "full")])
+            .unwrap()
+            .scope_mode,
+        ScopeMode::Full
+    );
+}
