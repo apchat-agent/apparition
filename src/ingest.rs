@@ -74,6 +74,8 @@ pub trait Storage: Send + Sync {
     fn register_user(&self, did: &str) -> Result<(), StorageError>;
     fn unregister_user(&self, did: &str) -> Result<(), StorageError>;
     fn is_registered(&self, did: &str) -> Result<bool, StorageError>;
+    fn rotate_web_session(&self, did: &str) -> Result<u64, StorageError>;
+    fn web_session_generation(&self, did: &str) -> Result<Option<u64>, StorageError>;
     fn set_follow(&self, actor: &str, subject: &str, following: bool) -> Result<(), StorageError>;
     fn is_followed_by_registered(&self, did: &str) -> Result<bool, StorageError>;
     fn enqueue_backfill(&self, did: &str) -> Result<(), StorageError>;
@@ -124,6 +126,7 @@ struct MemoryState {
     records: HashMap<(String, String, String), IndexedRecord>,
     cursor: Option<u64>,
     registered: HashSet<String>,
+    web_session_generations: HashMap<String, u64>,
     follows: HashSet<(String, String)>,
     backfill_queue: HashSet<String>,
     verified_handles: HashMap<String, (String, Instant)>,
@@ -234,6 +237,26 @@ impl Storage for MemoryStorage {
             .map_err(|_| StorageError::Poisoned)?
             .registered
             .contains(did))
+    }
+
+    fn rotate_web_session(&self, did: &str) -> Result<u64, StorageError> {
+        let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        let generation = inner
+            .web_session_generations
+            .entry(did.to_owned())
+            .or_default();
+        *generation = generation.saturating_add(1);
+        Ok(*generation)
+    }
+
+    fn web_session_generation(&self, did: &str) -> Result<Option<u64>, StorageError> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .web_session_generations
+            .get(did)
+            .copied())
     }
 
     fn unregister_user(&self, did: &str) -> Result<(), StorageError> {
@@ -373,6 +396,10 @@ impl SqliteStorage {
              CREATE INDEX IF NOT EXISTS records_collection_time ON records(collection, time_us DESC);
              CREATE TABLE IF NOT EXISTS appview_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS registered_users (did TEXT PRIMARY KEY);
+             CREATE TABLE IF NOT EXISTS web_session_generations (
+                 did TEXT PRIMARY KEY,
+                 generation INTEGER NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS follows (
                  actor TEXT NOT NULL,
                  subject TEXT NOT NULL,
@@ -615,6 +642,42 @@ impl Storage for SqliteStorage {
                 |row| row.get(0),
             )
             .optional()
+            .map_err(Into::into)
+    }
+
+    fn rotate_web_session(&self, did: &str) -> Result<u64, StorageError> {
+        let mut connection = self.conn()?;
+        let transaction = connection.transaction()?;
+        let current = transaction
+            .query_row(
+                "SELECT generation FROM web_session_generations WHERE did=?1",
+                [did],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let next = current
+            .checked_add(1)
+            .ok_or(rusqlite::Error::InvalidQuery)?;
+        transaction.execute(
+            "INSERT INTO web_session_generations(did,generation) VALUES(?1,?2)
+             ON CONFLICT(did) DO UPDATE SET generation=excluded.generation",
+            params![did, next],
+        )?;
+        transaction.commit()?;
+        u64::try_from(next).map_err(|_| rusqlite::Error::InvalidQuery.into())
+    }
+
+    fn web_session_generation(&self, did: &str) -> Result<Option<u64>, StorageError> {
+        self.conn()?
+            .query_row(
+                "SELECT generation FROM web_session_generations WHERE did=?1",
+                [did],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|generation| u64::try_from(generation).map_err(|_| rusqlite::Error::InvalidQuery))
+            .transpose()
             .map_err(Into::into)
     }
 

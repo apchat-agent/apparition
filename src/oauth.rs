@@ -299,9 +299,9 @@ impl OAuthPublic {
         })
     }
 
-    fn issue_session_cookie(&self, did: &str) -> String {
+    fn issue_session_cookie(&self, did: &str, generation: u64) -> String {
         let expires = unix_time().saturating_add(SESSION_TTL_SECONDS);
-        let payload = format!("{did}\n{expires}");
+        let payload = format!("{did}\n{expires}\n{generation}");
         let encoded = URL_SAFE_NO_PAD.encode(payload.as_bytes());
         let mut mac = HmacSha256::new_from_slice(&self.cookie_key())
             .expect("HMAC accepts keys of any length");
@@ -341,7 +341,7 @@ impl OAuthPublic {
         Some(binding.to_owned())
     }
 
-    fn verify_session_cookie(&self, token: &str) -> Option<String> {
+    fn verify_session_cookie(&self, token: &str) -> Option<(String, u64)> {
         let (payload, signature) = token.split_once('.')?;
         let signature = URL_SAFE_NO_PAD.decode(signature).ok()?;
         let mut mac = HmacSha256::new_from_slice(&self.cookie_key()).ok()?;
@@ -349,13 +349,14 @@ impl OAuthPublic {
         mac.verify_slice(&signature).ok()?;
         let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
         let value = std::str::from_utf8(&decoded).ok()?;
-        let (did, expires) = value.split_once('\n')?;
+        let (did, session) = value.split_once('\n')?;
+        let (expires, generation) = session.split_once('\n')?;
         if expires.parse::<u64>().ok()? <= unix_time()
             || !(did.starts_with("did:plc:") || did.starts_with("did:web:"))
         {
             return None;
         }
-        Some(did.to_owned())
+        Some((did.to_owned(), generation.parse().ok()?))
     }
 
     fn cookie_key(&self) -> Vec<u8> {
@@ -1015,10 +1016,14 @@ where
     {
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
+    let generation = match state.storage.rotate_web_session(&account.did) {
+        Ok(generation) => generation,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
     let mut response = Redirect::to("/app").into_response();
     let cookie = format!(
         "{SESSION_COOKIE}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL_SECONDS}{}",
-        state.public.issue_session_cookie(&account.did),
+        state.public.issue_session_cookie(&account.did, generation),
         if state.public.public_url.starts_with("https://") {
             "; Secure"
         } else {
@@ -1042,10 +1047,12 @@ where
     F: OAuthFlow,
     S: Storage,
 {
-    let cookie = cookie_value(&headers);
-    let Some(did) = cookie.and_then(|value| state.public.verify_session_cookie(value)) else {
+    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return clear_session_cookie(Redirect::to("/login").into_response());
     };
+    if let Err(error) = state.storage.rotate_web_session(&did) {
+        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+    }
     let remote_result = state.flow.logout(&did).await;
     if let Err(error) = state.storage.unregister_user(&did) {
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
@@ -1065,9 +1072,7 @@ where
     F: OAuthFlow,
     S: Storage,
 {
-    let Some(did) =
-        cookie_value(&headers).and_then(|value| state.public.verify_session_cookie(value))
-    else {
+    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return Redirect::to("/login").into_response();
     };
     let timeline = match state.flow.timeline(&did).await {
@@ -1107,7 +1112,7 @@ where
     F: OAuthFlow,
     S: Storage,
 {
-    let Some(did) = verified_cookie_did(&state.public, &headers) else {
+    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return Redirect::to("/login").into_response();
     };
     let subject = query.get("did").map(String::as_str).unwrap_or(&did);
@@ -1149,7 +1154,7 @@ where
     F: OAuthFlow,
     S: Storage,
 {
-    if verified_cookie_did(&state.public, &headers).is_none() {
+    if verified_cookie_did(&state.public, &headers, state.storage.as_ref()).is_none() {
         return Redirect::to("/login").into_response();
     }
     let Some(uri) = query.get("uri") else {
@@ -1184,7 +1189,7 @@ where
     F: OAuthFlow,
     S: Storage,
 {
-    let Some(did) = verified_cookie_did(&state.public, &headers) else {
+    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return Redirect::to("/login").into_response();
     };
     let text = form.get("text").map(String::as_str).unwrap_or("").trim();
@@ -1209,7 +1214,7 @@ where
     F: OAuthFlow,
     S: Storage,
 {
-    let Some(did) = verified_cookie_did(&state.public, &headers) else {
+    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return Redirect::to("/login").into_response();
     };
     let (Some(uri), Some(cid)) = (form.get("uri"), form.get("cid")) else {
@@ -1233,7 +1238,7 @@ where
     F: OAuthFlow,
     S: Storage,
 {
-    let Some(did) = verified_cookie_did(&state.public, &headers) else {
+    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return Redirect::to("/login").into_response();
     };
     let (Some(uri), Some(cid)) = (form.get("uri"), form.get("cid")) else {
@@ -1248,8 +1253,14 @@ where
     }
 }
 
-fn verified_cookie_did(public: &OAuthPublic, headers: &HeaderMap) -> Option<String> {
-    cookie_value(headers).and_then(|value| public.verify_session_cookie(value))
+fn verified_cookie_did<S: Storage>(
+    public: &OAuthPublic,
+    headers: &HeaderMap,
+    storage: &S,
+) -> Option<String> {
+    let (did, generation) =
+        cookie_value(headers).and_then(|value| public.verify_session_cookie(value))?;
+    (storage.web_session_generation(&did).ok().flatten() == Some(generation)).then_some(did)
 }
 
 fn cookie_value(headers: &HeaderMap) -> Option<&str> {
