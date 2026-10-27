@@ -141,3 +141,20 @@ F7 and F9–F13 were not addressed in av2: write-route CSRF, DID-document cachin
 - `cargo clippy --locked --offline -- -D warnings`: passed.
 - `cargo deny check licenses`: passed (`licenses ok`).
 - No external live-account OAuth run was made in this lane; the web and OAuth protocol checks use local fakes. Nothing was pushed.
+
+## av7 repository CAR decoding and retry handling (2026-10-27)
+
+| Item | Status | Evidence |
+| --- | --- | --- |
+| DAG-CBOR records with CID links and bytes | Fixed | `backfill_decodes_cid_links_and_bytes_into_atproto_json` builds a signed CAR with an image embed blob, a profile avatar, a CID link, and bytes. The verifier returns the ATProto JSON forms `$link` and unpadded standard-base64 `$bytes`, matching the JSON record shape used by Jetstream ingest. |
+| One unreadable record | Fixed | `verifier_skips_an_undecodable_record_and_keeps_the_rest_of_the_repo` puts a validly hashed record block with an invalid CID tag in a signed repo CAR. The verifier warns with collection, rkey, and CID, skips that record, and returns the readable post. Commit/signature/MST verification errors still fail the repo. |
+| Repeated fetch failures | Fixed | `backfill_worker_backs_off_after_a_failed_repository_fetch` observed 14 requests in 100 ms before the change and one after it. Failure delays double from 5 seconds and cap at one hour; `failed_repository_retry_delay_doubles_and_caps_at_one_hour` checks the sequence against both memory and SQLite storage. |
+| Failed progress | Fixed | `empty_timeline_reports_failed_backfill_accounts` verifies `/app` reports `Indexing 1 account, 0 done, 1 failed`. |
+
+### av7 verification
+
+- `cargo test --locked --offline`: passed, 73 tests (unit: 4, M1: 2, M2: 5, M3: 7, M4: 8, M5 config: 5, M5 read API: 11, M6 web OAuth: 27, M6 protocol: 4).
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy --locked --offline --all-targets -- -D warnings`: passed.
+- `cargo deny check licenses`: passed (`licenses ok`).
+- All CAR and backoff tests use local in-memory or local fake components; no live PDS request was made. Changes are committed locally and nothing was pushed.
