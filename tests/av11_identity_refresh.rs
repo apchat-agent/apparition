@@ -134,6 +134,34 @@ async fn failed_bidirectional_verification_clears_the_last_handle() {
 }
 
 #[tokio::test]
+async fn missing_did_document_invalidates_that_handle_and_does_not_block_the_batch() {
+    let storage = Arc::new(MemoryStorage::default());
+    storage.register_user("did:plc:alice").unwrap();
+    storage.register_user("did:plc:bob").unwrap();
+    storage
+        .set_verified_handle("did:plc:alice", "old-alice.test")
+        .unwrap();
+    storage
+        .set_verified_handle("did:plc:bob", "old-bob.test")
+        .unwrap();
+    let backend = FakeIdentityBackend::default();
+    backend.publish("did:plc:bob", Some("bob.test"));
+    let worker = HandleRefreshWorker::new(
+        storage.clone(),
+        IdentityResolver::new(backend, Duration::ZERO),
+        Duration::ZERO,
+        Duration::from_secs(60),
+    );
+
+    assert_eq!(worker.refresh_once().await.unwrap(), 2);
+    assert!(storage.handle_is_invalid("did:plc:alice").unwrap());
+    assert_eq!(
+        storage.verified_handle("did:plc:bob").unwrap().as_deref(),
+        Some("bob.test")
+    );
+}
+
+#[tokio::test]
 async fn tracked_identity_event_queues_handle_reverification() {
     let storage = Arc::new(MemoryStorage::default());
     storage.register_user("did:plc:alice").unwrap();
