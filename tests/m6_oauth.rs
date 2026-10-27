@@ -17,9 +17,28 @@ use std::{
 };
 use tower::ServiceExt;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct FakeOAuthFlow {
     actions: Arc<Mutex<Vec<String>>>,
+    granted_scope: Option<String>,
+}
+
+impl Default for FakeOAuthFlow {
+    fn default() -> Self {
+        Self {
+            actions: Arc::new(Mutex::new(Vec::new())),
+            granted_scope: Some("atproto".to_owned()),
+        }
+    }
+}
+
+impl FakeOAuthFlow {
+    fn with_granted_scope(scope: Option<&str>) -> Self {
+        Self {
+            granted_scope: scope.map(str::to_owned),
+            ..Self::default()
+        }
+    }
 }
 
 impl OAuthFlow for FakeOAuthFlow {
@@ -41,6 +60,7 @@ impl OAuthFlow for FakeOAuthFlow {
             Ok(OAuthAccount {
                 did: "did:plc:alice".to_owned(),
                 verified_handle: Some("alice.test".to_owned()),
+                granted_scope: self.granted_scope.clone(),
             })
         })
     }
@@ -469,7 +489,10 @@ async fn callback_rejects_sessions_without_the_required_atproto_scope() {
     let storage = Arc::new(MemoryStorage::default());
     let app = OAuthPublic::new("https://appview.example")
         .unwrap()
-        .router_with_flow(FakeOAuthFlow::default(), storage.clone());
+        .router_with_flow(
+            FakeOAuthFlow::with_granted_scope(Some("profile")),
+            storage.clone(),
+        );
     let response = app
         .oneshot(
             Request::builder()

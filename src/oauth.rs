@@ -82,6 +82,7 @@ pub struct OAuthCallback {
 pub struct OAuthAccount {
     pub did: String,
     pub verified_handle: Option<String>,
+    pub granted_scope: Option<String>,
 }
 
 pub trait OAuthFlow: Clone + Send + Sync + 'static {
@@ -334,6 +335,7 @@ type AppOAuthClient =
 pub struct AtriumOAuthFlow {
     client: Arc<AppOAuthClient>,
     identity_resolver: Arc<IdentityResolver<HttpIdentityBackend>>,
+    store: SqliteOAuthStore,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -537,7 +539,7 @@ impl AtriumOAuthFlow {
             client_metadata: metadata,
             keys: Some(vec![public.private_key.clone()]),
             state_store: store.clone(),
-            session_store: store,
+            session_store: store.clone(),
             resolver: OAuthResolverConfig {
                 did_resolver,
                 handle_resolver,
@@ -549,6 +551,7 @@ impl AtriumOAuthFlow {
         Ok(Self {
             client: Arc::new(client),
             identity_resolver,
+            store,
         })
     }
 
@@ -655,15 +658,28 @@ impl OAuthFlow for AtriumOAuthFlow {
                 .await
                 .ok_or_else(|| "OAuth session has no subject DID".to_owned())?;
             let did = did.as_ref().to_owned();
+            let parsed_did = did.parse::<Did>().map_err(|error| error.to_string())?;
+            let stored_session = self
+                .store
+                .get(&parsed_did)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "OAuth callback did not persist its session".to_owned())?;
+            let granted_scope = stored_session.token_set.scope;
+            if !has_atproto_scope(granted_scope.as_deref()) {
+                let _ = self.client.revoke(&parsed_did).await;
+                let _ = self.store.del(&parsed_did).await;
+                return Err("OAuth token response did not grant the atproto scope".into());
+            }
             if did != expected.did {
-                if let Ok(did) = did.parse::<Did>() {
-                    let _ = self.client.revoke(&did).await;
-                }
+                let _ = self.client.revoke(&parsed_did).await;
+                let _ = self.store.del(&parsed_did).await;
                 return Err("OAuth subject DID does not match the verified login identity".into());
             }
             Ok(OAuthAccount {
                 did,
                 verified_handle: expected.handle,
+                granted_scope,
             })
         })
     }
@@ -878,15 +894,6 @@ where
             .into_response();
     }
     let scope = query.get("scope").cloned();
-    if !scope
-        .as_deref()
-        .is_some_and(|scope| scope.split_whitespace().any(|value| value == "atproto"))
-    {
-        return oauth_error(
-            StatusCode::BAD_REQUEST,
-            "OAuth response must grant the atproto scope",
-        );
-    }
     let params = OAuthCallback {
         code: query.get("code").expect("validated above").clone(),
         state: query.get("state").expect("validated above").clone(),
@@ -897,6 +904,12 @@ where
         Ok(account) => account,
         Err(error) => return oauth_error(StatusCode::BAD_REQUEST, &error),
     };
+    if !has_atproto_scope(account.granted_scope.as_deref()) {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "OAuth token response must grant the atproto scope",
+        );
+    }
     if let Err(error) = state.storage.register_user(&account.did) {
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
@@ -1180,6 +1193,10 @@ fn html_escape(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+fn has_atproto_scope(scope: Option<&str>) -> bool {
+    scope.is_some_and(|scope| scope.split_whitespace().any(|value| value == "atproto"))
 }
 
 fn unix_time() -> u64 {

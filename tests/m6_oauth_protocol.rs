@@ -5,11 +5,11 @@ use atrium_api::{
     types::string::{Did, Handle},
 };
 use atrium_common::{resolver::Resolver, store::memory::MemoryStore};
-use atrium_oauth::{
-    AtprotoClientMetadata, AuthMethod, AuthorizeOptions, CallbackParams, GrantType,
-    KnownScope, OAuthClient, OAuthClientConfig, OAuthResolverConfig, Scope,
-};
 use atrium_oauth::store::{session::Session, state::InternalStateData};
+use atrium_oauth::{
+    AtprotoClientMetadata, AuthMethod, AuthorizeOptions, CallbackParams, GrantType, KnownScope,
+    OAuthClient, OAuthClientConfig, OAuthResolverConfig, Scope,
+};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Value, json};
 use std::{
@@ -97,7 +97,9 @@ async fn oauth_protocol_checks_state_issuer_nonce_and_refresh_against_fake_pds()
     });
 
     let public = OAuthPublic::new("https://appview.example").unwrap();
-    let did_resolver = FakeDidResolver { pds: origin.clone() };
+    let did_resolver = FakeDidResolver {
+        pds: origin.clone(),
+    };
     let client = OAuthClient::new(OAuthClientConfig {
         client_metadata: AtprotoClientMetadata {
             client_id: "https://appview.example/.well-known/oauth-client-metadata.json".to_owned(),
@@ -121,7 +123,10 @@ async fn oauth_protocol_checks_state_issuer_nonce_and_refresh_against_fake_pds()
     })
     .unwrap();
 
-    let authorize_url = client.authorize(DID, AuthorizeOptions::default()).await.unwrap();
+    let authorize_url = client
+        .authorize(DID, AuthorizeOptions::default())
+        .await
+        .unwrap();
     assert!(authorize_url.starts_with(&format!("{origin}/authorize?")));
     let par = shared
         .lock()
@@ -133,7 +138,10 @@ async fn oauth_protocol_checks_state_issuer_nonce_and_refresh_against_fake_pds()
         .clone();
     let state = form_field(&par.body, "state").unwrap();
     assert_eq!(form_field(&par.body, "scope").as_deref(), Some("atproto"));
-    assert_eq!(form_field(&par.body, "code_challenge_method").as_deref(), Some("S256"));
+    assert_eq!(
+        form_field(&par.body, "code_challenge_method").as_deref(),
+        Some("S256")
+    );
 
     let bad_state = client
         .callback(CallbackParams {
@@ -154,7 +162,10 @@ async fn oauth_protocol_checks_state_issuer_nonce_and_refresh_against_fake_pds()
     assert!(wrong_issuer.is_err());
     assert_eq!(shared.lock().unwrap().token_count, 0);
 
-    let authorize_url = client.authorize(DID, AuthorizeOptions::default()).await.unwrap();
+    let authorize_url = client
+        .authorize(DID, AuthorizeOptions::default())
+        .await
+        .unwrap();
     assert!(authorize_url.contains("request_uri="));
     let callback_state = latest_state(&shared);
     let (session, _) = client
@@ -184,26 +195,42 @@ async fn oauth_protocol_checks_state_issuer_nonce_and_refresh_against_fake_pds()
     assert!(output.feed.is_empty());
 
     let requests = shared.lock().unwrap().requests.clone();
-    let par_requests = requests.iter().filter(|request| request.path == "/par").collect::<Vec<_>>();
-    assert_eq!(par_requests.len(), 3, "PAR must retry once after the DPoP nonce challenge");
+    let par_requests = requests
+        .iter()
+        .filter(|request| request.path == "/par")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        par_requests.len(),
+        3,
+        "PAR must retry once after the DPoP nonce challenge"
+    );
     let first_proof = par_requests[0].headers.get("dpop").unwrap();
     let retry_proof = par_requests[1].headers.get("dpop").unwrap();
     assert_ne!(first_proof, retry_proof);
-    assert_eq!(jwt_claim(retry_proof, "nonce").as_deref(), Some("auth-nonce"));
+    assert_eq!(
+        jwt_claim(retry_proof, "nonce").as_deref(),
+        Some("auth-nonce")
+    );
 
     let timeline_requests = requests
         .iter()
         .filter(|request| request.path.starts_with("/xrpc/app.bsky.feed.getTimeline"))
         .collect::<Vec<_>>();
-    assert_eq!(timeline_requests.len(), 3, "expired access token must refresh and retry");
+    assert_eq!(
+        timeline_requests.len(),
+        3,
+        "expired access token must refresh and retry"
+    );
     assert_eq!(
         jwt_claim(timeline_requests[1].headers.get("dpop").unwrap(), "nonce").as_deref(),
         Some("resource-nonce")
     );
-    assert!(timeline_requests[2]
-        .headers
-        .get("authorization")
-        .is_some_and(|value| value.contains("access-fresh")));
+    assert!(
+        timeline_requests[2]
+            .headers
+            .get("authorization")
+            .is_some_and(|value| value.contains("access-fresh"))
+    );
     assert_eq!(shared.lock().unwrap().token_count, 2);
 
     server.abort();
@@ -238,11 +265,7 @@ fn jwt_claim(jwt: &str, claim: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-async fn serve_one(
-    mut stream: TcpStream,
-    origin: &str,
-    state: Arc<Mutex<FakeServerState>>,
-) {
+async fn serve_one(mut stream: TcpStream, origin: &str, state: Arc<Mutex<FakeServerState>>) {
     let request = read_request(&mut stream).await.unwrap();
     let response = {
         let mut state = state.lock().unwrap();
@@ -335,7 +358,10 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<CapturedRequest
     let header_end = loop {
         let read = stream.read(&mut chunk).await?;
         if read == 0 {
-            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "request ended"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "request ended",
+            ));
         }
         bytes.extend_from_slice(&chunk[..read]);
         if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
@@ -355,12 +381,19 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<CapturedRequest
             headers.insert(name.clone(), value.clone());
             (name, value)
         })
-        .find_map(|(name, value)| (name == "content-length").then(|| value.parse::<usize>().ok()).flatten())
+        .find_map(|(name, value)| {
+            (name == "content-length")
+                .then(|| value.parse::<usize>().ok())
+                .flatten()
+        })
         .unwrap_or(0);
     while bytes.len() < header_end + content_length {
         let read = stream.read(&mut chunk).await?;
         if read == 0 {
-            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "body ended"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "body ended",
+            ));
         }
         bytes.extend_from_slice(&chunk[..read]);
     }
@@ -371,12 +404,7 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<CapturedRequest
     })
 }
 
-async fn write_response(
-    stream: &mut TcpStream,
-    status: u16,
-    headers: &[(&str, &str)],
-    body: &str,
-) {
+async fn write_response(stream: &mut TcpStream, status: u16, headers: &[(&str, &str)], body: &str) {
     let reason = match status {
         200 => "OK",
         201 => "Created",
