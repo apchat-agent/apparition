@@ -961,11 +961,10 @@ async fn logging_in_again_invalidates_a_cookie_from_before_logout() {
     assert_eq!(new_session.status(), StatusCode::OK);
 }
 
-#[tokio::test]
-async fn logging_in_on_another_device_keeps_the_first_session_valid() {
+async fn assert_multiple_device_sessions<S: Storage + 'static>(storage: Arc<S>) {
     let app = OAuthPublic::new("https://appview.example")
         .unwrap()
-        .router_with_flow(FakeOAuthFlow::default(), Arc::new(MemoryStorage::default()));
+        .router_with_flow(FakeOAuthFlow::default(), storage);
     let first_device_cookie = finish_login(&app).await;
     let second_device_cookie = finish_login(&app).await;
 
@@ -983,6 +982,12 @@ async fn logging_in_on_another_device_keeps_the_first_session_valid() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
+}
+
+#[tokio::test]
+async fn logging_in_on_another_device_keeps_the_first_session_valid() {
+    assert_multiple_device_sessions(Arc::new(MemoryStorage::default())).await;
+    assert_multiple_device_sessions(Arc::new(SqliteStorage::open(":memory:").unwrap())).await;
 }
 
 #[tokio::test]
