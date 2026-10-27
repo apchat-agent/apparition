@@ -17,6 +17,8 @@ use std::{
 };
 use tower::ServiceExt;
 
+const EXPECTED_OAUTH_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete";
+
 #[derive(Clone)]
 struct FakeOAuthFlow {
     actions: Arc<Mutex<Vec<String>>>,
@@ -28,7 +30,7 @@ impl Default for FakeOAuthFlow {
     fn default() -> Self {
         Self {
             actions: Arc::new(Mutex::new(Vec::new())),
-            granted_scope: Some("atproto".to_owned()),
+            granted_scope: Some(EXPECTED_OAUTH_SCOPE.to_owned()),
             browser_binding: Arc::new(Mutex::new(None)),
         }
     }
@@ -332,13 +334,7 @@ async fn confidential_client_metadata_is_published() {
             .iter()
             .any(|grant| grant == "refresh_token")
     );
-    assert!(
-        metadata["scope"]
-            .as_str()
-            .unwrap()
-            .split_whitespace()
-            .any(|scope| scope == "atproto")
-    );
+    assert_eq!(metadata["scope"], EXPECTED_OAUTH_SCOPE);
     assert!(!metadata["jwks"]["keys"].as_array().unwrap().is_empty());
 }
 
@@ -357,7 +353,7 @@ fn loopback_oauth_metadata_uses_the_public_localhost_client() {
         "redirect_uri".into(),
         "http://127.0.0.1:3000/oauth/callback".into()
     )));
-    assert!(parameters.contains(&("scope".into(), "atproto".into())));
+    assert!(parameters.contains(&("scope".into(), EXPECTED_OAUTH_SCOPE.into())));
     assert_eq!(metadata["token_endpoint_auth_method"], "none");
     assert_eq!(metadata["dpop_bound_access_tokens"], true);
     assert!(metadata.get("jwks").is_none());
@@ -1227,6 +1223,79 @@ async fn logged_in_web_views_render_from_the_local_index_without_pds_reads() {
             .iter()
             .any(|action| action == "timeline")
     );
+}
+
+#[tokio::test]
+async fn callback_keeps_partial_write_grants_read_only_and_blocks_actions() {
+    let flow = FakeOAuthFlow::with_granted_scope(Some("atproto"));
+    let actions = flow.actions.clone();
+    let storage = Arc::new(MemoryStorage::default());
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage);
+    let login_cookie = prelogin_cookie(&app).await;
+    let callback = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?code=valid-code&state=valid-state&scope=atproto")
+                .header("cookie", login_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(callback.status(), StatusCode::SEE_OTHER);
+    let cookie = callback.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    let home = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = String::from_utf8(
+        home.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("Read-only"));
+    assert!(html.contains("write permissions were not granted"));
+    assert!(!html.contains("action=\"/post\""));
+    assert!(!html.contains("action=\"/like\""));
+    assert!(!html.contains("action=\"/repost\""));
+
+    let write = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/post")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", &cookie)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("text=must+not+write"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(write.status(), StatusCode::FORBIDDEN);
+    assert!(actions.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
