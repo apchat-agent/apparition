@@ -190,6 +190,39 @@ impl OAuthFlow for PanicCallbackFlow {
     }
 }
 
+#[derive(Clone)]
+struct AcceptingOAuthFlow;
+
+impl OAuthFlow for AcceptingOAuthFlow {
+    fn authorize<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async { Ok("https://auth.example/authorize".to_owned()) })
+    }
+
+    fn callback<'a>(
+        &'a self,
+        _: OAuthCallback,
+    ) -> Pin<Box<dyn Future<Output = Result<OAuthAccount, String>> + Send + 'a>> {
+        Box::pin(async {
+            Ok(OAuthAccount {
+                did: "did:plc:alice".to_owned(),
+                verified_handle: Some("alice.test".to_owned()),
+                granted_scope: Some("atproto".to_owned()),
+            })
+        })
+    }
+
+    fn logout<'a>(
+        &'a self,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
 #[test]
 fn public_oauth_origin_is_configurable() {
     let config =
@@ -285,6 +318,49 @@ async fn callback_rejects_valid_state_without_the_matching_browser_cookie() {
         .oneshot(
             Request::builder()
                 .uri("/oauth/callback?code=valid-code&state=valid-state&iss=https%3A%2F%2Fauth.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn web_callback_requires_a_login_cookie_independently_of_the_flow() {
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(AcceptingOAuthFlow, Arc::new(MemoryStorage::default()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?code=valid-code&state=valid-state")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn web_callback_rejects_a_forged_login_cookie_independently_of_the_flow() {
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(AcceptingOAuthFlow, Arc::new(MemoryStorage::default()));
+    let login_cookie = prelogin_cookie(&app).await;
+    let payload = login_cookie
+        .strip_prefix("appview_login=")
+        .unwrap()
+        .split_once('.')
+        .unwrap()
+        .0;
+    let forged_cookie = format!("appview_login={payload}.AAAA");
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?code=valid-code&state=valid-state")
+                .header("cookie", forged_cookie)
                 .body(Body::empty())
                 .unwrap(),
         )

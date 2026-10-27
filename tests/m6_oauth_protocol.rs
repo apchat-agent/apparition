@@ -317,6 +317,29 @@ async fn production_oauth_flow_accepts_standard_callback_and_binds_subject_and_s
     server.abort();
 }
 
+#[tokio::test]
+async fn production_oauth_flow_rejects_a_foreign_browser_binding() {
+    let (flow, shared, server) = production_flow(None, Some("atproto")).await;
+    flow.authorize(DID, "browser-binding-expected")
+        .await
+        .unwrap();
+    let state = latest_state(&shared);
+    let result = flow
+        .callback(OAuthCallback {
+            code: "valid-code".to_owned(),
+            state,
+            issuer: Some(server_origin(&shared)),
+            scope: None,
+            browser_binding: Some("browser-binding-from-another-browser".to_owned()),
+        })
+        .await;
+    assert!(
+        result.unwrap_err().contains("browser binding"),
+        "production callback must reject a state bound to another browser"
+    );
+    server.abort();
+}
+
 async fn production_flow(
     token_sub: Option<&str>,
     token_scope: Option<&str>,
