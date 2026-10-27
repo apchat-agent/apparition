@@ -196,3 +196,32 @@ The app-side root cause of the observed stall was that `JetstreamConsumer::consu
 - `cargo clippy --locked --offline --all-targets -- -D warnings`: passed.
 - `cargo deny check licenses`: passed (`licenses ok`).
 - All new regression tests use local fake WebSockets and a SQLite file under `target/`; no live server or external account was used. Changes are committed locally; nothing was pushed.
+
+## av10 reading experience (2026-10-27)
+
+| Item | Status | Evidence |
+| --- | --- | --- |
+| Indexed post counts and viewer state | Complete | Web and XRPC posts show like, repost, and reply counts. Authenticated XRPC views include `viewer.like` / `viewer.repost`; the web Like button changes to `Liked` and deletes the viewer's indexed like through OAuth `deleteRecord`. Regressions: `post_views_count_indexed_interactions_and_include_the_viewers_own_records`, `web_posts_show_local_counts_and_liked_state_and_submit_unlike`. |
+| Reply context | Complete | Timeline replies show the verified parent handle and link into the reply thread. `timeline_replies_name_the_parent_author_and_link_to_the_thread`. |
+| Thread traversal | Complete | Web and XRPC thread views render the parent chain, focused post, time-ordered replies, and nested replies. XRPC accepts `depth` and `parentHeight` and returns `threadViewPost` wrappers. `post_thread_returns_parent_chain_and_time_ordered_nested_replies`, `web_thread_renders_the_parent_chain_and_nested_replies_in_time_order`. |
+| Notifications | Complete | Logged-in `/notifications` lists likes, reposts, replies, facet mentions, quotes, and follows. XRPC `listNotifications` returns these reasons in the official notification shape; `seenAt` is returned, `updateSeen` is accepted, and unread count covers every reason. `notifications_include_likes_reposts_replies_mentions_quotes_and_follows`, `notifications_page_is_linked_and_shows_all_local_notification_reasons`. |
+| Paging and author filters | Complete | Timeline, profile feed, and notifications accept cursor-based Older pages. XRPC `getTimeline` and `getAuthorFeed` honor limit/cursor; author feed supports `posts_with_replies` (default) and `posts_no_replies`. Composite cursors preserve posts and notices with equal timestamps. Regressions: `timeline_paginates_by_cursor_and_author_feed_filters_replies`, `timeline_profile_and_notification_pages_offer_older_cursor_links`, `notification_cursor_keeps_same_timestamp_events_on_later_pages`. |
+
+### av10 SQLite index map
+
+- `records_collection_subject_uri` serves post like/repost counts.
+- `records_author_subject_uri` serves the viewer's own like/repost lookup.
+- `records_collection_parent_uri` serves reply counts; `records_replies_order` serves thread children ordered by time and URI.
+- `records_collection_uri` serves parent/root URI lookups.
+- `records_author_time` serves profile feeds and author feeds; `records_author_reply_time` serves `posts_no_replies` filtering.
+- `records_follow_actor_subject` serves followed-account selection for timelines.
+- `notification_events_subject_time` serves notification listing and unread counts by target DID. The notification event index is maintained on record writes/deletes and backfilled once for existing databases.
+
+### av10 verification
+
+- Red/green commits were made for counts/viewer state, reply context, thread traversal, notification reasons/page, feed and web paging, author filters, and equal-time notification cursors. Subjects end in `(codex av10)`.
+- `cargo test --locked --offline`: passed, 90 tests (unit: 4, M1: 2, M2: 5, M3: 12, M4: 8, M5 config: 5, M5 read API: 16, M6 web OAuth: 34, M6 protocol: 4).
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy --locked --offline --all-targets -- -D warnings`: passed.
+- `cargo deny check licenses`: passed (`licenses ok`).
+- All fixtures are local. No live-data or server access occurred, and nothing was pushed.
