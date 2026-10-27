@@ -163,6 +163,33 @@ async fn prelogin_cookie(app: &Router) -> String {
         .to_owned()
 }
 
+#[derive(Clone)]
+struct PanicCallbackFlow;
+
+impl OAuthFlow for PanicCallbackFlow {
+    fn authorize<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async { Ok("https://auth.example/authorize".to_owned()) })
+    }
+
+    fn callback<'a>(
+        &'a self,
+        _: OAuthCallback,
+    ) -> Pin<Box<dyn Future<Output = Result<OAuthAccount, String>> + Send + 'a>> {
+        Box::pin(async { panic!("simulated upstream OAuth panic") })
+    }
+
+    fn logout<'a>(
+        &'a self,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
 #[test]
 fn public_oauth_origin_is_configurable() {
     let config =
@@ -264,6 +291,25 @@ async fn callback_rejects_valid_state_without_the_matching_browser_cookie() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn callback_turns_an_upstream_panic_into_an_error_response() {
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(PanicCallbackFlow, Arc::new(MemoryStorage::default()));
+    let login_cookie = prelogin_cookie(&app).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?code=valid-code&state=valid-state")
+                .header("cookie", login_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
 }
 
 #[tokio::test]
