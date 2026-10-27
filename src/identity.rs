@@ -92,6 +92,8 @@ pub enum ResolutionError {
     UnsupportedDid(String),
     #[error("DID document was not found: {0}")]
     DidNotFound(String),
+    #[error("DID document id {actual} did not match requested DID {requested}")]
+    DidDocumentMismatch { actual: String, requested: String },
     #[error("handle is not bidirectionally verified: {0}")]
     UnverifiedHandle(String),
     #[error("identity backend failed: {0}")]
@@ -173,10 +175,10 @@ impl<B: IdentityBackend> IdentityResolver<B> {
             .await?
             .ok_or_else(|| ResolutionError::DidNotFound(did.to_owned()))?;
         if document.id != did {
-            return Err(ResolutionError::Backend(format!(
-                "DID document id {} did not match requested {did}",
-                document.id
-            )));
+            return Err(ResolutionError::DidDocumentMismatch {
+                actual: document.id,
+                requested: did.to_owned(),
+            });
         }
         Ok(document)
     }
@@ -214,10 +216,10 @@ impl<B: IdentityBackend> IdentityResolver<B> {
             .await?
             .ok_or_else(|| ResolutionError::DidNotFound(did.to_owned()))?;
         if doc.id != did {
-            return Err(ResolutionError::Backend(format!(
-                "DID document id {} did not match requested {did}",
-                doc.id
-            )));
+            return Err(ResolutionError::DidDocumentMismatch {
+                actual: doc.id,
+                requested: did.to_owned(),
+            });
         }
 
         let verified_handle = self.verified_handle_for_document(&doc).await?;
@@ -315,21 +317,22 @@ impl<S: Storage, B: IdentityBackend> HandleRefreshWorker<S, B> {
             .storage
             .pending_handle_refreshes(HANDLE_REFRESH_BATCH)?;
         let mut completed = 0;
+        let mut first_error = None;
         for did in pending {
             self.wait_for_refresh_slot().await;
-            let document = self.resolver.resolve_did_document(&did).await?;
-            match self
-                .resolver
-                .verified_handle_for_document(&document)
-                .await?
-            {
-                Some(handle) => self.storage.set_verified_handle(&did, &handle)?,
-                None => self.storage.clear_verified_handle(&did)?,
+            match self.refresh_one(&did).await {
+                Ok(()) => completed += 1,
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
             }
-            self.storage.complete_handle_refresh(&did)?;
-            completed += 1;
         }
-        Ok(completed)
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(completed),
+        }
     }
 
     pub async fn run(&self, mut shutdown: watch::Receiver<bool>) -> Result<(), HandleRefreshError> {
@@ -360,6 +363,34 @@ impl<S: Storage, B: IdentityBackend> HandleRefreshWorker<S, B> {
             }
         }
         *last_refresh = Some(Instant::now());
+    }
+
+    async fn refresh_one(&self, did: &str) -> Result<(), HandleRefreshError> {
+        let document = match self.resolver.resolve_did_document(did).await {
+            Ok(document) => document,
+            Err(
+                error @ (ResolutionError::DidNotFound(_)
+                | ResolutionError::DidDocumentMismatch { .. }
+                | ResolutionError::InvalidHandle(_)
+                | ResolutionError::UnsupportedDid(_)),
+            ) => {
+                tracing::debug!(%did, %error, "DID verification failed; clearing its cached handle");
+                self.storage.clear_verified_handle(did)?;
+                self.storage.complete_handle_refresh(did)?;
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        match self
+            .resolver
+            .verified_handle_for_document(&document)
+            .await?
+        {
+            Some(handle) => self.storage.set_verified_handle(did, &handle)?,
+            None => self.storage.clear_verified_handle(did)?,
+        }
+        self.storage.complete_handle_refresh(did)?;
+        Ok(())
     }
 }
 
