@@ -416,6 +416,89 @@ async fn author_feed_cursor_advances_between_pages() {
 }
 
 #[tokio::test]
+async fn post_views_count_indexed_interactions_and_include_the_viewers_own_records() {
+    let storage = Arc::new(MemoryStorage::default());
+    let post_uri = format!("at://{ALICE}/app.bsky.feed.post/p1");
+    for (did, collection, rkey, record) in [
+        (
+            ALICE,
+            "app.bsky.feed.post",
+            "p1",
+            json!({"text":"original"}),
+        ),
+        (
+            FRIEND,
+            "app.bsky.feed.like",
+            "other-like",
+            json!({"subject":{"uri":post_uri,"cid":"cid-p1"}}),
+        ),
+        (
+            ALICE,
+            "app.bsky.feed.like",
+            "own-like",
+            json!({"subject":{"uri":post_uri,"cid":"cid-p1"}}),
+        ),
+        (
+            FRIEND,
+            "app.bsky.feed.repost",
+            "other-repost",
+            json!({"subject":{"uri":post_uri,"cid":"cid-p1"}}),
+        ),
+        (
+            ALICE,
+            "app.bsky.feed.repost",
+            "own-repost",
+            json!({"subject":{"uri":post_uri,"cid":"cid-p1"}}),
+        ),
+        (
+            FRIEND,
+            "app.bsky.feed.post",
+            "reply",
+            json!({"text":"reply","reply":{"root":{"uri":post_uri},"parent":{"uri":post_uri}}}),
+        ),
+    ] {
+        storage
+            .put_record(&IndexedRecord {
+                did: did.into(),
+                collection: collection.into(),
+                rkey: rkey.into(),
+                uri: format!("at://{did}/{collection}/{rkey}"),
+                cid: Some(format!("cid-{rkey}")),
+                time_us: 100,
+                record,
+            })
+            .unwrap();
+    }
+    let (router, signing_key) = api_for_storage(storage);
+    let jwt = token(
+        &signing_key,
+        APPVIEW,
+        "app.bsky.feed.getPosts",
+        expiry(60),
+        Some(ALICE),
+    );
+    let (status, body) = request(
+        router,
+        "/xrpc/app.bsky.feed.getPosts?uris=at%3A%2F%2Fdid%3Aplc%3Aalice%2Fapp.bsky.feed.post%2Fp1",
+        Some(&jwt),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let post = &body["posts"][0];
+    assert_eq!(post["likeCount"], 2);
+    assert_eq!(post["repostCount"], 2);
+    assert_eq!(post["replyCount"], 1);
+    assert_eq!(
+        post["viewer"]["like"],
+        "at://did:plc:alice/app.bsky.feed.like/own-like"
+    );
+    assert_eq!(
+        post["viewer"]["repost"],
+        "at://did:plc:alice/app.bsky.feed.repost/own-repost"
+    );
+}
+
+#[tokio::test]
 async fn proxy_jwt_requires_signature_audience_method_and_expiration() {
     let (router, signing_key) = api();
     let protected = "/xrpc/app.bsky.feed.getTimeline";
