@@ -2,8 +2,11 @@ use appview_rs::router;
 use appview_rs::{
     config::Config,
     ingest::{MemoryStorage, Storage},
-    oauth::{OAuthAccount, OAuthCallback, OAuthFlow, OAuthPublic},
+    oauth::{OAuthAccount, OAuthCallback, OAuthFlow, OAuthPublic, SqliteOAuthStore},
 };
+use atrium_api::types::string::Did;
+use atrium_common::store::Store;
+use atrium_oauth::store::{session::Session, state::InternalStateData};
 use axum::{body::Body, http::Request, http::StatusCode};
 use http_body_util::BodyExt;
 use serde_json::Value;
@@ -188,4 +191,54 @@ async fn oauth_callback_registers_account_and_logout_clears_its_session() {
         .unwrap();
     assert_eq!(logout.status(), StatusCode::SEE_OTHER);
     assert!(!storage.is_registered("did:plc:alice").unwrap());
+}
+
+#[tokio::test]
+async fn oauth_authorization_state_and_tokens_survive_store_reopen() {
+    let file = std::env::temp_dir().join(format!(
+        "appview-oauth-{}-{}.sqlite",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let public = OAuthPublic::new("https://appview.example").unwrap();
+    let state = InternalStateData {
+        iss: "https://issuer.example".to_owned(),
+        dpop_key: public.private_key().key.clone(),
+        verifier: "pkce-verifier".to_owned(),
+        app_state: Some("expected-identity".to_owned()),
+    };
+    let did = "did:plc:alice".parse::<Did>().unwrap();
+    let session: Session = serde_json::from_value(serde_json::json!({
+        "dpop_key": public.private_key(),
+        "token_set": {
+            "iss":"https://issuer.example",
+            "sub":did,
+            "aud":"https://pds.example",
+            "scope":"atproto",
+            "refresh_token":"refresh-secret",
+            "access_token":"access-secret",
+            "token_type":"DPoP",
+            "expires_at":null
+        }
+    }))
+    .unwrap();
+
+    let store = SqliteOAuthStore::open(&file).unwrap();
+    store
+        .set("state-1".to_owned(), state.clone())
+        .await
+        .unwrap();
+    store.set(did.clone(), session.clone()).await.unwrap();
+    drop(store);
+
+    let reopened = SqliteOAuthStore::open(&file).unwrap();
+    assert_eq!(
+        reopened.get(&"state-1".to_owned()).await.unwrap(),
+        Some(state)
+    );
+    assert_eq!(reopened.get(&did).await.unwrap(), Some(session));
+    let _ = std::fs::remove_file(&file);
 }
