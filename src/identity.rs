@@ -356,7 +356,7 @@ struct DohAnswer {
 impl IdentityBackend for HttpIdentityBackend {
     async fn did_document(&self, did: &str) -> Result<Option<DidDocument>, ResolutionError> {
         let url = if did.starts_with("did:plc:") {
-            self.plc_directory.join(did).map_err(backend_error)?
+            plc_did_document_url(&self.plc_directory, did)?
         } else if let Some(host) = did.strip_prefix("did:web:") {
             let host = host.replace("%3A", ":").replace("%3a", ":");
             if host.contains(':') && !host.starts_with("localhost:") {
@@ -443,9 +443,18 @@ fn backend_error(error: impl std::fmt::Display) -> ResolutionError {
     ResolutionError::Backend(error.to_string())
 }
 
+fn plc_did_document_url(plc_directory: &Url, did: &str) -> Result<Url, ResolutionError> {
+    let mut url = plc_directory.clone();
+    url.path_segments_mut()
+        .map_err(|_| backend_error("PLC directory URL cannot contain path segments"))?
+        .pop_if_empty()
+        .push(did);
+    Ok(url)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::HttpIdentityBackend;
+    use super::{HttpIdentityBackend, plc_did_document_url};
 
     #[test]
     fn plc_did_is_appended_as_a_path_segment_for_each_base_shape() {
@@ -471,7 +480,7 @@ mod tests {
 
         for (base, expected) in cases {
             let backend = HttpIdentityBackend::new(base, "https://dns.example/query").unwrap();
-            let actual = backend.plc_directory.join(DID).unwrap();
+            let actual = plc_did_document_url(&backend.plc_directory, DID).unwrap();
             assert_eq!(actual.as_str(), expected, "base URL: {base}");
         }
     }

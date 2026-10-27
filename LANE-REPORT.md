@@ -104,3 +104,21 @@ F7 and F9–F13 were not addressed in av2: write-route CSRF, DID-document cachin
 - `cargo clippy --locked --offline -- -D warnings`: passed.
 - `cargo deny check licenses`: passed (`licenses ok`).
 - No live account login was attempted. Changes are committed locally; nothing was pushed.
+
+## av5 PLC DID URL fix (2026-10-27)
+
+| Item | Status | Evidence |
+| --- | --- | --- |
+| PLC DID document URL construction | Fixed | `HttpIdentityBackend` appends PLC DIDs as path segments, preserving the configured base path and avoiding `Url::join` treating `did:plc:…` as an absolute URL. |
+| Base URL shapes | Covered | `plc_did_is_appended_as_a_path_segment_for_each_base_shape` checks root and prefixed bases with and without trailing slashes. |
+| Production HTTP path | Covered | `http_identity_backend_reaches_fake_plc_server_using_did_path` exercises `HttpIdentityBackend` against a local fake PLC server and checks the requested DID path. |
+| Related URL construction audit | Complete | Backfill puts DIDs in encoded query parameters; OAuth parses and validates origins and serializes query data; JWT has no DID-based URL construction. Handle and `did:web` identity endpoints are built from validated identity inputs. No other `Url::join` with a DID or handle was found. |
+
+### av5 verification
+
+- Red test step failed against the original code with the `did:plc:…` builder error; green implementation passed both URL construction and fake-server regressions.
+- `cargo fmt --check`: passed.
+- `cargo test --locked --offline`: passed, 65 tests.
+- `cargo clippy --locked --offline --all-targets -- -D warnings`: passed.
+- `cargo deny check licenses`: passed (`licenses ok`).
+- Red and green changes are committed locally. No live-account login was attempted, and nothing was pushed.
