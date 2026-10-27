@@ -124,6 +124,178 @@ fn scoped_ingest_indexes_registered_and_followed_posts_and_registered_post_inter
 }
 
 #[test]
+fn scoped_ingest_indexes_interactions_and_post_references_on_followed_accounts() {
+    let storage = Arc::new(MemoryStorage::default());
+    storage.register_user("did:plc:root").unwrap();
+    storage
+        .set_follow("did:plc:root", "did:plc:friend", true)
+        .unwrap();
+    let ingestor = Ingestor::new(storage.clone(), ScopeMode::Scoped);
+    let root_uri = "at://did:plc:root/app.bsky.feed.post/root";
+    let friend_uri = "at://did:plc:friend/app.bsky.feed.post/friend";
+
+    for (did, rkey, text) in [
+        ("did:plc:root", "root", "root post"),
+        ("did:plc:friend", "friend", "followed post"),
+    ] {
+        ingestor
+            .process_json(&event(
+                did,
+                1,
+                "create",
+                "app.bsky.feed.post",
+                rkey,
+                Some(post(text)),
+            ))
+            .unwrap();
+    }
+
+    let like = |subject: &str| {
+        json!({"subject":{"uri":subject,"cid":"cid-post"},"createdAt":"2026-10-27T00:00:00Z"})
+    };
+    let repost = |subject: &str| {
+        json!({"subject":{"uri":subject,"cid":"cid-post"},"createdAt":"2026-10-27T00:00:00Z"})
+    };
+    for (time, collection, rkey, record) in [
+        (3, "app.bsky.feed.like", "friend-like", like(friend_uri)),
+        (4, "app.bsky.feed.like", "root-like", like(root_uri)),
+        (5, "app.bsky.feed.repost", "root-repost", repost(root_uri)),
+    ] {
+        ingestor
+            .process_json(&event(
+                "did:plc:stranger",
+                time,
+                "create",
+                collection,
+                rkey,
+                Some(record),
+            ))
+            .unwrap();
+    }
+
+    let reply = json!({
+        "text":"reply",
+        "reply":{
+            "root":{"uri":root_uri,"cid":"cid-root"},
+            "parent":{"uri":friend_uri,"cid":"cid-friend"}
+        }
+    });
+    ingestor
+        .process_json(&event(
+            "did:plc:stranger",
+            6,
+            "create",
+            "app.bsky.feed.post",
+            "reply",
+            Some(reply),
+        ))
+        .unwrap();
+    let root_only_reply = json!({
+        "text":"nested reply",
+        "reply":{
+            "root":{"uri":root_uri,"cid":"cid-root"},
+            "parent":{"uri":"at://did:plc:other/app.bsky.feed.post/parent","cid":"cid-other"}
+        }
+    });
+    ingestor
+        .process_json(&event(
+            "did:plc:stranger",
+            10,
+            "create",
+            "app.bsky.feed.post",
+            "root-only-reply",
+            Some(root_only_reply),
+        ))
+        .unwrap();
+    let quote = json!({
+        "text":"quote",
+        "embed":{"$type":"app.bsky.embed.record","record":{"uri":friend_uri,"cid":"cid-friend"}}
+    });
+    ingestor
+        .process_json(&event(
+            "did:plc:stranger",
+            7,
+            "create",
+            "app.bsky.feed.post",
+            "quote",
+            Some(quote),
+        ))
+        .unwrap();
+    let mention = json!({
+        "text":"hello",
+        "facets":[{"features":[{"$type":"app.bsky.richtext.facet#mention","did":"did:plc:friend"}]}]
+    });
+    ingestor
+        .process_json(&event(
+            "did:plc:stranger",
+            8,
+            "create",
+            "app.bsky.feed.post",
+            "mention",
+            Some(mention),
+        ))
+        .unwrap();
+    let unrelated = json!({"text":"unrelated","reply":{"parent":{"uri":"at://did:plc:other/app.bsky.feed.post/p"}}});
+    ingestor
+        .process_json(&event(
+            "did:plc:stranger",
+            9,
+            "create",
+            "app.bsky.feed.post",
+            "unrelated",
+            Some(unrelated),
+        ))
+        .unwrap();
+
+    for (collection, rkey) in [
+        ("app.bsky.feed.like", "friend-like"),
+        ("app.bsky.feed.like", "root-like"),
+        ("app.bsky.feed.repost", "root-repost"),
+        ("app.bsky.feed.post", "reply"),
+        ("app.bsky.feed.post", "root-only-reply"),
+        ("app.bsky.feed.post", "quote"),
+        ("app.bsky.feed.post", "mention"),
+    ] {
+        assert!(
+            storage
+                .get_record("did:plc:stranger", collection, rkey)
+                .unwrap()
+                .is_some(),
+            "expected in-scope {collection}/{rkey}"
+        );
+    }
+    assert!(
+        storage
+            .get_record("did:plc:stranger", "app.bsky.feed.post", "unrelated")
+            .unwrap()
+            .is_none()
+    );
+    let root_summary = storage.post_interaction_summary(root_uri, None).unwrap();
+    assert_eq!(root_summary.like_count, 1);
+    assert_eq!(root_summary.repost_count, 1);
+    assert_eq!(root_summary.reply_count, 1);
+
+    for (collection, rkey, time) in [
+        ("app.bsky.feed.like", "root-like", 10),
+        ("app.bsky.feed.repost", "root-repost", 11),
+    ] {
+        ingestor
+            .process_json(&event(
+                "did:plc:stranger",
+                time,
+                "delete",
+                collection,
+                rkey,
+                None,
+            ))
+            .unwrap();
+    }
+    let root_summary = storage.post_interaction_summary(root_uri, None).unwrap();
+    assert_eq!(root_summary.like_count, 0);
+    assert_eq!(root_summary.repost_count, 0);
+}
+
+#[test]
 fn deletes_remove_records_and_advance_the_jetstream_cursor() {
     let storage = Arc::new(MemoryStorage::default());
     storage.register_user("did:plc:root").unwrap();
