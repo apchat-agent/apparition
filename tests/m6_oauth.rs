@@ -1365,6 +1365,153 @@ async fn web_posts_show_hydrated_authors_and_times_on_timeline_profile_and_threa
 }
 
 #[tokio::test]
+async fn web_embeds_render_images_cards_quotes_and_escape_user_content() {
+    let storage = Arc::new(MemoryStorage::default());
+    storage.register_user("did:plc:alice").unwrap();
+    for record in [
+        IndexedRecord {
+            did: "did:plc:alice".into(),
+            collection: "app.bsky.actor.profile".into(),
+            rkey: "self".into(),
+            uri: "at://did:plc:alice/app.bsky.actor.profile/self".into(),
+            cid: Some("alice-profile-cid".into()),
+            time_us: 10,
+            record: serde_json::json!({"displayName":"Alice"}),
+        },
+        IndexedRecord {
+            did: "did:plc:alice".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "image-only".into(),
+            uri: "at://did:plc:alice/app.bsky.feed.post/image-only".into(),
+            cid: Some("image-only-cid".into()),
+            time_us: 9,
+            record: serde_json::json!({
+                "$type":"app.bsky.feed.post",
+                "createdAt":"2026-10-27T09:20:00Z",
+                "embed":{
+                    "$type":"app.bsky.embed.images",
+                    "images":[{
+                        "alt":"portrait <script>alert(1)</script>",
+                        "image":{"$type":"blob","ref":{"$link":"bafk-image-one"}}
+                    }]
+                }
+            }),
+        },
+        IndexedRecord {
+            did: "did:plc:alice".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "record-with-media".into(),
+            uri: "at://did:plc:alice/app.bsky.feed.post/record-with-media".into(),
+            cid: Some("record-with-media-cid".into()),
+            time_us: 8,
+            record: serde_json::json!({
+                "$type":"app.bsky.feed.post",
+                "createdAt":"2026-10-27T09:19:00Z",
+                "text":"Photo with a quote",
+                "embed":{
+                    "$type":"app.bsky.embed.recordWithMedia",
+                    "media":{
+                        "$type":"app.bsky.embed.images",
+                        "images":[{
+                            "alt":"media image",
+                            "image":{"$type":"blob","ref":{"$link":"bafk-image-two"}}
+                        }]
+                    },
+                    "record":{"$type":"app.bsky.embed.record","record":{"uri":"at://did:plc:quoted/app.bsky.feed.post/quoted","cid":"quoted-cid"}}
+                }
+            }),
+        },
+        IndexedRecord {
+            did: "did:plc:alice".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "external".into(),
+            uri: "at://did:plc:alice/app.bsky.feed.post/external".into(),
+            cid: Some("external-cid".into()),
+            time_us: 7,
+            record: serde_json::json!({
+                "$type":"app.bsky.feed.post",
+                "createdAt":"2026-10-27T09:18:00Z",
+                "embed":{
+                    "$type":"app.bsky.embed.external",
+                    "external":{
+                        "uri":"https://example.test/card?x=1&y=2",
+                        "title":"Card <Title>",
+                        "description":"Card description"
+                    }
+                }
+            }),
+        },
+        IndexedRecord {
+            did: "did:plc:alice".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "quoted".into(),
+            uri: "at://did:plc:alice/app.bsky.feed.post/quoted".into(),
+            cid: Some("quote-post-cid".into()),
+            time_us: 6,
+            record: serde_json::json!({
+                "$type":"app.bsky.feed.post",
+                "createdAt":"2026-10-27T09:17:00Z",
+                "embed":{
+                    "$type":"app.bsky.embed.record",
+                    "record":{"uri":"at://did:plc:quoted/app.bsky.feed.post/quoted","cid":"quoted-cid"}
+                }
+            }),
+        },
+        IndexedRecord {
+            did: "did:plc:quoted".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "quoted".into(),
+            uri: "at://did:plc:quoted/app.bsky.feed.post/quoted".into(),
+            cid: Some("quoted-cid".into()),
+            time_us: 5,
+            record: serde_json::json!({
+                "$type":"app.bsky.feed.post",
+                "createdAt":"2026-10-27T09:16:00Z",
+                "text":"Quoted <strong>text</strong>"
+            }),
+        },
+    ] {
+        storage.put_record(&record).unwrap();
+    }
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage);
+    let cookie = finish_login(&app).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+
+    assert!(
+        html.contains("https://cdn.bsky.app/img/feed_fullsize/plain/did:plc:alice/bafk-image-one")
+    );
+    assert!(
+        html.contains("https://cdn.bsky.app/img/feed_fullsize/plain/did:plc:alice/bafk-image-two")
+    );
+    assert!(html.contains("alt=\"portrait &lt;script&gt;alert(1)&lt;/script&gt;\""));
+    assert!(html.contains("Card &lt;Title&gt;"));
+    assert!(html.contains("https://example.test/card?x=1&amp;y=2"));
+    assert!(html.contains("Quoted &lt;strong&gt;text&lt;/strong&gt;"));
+    assert!(!html.contains("<script>alert(1)</script>"));
+}
+
+#[tokio::test]
 async fn callback_keeps_partial_write_grants_read_only_and_blocks_actions() {
     let flow = FakeOAuthFlow::with_granted_scope(Some("atproto"));
     let actions = flow.actions.clone();
