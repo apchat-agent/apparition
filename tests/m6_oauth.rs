@@ -623,7 +623,7 @@ async fn session_cookie_rejects_a_tampered_hmac() {
 #[tokio::test]
 async fn logging_in_again_invalidates_a_cookie_from_before_logout() {
     let public = OAuthPublic::new("https://appview.example").unwrap();
-    let storage = Arc::new(MemoryStorage::default());
+    let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
     let app = public.router_with_flow(FakeOAuthFlow::default(), storage);
 
     let first_login_cookie = prelogin_cookie(&app).await;
