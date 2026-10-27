@@ -588,3 +588,74 @@ async fn backfill_worker_drains_new_scope_entries_from_resolved_did_docs() {
     task.await.unwrap().unwrap();
     assert!(storage.pending_backfills().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn backfill_worker_backs_off_after_a_failed_repository_fetch() {
+    use appview_rs::{
+        backfill::{BackfillError, BackfillWorker, RepoFetcher},
+        identity::{IdentityBackend, IdentityResolver, ResolutionError},
+    };
+
+    #[derive(Clone)]
+    struct FakeIdentity(DidDocument);
+    impl IdentityBackend for FakeIdentity {
+        async fn did_document(&self, did: &str) -> Result<Option<DidDocument>, ResolutionError> {
+            Ok((self.0.id == did).then(|| self.0.clone()))
+        }
+        async fn dns_txt_did(&self, _: &str) -> Result<Option<String>, ResolutionError> {
+            Ok(None)
+        }
+        async fn well_known_did(&self, _: &str) -> Result<Option<String>, ResolutionError> {
+            Ok(None)
+        }
+    }
+
+    struct FailingFetcher(Arc<AtomicUsize>);
+    impl RepoFetcher for FailingFetcher {
+        async fn fetch_repo(&self, _: &str, _: &str) -> Result<Vec<u8>, BackfillError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(BackfillError::Fetch("offline fake failure".into()))
+        }
+    }
+
+    let did = "did:plc:retry";
+    let key = P256Keypair::create(&mut rand::thread_rng()).did();
+    let document = DidDocument {
+        id: did.into(),
+        also_known_as: vec![],
+        verification_method: vec![VerificationMethod {
+            id: "#atproto".into(),
+            type_name: "Multikey".into(),
+            controller: did.into(),
+            public_key_multibase: key.strip_prefix("did:key:").unwrap().into(),
+        }],
+        service: vec![DidService {
+            id: "#atproto_pds".into(),
+            type_name: "AtprotoPersonalDataServer".into(),
+            service_endpoint: "http://localhost:3001".into(),
+        }],
+    };
+    let storage = Arc::new(MemoryStorage::default());
+    storage.register_user(did).unwrap();
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let backfiller = RepoBackfiller::new(
+        storage.clone(),
+        FailingFetcher(fetches.clone()),
+        AtriumRepoVerifier,
+        HostRateLimiter::new(Duration::ZERO),
+    );
+    let worker = BackfillWorker::new(
+        storage.clone(),
+        IdentityResolver::new(FakeIdentity(document), Duration::from_secs(30)),
+        backfiller,
+        Duration::from_millis(5),
+    );
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move { worker.run(shutdown_rx).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = shutdown_tx.send(true);
+    task.await.unwrap().unwrap();
+
+    assert_eq!(fetches.load(Ordering::SeqCst), 1);
+    assert_eq!(storage.pending_backfills().unwrap(), [did]);
+}
