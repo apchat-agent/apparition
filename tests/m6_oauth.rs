@@ -10,11 +10,17 @@ use atrium_oauth::store::{session::Session, state::InternalStateData};
 use axum::{body::Body, http::Request, http::StatusCode};
 use http_body_util::BodyExt;
 use serde_json::Value;
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex},
+};
 use tower::ServiceExt;
 
-#[derive(Clone)]
-struct FakeOAuthFlow;
+#[derive(Clone, Default)]
+struct FakeOAuthFlow {
+    actions: Arc<Mutex<Vec<String>>>,
+}
 
 impl OAuthFlow for FakeOAuthFlow {
     fn authorize<'a>(
@@ -44,6 +50,50 @@ impl OAuthFlow for FakeOAuthFlow {
         _: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async { Ok(()) })
+    }
+
+    fn create_post<'a>(
+        &'a self,
+        did: &'a str,
+        text: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.actions
+                .lock()
+                .unwrap()
+                .push(format!("post:{did}:{text}"));
+            Ok(())
+        })
+    }
+
+    fn like<'a>(
+        &'a self,
+        did: &'a str,
+        uri: &'a str,
+        cid: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.actions
+                .lock()
+                .unwrap()
+                .push(format!("like:{did}:{uri}:{cid}"));
+            Ok(())
+        })
+    }
+
+    fn repost<'a>(
+        &'a self,
+        did: &'a str,
+        uri: &'a str,
+        cid: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.actions
+                .lock()
+                .unwrap()
+                .push(format!("repost:{did}:{uri}:{cid}"));
+            Ok(())
+        })
     }
 }
 
@@ -137,7 +187,7 @@ async fn authorization_and_callback_reject_missing_protocol_parameters() {
 async fn oauth_callback_registers_account_and_logout_clears_its_session() {
     let public = OAuthPublic::new("https://appview.example").unwrap();
     let storage = Arc::new(MemoryStorage::default());
-    let app = public.router_with_flow(FakeOAuthFlow, storage.clone());
+    let app = public.router_with_flow(FakeOAuthFlow::default(), storage.clone());
 
     let authorization = app
         .clone()
@@ -276,4 +326,65 @@ async fn web_views_and_write_actions_require_a_login_session() {
         assert_eq!(response.status(), StatusCode::SEE_OTHER, "{path}");
         assert_eq!(response.headers()["location"], "/login");
     }
+}
+
+#[tokio::test]
+async fn logged_in_write_forms_use_the_account_oauth_flow() {
+    let public = OAuthPublic::new("https://appview.example").unwrap();
+    let flow = FakeOAuthFlow::default();
+    let actions = flow.actions.clone();
+    let app = public.router_with_flow(flow, Arc::new(MemoryStorage::default()));
+    let callback = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?code=valid-code&state=valid-state")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cookie = callback.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    for (path, body) in [
+        ("/post", "text=hello+world"),
+        (
+            "/like",
+            "uri=at%3A%2F%2Fdid%3Aplc%3Aauthor%2Fapp.bsky.feed.post%2Fr1&cid=bafyreifake",
+        ),
+        (
+            "/repost",
+            "uri=at%3A%2F%2Fdid%3Aplc%3Aauthor%2Fapp.bsky.feed.post%2Fr1&cid=bafyreifake",
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER, "{path}");
+        assert_eq!(response.headers()["location"], "/app");
+    }
+    assert_eq!(
+        *actions.lock().unwrap(),
+        [
+            "post:did:plc:alice:hello world",
+            "like:did:plc:alice:at://did:plc:author/app.bsky.feed.post/r1:bafyreifake",
+            "repost:did:plc:alice:at://did:plc:author/app.bsky.feed.post/r1:bafyreifake",
+        ]
+    );
 }
