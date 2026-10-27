@@ -49,6 +49,8 @@ fn document(did: &str, handles: &[&str]) -> DidDocument {
             .iter()
             .map(|handle| format!("at://{handle}"))
             .collect(),
+        verification_method: vec![],
+        service: vec![],
     }
 }
 

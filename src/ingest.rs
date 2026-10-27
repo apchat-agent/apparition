@@ -55,6 +55,12 @@ pub enum StorageError {
 
 pub trait Storage: Send + Sync {
     fn put_record(&self, record: &IndexedRecord) -> Result<(), StorageError>;
+    fn replace_repo_snapshot(
+        &self,
+        did: &str,
+        records: &[IndexedRecord],
+        following: &[String],
+    ) -> Result<(), StorageError>;
     fn delete_record(&self, did: &str, collection: &str, rkey: &str) -> Result<(), StorageError>;
     fn get_record(
         &self,
@@ -97,6 +103,31 @@ impl Storage for MemoryStorage {
             .map_err(|_| StorageError::Poisoned)?
             .records
             .insert(key, record.clone());
+        Ok(())
+    }
+
+    fn replace_repo_snapshot(
+        &self,
+        did: &str,
+        records: &[IndexedRecord],
+        following: &[String],
+    ) -> Result<(), StorageError> {
+        let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        inner
+            .records
+            .retain(|(record_did, _, _), _| record_did != did);
+        inner.follows.retain(|(actor, _)| actor != did);
+        for record in records {
+            let key = (
+                record.did.clone(),
+                record.collection.clone(),
+                record.rkey.clone(),
+            );
+            inner.records.insert(key, record.clone());
+        }
+        for subject in following {
+            inner.follows.insert((did.to_owned(), subject.clone()));
+        }
         Ok(())
     }
 
@@ -248,6 +279,44 @@ impl Storage for SqliteStorage {
                  uri=excluded.uri, cid=excluded.cid, time_us=excluded.time_us, record_json=excluded.record_json",
             params![record.did, record.collection, record.rkey, record.uri, record.cid, record.time_us, record_json],
         )?;
+        Ok(())
+    }
+
+    fn replace_repo_snapshot(
+        &self,
+        did: &str,
+        records: &[IndexedRecord],
+        following: &[String],
+    ) -> Result<(), StorageError> {
+        let mut connection = self.conn()?;
+        let transaction = connection.transaction()?;
+        transaction.execute("DELETE FROM records WHERE did=?1", [did])?;
+        transaction.execute("DELETE FROM follows WHERE actor=?1", [did])?;
+        {
+            let mut insert = transaction.prepare(
+                "INSERT INTO records (did, collection, rkey, uri, cid, time_us, record_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for record in records {
+                insert.execute(params![
+                    record.did,
+                    record.collection,
+                    record.rkey,
+                    record.uri,
+                    record.cid,
+                    record.time_us,
+                    serde_json::to_string(&record.record)?,
+                ])?;
+            }
+        }
+        {
+            let mut insert_follow = transaction
+                .prepare("INSERT OR IGNORE INTO follows(actor,subject) VALUES(?1,?2)")?;
+            for subject in following {
+                insert_follow.execute(params![did, subject])?;
+            }
+        }
+        transaction.commit()?;
         Ok(())
     }
 

@@ -16,6 +16,10 @@ SQLite is the embedded store. It is permissively licensed, works without a separ
 
 The consumer subscribes to posts, likes, reposts, follows, blocks, and profiles; stores the latest `time_us` cursor; and reconnects to configured endpoints with exponential backoff. SQLite upserts make replay after a crash safe. Periodic structured log events report average events per second and SQLite/WAL bytes on disk.
 
+## Backfill
+
+M4 fetches `com.atproto.sync.getRepo` from the PDS advertised by the DID document. The CAR reader checks block hashes and MST completeness; the signed commit is checked against the document's `#atproto` key and DID. A verified snapshot replaces the local records and follow edges for that DID in one SQLite transaction. Requests are spaced per PDS host, and oversized CAR files are rejected.
+
 ## Current limits
 
-Backfill and XRPC/OAuth behavior are not implemented yet. Scope changes do not currently trigger historical backfill. CAR verification, full PDS repository reconciliation, retention/compaction policy, and production load measurements remain open.
+XRPC read APIs and OAuth are not implemented yet. Scope acquisition currently needs to call the backfill service explicitly; automatic queueing for newly followed and registered users is the next M4 integration step. Retention/compaction policy and production load measurements remain open.

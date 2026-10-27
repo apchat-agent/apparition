@@ -14,6 +14,66 @@ pub struct DidDocument {
     pub id: String,
     #[serde(default, rename = "alsoKnownAs")]
     pub also_known_as: Vec<String>,
+    #[serde(default, rename = "verificationMethod")]
+    pub verification_method: Vec<VerificationMethod>,
+    #[serde(default)]
+    pub service: Vec<DidService>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VerificationMethod {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub type_name: String,
+    pub controller: String,
+    #[serde(rename = "publicKeyMultibase")]
+    pub public_key_multibase: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DidService {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub type_name: String,
+    #[serde(rename = "serviceEndpoint")]
+    pub service_endpoint: String,
+}
+
+impl DidDocument {
+    /// Return the atproto signing key as a did:key identifier when the DID document
+    /// has the standard Multikey verification method controlled by this DID.
+    pub fn atproto_signing_key(&self) -> Option<String> {
+        self.verification_method.iter().find_map(|method| {
+            let key_id_matches =
+                method.id == "#atproto" || method.id == format!("{}#atproto", self.id);
+            (key_id_matches
+                && method.type_name == "Multikey"
+                && method.controller == self.id
+                && method.public_key_multibase.starts_with('z'))
+            .then(|| format!("did:key:{}", method.public_key_multibase))
+        })
+    }
+
+    /// Return the validated atproto PDS service endpoint from this DID document.
+    pub fn pds_endpoint(&self) -> Option<String> {
+        self.service.iter().find_map(|service| {
+            let service_id_matches =
+                service.id == "#atproto_pds" || service.id == format!("{}#atproto_pds", self.id);
+            if !service_id_matches || service.type_name != "AtprotoPersonalDataServer" {
+                return None;
+            }
+            let url = reqwest::Url::parse(&service.service_endpoint).ok()?;
+            let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
+            let valid_scheme = url.scheme() == "https" || (local && url.scheme() == "http");
+            (valid_scheme
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.path() == "/"
+                && url.query().is_none()
+                && url.fragment().is_none())
+            .then(|| service.service_endpoint.trim_end_matches('/').to_owned())
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -7,7 +7,7 @@ use atrium_api::types::string::Did;
 use atrium_crypto::keypair::{Did as _, P256Keypair};
 use atrium_repo::{
     Repository,
-    blockstore::{AsyncBlockStoreRead, AsyncBlockStoreWrite, MemoryBlockStore},
+    blockstore::{AsyncBlockStoreRead, MemoryBlockStore},
 };
 use axum::{
     Router,
