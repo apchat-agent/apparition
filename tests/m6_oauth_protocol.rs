@@ -169,10 +169,7 @@ async fn oauth_protocol_checks_state_issuer_nonce_and_refresh_against_fake_pds()
         .unwrap()
         .clone();
     let state = form_field(&par.body, "state").unwrap();
-    assert_eq!(
-        form_field(&par.body, "scope").as_deref(),
-        Some(EXPECTED_OAUTH_SCOPE)
-    );
+    assert_eq!(form_field(&par.body, "scope").as_deref(), Some("atproto"));
     assert_eq!(
         form_field(&par.body, "code_challenge_method").as_deref(),
         Some("S256")
@@ -287,6 +284,10 @@ async fn production_oauth_flow_accepts_standard_callback_and_binds_subject_and_s
     assert_eq!(
         decoded_form_field(&confidential_par.body, "client_id").as_deref(),
         Some("https://appview.example/.well-known/oauth-client-metadata.json")
+    );
+    assert_eq!(
+        decoded_form_field(&confidential_par.body, "scope").as_deref(),
+        Some(EXPECTED_OAUTH_SCOPE)
     );
     let state = latest_state(&shared);
     let result = flow

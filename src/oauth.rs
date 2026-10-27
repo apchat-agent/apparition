@@ -41,7 +41,7 @@ use serde_json::{Value, json};
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     future::Future,
     io::Write,
@@ -58,6 +58,12 @@ const SESSION_COOKIE: &str = "appview_session";
 const LOGIN_COOKIE: &str = "appview_login";
 const SESSION_TTL_SECONDS: u64 = 30 * 24 * 60 * 60;
 const LOGIN_COOKIE_TTL_SECONDS: u64 = 10 * 60;
+const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete";
+const WRITE_SCOPES: [&str; 3] = [
+    "repo:app.bsky.feed.post?action=create",
+    "repo:app.bsky.feed.like?action=create&action=delete",
+    "repo:app.bsky.feed.repost?action=create&action=delete",
+];
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Error)]
@@ -288,7 +294,7 @@ impl OAuthPublic {
             "application_type": "web",
             "redirect_uris": [redirect_uri],
             "grant_types": ["authorization_code", "refresh_token"],
-            "scope": "atproto",
+            "scope": REQUESTED_SCOPE,
             "token_endpoint_auth_method": "private_key_jwt",
             "token_endpoint_auth_signing_alg": "ES256",
             "dpop_bound_access_tokens": true,
@@ -311,7 +317,7 @@ impl OAuthPublic {
         let redirect_uri = format!("{origin}{CALLBACK_PATH}");
         let query = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("redirect_uri", &redirect_uri)
-            .append_pair("scope", "atproto")
+            .append_pair("scope", REQUESTED_SCOPE)
             .finish();
         let client_id = format!("http://localhost?{query}");
         let metadata = json!({
@@ -321,7 +327,7 @@ impl OAuthPublic {
             "redirect_uris": [redirect_uri],
             "grant_types": ["authorization_code", "refresh_token"],
             "response_types": ["code"],
-            "scope": "atproto",
+            "scope": REQUESTED_SCOPE,
             "token_endpoint_auth_method": "none",
             "dpop_bound_access_tokens": true
         });
@@ -337,9 +343,15 @@ impl OAuthPublic {
         self.mode == OAuthClientMode::Confidential && self.public_url.starts_with("https://")
     }
 
-    fn issue_session_cookie(&self, did: &str, session_id: &str, generation: u64) -> String {
+    fn issue_session_cookie(
+        &self,
+        did: &str,
+        session_id: &str,
+        generation: u64,
+        write_access: bool,
+    ) -> String {
         let expires = unix_time().saturating_add(SESSION_TTL_SECONDS);
-        let payload = format!("{did}\n{expires}\n{session_id}\n{generation}");
+        let payload = format!("{did}\n{expires}\n{session_id}\n{generation}\n{write_access}");
         let encoded = URL_SAFE_NO_PAD.encode(payload.as_bytes());
         let mut mac = HmacSha256::new_from_slice(&self.cookie_key())
             .expect("HMAC accepts keys of any length");
@@ -380,7 +392,7 @@ impl OAuthPublic {
         Some(binding.to_owned())
     }
 
-    fn verify_session_cookie(&self, token: &str) -> Option<(String, String, u64)> {
+    fn verify_session_cookie(&self, token: &str) -> Option<(String, String, u64, bool)> {
         let (payload, signature) = token.split_once('.')?;
         let signature = URL_SAFE_NO_PAD.decode(signature).ok()?;
         let mut mac = HmacSha256::new_from_slice(&self.cookie_key()).ok()?;
@@ -392,6 +404,7 @@ impl OAuthPublic {
         let (did, session) = value.split_once('\n')?;
         let (expires, session) = session.split_once('\n')?;
         let (session_id, generation) = session.split_once('\n')?;
+        let (generation, write_access) = generation.split_once('\n')?;
         if expires.parse::<u64>().ok()? <= unix_time()
             || session_id.is_empty()
             || !(did.starts_with("did:plc:") || did.starts_with("did:web:"))
@@ -402,6 +415,7 @@ impl OAuthPublic {
             did.to_owned(),
             session_id.to_owned(),
             generation.parse().ok()?,
+            write_access.parse().ok()?,
         ))
     }
 
@@ -639,7 +653,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             OAuthClientMode::Loopback => OAuthClient::new(OAuthClientConfig {
                 client_metadata: AtprotoLocalhostClientMetadata {
                     redirect_uris: Some(vec![redirect_uri]),
-                    scopes: Some(vec![Scope::Known(KnownScope::Atproto)]),
+                    scopes: Some(requested_scopes()),
                 },
                 keys: None,
                 state_store: store.clone(),
@@ -656,7 +670,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                     redirect_uris: vec![redirect_uri],
                     token_endpoint_auth_method: AuthMethod::PrivateKeyJwt,
                     grant_types: vec![GrantType::AuthorizationCode, GrantType::RefreshToken],
-                    scopes: vec![Scope::Known(KnownScope::Atproto)],
+                    scopes: requested_scopes(),
                     jwks_uri: None,
                     token_endpoint_auth_signing_alg: Some("ES256".to_owned()),
                 };
@@ -742,6 +756,7 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
                     login,
                     AuthorizeOptions {
                         state: Some(state),
+                        scopes: requested_scopes(),
                         ..Default::default()
                     },
                 )
@@ -1099,11 +1114,12 @@ where
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
     let mut response = Redirect::to("/app").into_response();
+    let write_access = has_all_write_scopes(account.granted_scope.as_deref());
     let cookie = format!(
         "{SESSION_COOKIE}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL_SECONDS}{}",
         state
             .public
-            .issue_session_cookie(&account.did, &session_id, generation),
+            .issue_session_cookie(&account.did, &session_id, generation, write_access),
         if state.public.secure_cookies() {
             "; Secure"
         } else {
@@ -1130,7 +1146,7 @@ where
     if !same_origin_request(&headers, &state.public.public_url) {
         return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
     }
-    let Some((did, session_id, _)) =
+    let Some((did, session_id, _, _)) =
         verified_cookie_session(&state.public, &headers, state.storage.as_ref())
     else {
         return clear_session_cookie(Redirect::to("/login").into_response());
@@ -1165,12 +1181,17 @@ where
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
     let timeline = timeline_records(&records, &did, 50);
+    let write_forms_enabled =
+        verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
     let posts = timeline
         .iter()
         .map(|record| {
             let uri = record.uri.as_str();
             let cid = record.cid.as_deref().unwrap_or("");
             let text = record.record.get("text").and_then(Value::as_str).unwrap_or("");
+            if !write_forms_enabled {
+                return format!("<li><a href=\"/thread?uri={}\">{}</a></li>", html_escape(uri), html_escape(text));
+            }
             format!(
                 "<li><a href=\"/thread?uri={}\">{}</a><form action=\"/like\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{}\"><input type=\"hidden\" name=\"cid\" value=\"{}\"><button>Like</button></form><form action=\"/repost\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{}\"><input type=\"hidden\" name=\"cid\" value=\"{}\"><button>Repost</button></form></li>",
                 html_escape(uri), html_escape(text), html_escape(uri), html_escape(cid),
@@ -1183,8 +1204,18 @@ where
     } else {
         posts
     };
+    let read_only_message = if write_forms_enabled {
+        String::new()
+    } else {
+        "<p role=\"status\">Read-only: write permissions were not granted, so posting, liking, and reposting are disabled.</p>".to_owned()
+    };
+    let post_form = if write_forms_enabled {
+        "<form action=\"/post\" method=\"post\"><textarea name=\"text\" required></textarea><button>Post</button></form>"
+    } else {
+        ""
+    };
     Html(format!(
-        "<!doctype html><html><head><title>AppView</title></head><body><main><h1>Timeline for {}</h1><nav><a href=\"/profile?did={}\">Profile</a> <form action=\"/logout\" method=\"post\"><button>Log out</button></form></nav><ol>{posts}</ol><form action=\"/post\" method=\"post\"><textarea name=\"text\" required></textarea><button>Post</button></form></main></body></html>",
+        "<!doctype html><html><head><title>AppView</title></head><body><main><h1>Timeline for {}</h1><nav><a href=\"/profile?did={}\">Profile</a> <form action=\"/logout\" method=\"post\"><button>Log out</button></form></nav>{read_only_message}<ol>{posts}</ol>{post_form}</main></body></html>",
         html_escape(&did), html_escape(&did)
     ))
     .into_response()
@@ -1259,10 +1290,24 @@ where
         .get("text")
         .and_then(Value::as_str)
         .unwrap_or("");
+    let write_forms = if verified_cookie_write_access(
+        &state.public,
+        &headers,
+        state.storage.as_ref(),
+    ) {
+        format!(
+            "<form action=\"/like\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{}\"><input type=\"hidden\" name=\"cid\" value=\"{}\"><button>Like</button></form><form action=\"/repost\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{}\"><input type=\"hidden\" name=\"cid\" value=\"{}\"><button>Repost</button></form>",
+            html_escape(&record.uri),
+            html_escape(record.cid.as_deref().unwrap_or("")),
+            html_escape(&record.uri),
+            html_escape(record.cid.as_deref().unwrap_or(""))
+        )
+    } else {
+        "<p role=\"status\">Read-only: write permissions were not granted.</p>".to_owned()
+    };
     Html(format!(
-        "<!doctype html><html><head><title>Post</title></head><body><main><p>{}</p><form action=\"/like\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{}\"><input type=\"hidden\" name=\"cid\" value=\"{}\"><button>Like</button></form><form action=\"/repost\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{}\"><input type=\"hidden\" name=\"cid\" value=\"{}\"><button>Repost</button></form><a href=\"/app\">Timeline</a></main></body></html>",
-        html_escape(text), html_escape(&record.uri), html_escape(record.cid.as_deref().unwrap_or("")),
-        html_escape(&record.uri), html_escape(record.cid.as_deref().unwrap_or(""))
+        "<!doctype html><html><head><title>Post</title></head><body><main><p>{}</p>{write_forms}<a href=\"/app\">Timeline</a></main></body></html>",
+        html_escape(text)
     ))
     .into_response()
 }
@@ -1282,6 +1327,9 @@ where
     let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return Redirect::to("/login").into_response();
     };
+    if !verified_cookie_write_access(&state.public, &headers, state.storage.as_ref()) {
+        return oauth_error(StatusCode::FORBIDDEN, "write permissions were not granted");
+    }
     let text = form.get("text").map(String::as_str).unwrap_or("").trim();
     if text.is_empty() || text.chars().count() > 300 {
         return oauth_error(
@@ -1310,6 +1358,9 @@ where
     let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return Redirect::to("/login").into_response();
     };
+    if !verified_cookie_write_access(&state.public, &headers, state.storage.as_ref()) {
+        return oauth_error(StatusCode::FORBIDDEN, "write permissions were not granted");
+    }
     let (Some(uri), Some(cid)) = (form.get("uri"), form.get("cid")) else {
         return oauth_error(StatusCode::BAD_REQUEST, "uri and cid are required");
     };
@@ -1337,6 +1388,9 @@ where
     let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return Redirect::to("/login").into_response();
     };
+    if !verified_cookie_write_access(&state.public, &headers, state.storage.as_ref()) {
+        return oauth_error(StatusCode::FORBIDDEN, "write permissions were not granted");
+    }
     let (Some(uri), Some(cid)) = (form.get("uri"), form.get("cid")) else {
         return oauth_error(StatusCode::BAD_REQUEST, "uri and cid are required");
     };
@@ -1354,22 +1408,31 @@ fn verified_cookie_did<S: Storage>(
     headers: &HeaderMap,
     storage: &S,
 ) -> Option<String> {
-    verified_cookie_session(public, headers, storage).map(|(did, _, _)| did)
+    verified_cookie_session(public, headers, storage).map(|(did, _, _, _)| did)
+}
+
+fn verified_cookie_write_access<S: Storage>(
+    public: &OAuthPublic,
+    headers: &HeaderMap,
+    storage: &S,
+) -> bool {
+    verified_cookie_session(public, headers, storage)
+        .is_some_and(|(_, _, _, write_access)| write_access)
 }
 
 fn verified_cookie_session<S: Storage>(
     public: &OAuthPublic,
     headers: &HeaderMap,
     storage: &S,
-) -> Option<(String, String, u64)> {
-    let (did, session_id, generation) =
+) -> Option<(String, String, u64, bool)> {
+    let (did, session_id, generation, write_access) =
         cookie_value(headers).and_then(|value| public.verify_session_cookie(value))?;
     (storage
         .web_session_generation(&did, &session_id)
         .ok()
         .flatten()
         == Some(generation))
-    .then_some((did, session_id, generation))
+    .then_some((did, session_id, generation, write_access))
 }
 
 fn same_origin_request(headers: &HeaderMap, public_url: &str) -> bool {
@@ -1470,6 +1533,26 @@ fn html_escape(value: &str) -> String {
 
 fn has_atproto_scope(scope: Option<&str>) -> bool {
     scope.is_some_and(|scope| scope.split_whitespace().any(|value| value == "atproto"))
+}
+
+fn has_all_write_scopes(scope: Option<&str>) -> bool {
+    let Some(scope) = scope else {
+        return false;
+    };
+    let granted = scope.split_whitespace().collect::<HashSet<_>>();
+    WRITE_SCOPES
+        .iter()
+        .all(|required| granted.contains(required))
+}
+
+fn requested_scopes() -> Vec<Scope> {
+    std::iter::once(Scope::Known(KnownScope::Atproto))
+        .chain(
+            WRITE_SCOPES
+                .iter()
+                .map(|scope| Scope::Unknown((*scope).to_owned())),
+        )
+        .collect()
 }
 
 fn unix_time() -> u64 {
