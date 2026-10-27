@@ -10,8 +10,9 @@ use atrium_identity::{
     handle::{AtprotoHandleResolver, AtprotoHandleResolverConfig, DnsTxtResolver},
 };
 use atrium_oauth::{
-    AtprotoClientMetadata, AuthMethod, AuthorizeOptions, DefaultHttpClient, GrantType,
-    KnownScope, OAuthClient, OAuthClientConfig, OAuthResolverConfig, Scope,
+    AtprotoClientMetadata, AtprotoLocalhostClientMetadata, AuthMethod, AuthorizeOptions,
+    DefaultHttpClient, GrantType, KnownScope, OAuthClient, OAuthClientConfig,
+    OAuthResolverConfig, Scope,
     store::{
         session::{Session, SessionStore},
         state::{InternalStateData, StateStore},
@@ -618,44 +619,56 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         plc_directory_url: &str,
     ) -> Result<Self, String> {
         let http_client = Arc::new(DefaultHttpClient::default());
-        let did_resolver = CommonDidResolver::new(CommonDidResolverConfig {
-            plc_directory_url: plc_directory_url.to_owned(),
-            http_client: http_client.clone(),
-        });
-        let handle_resolver = AtprotoHandleResolver::new(AtprotoHandleResolverConfig {
-            dns_txt_resolver: CloudflareDnsTxtResolver::default(),
-            http_client,
-        });
-        let metadata = AtprotoClientMetadata {
-            client_id: public.metadata["client_id"]
-                .as_str()
-                .ok_or_else(|| "OAuth client metadata has no client_id".to_owned())?
-                .to_owned(),
-            client_uri: Some(public.public_url.clone()),
-            redirect_uris: vec![
-                public.metadata["redirect_uris"][0]
-                    .as_str()
-                    .ok_or_else(|| "OAuth client metadata has no redirect URI".to_owned())?
-                    .to_owned(),
-            ],
-            token_endpoint_auth_method: AuthMethod::PrivateKeyJwt,
-            grant_types: vec![GrantType::AuthorizationCode, GrantType::RefreshToken],
-            scopes: vec![Scope::Known(KnownScope::Atproto)],
-            jwks_uri: None,
-            token_endpoint_auth_signing_alg: Some("ES256".to_owned()),
+        let redirect_uri = public.metadata["redirect_uris"][0]
+            .as_str()
+            .ok_or_else(|| "OAuth client metadata has no redirect URI".to_owned())?
+            .to_owned();
+        let make_resolver = || OAuthResolverConfig {
+            did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
+                plc_directory_url: plc_directory_url.to_owned(),
+                http_client: http_client.clone(),
+            }),
+            handle_resolver: AtprotoHandleResolver::new(AtprotoHandleResolverConfig {
+                dns_txt_resolver: CloudflareDnsTxtResolver::default(),
+                http_client: http_client.clone(),
+            }),
+            authorization_server_metadata: Default::default(),
+            protected_resource_metadata: Default::default(),
         };
-        let client = OAuthClient::new(OAuthClientConfig {
-            client_metadata: metadata,
-            keys: Some(vec![public.private_key.clone()]),
-            state_store: store.clone(),
-            session_store: store.clone(),
-            resolver: OAuthResolverConfig {
-                did_resolver,
-                handle_resolver,
-                authorization_server_metadata: Default::default(),
-                protected_resource_metadata: Default::default(),
-            },
-        })
+        let client = match public.mode {
+            OAuthClientMode::Loopback => OAuthClient::new(OAuthClientConfig {
+                client_metadata: AtprotoLocalhostClientMetadata {
+                    redirect_uris: Some(vec![redirect_uri]),
+                    scopes: Some(vec![Scope::Known(KnownScope::Atproto)]),
+                },
+                keys: None,
+                state_store: store.clone(),
+                session_store: store.clone(),
+                resolver: make_resolver(),
+            }),
+            OAuthClientMode::Confidential => {
+                let metadata = AtprotoClientMetadata {
+                    client_id: public.metadata["client_id"]
+                        .as_str()
+                        .ok_or_else(|| "OAuth client metadata has no client_id".to_owned())?
+                        .to_owned(),
+                    client_uri: Some(public.public_url.clone()),
+                    redirect_uris: vec![redirect_uri],
+                    token_endpoint_auth_method: AuthMethod::PrivateKeyJwt,
+                    grant_types: vec![GrantType::AuthorizationCode, GrantType::RefreshToken],
+                    scopes: vec![Scope::Known(KnownScope::Atproto)],
+                    jwks_uri: None,
+                    token_endpoint_auth_signing_alg: Some("ES256".to_owned()),
+                };
+                OAuthClient::new(OAuthClientConfig {
+                    client_metadata: metadata,
+                    keys: Some(vec![public.private_key.clone()]),
+                    state_store: store.clone(),
+                    session_store: store.clone(),
+                    resolver: make_resolver(),
+                })
+            }
+        }
         .map_err(|error| error.to_string())?;
         Ok(Self {
             client: Arc::new(client),
