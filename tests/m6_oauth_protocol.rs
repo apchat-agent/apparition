@@ -1,4 +1,10 @@
-use appview_rs::oauth::OAuthPublic;
+use appview_rs::{
+    identity::{
+        DidDocument as AppDidDocument, DidService, IdentityBackend, IdentityResolver,
+        ResolutionError,
+    },
+    oauth::{OAuthCallback, OAuthFlow, OAuthPublic, SqliteOAuthStore},
+};
 use atrium_api::{
     agent::Agent,
     did_doc::{DidDocument, Service},
@@ -15,6 +21,7 @@ use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -66,6 +73,27 @@ struct FakeServerState {
     par_count: usize,
     timeline_count: usize,
     token_count: usize,
+    token_sub: Option<String>,
+    token_scope: Option<String>,
+}
+
+#[derive(Clone)]
+struct ProductionFlowIdentity {
+    document: AppDidDocument,
+}
+
+impl IdentityBackend for ProductionFlowIdentity {
+    async fn did_document(&self, did: &str) -> Result<Option<AppDidDocument>, ResolutionError> {
+        Ok((self.document.id == did).then(|| self.document.clone()))
+    }
+
+    async fn dns_txt_did(&self, _: &str) -> Result<Option<String>, ResolutionError> {
+        Ok(None)
+    }
+
+    async fn well_known_did(&self, _: &str) -> Result<Option<String>, ResolutionError> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -236,6 +264,122 @@ async fn oauth_protocol_checks_state_issuer_nonce_and_refresh_against_fake_pds()
     server.abort();
 }
 
+#[tokio::test]
+async fn production_oauth_flow_accepts_standard_callback_and_binds_subject_and_scope() {
+    let (flow, shared, server) = production_flow(None, None).await;
+    flow.authorize(DID).await.unwrap();
+    let state = latest_state(&shared);
+    let result = flow
+        .callback(OAuthCallback {
+            code: "valid-code".to_owned(),
+            state,
+            issuer: Some(server_origin(&shared)),
+            scope: None,
+        })
+        .await;
+    assert!(
+        result.is_ok(),
+        "standard callback should succeed: {result:?}"
+    );
+    assert_eq!(shared.lock().unwrap().token_count, 1);
+    server.abort();
+
+    let (flow, shared, server) = production_flow(Some("did:plc:attacker"), Some("atproto")).await;
+    flow.authorize(DID).await.unwrap();
+    let state = latest_state(&shared);
+    let result = flow
+        .callback(OAuthCallback {
+            code: "valid-code".to_owned(),
+            state,
+            issuer: Some(server_origin(&shared)),
+            scope: None,
+        })
+        .await;
+    assert!(result.unwrap_err().contains("subject DID"));
+    server.abort();
+
+    let (flow, shared, server) = production_flow(Some(DID), Some("profile")).await;
+    flow.authorize(DID).await.unwrap();
+    let state = latest_state(&shared);
+    let result = flow
+        .callback(OAuthCallback {
+            code: "valid-code".to_owned(),
+            state,
+            issuer: Some(server_origin(&shared)),
+            scope: None,
+        })
+        .await;
+    assert!(result.unwrap_err().contains("atproto scope"));
+    server.abort();
+}
+
+async fn production_flow(
+    token_sub: Option<&str>,
+    token_scope: Option<&str>,
+) -> (
+    appview_rs::oauth::AtriumOAuthFlow<ProductionFlowIdentity>,
+    Arc<Mutex<FakeServerState>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let origin = format!("http://{address}");
+    let shared = Arc::new(Mutex::new(FakeServerState {
+        token_sub: token_sub.map(str::to_owned),
+        token_scope: token_scope.map(str::to_owned),
+        ..Default::default()
+    }));
+    let server_state = shared.clone();
+    let server_origin = origin.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let state = server_state.clone();
+            let origin = server_origin.clone();
+            tokio::spawn(async move {
+                serve_one(stream, &origin, state).await;
+            });
+        }
+    });
+
+    let identity = ProductionFlowIdentity {
+        document: AppDidDocument {
+            id: DID.to_owned(),
+            also_known_as: vec![],
+            verification_method: vec![],
+            service: vec![DidService {
+                id: "#atproto_pds".to_owned(),
+                type_name: "AtprotoPersonalDataServer".to_owned(),
+                service_endpoint: origin.clone(),
+            }],
+        },
+    };
+    let resolver = Arc::new(IdentityResolver::new(identity, Duration::from_secs(30)));
+    let public = OAuthPublic::new("https://appview.example").unwrap();
+    let flow = public
+        .atrium_flow_with_plc_directory(
+            resolver,
+            SqliteOAuthStore::open(":memory:").unwrap(),
+            &format!("{origin}/"),
+        )
+        .unwrap();
+    (flow, shared, server)
+}
+
+fn server_origin(shared: &Arc<Mutex<FakeServerState>>) -> String {
+    shared
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .find(|request| request.path == "/.well-known/oauth-authorization-server")
+        .and_then(|request| request.headers.get("host"))
+        .map(|host| format!("http://{host}"))
+        .unwrap()
+}
+
 fn latest_state(shared: &Arc<Mutex<FakeServerState>>) -> String {
     shared
         .lock()
@@ -271,6 +415,16 @@ async fn serve_one(mut stream: TcpStream, origin: &str, state: Arc<Mutex<FakeSer
         let mut state = state.lock().unwrap();
         state.requests.push(request.clone());
         match request.path.as_str() {
+            path if path == format!("/{DID}") => (
+                200,
+                vec![],
+                json!({
+                    "id":DID,
+                    "alsoKnownAs":[],
+                    "verificationMethod":[],
+                    "service":[{"id":"#atproto_pds","type":"AtprotoPersonalDataServer","serviceEndpoint":origin}]
+                }).to_string(),
+            ),
             "/.well-known/oauth-protected-resource" => (
                 200,
                 vec![],
@@ -313,17 +467,19 @@ async fn serve_one(mut stream: TcpStream, origin: &str, state: Arc<Mutex<FakeSer
             }
             "/token" => {
                 state.token_count += 1;
+                let sub = state.token_sub.as_deref().unwrap_or(DID);
+                let scope = state.token_scope.as_deref().unwrap_or("atproto");
                 if request.body.contains("grant_type=refresh_token") {
                     (
                         200,
                         vec![],
-                        json!({"access_token":"access-fresh","refresh_token":"refresh-fresh","token_type":"DPoP","expires_in":3600,"scope":"atproto","sub":DID}).to_string(),
+                        json!({"access_token":"access-fresh","refresh_token":"refresh-fresh","token_type":"DPoP","expires_in":3600,"scope":scope,"sub":sub}).to_string(),
                     )
                 } else {
                     (
                         200,
                         vec![],
-                        json!({"access_token":"access-expired","refresh_token":"refresh-initial","token_type":"DPoP","expires_in":0,"scope":"atproto","sub":DID}).to_string(),
+                        json!({"access_token":"access-expired","refresh_token":"refresh-initial","token_type":"DPoP","expires_in":0,"scope":scope,"sub":sub}).to_string(),
                     )
                 }
             }

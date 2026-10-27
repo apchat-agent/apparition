@@ -214,7 +214,18 @@ impl OAuthPublic {
         identity_resolver: Arc<IdentityResolver<HttpIdentityBackend>>,
         store: SqliteOAuthStore,
     ) -> Result<AtriumOAuthFlow, String> {
-        AtriumOAuthFlow::new(self, identity_resolver, store)
+        AtriumOAuthFlow::new(self, identity_resolver, store, DEFAULT_PLC_DIRECTORY_URL)
+    }
+
+    /// Construct the production flow against an injectable PLC directory.
+    /// This allows offline tests to use a local fake PDS and authorization server.
+    pub fn atrium_flow_with_plc_directory<B: crate::identity::IdentityBackend + 'static>(
+        &self,
+        identity_resolver: Arc<IdentityResolver<B>>,
+        store: SqliteOAuthStore,
+        plc_directory_url: &str,
+    ) -> Result<AtriumOAuthFlow<B>, String> {
+        AtriumOAuthFlow::new(self, identity_resolver, store, plc_directory_url)
     }
 
     pub fn router(&self) -> Router {
@@ -331,11 +342,20 @@ type OAuthHandleResolver = AtprotoHandleResolver<CloudflareDnsTxtResolver, Defau
 type AppOAuthClient =
     OAuthClient<SqliteOAuthStore, SqliteOAuthStore, OAuthDidResolver, OAuthHandleResolver>;
 
-#[derive(Clone)]
-pub struct AtriumOAuthFlow {
+pub struct AtriumOAuthFlow<B: crate::identity::IdentityBackend = HttpIdentityBackend> {
     client: Arc<AppOAuthClient>,
-    identity_resolver: Arc<IdentityResolver<HttpIdentityBackend>>,
+    identity_resolver: Arc<IdentityResolver<B>>,
     store: SqliteOAuthStore,
+}
+
+impl<B: crate::identity::IdentityBackend> Clone for AtriumOAuthFlow<B> {
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            identity_resolver: self.identity_resolver.clone(),
+            store: self.store.clone(),
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -502,15 +522,16 @@ impl Store<Did, Session> for SqliteOAuthStore {
 
 impl SessionStore for SqliteOAuthStore {}
 
-impl AtriumOAuthFlow {
+impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
     fn new(
         public: &OAuthPublic,
-        identity_resolver: Arc<IdentityResolver<HttpIdentityBackend>>,
+        identity_resolver: Arc<IdentityResolver<B>>,
         store: SqliteOAuthStore,
+        plc_directory_url: &str,
     ) -> Result<Self, String> {
         let http_client = Arc::new(DefaultHttpClient::default());
         let did_resolver = CommonDidResolver::new(CommonDidResolverConfig {
-            plc_directory_url: DEFAULT_PLC_DIRECTORY_URL.to_owned(),
+            plc_directory_url: plc_directory_url.to_owned(),
             http_client: http_client.clone(),
         });
         let handle_resolver = AtprotoHandleResolver::new(AtprotoHandleResolverConfig {
@@ -591,7 +612,7 @@ impl AtriumOAuthFlow {
     }
 }
 
-impl OAuthFlow for AtriumOAuthFlow {
+impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlow<B> {
     fn authorize<'a>(
         &'a self,
         login: &'a str,
