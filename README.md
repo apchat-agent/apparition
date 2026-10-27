@@ -16,7 +16,7 @@ cp appview.example.toml appview.toml
 APPVIEW_CONFIG=./appview.toml ./target/release/appview-rs
 ```
 
-The sample config uses the public east Jetstream and indexes in `scoped` mode. The server binds to `127.0.0.1:3000`; put it behind a TLS reverse proxy for a public deployment. Keep the SQLite database and OAuth client key in a persistent, private data directory. Back up `appview.db` and `oauth-client-key.json` together. The OAuth key is created with owner-only permissions on Unix and must remain stable across restarts.
+The sample config uses the public east Jetstream and indexes in `scoped` mode. The server binds to `127.0.0.1:3000`; put it behind a TLS reverse proxy for a public deployment. Keep the SQLite database and OAuth key in a persistent, private data directory. Back up `appview.db` and `oauth-client-key.json` together. The key is created with owner-only permissions on Unix and must remain stable across restarts. Confidential mode uses it for client assertions; loopback mode uses it only to sign local browser cookies.
 
 Check the server and public service documents:
 
@@ -27,6 +27,16 @@ curl http://127.0.0.1:3000/.well-known/oauth-client-metadata.json
 ```
 
 Set `APPVIEW_PUBLIC_URL` to the externally reachable HTTPS origin and `APPVIEW_DID` to its `did:web` identifier. The DID hostname, public URL hostname, and reverse proxy host must agree. For example, `did:web:appview.example.com` should be served at `https://appview.example.com/.well-known/did.json`. Terminate TLS at the proxy and forward requests to the configured local listen address.
+
+## Try it locally
+
+On the same Mac that runs the browser, start the app in loopback OAuth mode. It uses the default public east Jetstream and indexes registered accounts and their network in `scoped` mode:
+
+```sh
+APPVIEW_LISTEN=127.0.0.1:3000 APPVIEW_SCOPE=scoped APPVIEW_OAUTH_MODE=loopback cargo run --locked --offline -- --dev
+```
+
+Open [http://127.0.0.1:3000/login](http://127.0.0.1:3000/login), enter an AT Protocol handle or DID, and approve the request at the authorization page. The browser returns to the local callback and the AppView opens the signed-in account's timeline. The `--dev` log line prints the login URL. Loopback mode uses a public `http://localhost` OAuth client and does not publish confidential client metadata or a client key to the authorization server. The server rejects non-loopback listen addresses in this mode.
 
 ## Configuration
 
@@ -40,7 +50,8 @@ Set `APPVIEW_PUBLIC_URL` to the externally reachable HTTPS origin and `APPVIEW_D
 | `scope_mode` | `APPVIEW_SCOPE` | `scoped` | `scoped` or `full` indexing |
 | `jetstream_urls` | `APPVIEW_JETSTREAM_URLS` | east Jetstream URL | TOML string array, or comma-separated URLs in the environment |
 | `appview_did` | `APPVIEW_DID` | `did:web:localhost` | AppView service identity |
-| `public_url` | `APPVIEW_PUBLIC_URL` | `https://appview.example` | Public origin and OAuth client ID origin |
+| `public_url` | `APPVIEW_PUBLIC_URL` | `https://appview.example` | HTTPS origin and OAuth client ID origin in confidential mode; ignored in loopback mode |
+| `oauth_mode` | `APPVIEW_OAUTH_MODE` | `confidential` | `confidential` for the public HTTPS client, or `loopback` for local development OAuth |
 
 Use `scoped` for a small self-hosted instance. It indexes registered users, their follows, and interactions on their posts. `full` indexes every supported account and will use substantially more disk as the firehose continues. Neither mode currently has a retention or compaction policy.
 

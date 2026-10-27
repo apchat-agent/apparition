@@ -3,7 +3,7 @@ use appview_rs::{
     backfill::{
         AtriumRepoVerifier, BackfillWorker, HostRateLimiter, HttpRepoSource, RepoBackfiller,
     },
-    config::Config,
+    config::{Config, OAuthMode},
     identity::{HttpIdentityBackend, IdentityResolver},
     ingest::{Ingestor, JetstreamConsumer, SqliteStorage},
     init_tracing,
@@ -19,14 +19,17 @@ use tracing::{error, info};
 async fn main() -> Result<(), Box<dyn Error>> {
     let config = Config::load()?;
     init_tracing(&config.log_filter)?;
-    let address: SocketAddr = config.listen.parse()?;
+    let listen_address: SocketAddr = config.listen.parse()?;
+    let listener = TcpListener::bind(listen_address).await?;
+    let address = listener.local_addr()?;
     let database_path = PathBuf::from(&config.data_dir).join("appview.db");
     let storage = Arc::new(SqliteStorage::open(&database_path)?);
     let oauth_store = SqliteOAuthStore::open(&database_path)?;
-    let oauth = OAuthPublic::load_or_create(
-        &config.public_url,
-        PathBuf::from(&config.data_dir).join("oauth-client-key.json"),
-    )?;
+    let oauth_key_path = PathBuf::from(&config.data_dir).join("oauth-client-key.json");
+    let oauth = match config.oauth_mode {
+        OAuthMode::Confidential => OAuthPublic::load_or_create(&config.public_url, oauth_key_path)?,
+        OAuthMode::Loopback => OAuthPublic::load_or_create_loopback(address, oauth_key_path)?,
+    };
     let oauth_identity_resolver = Arc::new(IdentityResolver::new(
         HttpIdentityBackend::default(),
         Duration::from_secs(1800),
@@ -77,13 +80,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     });
 
-    let listener = TcpListener::bind(address).await?;
     info!(
         %address,
         data_dir = %config.data_dir,
         scope = ?config.scope_mode,
+        oauth_mode = ?config.oauth_mode,
         "starting appview-rs"
     );
+    if std::env::args().any(|arg| arg == "--dev") {
+        let login_url = match config.oauth_mode {
+            OAuthMode::Confidential => format!("{}/login", config.public_url.trim_end_matches('/')),
+            OAuthMode::Loopback => format!("http://{address}/login"),
+        };
+        info!(%login_url, "development login URL");
+    }
     axum::serve(listener, app_router)
         .with_graceful_shutdown(shutdown_signal())
         .await?;

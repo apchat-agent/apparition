@@ -14,6 +14,13 @@ fn loopback_oauth_mode_can_be_selected_and_defaults_to_confidential() {
 
     let config = Config::from_toml_and_env("", [("APPVIEW_OAUTH_MODE", "loopback")]).unwrap();
     assert!(format!("{config:?}").contains("oauth_mode: Loopback"));
+
+    let config = Config::from_toml_and_env(
+        "oauth_mode = \"loopback\"",
+        std::iter::empty::<(&str, &str)>(),
+    )
+    .unwrap();
+    assert!(format!("{config:?}").contains("oauth_mode: Loopback"));
 }
 
 #[test]
@@ -32,4 +39,17 @@ fn loopback_oauth_refuses_non_loopback_listen_addresses() {
 fn unknown_oauth_mode_is_rejected() {
     let error = Config::from_toml_and_env("", [("APPVIEW_OAUTH_MODE", "public")]);
     assert!(error.is_err(), "unknown OAuth modes must fail closed");
+}
+
+#[test]
+fn server_exits_before_starting_on_a_public_address_in_loopback_mode() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_appview-rs"))
+        .env_remove("APPVIEW_CONFIG")
+        .env("APPVIEW_OAUTH_MODE", "loopback")
+        .env("APPVIEW_LISTEN", "0.0.0.0:3000")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("UnsafeLoopbackListen"), "{stderr}");
 }

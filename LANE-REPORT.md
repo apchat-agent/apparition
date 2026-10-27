@@ -85,3 +85,22 @@ F7 and F9–F13 were not addressed in av2: write-route CSRF, DID-document cachin
 - `cargo clippy --locked --offline -- -D warnings`: passed.
 - `cargo deny check licenses`: passed (`licenses ok`).
 - Changes were committed locally in red/green steps. Nothing was pushed; no remote is configured.
+
+## av4 localhost development OAuth (2026-10-27)
+
+| Item | Status | Evidence |
+| --- | --- | --- |
+| OAuth mode configuration | Complete | `oauth_mode` / `APPVIEW_OAUTH_MODE` defaults to confidential, accepts `loopback`, and rejects unknown values. |
+| Loopback bind safety | Complete | Config rejects non-loopback binds; a process-level test verifies loopback mode exits on `0.0.0.0`. The callback uses the actual bound address and port. |
+| Public localhost client | Complete | The loopback client uses Atrium's `AtprotoLocalhostClientMetadata`, `http://localhost` client ID with redirect and scope query parameters, `none` client auth, and no published JWKS. |
+| Browser callback security | Complete | HTTP loopback cookies retain `HttpOnly` and `SameSite=Lax` without `Secure`; HTTP Origin and `Sec-Fetch-Site` checks are tested. |
+| OAuth protocol | Complete | The fake PDS/authorization server test exercises loopback PAR, PKCE, DPoP, state, browser binding, issuer, subject, scope, and token exchange. It checks no client assertion or metadata fetch; a confidential-flow assertion verifies the existing client assertion remains. |
+| Local run instructions | Complete | README includes the scoped Jetstream command, login URL, and expected redirect/timeline behavior. `--dev` logs the login URL. |
+
+### av4 verification
+
+- `cargo fmt --all -- --check`: passed.
+- `cargo test --locked --offline`: passed, 63 tests (unit: 3, M1: 2, M2: 4, M3: 7, M4: 3, M5 config: 5, M5 read API: 11, M6 web OAuth: 24, M6 protocol: 4).
+- `cargo clippy --locked --offline -- -D warnings`: passed.
+- `cargo deny check licenses`: passed (`licenses ok`).
+- No live account login was attempted. Changes are committed locally; nothing was pushed.

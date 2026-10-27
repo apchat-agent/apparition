@@ -361,12 +361,20 @@ async fn loopback_production_oauth_completes_a_public_client_login() {
         decoded_form_field(&par.body, "code_challenge_method").as_deref(),
         Some("S256")
     );
-    assert_eq!(decoded_form_field(&par.body, "scope").as_deref(), Some("atproto"));
+    assert_eq!(
+        decoded_form_field(&par.body, "scope").as_deref(),
+        Some("atproto")
+    );
     assert!(decoded_form_field(&par.body, "client_assertion").is_none());
     assert!(par.headers.contains_key("dpop"));
-    assert!(!shared.lock().unwrap().requests.iter().any(|request| {
-        request.path == "/.well-known/oauth-client-metadata.json"
-    }));
+    assert!(
+        !shared
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|request| { request.path == "/.well-known/oauth-client-metadata.json" })
+    );
 
     let state = latest_state(&shared);
     let account = flow

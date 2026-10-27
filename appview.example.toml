@@ -5,3 +5,4 @@ scope_mode = "scoped"
 jetstream_urls = ["wss://jetstream1.us-east.bsky.network/subscribe"]
 appview_did = "did:web:appview.example.com"
 public_url = "https://appview.example.com"
+oauth_mode = "confidential"

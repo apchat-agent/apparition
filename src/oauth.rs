@@ -11,8 +11,8 @@ use atrium_identity::{
 };
 use atrium_oauth::{
     AtprotoClientMetadata, AtprotoLocalhostClientMetadata, AuthMethod, AuthorizeOptions,
-    DefaultHttpClient, GrantType, KnownScope, OAuthClient, OAuthClientConfig,
-    OAuthResolverConfig, Scope,
+    DefaultHttpClient, GrantType, KnownScope, OAuthClient, OAuthClientConfig, OAuthResolverConfig,
+    Scope,
     store::{
         session::{Session, SessionStore},
         state::{InternalStateData, StateStore},
@@ -299,10 +299,7 @@ impl OAuthPublic {
         })
     }
 
-    fn from_loopback(
-        listen: SocketAddr,
-        private_key: Jwk,
-    ) -> Result<Self, OAuthConfigError> {
+    fn from_loopback(listen: SocketAddr, private_key: Jwk) -> Result<Self, OAuthConfigError> {
         if !listen.ip().is_loopback() {
             return Err(OAuthConfigError::InvalidLoopbackAddress);
         }
