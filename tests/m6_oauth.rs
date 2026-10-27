@@ -219,6 +219,23 @@ async fn authorization_and_callback_reject_missing_protocol_parameters() {
 }
 
 #[tokio::test]
+async fn callback_rejects_valid_state_without_the_matching_browser_cookie() {
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), Arc::new(MemoryStorage::default()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?code=valid-code&state=valid-state&iss=https%3A%2F%2Fauth.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn oauth_callback_registers_account_and_logout_clears_its_session() {
     let public = OAuthPublic::new("https://appview.example").unwrap();
     let storage = Arc::new(MemoryStorage::default());
