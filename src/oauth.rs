@@ -739,6 +739,40 @@ impl OAuthFlow for AtriumOAuthFlow {
             .await
         })
     }
+
+    fn timeline<'a>(
+        &'a self,
+        did: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Value>, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let did = did.parse::<Did>().map_err(|error| error.to_string())?;
+            let session = self
+                .client
+                .restore(&did)
+                .await
+                .map_err(|error| error.to_string())?;
+            let agent = Agent::new(session);
+            let params = atrium_api::app::bsky::feed::get_timeline::ParametersData {
+                algorithm: None,
+                cursor: None,
+                limit: 25u8.try_into().ok(),
+            }
+            .into();
+            let output = agent
+                .api
+                .app
+                .bsky
+                .feed
+                .get_timeline(params)
+                .await
+                .map_err(|error| format!("PDS getTimeline failed: {error:?}"))?;
+            output
+                .feed
+                .iter()
+                .map(|item| serde_json::to_value(item).map_err(|error| error.to_string()))
+                .collect()
+        })
+    }
 }
 
 #[derive(Clone, Default)]
@@ -921,24 +955,24 @@ where
     else {
         return Redirect::to("/login").into_response();
     };
-    let records = match state.storage.records() {
-        Ok(records) => records,
-        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    let timeline = match state.flow.timeline(&did).await {
+        Ok(timeline) => timeline,
+        Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
     };
-    let posts = records
+    let posts = timeline
         .iter()
-        .filter(|record| record.did == did && record.collection == "app.bsky.feed.post")
-        .take(25)
-        .map(|record| {
-            let text = record
-                .record
-                .get("text")
+        .map(|item| {
+            let post = item.get("post").unwrap_or(item);
+            let uri = post.get("uri").and_then(Value::as_str).unwrap_or("");
+            let cid = post.get("cid").and_then(Value::as_str).unwrap_or("");
+            let text = post
+                .pointer("/record/text")
                 .and_then(Value::as_str)
                 .unwrap_or("");
             format!(
-                "<li><a href=\"/thread?uri={}\">{}</a></li>",
-                html_escape(&record.uri),
-                html_escape(text)
+                "<li><a href=\"/thread?uri={}\">{}</a><form action=\"/like\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{}\"><input type=\"hidden\" name=\"cid\" value=\"{}\"><button>Like</button></form><form action=\"/repost\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{}\"><input type=\"hidden\" name=\"cid\" value=\"{}\"><button>Repost</button></form></li>",
+                html_escape(uri), html_escape(text), html_escape(uri), html_escape(cid),
+                html_escape(uri), html_escape(cid)
             )
         })
         .collect::<String>();
