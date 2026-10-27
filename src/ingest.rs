@@ -75,6 +75,9 @@ pub trait Storage: Send + Sync {
     fn is_registered(&self, did: &str) -> Result<bool, StorageError>;
     fn set_follow(&self, actor: &str, subject: &str, following: bool) -> Result<(), StorageError>;
     fn is_followed_by_registered(&self, did: &str) -> Result<bool, StorageError>;
+    fn enqueue_backfill(&self, did: &str) -> Result<(), StorageError>;
+    fn pending_backfills(&self) -> Result<Vec<String>, StorageError>;
+    fn complete_backfill(&self, did: &str) -> Result<(), StorageError>;
     fn bytes_on_disk(&self) -> u64;
 }
 
@@ -89,6 +92,7 @@ struct MemoryState {
     cursor: Option<u64>,
     registered: HashSet<String>,
     follows: HashSet<(String, String)>,
+    backfill_queue: HashSet<String>,
 }
 
 impl Storage for MemoryStorage {
@@ -183,11 +187,9 @@ impl Storage for MemoryStorage {
     }
 
     fn register_user(&self, did: &str) -> Result<(), StorageError> {
-        self.inner
-            .lock()
-            .map_err(|_| StorageError::Poisoned)?
-            .registered
-            .insert(did.to_owned());
+        let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        inner.registered.insert(did.to_owned());
+        inner.backfill_queue.insert(did.to_owned());
         Ok(())
     }
 
@@ -217,6 +219,37 @@ impl Storage for MemoryStorage {
             .follows
             .iter()
             .any(|(actor, subject)| subject == did && inner.registered.contains(actor)))
+    }
+
+    fn enqueue_backfill(&self, did: &str) -> Result<(), StorageError> {
+        self.inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .backfill_queue
+            .insert(did.to_owned());
+        Ok(())
+    }
+
+    fn pending_backfills(&self) -> Result<Vec<String>, StorageError> {
+        let mut pending = self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .backfill_queue
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        pending.sort();
+        Ok(pending)
+    }
+
+    fn complete_backfill(&self, did: &str) -> Result<(), StorageError> {
+        self.inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .backfill_queue
+            .remove(did);
+        Ok(())
     }
 
     fn bytes_on_disk(&self) -> u64 {
@@ -256,6 +289,10 @@ impl SqliteStorage {
                  actor TEXT NOT NULL,
                  subject TEXT NOT NULL,
                  PRIMARY KEY (actor, subject)
+             );
+             CREATE TABLE IF NOT EXISTS backfill_queue (
+                 did TEXT PRIMARY KEY,
+                 enqueued_at INTEGER NOT NULL DEFAULT (unixepoch())
              );",
         )?;
         Ok(Self {
@@ -379,10 +416,17 @@ impl Storage for SqliteStorage {
     }
 
     fn register_user(&self, did: &str) -> Result<(), StorageError> {
-        self.conn()?.execute(
+        let mut connection = self.conn()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
             "INSERT OR IGNORE INTO registered_users(did) VALUES(?1)",
             [did],
         )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO backfill_queue(did) VALUES(?1)",
+            [did],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -415,6 +459,29 @@ impl Storage for SqliteStorage {
             [did],
             |row| row.get(0),
         )?)
+    }
+
+    fn enqueue_backfill(&self, did: &str) -> Result<(), StorageError> {
+        self.conn()?.execute(
+            "INSERT OR IGNORE INTO backfill_queue(did) VALUES(?1)",
+            [did],
+        )?;
+        Ok(())
+    }
+
+    fn pending_backfills(&self) -> Result<Vec<String>, StorageError> {
+        let conn = self.conn()?;
+        let mut statement =
+            conn.prepare("SELECT did FROM backfill_queue ORDER BY enqueued_at,did")?;
+        Ok(statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn complete_backfill(&self, did: &str) -> Result<(), StorageError> {
+        self.conn()?
+            .execute("DELETE FROM backfill_queue WHERE did=?1", [did])?;
+        Ok(())
     }
 
     fn bytes_on_disk(&self) -> u64 {
@@ -565,6 +632,9 @@ impl<S: Storage> Ingestor<S> {
                 && let Some(subject) = subject.as_str()
             {
                 self.storage.set_follow(&did, subject, true)?;
+                if self.scope == ScopeMode::Scoped {
+                    self.storage.enqueue_backfill(subject)?;
+                }
             }
         }
         Ok(())

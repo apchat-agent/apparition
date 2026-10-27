@@ -1,5 +1,9 @@
 use appview_rs::{
+    backfill::{
+        AtriumRepoVerifier, BackfillWorker, HostRateLimiter, HttpRepoSource, RepoBackfiller,
+    },
     config::Config,
+    identity::{HttpIdentityBackend, IdentityResolver},
     ingest::{Ingestor, JetstreamConsumer, SqliteStorage},
     init_tracing, router,
 };
@@ -15,13 +19,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let storage = Arc::new(SqliteStorage::open(
         PathBuf::from(&config.data_dir).join("appview.db"),
     )?);
-    let ingestor = Ingestor::new(storage, config.scope_mode);
+    let ingestor = Ingestor::new(storage.clone(), config.scope_mode);
     let consumer = JetstreamConsumer::new(ingestor, Duration::from_secs(1));
     let jetstream_urls = config.jetstream_urls.clone();
+    let resolver = IdentityResolver::new(HttpIdentityBackend::default(), Duration::from_secs(1800));
+    let backfiller = RepoBackfiller::new(
+        storage.clone(),
+        HttpRepoSource::default(),
+        AtriumRepoVerifier,
+        HostRateLimiter::new(Duration::from_millis(500)),
+    );
+    let worker = BackfillWorker::new(storage, resolver, backfiller, Duration::from_secs(5));
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let ingestion_shutdown = shutdown_rx.clone();
     let ingestion_task = tokio::spawn(async move {
-        if let Err(error) = consumer.run(&jetstream_urls, shutdown_rx).await {
+        if let Err(error) = consumer.run(&jetstream_urls, ingestion_shutdown).await {
             error!(%error, "Jetstream consumer stopped");
+        }
+    });
+    let backfill_task = tokio::spawn(async move {
+        if let Err(error) = worker.run(shutdown_rx).await {
+            error!(%error, "backfill worker stopped");
         }
     });
 
@@ -36,12 +55,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     let _ = shutdown_tx.send(true);
-    if tokio::time::timeout(Duration::from_secs(3), ingestion_task)
-        .await
-        .is_err()
-    {
-        info!("aborting delayed Jetstream shutdown");
-    }
+    let _ = tokio::time::timeout(Duration::from_secs(3), async {
+        let _ = ingestion_task.await;
+        let _ = backfill_task.await;
+    })
+    .await;
     Ok(())
 }
 

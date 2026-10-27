@@ -264,6 +264,7 @@ impl HostRateLimiter {
         let wait = {
             let now = Instant::now();
             let mut next_allowed = self.next_allowed.lock().await;
+            next_allowed.retain(|_, next| *next > now);
             let next = next_allowed.get(host).copied().unwrap_or(now).max(now);
             next_allowed.insert(host.to_owned(), next + self.interval);
             next.saturating_duration_since(now)
@@ -357,4 +358,86 @@ fn parse_rfc3339_micros(value: &str) -> Option<u64> {
     let parsed =
         time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()?;
     u64::try_from(parsed.unix_timestamp_nanos() / 1_000).ok()
+}
+
+pub struct BackfillWorker<S, F, V, B>
+where
+    S: Storage,
+    F: RepoFetcher,
+    V: RepoVerifier,
+    B: crate::identity::IdentityBackend,
+{
+    storage: Arc<S>,
+    resolver: crate::identity::IdentityResolver<B>,
+    backfiller: RepoBackfiller<S, F, V>,
+    poll_interval: Duration,
+}
+
+impl<S, F, V, B> BackfillWorker<S, F, V, B>
+where
+    S: Storage + 'static,
+    F: RepoFetcher + 'static,
+    V: RepoVerifier + 'static,
+    B: crate::identity::IdentityBackend + 'static,
+{
+    pub fn new(
+        storage: Arc<S>,
+        resolver: crate::identity::IdentityResolver<B>,
+        backfiller: RepoBackfiller<S, F, V>,
+        poll_interval: Duration,
+    ) -> Self {
+        Self {
+            storage,
+            resolver,
+            backfiller,
+            poll_interval,
+        }
+    }
+
+    pub async fn run(
+        &self,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), BackfillError> {
+        loop {
+            if *shutdown.borrow() {
+                return Ok(());
+            }
+            for did in self.storage.pending_backfills()? {
+                if *shutdown.borrow() {
+                    return Ok(());
+                }
+                let result = self.backfill_one(&did).await;
+                if let Err(error) = result {
+                    tracing::warn!(%did, %error, "queued repository backfill will retry");
+                }
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(self.poll_interval) => {},
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
+    async fn backfill_one(&self, did: &str) -> Result<(), BackfillError> {
+        let document = self
+            .resolver
+            .resolve_did_document(did)
+            .await
+            .map_err(|error| BackfillError::Verify(error.to_string()))?;
+        let pds = document.pds_endpoint().ok_or_else(|| {
+            BackfillError::InvalidPds(format!("no valid PDS endpoint in {did} DID document"))
+        })?;
+        let signing_key = document.atproto_signing_key().ok_or_else(|| {
+            BackfillError::Verify(format!(
+                "no valid #atproto signing key in {did} DID document"
+            ))
+        })?;
+        self.backfiller.backfill(did, &pds, &signing_key).await?;
+        self.storage.complete_backfill(did)?;
+        Ok(())
+    }
 }

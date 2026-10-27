@@ -18,8 +18,8 @@ The consumer subscribes to posts, likes, reposts, follows, blocks, and profiles;
 
 ## Backfill
 
-M4 fetches `com.atproto.sync.getRepo` from the PDS advertised by the DID document. The CAR reader checks block hashes and MST completeness; the signed commit is checked against the document's `#atproto` key and DID. A verified snapshot replaces the local records and follow edges for that DID in one SQLite transaction. Requests are spaced per PDS host, and oversized CAR files are rejected.
+M4 queues registered users and accounts newly followed by registered users for backfill. The worker fetches `com.atproto.sync.getRepo` from the PDS advertised by each DID document. The CAR reader checks block hashes and MST completeness; the signed commit is checked against the document's `#atproto` key and DID. A verified snapshot replaces the local records and follow edges for that DID in one SQLite transaction. Requests are spaced per PDS host, and oversized CAR files are rejected.
 
 ## Current limits
 
-XRPC read APIs and OAuth are not implemented yet. Scope acquisition currently needs to call the backfill service explicitly; automatic queueing for newly followed and registered users is the next M4 integration step. Retention/compaction policy and production load measurements remain open.
+XRPC read APIs and OAuth are not implemented yet. Retention/compaction policy and production load measurements remain open.

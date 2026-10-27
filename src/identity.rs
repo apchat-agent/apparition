@@ -164,6 +164,22 @@ impl<B: IdentityBackend> IdentityResolver<B> {
         Ok(identity)
     }
 
+    pub async fn resolve_did_document(&self, did: &str) -> Result<DidDocument, ResolutionError> {
+        validate_did(did)?;
+        let document = self
+            .backend
+            .did_document(did)
+            .await?
+            .ok_or_else(|| ResolutionError::DidNotFound(did.to_owned()))?;
+        if document.id != did {
+            return Err(ResolutionError::Backend(format!(
+                "DID document id {} did not match requested {did}",
+                document.id
+            )));
+        }
+        Ok(document)
+    }
+
     pub async fn resolve_did(&self, did: &str) -> Result<Identity, ResolutionError> {
         validate_did(did)?;
         let key = format!("did:{did}");
