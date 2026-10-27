@@ -259,6 +259,26 @@ async fn oauth_callback_registers_account_and_logout_clears_its_session() {
 }
 
 #[tokio::test]
+async fn oauth_callback_accepts_scope_from_the_token_response_without_query_scope() {
+    let storage = Arc::new(MemoryStorage::default());
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage.clone());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?code=valid-code&state=valid-state&iss=https%3A%2F%2Fauth.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert!(storage.is_registered("did:plc:alice").unwrap());
+}
+
+#[tokio::test]
 async fn oauth_authorization_state_and_tokens_survive_store_reopen() {
     let file = std::env::temp_dir().join(format!(
         "appview-oauth-{}-{}.sqlite",
