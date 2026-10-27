@@ -6,7 +6,10 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
@@ -1019,19 +1022,18 @@ struct JetstreamCommit {
 pub struct Ingestor<S: Storage> {
     storage: Arc<S>,
     scope: ScopeMode,
-    started: Instant,
-    processed: Mutex<u64>,
-    last_metrics: Mutex<Instant>,
+    cursor: AtomicU64,
+    processed: AtomicU64,
 }
 
 impl<S: Storage> Ingestor<S> {
     pub fn new(storage: Arc<S>, scope: ScopeMode) -> Self {
+        let cursor = storage.cursor().ok().flatten().unwrap_or_default();
         Self {
             storage,
             scope,
-            started: Instant::now(),
-            processed: Mutex::new(0),
-            last_metrics: Mutex::new(Instant::now()),
+            cursor: AtomicU64::new(cursor),
+            processed: AtomicU64::new(0),
         }
     }
 
@@ -1044,7 +1046,8 @@ impl<S: Storage> Ingestor<S> {
             self.process_commit(event.did, event.time_us, commit)?;
         }
         self.storage.set_cursor(event.time_us)?;
-        self.record_metrics();
+        self.cursor.store(event.time_us, Ordering::Relaxed);
+        self.processed.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1122,22 +1125,25 @@ impl<S: Storage> Ingestor<S> {
         Ok(())
     }
 
-    fn record_metrics(&self) {
-        if let (Ok(mut processed), Ok(mut last_metrics)) =
-            (self.processed.lock(), self.last_metrics.lock())
-        {
-            *processed += 1;
-            if last_metrics.elapsed() >= Duration::from_secs(10) {
-                let elapsed = self.started.elapsed().as_secs_f64().max(0.001);
-                tracing::info!(
-                    events_per_second = *processed as f64 / elapsed,
-                    bytes_on_disk = self.storage.bytes_on_disk(),
-                    events = *processed,
-                    "Jetstream ingestion metrics"
-                );
-                *last_metrics = Instant::now();
-            }
-        }
+    fn record_metrics(&self, interval: Duration) {
+        let events = self.processed.swap(0, Ordering::Relaxed);
+        let seconds = interval.as_secs_f64().max(0.001);
+        let cursor = self.cursor.load(Ordering::Relaxed);
+        let cursor_lag_seconds = (cursor != 0).then(|| {
+            let now_us = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros()
+                .min(u64::MAX as u128) as u64;
+            now_us.saturating_sub(cursor) as f64 / 1_000_000.0
+        });
+        tracing::info!(
+            events,
+            events_per_second = events as f64 / seconds,
+            bytes_on_disk = self.storage.bytes_on_disk(),
+            cursor_lag_seconds = ?cursor_lag_seconds,
+            "Jetstream ingestion metrics"
+        );
     }
 }
 
@@ -1153,6 +1159,16 @@ pub struct JetstreamConsumer<S: Storage> {
     ingestor: Arc<Ingestor<S>>,
     reconnect_delay: Duration,
     idle_timeout: Duration,
+    event_timeout: Duration,
+    metrics_interval: Duration,
+}
+
+struct JetstreamConnectionLog(String);
+
+impl Drop for JetstreamConnectionLog {
+    fn drop(&mut self) {
+        tracing::info!(url = %self.0, "Jetstream disconnected");
+    }
 }
 
 impl<S: Storage + 'static> JetstreamConsumer<S> {
@@ -1161,6 +1177,8 @@ impl<S: Storage + 'static> JetstreamConsumer<S> {
             ingestor: Arc::new(ingestor),
             reconnect_delay,
             idle_timeout: Duration::from_secs(60),
+            event_timeout: Duration::from_secs(60),
+            metrics_interval: Duration::from_secs(10),
         }
     }
 
@@ -1169,11 +1187,22 @@ impl<S: Storage + 'static> JetstreamConsumer<S> {
         self
     }
 
+    pub fn with_event_timeout(mut self, event_timeout: Duration) -> Self {
+        self.event_timeout = event_timeout;
+        self
+    }
+
+    pub fn with_metrics_interval(mut self, metrics_interval: Duration) -> Self {
+        self.metrics_interval = metrics_interval.max(Duration::from_millis(1));
+        self
+    }
+
     pub async fn consume_connection(&self, url: &str) -> Result<(), IngestError> {
         let (mut websocket, _) = connect_async(url)
             .await
             .map_err(|error| IngestError::WebSocket(error.to_string()))?;
         tracing::info!(%url, "Jetstream connected");
+        let _connection_log = JetstreamConnectionLog(url.to_owned());
         let result = async {
             loop {
                 let message = tokio::time::timeout(self.idle_timeout, websocket.next())
@@ -1188,11 +1217,11 @@ impl<S: Storage + 'static> JetstreamConsumer<S> {
                     break;
                 };
                 match message.map_err(|error| IngestError::WebSocket(error.to_string()))? {
-                    Message::Text(text) => self.ingestor.process_json(&text)?,
+                    Message::Text(text) => self.process_event_text(text.to_string()).await?,
                     Message::Binary(bytes) => {
                         let text = std::str::from_utf8(&bytes)
                             .map_err(|error| IngestError::WebSocket(error.to_string()))?;
-                        self.ingestor.process_json(text)?;
+                        self.process_event_text(text.to_owned()).await?;
                     }
                     Message::Close(_) => break,
                     Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
@@ -1201,11 +1230,46 @@ impl<S: Storage + 'static> JetstreamConsumer<S> {
             Ok(())
         }
         .await;
-        match &result {
-            Ok(()) => tracing::info!(%url, "Jetstream disconnected"),
-            Err(error) => tracing::info!(%url, %error, "Jetstream disconnected"),
-        }
         result
+    }
+
+    async fn process_event_text(&self, text: String) -> Result<(), IngestError> {
+        let event: Value = serde_json::from_str(&text)?;
+        let did = event
+            .get("did")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned();
+        let collection = event
+            .pointer("/commit/collection")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned();
+        let rkey = event
+            .pointer("/commit/rkey")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned();
+        let ingestor = self.ingestor.clone();
+        let task = tokio::task::spawn_blocking(move || ingestor.process_json(&text));
+        match tokio::time::timeout(self.event_timeout, task).await {
+            Err(_) => {
+                tracing::warn!(
+                    %did,
+                    %collection,
+                    %rkey,
+                    timeout_seconds = self.event_timeout.as_secs_f64(),
+                    "Jetstream event processing timed out"
+                );
+                Err(IngestError::WebSocket(
+                    "event processing timed out".to_owned(),
+                ))
+            }
+            Ok(Err(error)) => Err(IngestError::WebSocket(format!(
+                "Jetstream event processing task failed: {error}"
+            ))),
+            Ok(Ok(result)) => result,
+        }
     }
 
     pub async fn run(
@@ -1220,6 +1284,12 @@ impl<S: Storage + 'static> JetstreamConsumer<S> {
         }
         let mut next_url = 0usize;
         let mut backoff = self.reconnect_delay;
+        let metrics_interval = self.metrics_interval.max(Duration::from_millis(1));
+        let mut metrics = tokio::time::interval_at(
+            tokio::time::Instant::now() + metrics_interval,
+            metrics_interval,
+        );
+        metrics.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             if *shutdown.borrow() {
                 return Ok(());
@@ -1227,19 +1297,28 @@ impl<S: Storage + 'static> JetstreamConsumer<S> {
             let base_url = &urls[next_url % urls.len()];
             next_url += 1;
             let url = self.url_with_cursor(base_url)?;
-            tokio::select! {
-                result = self.consume_connection(&url) => match result {
-                    Ok(()) => backoff = self.reconnect_delay,
-                    Err(error) => tracing::warn!(%error, %url, "Jetstream connection ended"),
-                },
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        return Ok(());
+            let connection_result = {
+                let connection = self.consume_connection(&url);
+                tokio::pin!(connection);
+                loop {
+                    tokio::select! {
+                        result = &mut connection => break result,
+                        _ = metrics.tick() => self.ingestor.record_metrics(metrics_interval),
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                return Ok(());
+                            }
+                        }
                     }
                 }
+            };
+            match connection_result {
+                Ok(()) => backoff = self.reconnect_delay,
+                Err(error) => tracing::warn!(%error, %url, "Jetstream connection ended"),
             }
             tokio::select! {
                 _ = tokio::time::sleep(backoff) => {},
+                _ = metrics.tick() => self.ingestor.record_metrics(metrics_interval),
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
                         return Ok(());

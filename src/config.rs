@@ -15,6 +15,10 @@ pub struct Config {
     pub scope_mode: ScopeMode,
     #[serde(default = "default_jetstream_urls")]
     pub jetstream_urls: Vec<String>,
+    #[serde(default = "default_jetstream_idle_timeout_secs")]
+    pub jetstream_idle_timeout_secs: u64,
+    #[serde(default = "default_jetstream_event_timeout_secs")]
+    pub jetstream_event_timeout_secs: u64,
     #[serde(default = "default_appview_did")]
     pub appview_did: String,
     #[serde(default = "default_public_url")]
@@ -39,6 +43,8 @@ impl Default for Config {
             log_filter: default_log_filter(),
             scope_mode: ScopeMode::default(),
             jetstream_urls: default_jetstream_urls(),
+            jetstream_idle_timeout_secs: default_jetstream_idle_timeout_secs(),
+            jetstream_event_timeout_secs: default_jetstream_event_timeout_secs(),
             appview_did: default_appview_did(),
             public_url: default_public_url(),
             oauth_mode: OAuthMode::default(),
@@ -59,6 +65,11 @@ pub enum ConfigError {
     InvalidScope(String),
     #[error("APPVIEW_OAUTH_MODE must be 'confidential' or 'loopback', got {0}")]
     InvalidOAuthMode(String),
+    #[error("{variable} must be an unsigned integer number of seconds, got {value}")]
+    InvalidTimeout {
+        variable: &'static str,
+        value: String,
+    },
     #[error("loopback OAuth requires APPVIEW_LISTEN to be a loopback socket address, got {0}")]
     UnsafeLoopbackListen(String),
 }
@@ -91,6 +102,14 @@ impl Config {
                         .filter(|url| !url.is_empty())
                         .map(str::to_owned)
                         .collect();
+                }
+                "APPVIEW_JETSTREAM_IDLE_TIMEOUT_SECS" => {
+                    config.jetstream_idle_timeout_secs =
+                        parse_timeout("APPVIEW_JETSTREAM_IDLE_TIMEOUT_SECS", value)?;
+                }
+                "APPVIEW_JETSTREAM_EVENT_TIMEOUT_SECS" => {
+                    config.jetstream_event_timeout_secs =
+                        parse_timeout("APPVIEW_JETSTREAM_EVENT_TIMEOUT_SECS", value)?;
                 }
                 "APPVIEW_DID" => config.appview_did = value.to_owned(),
                 "APPVIEW_PUBLIC_URL" => config.public_url = value.to_owned(),
@@ -145,6 +164,14 @@ impl Config {
                 "APPVIEW_JETSTREAM_URLS",
                 env::var("APPVIEW_JETSTREAM_URLS").unwrap_or_default(),
             ),
+            (
+                "APPVIEW_JETSTREAM_IDLE_TIMEOUT_SECS",
+                env::var("APPVIEW_JETSTREAM_IDLE_TIMEOUT_SECS").unwrap_or_default(),
+            ),
+            (
+                "APPVIEW_JETSTREAM_EVENT_TIMEOUT_SECS",
+                env::var("APPVIEW_JETSTREAM_EVENT_TIMEOUT_SECS").unwrap_or_default(),
+            ),
             ("APPVIEW_DID", env::var("APPVIEW_DID").unwrap_or_default()),
             (
                 "APPVIEW_PUBLIC_URL",
@@ -179,6 +206,12 @@ impl Config {
                             .filter(|url| !url.is_empty())
                             .map(str::to_owned)
                             .collect();
+                    }
+                    "APPVIEW_JETSTREAM_IDLE_TIMEOUT_SECS" => {
+                        config.jetstream_idle_timeout_secs = parse_timeout(key, &value)?;
+                    }
+                    "APPVIEW_JETSTREAM_EVENT_TIMEOUT_SECS" => {
+                        config.jetstream_event_timeout_secs = parse_timeout(key, &value)?;
                     }
                     "APPVIEW_DID" => config.appview_did = value,
                     "APPVIEW_PUBLIC_URL" => config.public_url = value,
@@ -215,6 +248,21 @@ fn default_log_filter() -> String {
 
 fn default_jetstream_urls() -> Vec<String> {
     vec!["wss://jetstream1.us-east.bsky.network/subscribe".to_owned()]
+}
+
+fn default_jetstream_idle_timeout_secs() -> u64 {
+    60
+}
+
+fn default_jetstream_event_timeout_secs() -> u64 {
+    60
+}
+
+fn parse_timeout(variable: &'static str, value: &str) -> Result<u64, ConfigError> {
+    value.parse().map_err(|_| ConfigError::InvalidTimeout {
+        variable,
+        value: value.to_owned(),
+    })
 }
 
 fn default_appview_did() -> String {

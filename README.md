@@ -49,6 +49,8 @@ Open [http://127.0.0.1:3000/login](http://127.0.0.1:3000/login), enter an AT Pro
 | `log_filter` | `APPVIEW_LOG_FILTER` | `info` | `tracing` filter |
 | `scope_mode` | `APPVIEW_SCOPE` | `scoped` | `scoped` or `full` indexing |
 | `jetstream_urls` | `APPVIEW_JETSTREAM_URLS` | east Jetstream URL | TOML string array, or comma-separated URLs in the environment |
+| `jetstream_idle_timeout_secs` | `APPVIEW_JETSTREAM_IDLE_TIMEOUT_SECS` | `60` | Reconnect when a Jetstream connection sends no websocket messages for this long |
+| `jetstream_event_timeout_secs` | `APPVIEW_JETSTREAM_EVENT_TIMEOUT_SECS` | `60` | Drop and reconnect if one event takes longer than this to process |
 | `appview_did` | `APPVIEW_DID` | `did:web:localhost` | AppView service identity |
 | `public_url` | `APPVIEW_PUBLIC_URL` | `https://appview.example` | HTTPS origin and OAuth client ID origin in confidential mode; ignored in loopback mode |
 | `oauth_mode` | `APPVIEW_OAUTH_MODE` | `confidential` | `confidential` for the public HTTPS client, or `loopback` for local development OAuth |

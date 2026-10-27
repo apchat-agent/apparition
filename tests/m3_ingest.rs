@@ -390,20 +390,54 @@ async fn metrics_are_emitted_during_idle_periods_with_zero_events_and_cursor_lag
         .with_idle_timeout(Duration::from_millis(200))
         .with_metrics_interval(Duration::from_millis(10));
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let run_task = tokio::spawn(async move {
-        consumer
-            .run(&[format!("ws://{address}/subscribe")], shutdown_rx)
-            .await
-    });
-    tokio::time::sleep(Duration::from_millis(35)).await;
+    let urls = vec![format!("ws://{address}/subscribe")];
+    let run = consumer.run(&urls, shutdown_rx);
+    tokio::pin!(run);
+    tokio::select! {
+        result = &mut run => panic!("consumer stopped before shutdown: {result:?}"),
+        _ = tokio::time::sleep(Duration::from_millis(35)) => {},
+    }
     shutdown_tx.send(true).unwrap();
-    run_task.await.unwrap().unwrap();
+    run.await.unwrap();
     server.await.unwrap();
 
     let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
     assert!(logs.contains("Jetstream ingestion metrics"), "{logs}");
     assert!(logs.contains("events=0"), "{logs}");
     assert!(logs.contains("cursor_lag_seconds="), "{logs}");
+    assert!(logs.contains("Jetstream disconnected"), "{logs}");
+}
+
+#[tokio::test]
+async fn websocket_connection_lifecycle_is_logged_at_info() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_async(stream).await.unwrap();
+        websocket.close(None).await.unwrap();
+    });
+
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(CapturedMakeWriter(output.clone()))
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let _guard = tracing::dispatcher::set_default(&dispatch);
+
+    let consumer = JetstreamConsumer::new(
+        Ingestor::new(Arc::new(MemoryStorage::default()), ScopeMode::Full),
+        Duration::from_millis(1),
+    );
+    consumer
+        .consume_connection(&format!("ws://{address}/subscribe"))
+        .await
+        .unwrap();
+    server.await.unwrap();
+
+    let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
     assert!(logs.contains("Jetstream connected"), "{logs}");
     assert!(logs.contains("Jetstream disconnected"), "{logs}");
 }
