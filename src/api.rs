@@ -1,6 +1,6 @@
 use crate::{
     identity::IdentityBackend,
-    ingest::{IndexedRecord, Storage},
+    ingest::{IndexedRecord, Storage, StorageError},
     jwt::{ServiceClaims, ServiceJwtVerifier},
 };
 use axum::{
@@ -513,12 +513,16 @@ fn profile_view<S: Storage, B: IdentityBackend>(
     state: &ApiState<S, B>,
     did: &str,
 ) -> Result<Value, ApiError> {
-    let profile = state
-        .storage
-        .get_record(did, ACTOR_PROFILE, "self")
-        .map_err(|_| ApiError::internal())?;
+    profile_view_from_storage(state.storage.as_ref(), did).map_err(|_| ApiError::internal())
+}
+
+pub(crate) fn profile_view_from_storage<S: Storage>(
+    storage: &S,
+    did: &str,
+) -> Result<Value, StorageError> {
+    let profile = storage.get_record(did, ACTOR_PROFILE, "self")?;
     let record = profile.as_ref().map(|profile| &profile.record);
-    let all_records = state.storage.records().map_err(|_| ApiError::internal())?;
+    let all_records = storage.records()?;
     let follows = all_records
         .iter()
         .filter(|entry| entry.collection == FOLLOW && entry.did == did)
@@ -534,10 +538,8 @@ fn profile_view<S: Storage, B: IdentityBackend>(
         .iter()
         .filter(|entry| entry.collection == POST && entry.did == did)
         .count();
-    let handle = state
-        .storage
-        .verified_handle(did)
-        .map_err(|_| ApiError::internal())?
+    let handle = storage
+        .verified_handle(did)?
         .unwrap_or_else(|| "handle.invalid".to_owned());
     let mut view = json!({
         "did":did,

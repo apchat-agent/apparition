@@ -1,7 +1,7 @@
-use crate::ingest::{MemoryStorage, Storage};
+use crate::identity::{HttpIdentityBackend, IdentityResolver};
 use crate::{
-    api::timeline_records,
-    identity::{HttpIdentityBackend, IdentityResolver},
+    api::{profile_view_from_storage, timeline_records},
+    ingest::{IndexedRecord, MemoryStorage, Storage},
 };
 use atrium_api::{
     agent::{Agent, SessionManager},
@@ -1186,16 +1186,9 @@ where
     let posts = timeline
         .iter()
         .map(|record| {
-            let uri = record.uri.as_str();
-            let cid = record.cid.as_deref().unwrap_or("");
-            let text = record.record.get("text").and_then(Value::as_str).unwrap_or("");
-            if !write_forms_enabled {
-                return format!("<li><a href=\"/thread?uri={}\">{}</a></li>", html_escape(uri), html_escape(text));
-            }
             format!(
-                "<li><a href=\"/thread?uri={}\">{}</a><form action=\"/like\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{}\"><input type=\"hidden\" name=\"cid\" value=\"{}\"><button>Like</button></form><form action=\"/repost\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{}\"><input type=\"hidden\" name=\"cid\" value=\"{}\"><button>Repost</button></form></li>",
-                html_escape(uri), html_escape(text), html_escape(uri), html_escape(cid),
-                html_escape(uri), html_escape(cid)
+                "<li>{}</li>",
+                render_web_post(state.storage.as_ref(), record, write_forms_enabled, true)
             )
         })
         .collect::<String>();
@@ -1261,30 +1254,39 @@ where
         return Redirect::to("/login").into_response();
     };
     let subject = query.get("did").map(String::as_str).unwrap_or(&did);
-    if subject != did {
-        return oauth_error(
-            StatusCode::FORBIDDEN,
-            "profiles are limited to the logged-in account",
-        );
-    }
-    let handle = state
-        .storage
-        .verified_handle(&did)
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "handle.invalid".to_owned());
-    let record = state
-        .storage
-        .get_record(&did, "app.bsky.actor.profile", "self")
-        .ok()
-        .flatten();
-    let display_name = record
-        .as_ref()
-        .and_then(|record| record.record.get("displayName"))
+    let profile = match profile_view_from_storage(state.storage.as_ref(), subject) {
+        Ok(profile) => profile,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    let handle = profile_handle(&profile, subject);
+    let display_name = profile
+        .get("displayName")
         .and_then(Value::as_str)
         .unwrap_or(&handle);
+    let mut records = match state.storage.records() {
+        Ok(records) => records,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    records.retain(|record| record.collection == "app.bsky.feed.post" && record.did == subject);
+    records.sort_by_key(|record| std::cmp::Reverse(record.time_us));
+    let write_forms_enabled =
+        verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
+    let posts = records
+        .iter()
+        .map(|record| {
+            format!(
+                "<li>{}</li>",
+                render_web_post(state.storage.as_ref(), record, write_forms_enabled, true)
+            )
+        })
+        .collect::<String>();
+    let posts = if posts.is_empty() {
+        "<li>No indexed posts yet.</li>".to_owned()
+    } else {
+        posts
+    };
     Html(format!(
-        "<!doctype html><html><head><title>Profile</title></head><body><main><h1>{}</h1><p>{}</p><a href=\"/app\">Timeline</a></main></body></html>",
+        "<!doctype html><html><head><title>Profile</title></head><body><main><h1>{}</h1><p>@{}</p><a href=\"/app\">Timeline</a><ol>{posts}</ol></main></body></html>",
         html_escape(display_name), html_escape(&handle)
     ))
     .into_response()
@@ -1312,11 +1314,6 @@ where
     let Some(record) = record else {
         return oauth_error(StatusCode::NOT_FOUND, "post not found");
     };
-    let text = record
-        .record
-        .get("text")
-        .and_then(Value::as_str)
-        .unwrap_or("");
     let write_forms = if verified_cookie_write_access(
         &state.public,
         &headers,
@@ -1333,8 +1330,8 @@ where
         "<p role=\"status\">Read-only: write permissions were not granted.</p>".to_owned()
     };
     Html(format!(
-        "<!doctype html><html><head><title>Post</title></head><body><main><p>{}</p>{write_forms}<a href=\"/app\">Timeline</a></main></body></html>",
-        html_escape(text)
+        "<!doctype html><html><head><title>Post</title></head><body><main>{}{write_forms}<a href=\"/app\">Timeline</a></main></body></html>",
+        render_web_post(state.storage.as_ref(), &record, false, false)
     ))
     .into_response()
 }
@@ -1556,6 +1553,80 @@ fn html_escape(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+fn profile_handle(profile: &Value, did: &str) -> String {
+    profile
+        .get("handle")
+        .and_then(Value::as_str)
+        .filter(|handle| !handle.is_empty() && *handle != "handle.invalid")
+        .unwrap_or(did)
+        .to_owned()
+}
+
+fn render_web_post<S: Storage>(
+    storage: &S,
+    record: &IndexedRecord,
+    write_forms_enabled: bool,
+    link_text_to_thread: bool,
+) -> String {
+    let profile = profile_view_from_storage(storage, &record.did)
+        .unwrap_or_else(|_| json!({"did":record.did,"handle":record.did}));
+    let handle = profile_handle(&profile, &record.did);
+    let display_name = profile
+        .get("displayName")
+        .and_then(Value::as_str)
+        .unwrap_or(&handle);
+    let profile_uri = format!(
+        "/profile?did={}",
+        url::form_urlencoded::byte_serialize(record.did.as_bytes()).collect::<String>()
+    );
+    let author = format!(
+        "<a href=\"{}\">{} @{}</a>",
+        html_escape(&profile_uri),
+        html_escape(display_name),
+        html_escape(&handle)
+    );
+    let time = record
+        .record
+        .get("createdAt")
+        .and_then(Value::as_str)
+        .map(|created_at| {
+            format!(
+                "<time datetime=\"{}\">{}</time>",
+                html_escape(created_at),
+                html_escape(created_at)
+            )
+        })
+        .unwrap_or_default();
+    let text = record
+        .record
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let text = if link_text_to_thread {
+        let thread_uri = format!(
+            "/thread?uri={}",
+            url::form_urlencoded::byte_serialize(record.uri.as_bytes()).collect::<String>()
+        );
+        format!(
+            "<a href=\"{}\">{}</a>",
+            html_escape(&thread_uri),
+            html_escape(text)
+        )
+    } else {
+        html_escape(text)
+    };
+    let actions = if write_forms_enabled {
+        let uri = html_escape(&record.uri);
+        let cid = html_escape(record.cid.as_deref().unwrap_or(""));
+        format!(
+            "<form action=\"/like\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\"><button>Like</button></form><form action=\"/repost\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\"><button>Repost</button></form>"
+        )
+    } else {
+        String::new()
+    };
+    format!("<article><header>{author}</header>{time}<p>{text}</p>{actions}</article>")
 }
 
 fn has_atproto_scope(scope: Option<&str>) -> bool {

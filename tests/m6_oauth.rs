@@ -1307,7 +1307,7 @@ async fn web_posts_show_hydrated_authors_and_times_on_timeline_profile_and_threa
     .unwrap();
     assert!(timeline_html.contains("Friend &amp; Co"));
     assert!(timeline_html.contains("@friend.test"));
-    assert!(timeline_html.contains("href=\"/profile?did=did:plc:friend\""));
+    assert!(timeline_html.contains("href=\"/profile?did=did%3Aplc%3Afriend\""));
     assert!(
         timeline_html
             .contains("<time datetime=\"2026-10-27T09:15:00Z\">2026-10-27T09:15:00Z</time>")
