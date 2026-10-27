@@ -1,0 +1,27 @@
+[package]
+name = "appview-rs"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "A small, self-hostable ATProto AppView"
+
+[lib]
+name = "appview_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "appview-rs"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "fs", "time", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+thiserror = "2"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
