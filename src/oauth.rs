@@ -75,6 +75,7 @@ pub struct OAuthCallback {
     pub code: String,
     pub state: String,
     pub issuer: Option<String>,
+    pub scope: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -621,6 +622,13 @@ impl OAuthFlow for AtriumOAuthFlow {
         params: OAuthCallback,
     ) -> Pin<Box<dyn Future<Output = Result<OAuthAccount, String>> + Send + 'a>> {
         Box::pin(async move {
+            if !params
+                .scope
+                .as_deref()
+                .is_some_and(|scope| scope.split_whitespace().any(|value| value == "atproto"))
+            {
+                return Err("OAuth authorization response did not grant the atproto scope".into());
+            }
             let (session, app_state) = self
                 .client
                 .callback(atrium_oauth::CallbackParams {
@@ -829,10 +837,21 @@ where
         )
             .into_response();
     }
+    let scope = query.get("scope").cloned();
+    if !scope
+        .as_deref()
+        .is_some_and(|scope| scope.split_whitespace().any(|value| value == "atproto"))
+    {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "OAuth response must grant the atproto scope",
+        );
+    }
     let params = OAuthCallback {
         code: query.get("code").expect("validated above").clone(),
         state: query.get("state").expect("validated above").clone(),
         issuer: query.get("iss").cloned(),
+        scope,
     };
     let account = match state.flow.callback(params).await {
         Ok(account) => account,
