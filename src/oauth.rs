@@ -930,15 +930,14 @@ where
     let mut binding_bytes = [0u8; 32];
     thread_rng().fill_bytes(&mut binding_bytes);
     let browser_binding = URL_SAFE_NO_PAD.encode(binding_bytes);
-    match state
-        .flow
-        .authorize(
-            query.get("handle").expect("validated above"),
-            &browser_binding,
-        )
-        .await
-    {
-        Ok(url) if valid_redirect_url(&url) => {
+    let authorize_result = std::panic::AssertUnwindSafe(state.flow.authorize(
+        query.get("handle").expect("validated above"),
+        &browser_binding,
+    ))
+    .catch_unwind()
+    .await;
+    match authorize_result {
+        Ok(Ok(url)) if valid_redirect_url(&url) => {
             let mut response = Redirect::to(&url).into_response();
             let cookie = format!(
                 "{LOGIN_COOKIE}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={LOGIN_COOKIE_TTL_SECONDS}{}",
@@ -955,11 +954,15 @@ where
             );
             response
         }
-        Ok(_) => oauth_error(
+        Ok(Ok(_)) => oauth_error(
             StatusCode::BAD_GATEWAY,
             "invalid authorization endpoint URL",
         ),
-        Err(error) => oauth_error(StatusCode::BAD_REQUEST, &error),
+        Ok(Err(error)) => oauth_error(StatusCode::BAD_REQUEST, &error),
+        Err(_) => oauth_error_page(
+            StatusCode::BAD_GATEWAY,
+            "Sign-in could not be completed. Please start again.",
+        ),
     }
 }
 
