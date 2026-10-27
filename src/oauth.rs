@@ -16,7 +16,7 @@ use atrium_oauth::{
 };
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{Form, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -199,6 +199,11 @@ impl OAuthPublic {
             .route("/oauth/callback", get(callback::<F, S>))
             .route("/logout", post(logout::<F, S>))
             .route("/app", get(app_home::<F, S>))
+            .route("/profile", get(profile_page::<F, S>))
+            .route("/thread", get(thread_page::<F, S>))
+            .route("/post", post(write_post::<F, S>))
+            .route("/like", post(write_like::<F, S>))
+            .route("/repost", post(write_repost::<F, S>))
             .with_state(Arc::new(OAuthWebState {
                 public: self.clone(),
                 flow,
@@ -797,6 +802,135 @@ where
         html_escape(&did), html_escape(&did)
     ))
     .into_response()
+}
+
+async fn profile_page<F, S>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response
+where
+    F: OAuthFlow,
+    S: Storage,
+{
+    let Some(did) = verified_cookie_did(&state.public, &headers) else {
+        return Redirect::to("/login").into_response();
+    };
+    let subject = query.get("did").map(String::as_str).unwrap_or(&did);
+    if subject != did {
+        return oauth_error(
+            StatusCode::FORBIDDEN,
+            "profiles are limited to the logged-in account",
+        );
+    }
+    let handle = state
+        .storage
+        .verified_handle(&did)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "handle.invalid".to_owned());
+    let record = state
+        .storage
+        .get_record(&did, "app.bsky.actor.profile", "self")
+        .ok()
+        .flatten();
+    let display_name = record
+        .as_ref()
+        .and_then(|record| record.record.get("displayName"))
+        .and_then(Value::as_str)
+        .unwrap_or(&handle);
+    Html(format!(
+        "<!doctype html><html><head><title>Profile</title></head><body><main><h1>{}</h1><p>{}</p><a href=\"/app\">Timeline</a></main></body></html>",
+        html_escape(display_name), html_escape(&handle)
+    ))
+    .into_response()
+}
+
+async fn thread_page<F, S>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response
+where
+    F: OAuthFlow,
+    S: Storage,
+{
+    if verified_cookie_did(&state.public, &headers).is_none() {
+        return Redirect::to("/login").into_response();
+    }
+    let Some(uri) = query.get("uri") else {
+        return oauth_error(StatusCode::BAD_REQUEST, "uri is required");
+    };
+    let record = match state.storage.records() {
+        Ok(records) => records.into_iter().find(|record| record.uri == *uri),
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    let Some(record) = record else {
+        return oauth_error(StatusCode::NOT_FOUND, "post not found");
+    };
+    let text = record
+        .record
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    Html(format!(
+        "<!doctype html><html><head><title>Post</title></head><body><main><p>{}</p><form action=\"/like\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{}\"><input type=\"hidden\" name=\"cid\" value=\"{}\"><button>Like</button></form><form action=\"/repost\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{}\"><input type=\"hidden\" name=\"cid\" value=\"{}\"><button>Repost</button></form><a href=\"/app\">Timeline</a></main></body></html>",
+        html_escape(text), html_escape(&record.uri), html_escape(record.cid.as_deref().unwrap_or("")),
+        html_escape(&record.uri), html_escape(record.cid.as_deref().unwrap_or(""))
+    ))
+    .into_response()
+}
+
+async fn write_post<F, S>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    headers: HeaderMap,
+    Form(_form): Form<HashMap<String, String>>,
+) -> Response
+where
+    F: OAuthFlow,
+    S: Storage,
+{
+    if verified_cookie_did(&state.public, &headers).is_none() {
+        return Redirect::to("/login").into_response();
+    }
+    oauth_error(StatusCode::NOT_IMPLEMENTED, "post action is not available")
+}
+
+async fn write_like<F, S>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    headers: HeaderMap,
+    Form(_form): Form<HashMap<String, String>>,
+) -> Response
+where
+    F: OAuthFlow,
+    S: Storage,
+{
+    if verified_cookie_did(&state.public, &headers).is_none() {
+        return Redirect::to("/login").into_response();
+    }
+    oauth_error(StatusCode::NOT_IMPLEMENTED, "like action is not available")
+}
+
+async fn write_repost<F, S>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    headers: HeaderMap,
+    Form(_form): Form<HashMap<String, String>>,
+) -> Response
+where
+    F: OAuthFlow,
+    S: Storage,
+{
+    if verified_cookie_did(&state.public, &headers).is_none() {
+        return Redirect::to("/login").into_response();
+    }
+    oauth_error(
+        StatusCode::NOT_IMPLEMENTED,
+        "repost action is not available",
+    )
+}
+
+fn verified_cookie_did(public: &OAuthPublic, headers: &HeaderMap) -> Option<String> {
+    cookie_value(headers).and_then(|value| public.verify_session_cookie(value))
 }
 
 fn cookie_value(headers: &HeaderMap) -> Option<&str> {
