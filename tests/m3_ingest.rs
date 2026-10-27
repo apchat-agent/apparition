@@ -150,12 +150,8 @@ fn scoped_ingest_indexes_interactions_and_post_references_on_followed_accounts()
             .unwrap();
     }
 
-    let like = |subject: &str| {
-        json!({"subject":{"uri":subject,"cid":"cid-post"},"createdAt":"2026-10-27T00:00:00Z"})
-    };
-    let repost = |subject: &str| {
-        json!({"subject":{"uri":subject,"cid":"cid-post"},"createdAt":"2026-10-27T00:00:00Z"})
-    };
+    let like = |subject: &str| json!({"subject":{"uri":subject,"cid":"cid-post"},"createdAt":"2026-10-27T00:00:00Z"});
+    let repost = |subject: &str| json!({"subject":{"uri":subject,"cid":"cid-post"},"createdAt":"2026-10-27T00:00:00Z"});
     for (time, collection, rkey, record) in [
         (3, "app.bsky.feed.like", "friend-like", like(friend_uri)),
         (4, "app.bsky.feed.like", "root-like", like(root_uri)),
@@ -188,6 +184,23 @@ fn scoped_ingest_indexes_interactions_and_post_references_on_followed_accounts()
             "app.bsky.feed.post",
             "reply",
             Some(reply),
+        ))
+        .unwrap();
+    let direct_reply = json!({
+        "text":"direct reply",
+        "reply":{
+            "root":{"uri":root_uri,"cid":"cid-root"},
+            "parent":{"uri":root_uri,"cid":"cid-root"}
+        }
+    });
+    ingestor
+        .process_json(&event(
+            "did:plc:stranger",
+            11,
+            "create",
+            "app.bsky.feed.post",
+            "root-direct-reply",
+            Some(direct_reply),
         ))
         .unwrap();
     let root_only_reply = json!({
@@ -252,6 +265,7 @@ fn scoped_ingest_indexes_interactions_and_post_references_on_followed_accounts()
         ("app.bsky.feed.like", "root-like"),
         ("app.bsky.feed.repost", "root-repost"),
         ("app.bsky.feed.post", "reply"),
+        ("app.bsky.feed.post", "root-direct-reply"),
         ("app.bsky.feed.post", "root-only-reply"),
         ("app.bsky.feed.post", "quote"),
         ("app.bsky.feed.post", "mention"),

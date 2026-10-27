@@ -653,12 +653,14 @@ pub(crate) fn profile_view_from_storage<S: Storage>(
         .iter()
         .filter(|entry| entry.collection == POST && entry.did == did)
         .count();
-    let handle = storage
-        .verified_handle(did)?
-        .unwrap_or_else(|| "handle.invalid".to_owned());
-    if handle == "handle.invalid" {
+    let handle = if let Some(handle) = storage.verified_handle(did)? {
+        handle
+    } else if storage.handle_is_invalid(did)? {
+        "handle.invalid".to_owned()
+    } else {
         storage.queue_handle_refresh(did)?;
-    }
+        did.to_owned()
+    };
     let mut view = json!({
         "did":did,
         "handle":handle,

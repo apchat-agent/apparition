@@ -914,6 +914,7 @@ async fn profile_handles_are_taken_from_verified_identity_data() {
 #[tokio::test]
 async fn profile_records_cannot_claim_unverified_handles() {
     let storage = Arc::new(MemoryStorage::default());
+    storage.clear_verified_handle(ALICE).unwrap();
     storage
         .put_record(&IndexedRecord {
             did: ALICE.into(),

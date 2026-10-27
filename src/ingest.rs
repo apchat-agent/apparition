@@ -329,8 +329,10 @@ pub trait Storage: Send + Sync {
     fn set_verified_handle(&self, did: &str, handle: &str) -> Result<(), StorageError>;
     fn clear_verified_handle(&self, did: &str) -> Result<(), StorageError>;
     fn verified_handle(&self, did: &str) -> Result<Option<String>, StorageError>;
+    fn handle_is_invalid(&self, did: &str) -> Result<bool, StorageError>;
     fn did_by_verified_handle(&self, handle: &str) -> Result<Option<String>, StorageError>;
     fn is_tracked_did(&self, did: &str) -> Result<bool, StorageError>;
+    fn is_displayed_did(&self, did: &str) -> Result<bool, StorageError>;
     fn stale_handle_dids(&self, ttl: Duration, limit: usize) -> Result<Vec<String>, StorageError>;
     fn queue_handle_refresh(&self, did: &str) -> Result<(), StorageError>;
     fn pending_handle_refreshes(&self, limit: usize) -> Result<Vec<String>, StorageError>;
@@ -386,6 +388,7 @@ struct MemoryState {
     backfill_owners: HashSet<(String, String)>,
     backfill_completed: HashSet<String>,
     verified_handles: HashMap<String, (String, Instant)>,
+    invalid_handles: HashMap<String, Instant>,
     handle_refresh_queue: HashSet<String>,
 }
 
@@ -860,20 +863,18 @@ impl Storage for MemoryStorage {
     }
 
     fn set_verified_handle(&self, did: &str, handle: &str) -> Result<(), StorageError> {
-        self.inner
-            .lock()
-            .map_err(|_| StorageError::Poisoned)?
+        let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        inner
             .verified_handles
             .insert(did.to_owned(), (handle.to_owned(), Instant::now()));
+        inner.invalid_handles.remove(did);
         Ok(())
     }
 
     fn clear_verified_handle(&self, did: &str) -> Result<(), StorageError> {
-        self.inner
-            .lock()
-            .map_err(|_| StorageError::Poisoned)?
-            .verified_handles
-            .remove(did);
+        let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        inner.verified_handles.remove(did);
+        inner.invalid_handles.insert(did.to_owned(), Instant::now());
         Ok(())
     }
 
@@ -883,6 +884,15 @@ impl Storage for MemoryStorage {
             .verified_handles
             .get(did)
             .map(|(handle, _)| handle.clone()))
+    }
+
+    fn handle_is_invalid(&self, did: &str) -> Result<bool, StorageError> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .invalid_handles
+            .contains_key(did))
     }
 
     fn did_by_verified_handle(&self, handle: &str) -> Result<Option<String>, StorageError> {
@@ -897,29 +907,42 @@ impl Storage for MemoryStorage {
     fn is_tracked_did(&self, did: &str) -> Result<bool, StorageError> {
         let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
         Ok(inner.registered.contains(did)
-            || inner.records.values().any(|record| record.did == did)
             || inner
                 .follows
                 .iter()
                 .any(|(actor, subject)| subject == did && inner.registered.contains(actor)))
     }
 
+    fn is_displayed_did(&self, did: &str) -> Result<bool, StorageError> {
+        let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        Ok(inner.records.values().any(|record| record.did == did))
+    }
+
     fn stale_handle_dids(&self, ttl: Duration, limit: usize) -> Result<Vec<String>, StorageError> {
         let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        let is_tracked = |did: &str| {
+            inner.registered.contains(did)
+                || inner.records.values().any(|record| record.did == did)
+                || inner
+                    .follows
+                    .iter()
+                    .any(|(actor, subject)| subject == did && inner.registered.contains(actor))
+        };
         let mut dids = inner
             .verified_handles
             .iter()
-            .filter(|(did, (_, verified_at))| {
-                verified_at.elapsed() >= ttl
-                    && (inner.registered.contains(did.as_str())
-                        || inner.records.values().any(|record| record.did == **did)
-                        || inner.follows.iter().any(|(actor, subject)| {
-                            subject == *did && inner.registered.contains(actor)
-                        }))
-            })
+            .filter(|(did, (_, verified_at))| verified_at.elapsed() >= ttl && is_tracked(did))
             .map(|(did, _)| did.clone())
             .collect::<Vec<_>>();
+        dids.extend(
+            inner
+                .invalid_handles
+                .iter()
+                .filter(|(did, checked_at)| checked_at.elapsed() >= ttl && is_tracked(did))
+                .map(|(did, _)| did.clone()),
+        );
         dids.sort();
+        dids.dedup();
         dids.truncate(limit.max(1));
         Ok(dids)
     }
@@ -1052,6 +1075,10 @@ impl SqliteStorage {
                  did TEXT PRIMARY KEY,
                  handle TEXT NOT NULL,
                  updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+             );
+             CREATE TABLE IF NOT EXISTS invalid_handles (
+                 did TEXT PRIMARY KEY,
+                 checked_at INTEGER NOT NULL DEFAULT (unixepoch())
              );
              CREATE TABLE IF NOT EXISTS handle_refresh_queue (
                  did TEXT PRIMARY KEY,
@@ -1577,17 +1604,24 @@ impl Storage for SqliteStorage {
     }
 
     fn set_verified_handle(&self, did: &str, handle: &str) -> Result<(), StorageError> {
-        self.conn()?.execute(
+        let connection = self.conn()?;
+        connection.execute(
             "INSERT INTO verified_handles(did,handle,updated_at) VALUES(?1,?2,unixepoch())
              ON CONFLICT(did) DO UPDATE SET handle=excluded.handle,updated_at=unixepoch()",
             params![did, handle],
         )?;
+        connection.execute("DELETE FROM invalid_handles WHERE did=?1", [did])?;
         Ok(())
     }
 
     fn clear_verified_handle(&self, did: &str) -> Result<(), StorageError> {
-        self.conn()?
-            .execute("DELETE FROM verified_handles WHERE did=?1", [did])?;
+        let connection = self.conn()?;
+        connection.execute("DELETE FROM verified_handles WHERE did=?1", [did])?;
+        connection.execute(
+            "INSERT INTO invalid_handles(did,checked_at) VALUES(?1,unixepoch())
+             ON CONFLICT(did) DO UPDATE SET checked_at=unixepoch()",
+            [did],
+        )?;
         Ok(())
     }
 
@@ -1600,6 +1634,14 @@ impl Storage for SqliteStorage {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    fn handle_is_invalid(&self, did: &str) -> Result<bool, StorageError> {
+        Ok(self.conn()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM invalid_handles WHERE did=?1)",
+            [did],
+            |row| row.get(0),
+        )?)
     }
 
     fn rotate_web_session(&self, did: &str, session_id: &str) -> Result<u64, StorageError> {
@@ -1656,8 +1698,15 @@ impl Storage for SqliteStorage {
     fn is_tracked_did(&self, did: &str) -> Result<bool, StorageError> {
         Ok(self.conn()?.query_row(
             "SELECT EXISTS(SELECT 1 FROM registered_users WHERE did=?1)
-                OR EXISTS(SELECT 1 FROM records WHERE did=?1)
                 OR EXISTS(SELECT 1 FROM follows f JOIN registered_users r ON r.did=f.actor WHERE f.subject=?1)",
+            [did],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn is_displayed_did(&self, did: &str) -> Result<bool, StorageError> {
+        Ok(self.conn()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM records WHERE did=?1)",
             [did],
             |row| row.get(0),
         )?)
@@ -1667,12 +1716,16 @@ impl Storage for SqliteStorage {
         let ttl_seconds = i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX);
         let connection = self.conn()?;
         let mut statement = connection.prepare(
-            "SELECT h.did FROM verified_handles h
-             WHERE h.updated_at<=unixepoch()-?1
+            "SELECT did FROM (
+                 SELECT h.did AS did,h.updated_at AS checked_at FROM verified_handles h
+                 UNION ALL
+                 SELECT i.did AS did,i.checked_at AS checked_at FROM invalid_handles i
+             ) h
+             WHERE h.checked_at<=unixepoch()-?1
                AND (EXISTS(SELECT 1 FROM registered_users r WHERE r.did=h.did)
                     OR EXISTS(SELECT 1 FROM records x WHERE x.did=h.did)
                     OR EXISTS(SELECT 1 FROM follows f JOIN registered_users r ON r.did=f.actor WHERE f.subject=h.did))
-             ORDER BY h.updated_at,h.did LIMIT ?2",
+             GROUP BY h.did ORDER BY MIN(h.checked_at),h.did LIMIT ?2",
         )?;
         let dids = statement
             .query_map(
@@ -1836,7 +1889,8 @@ impl<S: Storage> Ingestor<S> {
     pub fn process_json(&self, json: &str) -> Result<(), IngestError> {
         let event: JetstreamEvent = serde_json::from_str(json)?;
         if matches!(event.kind.as_str(), "identity" | "account")
-            && self.storage.is_tracked_did(&event.did)?
+            && (self.storage.is_tracked_did(&event.did)?
+                || self.storage.is_displayed_did(&event.did)?)
         {
             self.storage.queue_handle_refresh(&event.did)?;
         }
@@ -1858,32 +1912,38 @@ impl<S: Storage> Ingestor<S> {
         time_us: u64,
         commit: JetstreamCommit,
     ) -> Result<(), IngestError> {
-        let previous = self
-            .storage
-            .get_record(&did, &commit.collection, &commit.rkey)?;
-        let should_index = match self.scope {
-            ScopeMode::Full => true,
-            ScopeMode::Scoped => {
-                if matches!(
-                    commit.collection.as_str(),
-                    "app.bsky.feed.like" | "app.bsky.feed.repost"
-                ) {
-                    let target_did = commit
-                        .record
-                        .as_ref()
-                        .and_then(|record| record.pointer("/subject/uri"))
-                        .and_then(Value::as_str)
-                        .and_then(uri_did);
-                    match target_did {
-                        Some(target_did) => self.storage.is_registered(target_did)?,
-                        None => false,
-                    }
-                } else {
-                    self.storage.is_registered(&did)?
-                        || self.storage.is_followed_by_registered(&did)?
-                }
+        // Parse and filter target DIDs before querying records or writing anything.
+        let referenced_tracked = if self.scope == ScopeMode::Full {
+            false
+        } else {
+            match commit.collection.as_str() {
+                "app.bsky.feed.like" | "app.bsky.feed.repost" => commit
+                    .record
+                    .as_ref()
+                    .and_then(|record| record.pointer("/subject/uri"))
+                    .and_then(Value::as_str)
+                    .and_then(uri_did)
+                    .map(|target_did| self.storage.is_tracked_did(target_did))
+                    .transpose()?
+                    .unwrap_or(false),
+                "app.bsky.feed.post" => self.post_references_tracked(commit.record.as_ref())?,
+                _ => false,
             }
         };
+        let actor_tracked = match self.scope {
+            ScopeMode::Full => true,
+            ScopeMode::Scoped => self.storage.is_tracked_did(&did)?,
+        };
+        // Avoid a database record lookup for unrelated creates and updates. For a
+        // delete, inspect the key so previously indexed interactions can be removed.
+        let previous =
+            if commit.operation == "delete" || commit.collection == "app.bsky.graph.follow" {
+                self.storage
+                    .get_record(&did, &commit.collection, &commit.rkey)?
+            } else {
+                None
+            };
+        let should_index = actor_tracked || referenced_tracked || previous.is_some();
 
         if should_index {
             if commit.operation == "delete" {
@@ -1924,6 +1984,48 @@ impl<S: Storage> Ingestor<S> {
             }
         }
         Ok(())
+    }
+
+    fn post_references_tracked(&self, record: Option<&Value>) -> Result<bool, IngestError> {
+        let Some(record) = record else {
+            return Ok(false);
+        };
+        let uri_paths = [
+            "/reply/parent/uri",
+            "/reply/root/uri",
+            "/embed/record/uri",
+            "/embed/record/record/uri",
+            "/embed/recordWithMedia/record/uri",
+            "/embed/recordWithMedia/record/record/uri",
+        ];
+        for uri in uri_paths
+            .iter()
+            .filter_map(|path| record.pointer(path).and_then(Value::as_str))
+        {
+            if let Some(did) = uri_did(uri)
+                && self.storage.is_tracked_did(did)?
+            {
+                return Ok(true);
+            }
+        }
+        for did in record
+            .get("facets")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|facet| facet.get("features").and_then(Value::as_array))
+            .flatten()
+            .filter(|feature| {
+                feature.get("$type").and_then(Value::as_str)
+                    == Some("app.bsky.richtext.facet#mention")
+            })
+            .filter_map(|feature| feature.get("did").and_then(Value::as_str))
+        {
+            if self.storage.is_tracked_did(did)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn record_metrics(&self, interval: Duration) {

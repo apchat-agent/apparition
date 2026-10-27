@@ -32,7 +32,10 @@ impl FakeIdentityBackend {
                 service: vec![],
             },
         );
-        self.dns.write().unwrap().retain(|_, found_did| found_did != did);
+        self.dns
+            .write()
+            .unwrap()
+            .retain(|_, found_did| found_did != did);
         if let Some(handle) = handle {
             self.dns
                 .write()
@@ -58,7 +61,8 @@ impl IdentityBackend for FakeIdentityBackend {
 
 #[test]
 fn stale_sqlite_handle_remains_available_until_refresh_verifies_a_change() {
-    let path = std::env::temp_dir().join(format!("appview-rs-av11-stale-{}.db", std::process::id()));
+    let path =
+        std::env::temp_dir().join(format!("appview-rs-av11-stale-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let storage = SqliteStorage::open(&path).unwrap();
     storage
@@ -126,6 +130,7 @@ async fn failed_bidirectional_verification_clears_the_last_handle() {
 
     assert_eq!(worker.refresh_once().await.unwrap(), 1);
     assert_eq!(storage.verified_handle("did:plc:alice").unwrap(), None);
+    assert!(storage.handle_is_invalid("did:plc:alice").unwrap());
 }
 
 #[tokio::test]
