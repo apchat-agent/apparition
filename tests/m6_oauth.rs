@@ -1,8 +1,16 @@
+use appview_rs::config::Config;
 use appview_rs::router;
 use axum::{body::Body, http::Request, http::StatusCode};
 use http_body_util::BodyExt;
 use serde_json::Value;
 use tower::ServiceExt;
+
+#[test]
+fn public_oauth_origin_is_configurable() {
+    let config =
+        Config::from_toml_and_env("", [("APPVIEW_PUBLIC_URL", "https://social.example")]).unwrap();
+    assert!(format!("{config:?}").contains("public_url: \"https://social.example\""));
+}
 
 #[tokio::test]
 async fn confidential_client_metadata_is_published() {
