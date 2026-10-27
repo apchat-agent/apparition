@@ -139,6 +139,13 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async { Err("like action is not available".to_owned()) })
     }
+    fn delete_like<'a>(
+        &'a self,
+        _did: &'a str,
+        _like_uri: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Err("unlike action is not available".to_owned()) })
+    }
     fn repost<'a>(
         &'a self,
         _did: &'a str,
@@ -725,6 +732,43 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             .map(|_| ())
             .map_err(|error| format!("PDS createRecord failed: {error:?}"))
     }
+
+    async fn delete_like_record(&self, did: &str, like_uri: &str) -> Result<(), String> {
+        let collection = "app.bsky.feed.like";
+        let prefix = format!("at://{did}/{collection}/");
+        let rkey = like_uri
+            .strip_prefix(&prefix)
+            .filter(|rkey| !rkey.is_empty() && !rkey.contains('/'))
+            .ok_or_else(|| "like URI does not belong to this account".to_owned())?;
+        let did = did.parse::<Did>().map_err(|error| error.to_string())?;
+        let session = self
+            .client
+            .restore(&did)
+            .await
+            .map_err(|error| error.to_string())?;
+        let agent = Agent::new(session);
+        let input = atrium_api::com::atproto::repo::delete_record::InputData {
+            collection: collection
+                .parse()
+                .map_err(|error| format!("invalid collection: {error}"))?,
+            repo: AtIdentifier::Did(did),
+            rkey: rkey
+                .parse()
+                .map_err(|error| format!("invalid record key: {error}"))?,
+            swap_commit: None,
+            swap_record: None,
+        }
+        .into();
+        agent
+            .api
+            .com
+            .atproto
+            .repo
+            .delete_record(input)
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("PDS deleteRecord failed: {error:?}"))
+    }
 }
 
 impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlow<B> {
@@ -871,6 +915,14 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
             )
             .await
         })
+    }
+
+    fn delete_like<'a>(
+        &'a self,
+        did: &'a str,
+        like_uri: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move { self.delete_like_record(did, like_uri).await })
     }
 
     fn repost<'a>(
@@ -1188,7 +1240,13 @@ where
         .map(|record| {
             format!(
                 "<li>{}</li>",
-                render_web_post(state.storage.as_ref(), record, write_forms_enabled, true)
+                render_web_post(
+                    state.storage.as_ref(),
+                    record,
+                    &did,
+                    write_forms_enabled,
+                    true
+                )
             )
         })
         .collect::<String>();
@@ -1276,7 +1334,13 @@ where
         .map(|record| {
             format!(
                 "<li>{}</li>",
-                render_web_post(state.storage.as_ref(), record, write_forms_enabled, true)
+                render_web_post(
+                    state.storage.as_ref(),
+                    record,
+                    &did,
+                    write_forms_enabled,
+                    true
+                )
             )
         })
         .collect::<String>();
@@ -1301,9 +1365,10 @@ where
     F: OAuthFlow,
     S: Storage,
 {
-    if verified_cookie_did(&state.public, &headers, state.storage.as_ref()).is_none() {
+    let Some(viewer_did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref())
+    else {
         return Redirect::to("/login").into_response();
-    }
+    };
     let Some(uri) = query.get("uri") else {
         return oauth_error(StatusCode::BAD_REQUEST, "uri is required");
     };
@@ -1314,24 +1379,9 @@ where
     let Some(record) = record else {
         return oauth_error(StatusCode::NOT_FOUND, "post not found");
     };
-    let write_forms = if verified_cookie_write_access(
-        &state.public,
-        &headers,
-        state.storage.as_ref(),
-    ) {
-        format!(
-            "<form action=\"/like\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{}\"><input type=\"hidden\" name=\"cid\" value=\"{}\"><button>Like</button></form><form action=\"/repost\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{}\"><input type=\"hidden\" name=\"cid\" value=\"{}\"><button>Repost</button></form>",
-            html_escape(&record.uri),
-            html_escape(record.cid.as_deref().unwrap_or("")),
-            html_escape(&record.uri),
-            html_escape(record.cid.as_deref().unwrap_or(""))
-        )
-    } else {
-        "<p role=\"status\">Read-only: write permissions were not granted.</p>".to_owned()
-    };
     Html(format!(
-        "<!doctype html><html><head><title>Post</title></head><body><main>{}{write_forms}<a href=\"/app\">Timeline</a></main></body></html>",
-        render_web_post(state.storage.as_ref(), &record, false, false)
+        "<!doctype html><html><head><title>Post</title></head><body><main>{}<a href=\"/app\">Timeline</a></main></body></html>",
+        render_web_post(state.storage.as_ref(), &record, &viewer_did, verified_cookie_write_access(&state.public, &headers, state.storage.as_ref()), false)
     ))
     .into_response()
 }
@@ -1390,6 +1440,24 @@ where
     };
     if !uri.starts_with("at://") || cid.is_empty() {
         return oauth_error(StatusCode::BAD_REQUEST, "uri and cid are invalid");
+    }
+    if form.get("intent").is_some_and(|intent| intent == "delete") {
+        let summary = match state.storage.post_interaction_summary(uri, Some(&did)) {
+            Ok(summary) => summary,
+            Err(error) => {
+                return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+            }
+        };
+        let Some(like_uri) = summary.viewer_like else {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "like record was not found in the local index",
+            );
+        };
+        return match state.flow.delete_like(&did, &like_uri).await {
+            Ok(()) => Redirect::to("/app").into_response(),
+            Err(error) => oauth_error(StatusCode::BAD_GATEWAY, &error),
+        };
     }
     match state.flow.like(&did, uri, cid).await {
         Ok(()) => Redirect::to("/app").into_response(),
@@ -1567,6 +1635,7 @@ fn profile_handle(profile: &Value, did: &str) -> String {
 fn render_web_post<S: Storage>(
     storage: &S,
     record: &IndexedRecord,
+    viewer_did: &str,
     write_forms_enabled: bool,
     link_text_to_thread: bool,
 ) -> String {
@@ -1617,11 +1686,48 @@ fn render_web_post<S: Storage>(
     } else {
         html_escape(text)
     };
+    let interactions = storage
+        .post_interaction_summary(&record.uri, Some(viewer_did))
+        .unwrap_or_default();
+    let counts = format!(
+        "{} {} · {} {} · {} {}",
+        interactions.like_count,
+        if interactions.like_count == 1 {
+            "like"
+        } else {
+            "likes"
+        },
+        interactions.repost_count,
+        if interactions.repost_count == 1 {
+            "repost"
+        } else {
+            "reposts"
+        },
+        interactions.reply_count,
+        if interactions.reply_count == 1 {
+            "reply"
+        } else {
+            "replies"
+        },
+    );
     let actions = if write_forms_enabled {
         let uri = html_escape(&record.uri);
         let cid = html_escape(record.cid.as_deref().unwrap_or(""));
+        let (like_intent, like_label) = if interactions.viewer_like.is_some() {
+            (
+                "<input type=\"hidden\" name=\"intent\" value=\"delete\">",
+                "Liked",
+            )
+        } else {
+            ("", "Like")
+        };
+        let repost_label = if interactions.viewer_repost.is_some() {
+            "Reposted"
+        } else {
+            "Repost"
+        };
         format!(
-            "<form action=\"/like\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\"><button>Like</button></form><form action=\"/repost\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\"><button>Repost</button></form>"
+            "<form action=\"/like\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\">{like_intent}<button>{like_label}</button></form><form action=\"/repost\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\"><button>{repost_label}</button></form>"
         )
     } else {
         String::new()
@@ -1631,7 +1737,9 @@ fn render_web_post<S: Storage>(
         .get("embed")
         .map(|embed| render_web_embed(storage, &record.did, embed))
         .unwrap_or_default();
-    format!("<article><header>{author}</header>{time}<p>{text}</p>{embed}{actions}</article>")
+    format!(
+        "<article><header>{author}</header>{time}<p>{text}</p><p class=\"counts\">{counts}</p>{embed}{actions}</article>"
+    )
 }
 
 fn render_web_embed<S: Storage>(storage: &S, author_did: &str, embed: &Value) -> String {

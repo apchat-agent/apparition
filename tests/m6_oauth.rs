@@ -113,6 +113,20 @@ impl OAuthFlow for FakeOAuthFlow {
         })
     }
 
+    fn delete_like<'a>(
+        &'a self,
+        did: &'a str,
+        like_uri: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.actions
+                .lock()
+                .unwrap()
+                .push(format!("unlike:{did}:{like_uri}"));
+            Ok(())
+        })
+    }
+
     fn repost<'a>(
         &'a self,
         did: &'a str,
