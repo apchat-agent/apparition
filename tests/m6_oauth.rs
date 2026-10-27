@@ -191,6 +191,33 @@ impl OAuthFlow for PanicCallbackFlow {
 }
 
 #[derive(Clone)]
+struct PanicAuthorizeFlow;
+
+impl OAuthFlow for PanicAuthorizeFlow {
+    fn authorize<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async { panic!("simulated upstream authorize panic") })
+    }
+
+    fn callback<'a>(
+        &'a self,
+        _: OAuthCallback,
+    ) -> Pin<Box<dyn Future<Output = Result<OAuthAccount, String>> + Send + 'a>> {
+        Box::pin(async { Err("unused callback".to_owned()) })
+    }
+
+    fn logout<'a>(
+        &'a self,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[derive(Clone)]
 struct AcceptingOAuthFlow;
 
 impl OAuthFlow for AcceptingOAuthFlow {
@@ -386,6 +413,31 @@ async fn callback_turns_an_upstream_panic_into_an_error_response() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn authorize_turns_an_upstream_panic_into_an_error_page() {
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(PanicAuthorizeFlow, Arc::new(MemoryStorage::default()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/authorize?handle=alice.test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(
+        response.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .contains("text/html")
+    );
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(String::from_utf8_lossy(&body).contains("Sign-in could not be completed"));
 }
 
 #[cfg(unix)]
