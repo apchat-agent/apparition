@@ -24,8 +24,15 @@ const SUPPORTED_COLLECTIONS: &[&str] = &[
 const BACKFILL_RETRY_BASE: Duration = Duration::from_secs(5);
 const BACKFILL_RETRY_MAX: Duration = Duration::from_secs(60 * 60);
 
-fn backfill_retry_delay(_failures: u32) -> Duration {
-    BACKFILL_RETRY_BASE.min(BACKFILL_RETRY_MAX)
+fn backfill_retry_delay(failures: u32) -> Duration {
+    let exponent = failures.saturating_sub(1).min(63);
+    let multiplier = 1_u64.checked_shl(exponent).unwrap_or(u64::MAX);
+    Duration::from_secs(
+        BACKFILL_RETRY_BASE
+            .as_secs()
+            .saturating_mul(multiplier)
+            .min(BACKFILL_RETRY_MAX.as_secs()),
+    )
 }
 
 fn epoch_millis() -> i64 {
