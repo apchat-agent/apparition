@@ -1,7 +1,7 @@
 use crate::identity::{HttpIdentityBackend, IdentityResolver};
 use crate::{
     api::{profile_view_from_storage, timeline_records},
-    ingest::{IndexedRecord, MemoryStorage, Storage, StorageError},
+    ingest::{IndexedNotification, IndexedRecord, MemoryStorage, Storage, StorageError},
 };
 use atrium_api::{
     agent::{Agent, SessionManager},
@@ -274,6 +274,7 @@ impl OAuthPublic {
             .route("/oauth/callback", get(callback::<F, S>))
             .route("/logout", post(logout::<F, S>))
             .route("/app", get(app_home::<F, S>))
+            .route("/notifications", get(notifications_page::<F, S>))
             .route("/profile", get(profile_page::<F, S>))
             .route("/thread", get(thread_page::<F, S>))
             .route("/post", post(write_post::<F, S>))
@@ -1293,10 +1294,113 @@ where
         ""
     };
     Html(format!(
-        "<!doctype html><html><head><title>AppView</title></head><body><main><h1>Timeline for {}</h1><nav><a href=\"/profile?did={}\">Profile</a> <form action=\"/logout\" method=\"post\"><button>Log out</button></form></nav>{read_only_message}{indexing_status}<ol>{posts}</ol>{post_form}</main></body></html>",
+        "<!doctype html><html><head><title>AppView</title></head><body><main><h1>Timeline for {}</h1><nav><a href=\"/profile?did={}\">Profile</a> <a href=\"/notifications\">Notifications</a> <form action=\"/logout\" method=\"post\"><button>Log out</button></form></nav>{read_only_message}{indexing_status}<ol>{posts}</ol>{post_form}</main></body></html>",
         html_escape(&did), html_escape(&did)
     ))
     .into_response()
+}
+
+async fn notifications_page<F, S>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response
+where
+    F: OAuthFlow,
+    S: Storage,
+{
+    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+        return Redirect::to("/login").into_response();
+    };
+    let limit = query
+        .get("limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(50)
+        .clamp(1, 100);
+    let before = query
+        .get("cursor")
+        .and_then(|cursor| cursor.parse::<u64>().ok());
+    let page = match state.storage.notifications_for(&did, before, limit + 1) {
+        Ok(page) => page,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    let has_more = page.len() > limit;
+    let items = page
+        .iter()
+        .take(limit)
+        .map(|notification| render_web_notification(state.storage.as_ref(), notification))
+        .collect::<String>();
+    let items = if items.is_empty() {
+        "<li>No notifications yet.</li>".to_owned()
+    } else {
+        items
+    };
+    let older = if has_more {
+        page.get(limit)
+            .map(|notification| {
+                let cursor = notification.record.time_us.to_string();
+                format!(
+                    "<a rel=\"next\" href=\"/notifications?cursor={}\">Older</a>",
+                    html_escape(&cursor)
+                )
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    Html(format!(
+        "<!doctype html><html><head><title>Notifications</title></head><body><main><h1>Notifications</h1><nav><a href=\"/app\">Timeline</a> <a href=\"/profile?did={}\">Profile</a></nav><ol>{items}</ol>{older}</main></body></html>",
+        html_escape(&did)
+    )).into_response()
+}
+
+fn render_web_notification<S: Storage>(storage: &S, notification: &IndexedNotification) -> String {
+    let record = &notification.record;
+    let author = profile_view_from_storage(storage, &record.did)
+        .unwrap_or_else(|_| json!({"did":record.did,"handle":record.did}));
+    let handle = profile_handle(&author, &record.did);
+    let author_uri = format!(
+        "/profile?did={}",
+        url::form_urlencoded::byte_serialize(record.did.as_bytes()).collect::<String>()
+    );
+    let reason = match notification.reason.as_str() {
+        "like" => "liked your post",
+        "repost" => "reposted your post",
+        "reply" => "replied to your post",
+        "mention" => "mentioned you",
+        "quote" => "quoted your post",
+        "follow" => "started following you",
+        _ => "interacted with you",
+    };
+    let text = record
+        .record
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let text = if text.is_empty() {
+        String::new()
+    } else {
+        format!("<p>{}</p>", html_escape(text))
+    };
+    let target_uri = notification
+        .reason_subject
+        .as_deref()
+        .unwrap_or(&record.uri);
+    let thread_link = if target_uri.starts_with("at://") {
+        let encoded =
+            url::form_urlencoded::byte_serialize(target_uri.as_bytes()).collect::<String>();
+        format!(
+            "<a href=\"/thread?uri={}\">View thread</a>",
+            html_escape(&encoded)
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "<li><article><header><a href=\"{}\">@{}</a> {reason}</header>{text}{thread_link}</article></li>",
+        html_escape(&author_uri),
+        html_escape(&handle)
+    )
 }
 
 async fn profile_page<F, S>(
