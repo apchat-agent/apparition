@@ -1152,6 +1152,7 @@ fn uri_did(uri: &str) -> Option<&str> {
 pub struct JetstreamConsumer<S: Storage> {
     ingestor: Arc<Ingestor<S>>,
     reconnect_delay: Duration,
+    idle_timeout: Duration,
 }
 
 impl<S: Storage + 'static> JetstreamConsumer<S> {
@@ -1159,26 +1160,52 @@ impl<S: Storage + 'static> JetstreamConsumer<S> {
         Self {
             ingestor: Arc::new(ingestor),
             reconnect_delay,
+            idle_timeout: Duration::from_secs(60),
         }
+    }
+
+    pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = idle_timeout;
+        self
     }
 
     pub async fn consume_connection(&self, url: &str) -> Result<(), IngestError> {
         let (mut websocket, _) = connect_async(url)
             .await
             .map_err(|error| IngestError::WebSocket(error.to_string()))?;
-        while let Some(message) = websocket.next().await {
-            match message.map_err(|error| IngestError::WebSocket(error.to_string()))? {
-                Message::Text(text) => self.ingestor.process_json(&text)?,
-                Message::Binary(bytes) => {
-                    let text = std::str::from_utf8(&bytes)
-                        .map_err(|error| IngestError::WebSocket(error.to_string()))?;
-                    self.ingestor.process_json(text)?;
+        tracing::info!(%url, "Jetstream connected");
+        let result = async {
+            loop {
+                let message = tokio::time::timeout(self.idle_timeout, websocket.next())
+                    .await
+                    .map_err(|_| {
+                        IngestError::WebSocket(format!(
+                            "no websocket message received for {} seconds",
+                            self.idle_timeout.as_secs_f64()
+                        ))
+                    })?;
+                let Some(message) = message else {
+                    break;
+                };
+                match message.map_err(|error| IngestError::WebSocket(error.to_string()))? {
+                    Message::Text(text) => self.ingestor.process_json(&text)?,
+                    Message::Binary(bytes) => {
+                        let text = std::str::from_utf8(&bytes)
+                            .map_err(|error| IngestError::WebSocket(error.to_string()))?;
+                        self.ingestor.process_json(text)?;
+                    }
+                    Message::Close(_) => break,
+                    Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
                 }
-                Message::Close(_) => break,
-                Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
             }
+            Ok(())
         }
-        Ok(())
+        .await;
+        match &result {
+            Ok(()) => tracing::info!(%url, "Jetstream disconnected"),
+            Err(error) => tracing::info!(%url, %error, "Jetstream disconnected"),
+        }
+        result
     }
 
     pub async fn run(
