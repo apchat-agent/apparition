@@ -1,4 +1,5 @@
 pub mod config;
+pub mod identity;
 
 use axum::{Json, Router, routing::get};
 use serde::Serialize;
