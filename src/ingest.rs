@@ -330,6 +330,11 @@ pub trait Storage: Send + Sync {
     fn clear_verified_handle(&self, did: &str) -> Result<(), StorageError>;
     fn verified_handle(&self, did: &str) -> Result<Option<String>, StorageError>;
     fn did_by_verified_handle(&self, handle: &str) -> Result<Option<String>, StorageError>;
+    fn is_tracked_did(&self, did: &str) -> Result<bool, StorageError>;
+    fn stale_handle_dids(&self, ttl: Duration, limit: usize) -> Result<Vec<String>, StorageError>;
+    fn queue_handle_refresh(&self, did: &str) -> Result<(), StorageError>;
+    fn pending_handle_refreshes(&self, limit: usize) -> Result<Vec<String>, StorageError>;
+    fn complete_handle_refresh(&self, did: &str) -> Result<(), StorageError>;
     fn bytes_on_disk(&self) -> u64;
 }
 
@@ -381,6 +386,7 @@ struct MemoryState {
     backfill_owners: HashSet<(String, String)>,
     backfill_completed: HashSet<String>,
     verified_handles: HashMap<String, (String, Instant)>,
+    handle_refresh_queue: HashSet<String>,
 }
 
 struct BackfillRetry {
@@ -876,7 +882,6 @@ impl Storage for MemoryStorage {
         Ok(inner
             .verified_handles
             .get(did)
-            .filter(|(_, verified_at)| verified_at.elapsed() < Duration::from_secs(1800))
             .map(|(handle, _)| handle.clone()))
     }
 
@@ -885,11 +890,68 @@ impl Storage for MemoryStorage {
         Ok(inner
             .verified_handles
             .iter()
-            .find(|(_, (stored, verified_at))| {
-                verified_at.elapsed() < Duration::from_secs(1800)
-                    && stored.eq_ignore_ascii_case(handle)
-            })
+            .find(|(_, (stored, _))| stored.eq_ignore_ascii_case(handle))
             .map(|(did, _)| did.clone()))
+    }
+
+    fn is_tracked_did(&self, did: &str) -> Result<bool, StorageError> {
+        let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        Ok(inner.registered.contains(did)
+            || inner.records.values().any(|record| record.did == did)
+            || inner
+                .follows
+                .iter()
+                .any(|(actor, subject)| subject == did && inner.registered.contains(actor)))
+    }
+
+    fn stale_handle_dids(&self, ttl: Duration, limit: usize) -> Result<Vec<String>, StorageError> {
+        let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut dids = inner
+            .verified_handles
+            .iter()
+            .filter(|(did, (_, verified_at))| {
+                verified_at.elapsed() >= ttl
+                    && (inner.registered.contains(did.as_str())
+                        || inner.records.values().any(|record| record.did == **did)
+                        || inner.follows.iter().any(|(actor, subject)| {
+                            subject == *did && inner.registered.contains(actor)
+                        }))
+            })
+            .map(|(did, _)| did.clone())
+            .collect::<Vec<_>>();
+        dids.sort();
+        dids.truncate(limit.max(1));
+        Ok(dids)
+    }
+
+    fn queue_handle_refresh(&self, did: &str) -> Result<(), StorageError> {
+        self.inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .handle_refresh_queue
+            .insert(did.to_owned());
+        Ok(())
+    }
+
+    fn pending_handle_refreshes(&self, limit: usize) -> Result<Vec<String>, StorageError> {
+        let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut dids = inner
+            .handle_refresh_queue
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        dids.sort();
+        dids.truncate(limit.max(1));
+        Ok(dids)
+    }
+
+    fn complete_handle_refresh(&self, did: &str) -> Result<(), StorageError> {
+        self.inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .handle_refresh_queue
+            .remove(did);
+        Ok(())
     }
 
     fn bytes_on_disk(&self) -> u64 {
@@ -990,6 +1052,10 @@ impl SqliteStorage {
                  did TEXT PRIMARY KEY,
                  handle TEXT NOT NULL,
                  updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+             );
+             CREATE TABLE IF NOT EXISTS handle_refresh_queue (
+                 did TEXT PRIMARY KEY,
+                 requested_at INTEGER NOT NULL DEFAULT (unixepoch())
              );",
         )?;
         migrate_notification_events(&connection)?;
@@ -1528,7 +1594,7 @@ impl Storage for SqliteStorage {
     fn verified_handle(&self, did: &str) -> Result<Option<String>, StorageError> {
         self.conn()?
             .query_row(
-                "SELECT handle FROM verified_handles WHERE did=?1 AND updated_at>=unixepoch()-1800",
+                "SELECT handle FROM verified_handles WHERE did=?1",
                 [did],
                 |row| row.get(0),
             )
@@ -1579,11 +1645,68 @@ impl Storage for SqliteStorage {
     fn did_by_verified_handle(&self, handle: &str) -> Result<Option<String>, StorageError> {
         self.conn()?
             .query_row(
-                "SELECT did FROM verified_handles WHERE lower(handle)=lower(?1) AND updated_at>=unixepoch()-1800",
-                [handle], |row| row.get(0),
+                "SELECT did FROM verified_handles WHERE lower(handle)=lower(?1)",
+                [handle],
+                |row| row.get(0),
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    fn is_tracked_did(&self, did: &str) -> Result<bool, StorageError> {
+        Ok(self.conn()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM registered_users WHERE did=?1)
+                OR EXISTS(SELECT 1 FROM records WHERE did=?1)
+                OR EXISTS(SELECT 1 FROM follows f JOIN registered_users r ON r.did=f.actor WHERE f.subject=?1)",
+            [did],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn stale_handle_dids(&self, ttl: Duration, limit: usize) -> Result<Vec<String>, StorageError> {
+        let ttl_seconds = i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX);
+        let connection = self.conn()?;
+        let mut statement = connection.prepare(
+            "SELECT h.did FROM verified_handles h
+             WHERE h.updated_at<=unixepoch()-?1
+               AND (EXISTS(SELECT 1 FROM registered_users r WHERE r.did=h.did)
+                    OR EXISTS(SELECT 1 FROM records x WHERE x.did=h.did)
+                    OR EXISTS(SELECT 1 FROM follows f JOIN registered_users r ON r.did=f.actor WHERE f.subject=h.did))
+             ORDER BY h.updated_at,h.did LIMIT ?2",
+        )?;
+        let dids = statement
+            .query_map(
+                params![ttl_seconds, i64::try_from(limit.max(1)).unwrap_or(i64::MAX)],
+                |row| row.get(0),
+            )?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(dids)
+    }
+
+    fn queue_handle_refresh(&self, did: &str) -> Result<(), StorageError> {
+        self.conn()?.execute(
+            "INSERT OR IGNORE INTO handle_refresh_queue(did) VALUES(?1)",
+            [did],
+        )?;
+        Ok(())
+    }
+
+    fn pending_handle_refreshes(&self, limit: usize) -> Result<Vec<String>, StorageError> {
+        let connection = self.conn()?;
+        let mut statement = connection
+            .prepare("SELECT did FROM handle_refresh_queue ORDER BY requested_at,did LIMIT ?1")?;
+        let dids = statement
+            .query_map([i64::try_from(limit.max(1)).unwrap_or(i64::MAX)], |row| {
+                row.get(0)
+            })?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(dids)
+    }
+
+    fn complete_handle_refresh(&self, did: &str) -> Result<(), StorageError> {
+        self.conn()?
+            .execute("DELETE FROM handle_refresh_queue WHERE did=?1", [did])?;
+        Ok(())
     }
 
     fn bytes_on_disk(&self) -> u64 {
@@ -1712,6 +1835,11 @@ impl<S: Storage> Ingestor<S> {
 
     pub fn process_json(&self, json: &str) -> Result<(), IngestError> {
         let event: JetstreamEvent = serde_json::from_str(json)?;
+        if matches!(event.kind.as_str(), "identity" | "account")
+            && self.storage.is_tracked_did(&event.did)?
+        {
+            self.storage.queue_handle_refresh(&event.did)?;
+        }
         if event.kind == "commit"
             && let Some(commit) = event.commit
             && SUPPORTED_COLLECTIONS.contains(&commit.collection.as_str())

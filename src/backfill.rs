@@ -504,7 +504,12 @@ where
             .resolve_did_document(did)
             .await
             .map_err(|error| BackfillError::Verify(error.to_string()))?;
-        match self.resolver.verified_handle_for_document(&document).await {
+        match self
+            .resolver
+            .verified_handle_for_document(&document)
+            .await
+            .map_err(|error| BackfillError::Verify(error.to_string()))?
+        {
             Some(handle) => self.storage.set_verified_handle(did, &handle)?,
             None => self.storage.clear_verified_handle(did)?,
         }

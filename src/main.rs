@@ -4,7 +4,7 @@ use appview_rs::{
         AtriumRepoVerifier, BackfillWorker, HostRateLimiter, HttpRepoSource, RepoBackfiller,
     },
     config::{Config, OAuthMode},
-    identity::{HttpIdentityBackend, IdentityResolver},
+    identity::{HandleRefreshWorker, HttpIdentityBackend, IdentityResolver},
     ingest::{Ingestor, JetstreamConsumer, SqliteStorage},
     init_tracing,
     jwt::ServiceJwtVerifier,
@@ -68,6 +68,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         backfiller,
         Duration::from_secs(5),
     );
+    let handle_refresh_worker = HandleRefreshWorker::new(
+        storage.clone(),
+        IdentityResolver::new(HttpIdentityBackend::default(), Duration::from_secs(1800)),
+        Duration::from_secs(1800),
+        Duration::from_secs(30),
+    );
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let ingestion_shutdown = shutdown_rx.clone();
@@ -76,9 +82,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
             error!(%error, "Jetstream consumer stopped");
         }
     });
+    let backfill_shutdown = shutdown_rx.clone();
     let backfill_task = tokio::spawn(async move {
-        if let Err(error) = worker.run(shutdown_rx).await {
+        if let Err(error) = worker.run(backfill_shutdown).await {
             error!(%error, "backfill worker stopped");
+        }
+    });
+    let handle_refresh_shutdown = shutdown_rx.clone();
+    let handle_refresh_task = tokio::spawn(async move {
+        if let Err(error) = handle_refresh_worker.run(handle_refresh_shutdown).await {
+            error!(%error, "verified handle refresh worker stopped");
         }
     });
 
@@ -103,6 +116,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let _ = tokio::time::timeout(Duration::from_secs(3), async {
         let _ = ingestion_task.await;
         let _ = backfill_task.await;
+        let _ = handle_refresh_task.await;
     })
     .await;
     Ok(())

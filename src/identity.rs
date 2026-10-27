@@ -1,3 +1,4 @@
+use crate::ingest::{Storage, StorageError};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -7,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock, watch};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct DidDocument {
@@ -180,18 +181,24 @@ impl<B: IdentityBackend> IdentityResolver<B> {
         Ok(document)
     }
 
-    pub async fn verified_handle_for_document(&self, document: &DidDocument) -> Option<String> {
+    pub async fn verified_handle_for_document(
+        &self,
+        document: &DidDocument,
+    ) -> Result<Option<String>, ResolutionError> {
         for alias in &document.also_known_as {
             if let Some(candidate) = alias.strip_prefix("at://")
                 && let Ok(handle) = normalize_handle(candidate)
             {
-                return match self.resolve_handle_assertion(&handle).await {
-                    Ok(asserted_did) if asserted_did == document.id => Some(handle),
-                    _ => None,
-                };
+                match self.resolve_handle_assertion(&handle).await {
+                    Ok(asserted_did) if asserted_did == document.id => {
+                        return Ok(Some(handle));
+                    }
+                    Ok(_) | Err(ResolutionError::UnverifiedHandle(_)) => {}
+                    Err(error) => return Err(error),
+                }
             }
         }
-        None
+        Ok(None)
     }
 
     pub async fn resolve_did(&self, did: &str) -> Result<Identity, ResolutionError> {
@@ -213,7 +220,7 @@ impl<B: IdentityBackend> IdentityResolver<B> {
             )));
         }
 
-        let verified_handle = self.verified_handle_for_document(&doc).await;
+        let verified_handle = self.verified_handle_for_document(&doc).await?;
         let identity = Identity {
             did: did.to_owned(),
             handle: verified_handle,
@@ -255,6 +262,104 @@ impl<B: IdentityBackend> IdentityResolver<B> {
                 identity,
             },
         );
+    }
+}
+
+const HANDLE_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+const HANDLE_REFRESH_BATCH: usize = 128;
+
+#[derive(Debug, Error)]
+pub enum HandleRefreshError {
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error(transparent)]
+    Resolution(#[from] ResolutionError),
+}
+
+/// Periodically re-verifies stored handles for DIDs with indexed or registered data.
+/// Stale values remain available until a completed check proves them invalid.
+pub struct HandleRefreshWorker<S: Storage, B: IdentityBackend> {
+    storage: Arc<S>,
+    resolver: IdentityResolver<B>,
+    handle_ttl: Duration,
+    poll_interval: Duration,
+    last_refresh: Mutex<Option<Instant>>,
+}
+
+impl<S: Storage, B: IdentityBackend> HandleRefreshWorker<S, B> {
+    pub fn new(
+        storage: Arc<S>,
+        resolver: IdentityResolver<B>,
+        handle_ttl: Duration,
+        poll_interval: Duration,
+    ) -> Self {
+        Self {
+            storage,
+            resolver,
+            handle_ttl,
+            poll_interval: poll_interval.max(Duration::from_millis(1)),
+            last_refresh: Mutex::new(None),
+        }
+    }
+
+    /// Queue stale verifications and process up to one bounded batch.
+    pub async fn refresh_once(&self) -> Result<usize, HandleRefreshError> {
+        for did in self
+            .storage
+            .stale_handle_dids(self.handle_ttl, HANDLE_REFRESH_BATCH)?
+        {
+            self.storage.queue_handle_refresh(&did)?;
+        }
+
+        let pending = self
+            .storage
+            .pending_handle_refreshes(HANDLE_REFRESH_BATCH)?;
+        let mut completed = 0;
+        for did in pending {
+            self.wait_for_refresh_slot().await;
+            let document = self.resolver.resolve_did_document(&did).await?;
+            match self
+                .resolver
+                .verified_handle_for_document(&document)
+                .await?
+            {
+                Some(handle) => self.storage.set_verified_handle(&did, &handle)?,
+                None => self.storage.clear_verified_handle(&did)?,
+            }
+            self.storage.complete_handle_refresh(&did)?;
+            completed += 1;
+        }
+        Ok(completed)
+    }
+
+    pub async fn run(&self, mut shutdown: watch::Receiver<bool>) -> Result<(), HandleRefreshError> {
+        loop {
+            if *shutdown.borrow() {
+                return Ok(());
+            }
+            if let Err(error) = self.refresh_once().await {
+                tracing::warn!(%error, "verified handle refresh failed; retry scheduled");
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(self.poll_interval) => {},
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
+    async fn wait_for_refresh_slot(&self) {
+        let mut last_refresh = self.last_refresh.lock().await;
+        if let Some(previous) = *last_refresh {
+            let elapsed = previous.elapsed();
+            if elapsed < HANDLE_REFRESH_INTERVAL {
+                tokio::time::sleep(HANDLE_REFRESH_INTERVAL - elapsed).await;
+            }
+        }
+        *last_refresh = Some(Instant::now());
     }
 }
 
