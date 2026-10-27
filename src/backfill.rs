@@ -233,12 +233,40 @@ impl RepoVerifier for AtriumRepoVerifier {
             if !INDEXED_COLLECTIONS.contains(&collection) {
                 continue;
             }
-            let record = repository
-                .get_raw::<Ipld>(&path)
-                .await
-                .map_err(|error| BackfillError::Verify(error.to_string()))?
-                .ok_or_else(|| BackfillError::Verify(format!("record block {cid} is missing")))?;
-            let record = ipld_to_atproto_json(record).map_err(BackfillError::Verify)?;
+            let record = match repository.get_raw::<Ipld>(&path).await {
+                Ok(Some(record)) => match ipld_to_atproto_json(record) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        tracing::warn!(
+                            collection,
+                            rkey,
+                            cid = %cid,
+                            %error,
+                            "skipping repository record that cannot be represented as ATProto JSON"
+                        );
+                        continue;
+                    }
+                },
+                Ok(None) => {
+                    tracing::warn!(
+                        collection,
+                        rkey,
+                        cid = %cid,
+                        "skipping missing repository record block"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        collection,
+                        rkey,
+                        cid = %cid,
+                        %error,
+                        "skipping repository record that cannot be decoded"
+                    );
+                    continue;
+                }
+            };
             records.push(RepoRecord {
                 collection: collection.to_owned(),
                 rkey: rkey.to_owned(),
