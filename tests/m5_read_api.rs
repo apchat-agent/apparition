@@ -42,19 +42,21 @@ impl IdentityBackend for FakeIdentity {
 fn fixture_storage() -> Arc<MemoryStorage> {
     let storage = Arc::new(MemoryStorage::default());
     storage.register_user(ALICE).unwrap();
+    storage.set_verified_handle(ALICE, "alice.test").unwrap();
+    storage.set_verified_handle(FRIEND, "friend.test").unwrap();
     storage.set_follow(ALICE, FRIEND, true).unwrap();
     let fixtures = [
         (
             ALICE,
             "app.bsky.actor.profile",
             "self",
-            json!({"handle":"alice.test","displayName":"Alice","description":"Example","createdAt":"2024-01-01T00:00:00Z"}),
+            json!({"displayName":"Alice","description":"Example","createdAt":"2024-01-01T00:00:00Z"}),
         ),
         (
             FRIEND,
             "app.bsky.actor.profile",
             "self",
-            json!({"handle":"friend.test","displayName":"Friend","createdAt":"2024-01-01T00:00:00Z"}),
+            json!({"displayName":"Friend","createdAt":"2024-01-01T00:00:00Z"}),
         ),
         (
             ALICE,
@@ -414,4 +416,70 @@ async fn profile_records_cannot_claim_unverified_handles() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn remaining_read_responses_preserve_recorded_public_api_keys() {
+    let (router, _) = api();
+    let route_fixtures = [
+        (
+            "/xrpc/app.bsky.feed.getPosts?uris=at%3A%2F%2Fdid:plc:alice%2Fapp.bsky.feed.post%2Fp1",
+            include_str!("fixtures/get_posts.json"),
+            "posts",
+        ),
+        (
+            "/xrpc/app.bsky.feed.getLikes?uri=at%3A%2F%2Fdid:plc:alice%2Fapp.bsky.feed.post%2Fp1",
+            include_str!("fixtures/get_likes.json"),
+            "likes",
+        ),
+        (
+            "/xrpc/app.bsky.feed.getRepostedBy?uri=at%3A%2F%2Fdid:plc:alice%2Fapp.bsky.feed.post%2Fp1",
+            include_str!("fixtures/get_reposted_by.json"),
+            "repostedBy",
+        ),
+        (
+            "/xrpc/app.bsky.graph.getFollows?actor=did%3Aplc%3Aalice",
+            include_str!("fixtures/get_follows.json"),
+            "follows",
+        ),
+        (
+            "/xrpc/app.bsky.graph.getFollowers?actor=did%3Aplc%3Afriend",
+            include_str!("fixtures/get_followers.json"),
+            "followers",
+        ),
+    ];
+    for (uri, fixture_json, list_key) in route_fixtures {
+        let fixture: Value = serde_json::from_str(fixture_json).unwrap();
+        let (status, body) = request(router.clone(), uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        for key in fixture.as_object().unwrap().keys() {
+            assert!(body.get(key).is_some(), "{uri} omitted fixture key {key}");
+        }
+        assert!(body[list_key].is_array());
+        if let Some(fixture_item) = fixture[list_key].as_array().and_then(|items| items.first()) {
+            let response_item = body[list_key].as_array().unwrap().first().unwrap();
+            for key in fixture_item.as_object().unwrap().keys() {
+                assert!(
+                    response_item.get(key).is_some(),
+                    "{uri} item omitted fixture key {key}"
+                );
+            }
+        }
+    }
+
+    let thread_fixture: Value =
+        serde_json::from_str(include_str!("fixtures/get_post_thread.json")).unwrap();
+    let (status, body) = request(
+        router,
+        "/xrpc/app.bsky.feed.getPostThread?uri=at%3A%2F%2Fdid:plc:alice%2Fapp.bsky.feed.post%2Fp1",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for key in thread_fixture["thread"].as_object().unwrap().keys() {
+        assert!(
+            body["thread"].get(key).is_some(),
+            "thread omitted fixture key {key}"
+        );
+    }
 }
