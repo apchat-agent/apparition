@@ -1227,6 +1227,144 @@ async fn logged_in_web_views_render_from_the_local_index_without_pds_reads() {
 }
 
 #[tokio::test]
+async fn web_posts_show_hydrated_authors_and_times_on_timeline_profile_and_thread() {
+    let storage = Arc::new(MemoryStorage::default());
+    storage.register_user("did:plc:alice").unwrap();
+    storage
+        .set_verified_handle("did:plc:alice", "alice.test")
+        .unwrap();
+    storage
+        .set_verified_handle("did:plc:friend", "friend.test")
+        .unwrap();
+    storage
+        .set_follow("did:plc:alice", "did:plc:friend", true)
+        .unwrap();
+    for record in [
+        IndexedRecord {
+            did: "did:plc:alice".into(),
+            collection: "app.bsky.actor.profile".into(),
+            rkey: "self".into(),
+            uri: "at://did:plc:alice/app.bsky.actor.profile/self".into(),
+            cid: Some("alice-profile-cid".into()),
+            time_us: 3,
+            record: serde_json::json!({"displayName":"Alice"}),
+        },
+        IndexedRecord {
+            did: "did:plc:friend".into(),
+            collection: "app.bsky.actor.profile".into(),
+            rkey: "self".into(),
+            uri: "at://did:plc:friend/app.bsky.actor.profile/self".into(),
+            cid: Some("friend-profile-cid".into()),
+            time_us: 2,
+            record: serde_json::json!({"displayName":"Friend & Co"}),
+        },
+        IndexedRecord {
+            did: "did:plc:alice".into(),
+            collection: "app.bsky.graph.follow".into(),
+            rkey: "friend-follow".into(),
+            uri: "at://did:plc:alice/app.bsky.graph.follow/friend-follow".into(),
+            cid: Some("follow-cid".into()),
+            time_us: 1,
+            record: serde_json::json!({"subject":"did:plc:friend"}),
+        },
+        IndexedRecord {
+            did: "did:plc:friend".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "friend-post".into(),
+            uri: "at://did:plc:friend/app.bsky.feed.post/friend-post".into(),
+            cid: Some("friend-post-cid".into()),
+            time_us: 1,
+            record: serde_json::json!({"text":"A post by a friend", "createdAt":"2026-10-27T09:15:00Z"}),
+        },
+    ] {
+        storage.put_record(&record).unwrap();
+    }
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage);
+    let cookie = finish_login(&app).await;
+
+    let timeline = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let timeline_html = String::from_utf8(
+        timeline
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(timeline_html.contains("Friend &amp; Co"));
+    assert!(timeline_html.contains("@friend.test"));
+    assert!(timeline_html.contains("href=\"/profile?did=did:plc:friend\""));
+    assert!(
+        timeline_html
+            .contains("<time datetime=\"2026-10-27T09:15:00Z\">2026-10-27T09:15:00Z</time>")
+    );
+
+    let profile = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/profile?did=did%3Aplc%3Afriend")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(profile.status(), StatusCode::OK);
+    let profile_html = String::from_utf8(
+        profile
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(profile_html.contains("A post by a friend"));
+    assert!(profile_html.contains("@friend.test"));
+    assert!(profile_html.contains("2026-10-27T09:15:00Z"));
+
+    let thread = app
+        .oneshot(
+            Request::builder()
+                .uri("/thread?uri=at%3A%2F%2Fdid%3Aplc%3Afriend%2Fapp.bsky.feed.post%2Ffriend-post")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let thread_html = String::from_utf8(
+        thread
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(thread_html.contains("Friend &amp; Co"));
+    assert!(thread_html.contains("@friend.test"));
+    assert!(thread_html.contains("2026-10-27T09:15:00Z"));
+}
+
+#[tokio::test]
 async fn callback_keeps_partial_write_grants_read_only_and_blocks_actions() {
     let flow = FakeOAuthFlow::with_granted_scope(Some("atproto"));
     let actions = flow.actions.clone();
