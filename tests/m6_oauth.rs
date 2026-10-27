@@ -1,7 +1,7 @@
 use appview_rs::router;
 use appview_rs::{
     config::Config,
-    ingest::{MemoryStorage, SqliteStorage, Storage},
+    ingest::{IndexedRecord, MemoryStorage, SqliteStorage, Storage},
     oauth::{OAuthAccount, OAuthCallback, OAuthFlow, OAuthPublic, SqliteOAuthStore},
 };
 use atrium_api::types::string::Did;
@@ -130,7 +130,8 @@ impl OAuthFlow for FakeOAuthFlow {
         &'a self,
         _: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Value>, String>> + Send + 'a>> {
-        Box::pin(async {
+        Box::pin(async move {
+            self.actions.lock().unwrap().push("timeline".to_owned());
             Ok(vec![serde_json::json!({
                 "post": {
                     "uri":"at://did:plc:author/app.bsky.feed.post/r1",
@@ -1077,10 +1078,47 @@ async fn logging_in_on_another_device_keeps_the_first_session_valid() {
 }
 
 #[tokio::test]
-async fn logged_in_timeline_comes_from_the_oauth_account_pds() {
+async fn logged_in_web_views_render_from_the_local_index_without_pds_reads() {
+    let storage = Arc::new(MemoryStorage::default());
+    storage.register_user("did:plc:alice").unwrap();
+    storage.set_verified_handle("did:plc:alice", "alice.test").unwrap();
+    storage.set_follow("did:plc:alice", "did:plc:friend", true).unwrap();
+    for record in [
+        IndexedRecord {
+            did: "did:plc:alice".into(),
+            collection: "app.bsky.actor.profile".into(),
+            rkey: "self".into(),
+            uri: "at://did:plc:alice/app.bsky.actor.profile/self".into(),
+            cid: Some("profile-cid".into()),
+            time_us: 3,
+            record: serde_json::json!({"displayName":"Alice from local index"}),
+        },
+        IndexedRecord {
+            did: "did:plc:alice".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "local-post".into(),
+            uri: "at://did:plc:alice/app.bsky.feed.post/local-post".into(),
+            cid: Some("local-cid".into()),
+            time_us: 2,
+            record: serde_json::json!({"text":"post from local index"}),
+        },
+        IndexedRecord {
+            did: "did:plc:friend".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "friend-post".into(),
+            uri: "at://did:plc:friend/app.bsky.feed.post/friend-post".into(),
+            cid: Some("friend-cid".into()),
+            time_us: 1,
+            record: serde_json::json!({"text":"followed account from local index"}),
+        },
+    ] {
+        storage.put_record(&record).unwrap();
+    }
+    let flow = FakeOAuthFlow::default();
+    let actions = flow.actions.clone();
     let app = OAuthPublic::new("https://appview.example")
         .unwrap()
-        .router_with_flow(FakeOAuthFlow::default(), Arc::new(MemoryStorage::default()));
+        .router_with_flow(flow, storage);
     let login_cookie = prelogin_cookie(&app).await;
     let callback = app
         .clone()
@@ -1101,10 +1139,11 @@ async fn logged_in_timeline_comes_from_the_oauth_account_pds() {
         .unwrap()
         .to_owned();
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/app")
-                .header("cookie", cookie)
+                .header("cookie", &cookie)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1113,9 +1152,44 @@ async fn logged_in_timeline_comes_from_the_oauth_account_pds() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let html = String::from_utf8(body.to_vec()).unwrap();
-    assert!(html.contains("from OAuth timeline"));
-    assert!(html.contains("/like"));
-    assert!(html.contains("/repost"));
+    assert!(html.contains("post from local index"));
+    assert!(html.contains("followed account from local index"));
+    assert!(!html.contains("from OAuth timeline"));
+    assert!(!actions.lock().unwrap().iter().any(|action| action == "timeline"));
+
+    let profile = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/profile?did=did%3Aplc%3Aalice")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let profile_html = String::from_utf8(
+        profile.into_body().collect().await.unwrap().to_bytes().to_vec(),
+    )
+    .unwrap();
+    assert!(profile_html.contains("Alice from local index"));
+
+    let thread = app
+        .oneshot(
+            Request::builder()
+                .uri("/thread?uri=at%3A%2F%2Fdid%3Aplc%3Aalice%2Fapp.bsky.feed.post%2Flocal-post")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let thread_html = String::from_utf8(
+        thread.into_body().collect().await.unwrap().to_bytes().to_vec(),
+    )
+    .unwrap();
+    assert!(thread_html.contains("post from local index"));
+    assert!(!actions.lock().unwrap().iter().any(|action| action == "timeline"));
 }
 
 #[tokio::test]
