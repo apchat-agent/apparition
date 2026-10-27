@@ -229,7 +229,20 @@ async fn consumer_reconnects_after_a_silent_websocket_and_rotates_urls() {
     let silent_server = tokio::spawn(async move {
         let (stream, _) = silent_listener.accept().await.unwrap();
         let mut websocket = accept_async(stream).await.unwrap();
-        let _ = websocket.next().await;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                    if websocket.send(Message::Ping(Default::default())).await.is_err() {
+                        break;
+                    }
+                }
+                message = websocket.next() => {
+                    if message.is_none() || matches!(message, Some(Ok(Message::Close(_)))) {
+                        break;
+                    }
+                }
+            }
+        }
     });
 
     let live_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
