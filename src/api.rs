@@ -5,7 +5,7 @@ use crate::{
 };
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{Query, RawQuery, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
@@ -170,12 +170,15 @@ async fn get_profile<S: Storage, B: IdentityBackend>(
 async fn get_profiles<S: Storage, B: IdentityBackend>(
     State(state): State<ApiState<S, B>>,
     headers: HeaderMap,
-    Query(query): Query<HashMap<String, String>>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
     let _ = authorize(&state, &headers, "app.bsky.actor.getProfiles", false).await?;
-    let actors = required(&query, "actors")?;
+    let actors = repeated_query_values(raw_query.as_deref(), "actors");
+    if actors.is_empty() {
+        return Err(ApiError::bad_request("missing query parameter actors"));
+    }
     let mut profiles = Vec::new();
-    for actor in actors.split(',').take(25) {
+    for actor in actors.iter().take(25) {
         if let Ok(did) = actor_to_did(&state, actor) {
             profiles.push(profile_view(&state, &did)?);
         }
@@ -217,18 +220,21 @@ async fn get_author_feed<S: Storage, B: IdentityBackend>(
 async fn get_posts<S: Storage, B: IdentityBackend>(
     State(state): State<ApiState<S, B>>,
     headers: HeaderMap,
-    Query(query): Query<HashMap<String, String>>,
+    RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
     let _ = authorize(&state, &headers, "app.bsky.feed.getPosts", false).await?;
-    let uris = required(&query, "uris")?;
+    let uris = repeated_query_values(raw_query.as_deref(), "uris");
+    if uris.is_empty() {
+        return Err(ApiError::bad_request("missing query parameter uris"));
+    }
     let records = state.storage.records().map_err(|_| ApiError::internal())?;
     let posts = uris
-        .split(',')
+        .iter()
         .take(25)
         .filter_map(|uri| {
             records
                 .iter()
-                .find(|record| record.collection == POST && record.uri == uri)
+                .find(|record| record.collection == POST && record.uri == uri.as_str())
         })
         .map(|record| post_view(&state, record, &records))
         .collect::<Vec<_>>();
@@ -455,6 +461,16 @@ fn required<'a>(query: &'a HashMap<String, String>, key: &str) -> Result<&'a str
         .map(String::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::bad_request(format!("missing query parameter {key}")))
+}
+
+fn repeated_query_values(query: Option<&str>, key: &str) -> Vec<String> {
+    query
+        .map(|query| url::form_urlencoded::parse(query.as_bytes()))
+        .into_iter()
+        .flatten()
+        .filter(|(name, _)| name == key)
+        .map(|(_, value)| value.into_owned())
+        .collect()
 }
 
 fn query_limit(query: &HashMap<String, String>, default: usize) -> usize {

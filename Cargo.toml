@@ -41,6 +41,7 @@ hmac = "0.12"
 sha2 = "0.10"
 atrium-identity = "0.1.9"
 atrium-common = "0.1.4"
+url = "2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
