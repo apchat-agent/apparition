@@ -198,21 +198,24 @@ async fn get_author_feed<S: Storage, B: IdentityBackend>(
         .get("cursor")
         .and_then(|cursor| cursor.parse::<u64>().ok());
     let records = state.storage.records().map_err(|_| ApiError::internal())?;
-    let feed = records
+    let page_records = records
         .iter()
         .filter(|record| record.did == actor && record.collection == POST)
         .filter(|record| before.is_none_or(|cursor| record.time_us < cursor))
         .take(limit)
+        .collect::<Vec<_>>();
+    let next_cursor = if page_records.len() == limit {
+        page_records.last().map(|record| record.time_us.to_string())
+    } else {
+        None
+    };
+    let feed = page_records
+        .iter()
         .map(|record| json!({"post":post_view(&state, record, &records)}))
         .collect::<Vec<_>>();
     let mut result = json!({"feed":feed});
-    if feed.len() == limit
-        && let Some(last) = records
-            .iter()
-            .filter(|record| record.did == actor && record.collection == POST)
-            .nth(limit - 1)
-    {
-        result["cursor"] = json!(last.time_us.to_string());
+    if let Some(next_cursor) = next_cursor {
+        result["cursor"] = json!(next_cursor);
     }
     Ok(Json(result))
 }
