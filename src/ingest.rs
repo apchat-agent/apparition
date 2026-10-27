@@ -1204,12 +1204,15 @@ impl<S: Storage + 'static> JetstreamConsumer<S> {
         tracing::info!(%url, "Jetstream connected");
         let _connection_log = JetstreamConnectionLog(url.to_owned());
         async {
+            let mut idle_deadline = tokio::time::Instant::now() + self.idle_timeout;
             loop {
-                let message = tokio::time::timeout(self.idle_timeout, websocket.next())
+                let remaining =
+                    idle_deadline.saturating_duration_since(tokio::time::Instant::now());
+                let message = tokio::time::timeout(remaining, websocket.next())
                     .await
                     .map_err(|_| {
                         IngestError::WebSocket(format!(
-                            "no websocket message received for {} seconds",
+                            "no Jetstream event received for {} seconds",
                             self.idle_timeout.as_secs_f64()
                         ))
                     })?;
@@ -1217,11 +1220,15 @@ impl<S: Storage + 'static> JetstreamConsumer<S> {
                     break;
                 };
                 match message.map_err(|error| IngestError::WebSocket(error.to_string()))? {
-                    Message::Text(text) => self.process_event_text(text.to_string()).await?,
+                    Message::Text(text) => {
+                        self.process_event_text(text.to_string()).await?;
+                        idle_deadline = tokio::time::Instant::now() + self.idle_timeout;
+                    }
                     Message::Binary(bytes) => {
                         let text = std::str::from_utf8(&bytes)
                             .map_err(|error| IngestError::WebSocket(error.to_string()))?;
                         self.process_event_text(text.to_owned()).await?;
+                        idle_deadline = tokio::time::Instant::now() + self.idle_timeout;
                     }
                     Message::Close(_) => break,
                     Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
