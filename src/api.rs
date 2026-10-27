@@ -482,17 +482,30 @@ async fn list_notifications<S: Storage, B: IdentityBackend>(
     .await?
     .ok_or_else(|| ApiError::unauthorized("service JWT required"))?;
     let actor = claims.iss;
-    let records = state.storage.records().map_err(|_| ApiError::internal())?;
-    let mut notifications = notification_records(&records, &actor).into_iter().map(|(record, reason, subject)| json!({
+    let limit = query_limit(&query, 50);
+    let before = query
+        .get("cursor")
+        .and_then(|cursor| cursor.parse::<u64>().ok());
+    let page = state
+        .storage
+        .notifications_for(&actor, before, limit + 1)
+        .map_err(|_| ApiError::internal())?;
+    let has_more = page.len() > limit;
+    let notifications = page.iter().take(limit).map(|notice| {
+        let record = &notice.record;
+        json!({
         "$type":"app.bsky.notification.listNotifications#notification",
         "uri":record.uri,"cid":record.cid,"author":profile_view(&state, &record.did).unwrap_or_else(|_| json!({"did":record.did,"handle":"handle.invalid"})),
-        "reason":reason,"reasonSubject":subject,"record":record.record,"isRead":false,
-        "indexedAt":record.record.get("createdAt").cloned().unwrap_or(Value::Null)
-    })).collect::<Vec<_>>();
-    notifications.truncate(query_limit(&query, 50));
-    Ok(Json(
-        json!({"notifications":notifications,"seenAt":now_rfc3339()}),
-    ))
+        "reason":notice.reason,"reasonSubject":notice.reason_subject,"record":record.record,"isRead":false,
+        "indexedAt":record.record.get("createdAt").cloned().unwrap_or_else(|| json!(timestamp_us_to_rfc3339(record.time_us)))
+    })}).collect::<Vec<_>>();
+    let mut result = json!({"notifications":notifications,"seenAt":now_rfc3339()});
+    if has_more {
+        if let Some(last) = page.get(limit) {
+            result["cursor"] = json!(last.record.time_us.to_string());
+        }
+    }
+    Ok(Json(result))
 }
 
 async fn get_unread_count<S: Storage, B: IdentityBackend>(
@@ -508,10 +521,11 @@ async fn get_unread_count<S: Storage, B: IdentityBackend>(
     .await?
     .ok_or_else(|| ApiError::unauthorized("service JWT required"))?;
     let actor = claims.iss;
-    let records = state.storage.records().map_err(|_| ApiError::internal())?;
-    Ok(Json(
-        json!({"count":notification_records(&records, &actor).len()}),
-    ))
+    let count = state
+        .storage
+        .notification_count(&actor)
+        .map_err(|_| ApiError::internal())?;
+    Ok(Json(json!({"count":count})))
 }
 
 async fn authorize<S: Storage, B: IdentityBackend>(
@@ -710,43 +724,19 @@ fn follow_subjects(records: &[IndexedRecord], actor: &str) -> HashSet<String> {
         .collect()
 }
 
-fn notification_records<'a>(
-    records: &'a [IndexedRecord],
-    actor: &str,
-) -> Vec<(&'a IndexedRecord, &'static str, Option<String>)> {
-    let mut result = records
-        .iter()
-        .filter_map(|record| {
-            if record.collection == FOLLOW
-                && record.record.get("subject").and_then(Value::as_str) == Some(actor)
-            {
-                return Some((record, "follow", None));
-            }
-            if record.collection == LIKE
-                && subject_uri(record).is_some_and(|uri| uri_did(uri) == Some(actor))
-            {
-                return Some((record, "like", subject_uri(record).map(str::to_owned)));
-            }
-            if record.collection == REPOST
-                && subject_uri(record).is_some_and(|uri| uri_did(uri) == Some(actor))
-            {
-                return Some((record, "repost", subject_uri(record).map(str::to_owned)));
-            }
-            None
-        })
-        .collect::<Vec<_>>();
-    result.sort_by_key(|(record, _, _)| std::cmp::Reverse(record.time_us));
-    result
-}
-
-fn uri_did(uri: &str) -> Option<&str> {
-    let rest = uri.strip_prefix("at://")?;
-    let (did, _) = rest.split_once('/')?;
-    did.starts_with("did:").then_some(did)
-}
-
 fn now_rfc3339() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
+}
+
+fn timestamp_us_to_rfc3339(time_us: u64) -> String {
+    let nanos = i128::from(time_us).saturating_mul(1_000);
+    time::OffsetDateTime::from_unix_timestamp_nanos(nanos)
+        .ok()
+        .and_then(|date| {
+            date.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_else(now_rfc3339)
 }

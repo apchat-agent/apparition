@@ -74,6 +74,13 @@ pub struct PostInteractionSummary {
     pub viewer_repost: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct IndexedNotification {
+    pub record: IndexedRecord,
+    pub reason: String,
+    pub reason_subject: Option<String>,
+}
+
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("SQLite error: {0}")]
@@ -84,6 +91,98 @@ pub enum StorageError {
     Poisoned,
     #[error("storage I/O error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+fn notification_edges(
+    record: &IndexedRecord,
+) -> Vec<(IndexedRecord, String, String, Option<String>)> {
+    let mut edges = Vec::new();
+    let mut seen = HashSet::new();
+    let mut add = |did: &str, reason: &str, subject: Option<&str>| {
+        if did.starts_with("did:") && seen.insert((did.to_owned(), reason.to_owned())) {
+            edges.push((
+                record.clone(),
+                did.to_owned(),
+                reason.to_owned(),
+                subject.map(str::to_owned),
+            ));
+        }
+    };
+    match record.collection.as_str() {
+        "app.bsky.feed.like" | "app.bsky.feed.repost" => {
+            if let Some(uri) = record
+                .record
+                .pointer("/subject/uri")
+                .and_then(Value::as_str)
+            {
+                if let Some(did) = at_uri_did(uri) {
+                    add(
+                        did,
+                        if record.collection == "app.bsky.feed.like" {
+                            "like"
+                        } else {
+                            "repost"
+                        },
+                        Some(uri),
+                    );
+                }
+            }
+        }
+        "app.bsky.graph.follow" => {
+            if let Some(did) = record.record.get("subject").and_then(Value::as_str) {
+                add(did, "follow", None);
+            }
+        }
+        "app.bsky.feed.post" => {
+            if let Some(uri) = record
+                .record
+                .pointer("/reply/parent/uri")
+                .and_then(Value::as_str)
+            {
+                if let Some(did) = at_uri_did(uri) {
+                    add(did, "reply", Some(uri));
+                }
+            }
+            if let Some(facets) = record.record.get("facets").and_then(Value::as_array) {
+                for did in facets
+                    .iter()
+                    .filter_map(|facet| facet.get("features").and_then(Value::as_array))
+                    .flatten()
+                    .filter(|feature| {
+                        feature.get("$type").and_then(Value::as_str)
+                            == Some("app.bsky.richtext.facet#mention")
+                    })
+                    .filter_map(|feature| feature.get("did").and_then(Value::as_str))
+                {
+                    add(did, "mention", None);
+                }
+            }
+            for quote_uri in [
+                record.record.pointer("/embed/record/uri"),
+                record.record.pointer("/embed/record/record/uri"),
+                record.record.pointer("/embed/recordWithMedia/record/uri"),
+                record
+                    .record
+                    .pointer("/embed/recordWithMedia/record/record/uri"),
+            ]
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            {
+                if let Some(did) = at_uri_did(quote_uri) {
+                    add(did, "quote", Some(quote_uri));
+                }
+            }
+        }
+        _ => {}
+    }
+    edges
+}
+
+fn at_uri_did(uri: &str) -> Option<&str> {
+    let rest = uri.strip_prefix("at://")?;
+    let (did, _) = rest.split_once('/')?;
+    did.starts_with("did:").then_some(did)
 }
 
 pub trait Storage: Send + Sync {
@@ -107,6 +206,13 @@ pub trait Storage: Send + Sync {
         uri: &str,
     ) -> Result<Option<IndexedRecord>, StorageError>;
     fn replies_to(&self, parent_uri: &str) -> Result<Vec<IndexedRecord>, StorageError>;
+    fn notifications_for(
+        &self,
+        did: &str,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<IndexedNotification>, StorageError>;
+    fn notification_count(&self, did: &str) -> Result<usize, StorageError>;
     fn post_interaction_summary(
         &self,
         uri: &str,
@@ -307,6 +413,48 @@ impl Storage for MemoryStorage {
                 .then_with(|| left.uri.cmp(&right.uri))
         });
         Ok(replies)
+    }
+
+    fn notifications_for(
+        &self,
+        did: &str,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<IndexedNotification>, StorageError> {
+        let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut notifications = inner
+            .records
+            .values()
+            .filter(|record| before.is_none_or(|cursor| record.time_us < cursor))
+            .flat_map(notification_edges)
+            .filter_map(|(record, subject_did, reason, reason_subject)| {
+                (subject_did == did).then(|| IndexedNotification {
+                    record,
+                    reason,
+                    reason_subject,
+                })
+            })
+            .collect::<Vec<_>>();
+        notifications.sort_by(|left, right| {
+            right
+                .record
+                .time_us
+                .cmp(&left.record.time_us)
+                .then_with(|| right.record.uri.cmp(&left.record.uri))
+                .then_with(|| right.reason.cmp(&left.reason))
+        });
+        notifications.truncate(limit.clamp(1, 101));
+        Ok(notifications)
+    }
+
+    fn notification_count(&self, did: &str) -> Result<usize, StorageError> {
+        let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        Ok(inner
+            .records
+            .values()
+            .flat_map(notification_edges)
+            .filter(|(_, subject_did, _, _)| subject_did == did)
+            .count())
     }
 
     fn post_interaction_summary(
@@ -631,6 +779,19 @@ impl SqliteStorage {
              CREATE INDEX IF NOT EXISTS records_author_subject_uri
                  ON records(collection, did, json_extract(record_json, '$.subject.uri'));
              CREATE TABLE IF NOT EXISTS appview_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS notification_events (
+                 source_did TEXT NOT NULL,
+                 source_collection TEXT NOT NULL,
+                 source_rkey TEXT NOT NULL,
+                 source_uri TEXT NOT NULL,
+                 reason TEXT NOT NULL,
+                 subject_did TEXT NOT NULL,
+                 reason_subject TEXT,
+                 time_us INTEGER NOT NULL,
+                 PRIMARY KEY(source_did, source_collection, source_rkey, reason, subject_did)
+             );
+             CREATE INDEX IF NOT EXISTS notification_events_subject_time
+                 ON notification_events(subject_did, time_us DESC, source_uri DESC, reason);
              CREATE TABLE IF NOT EXISTS registered_users (did TEXT PRIMARY KEY);
              CREATE TABLE IF NOT EXISTS web_session_generations (
                  did TEXT PRIMARY KEY,
@@ -671,6 +832,7 @@ impl SqliteStorage {
                  updated_at INTEGER NOT NULL DEFAULT (unixepoch())
              );",
         )?;
+        migrate_notification_events(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
             path,
@@ -685,13 +847,15 @@ impl SqliteStorage {
 impl Storage for SqliteStorage {
     fn put_record(&self, record: &IndexedRecord) -> Result<(), StorageError> {
         let record_json = serde_json::to_string(&record.record)?;
-        self.conn()?.execute(
+        let connection = self.conn()?;
+        connection.execute(
             "INSERT INTO records (did, collection, rkey, uri, cid, time_us, record_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(did, collection, rkey) DO UPDATE SET
                  uri=excluded.uri, cid=excluded.cid, time_us=excluded.time_us, record_json=excluded.record_json",
             params![record.did, record.collection, record.rkey, record.uri, record.cid, record.time_us, record_json],
         )?;
+        write_notification_events(&connection, record)?;
         Ok(())
     }
 
@@ -704,6 +868,7 @@ impl Storage for SqliteStorage {
         let mut connection = self.conn()?;
         let transaction = connection.transaction()?;
         transaction.execute("DELETE FROM records WHERE did=?1", [did])?;
+        transaction.execute("DELETE FROM notification_events WHERE source_did=?1", [did])?;
         transaction.execute("DELETE FROM follows WHERE actor=?1", [did])?;
         transaction.execute(
             "DELETE FROM backfill_scope WHERE owner_did=?1 AND target_did!=?1",
@@ -729,6 +894,7 @@ impl Storage for SqliteStorage {
                     record.time_us,
                     serde_json::to_string(&record.record)?,
                 ])?;
+                write_notification_events(&transaction, record)?;
             }
         }
         {
@@ -757,8 +923,13 @@ impl Storage for SqliteStorage {
     }
 
     fn delete_record(&self, did: &str, collection: &str, rkey: &str) -> Result<(), StorageError> {
-        self.conn()?.execute(
+        let connection = self.conn()?;
+        connection.execute(
             "DELETE FROM records WHERE did=?1 AND collection=?2 AND rkey=?3",
+            params![did, collection, rkey],
+        )?;
+        connection.execute(
+            "DELETE FROM notification_events WHERE source_did=?1 AND source_collection=?2 AND source_rkey=?3",
             params![did, collection, rkey],
         )?;
         Ok(())
@@ -807,6 +978,49 @@ impl Storage for SqliteStorage {
             .query_map([parent_uri], row_to_record)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    fn notifications_for(
+        &self,
+        did: &str,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<IndexedNotification>, StorageError> {
+        let conn = self.conn()?;
+        let mut statement = conn.prepare(
+            "SELECT r.did, r.collection, r.rkey, r.uri, r.cid, r.time_us, r.record_json,
+                    n.reason, n.reason_subject
+             FROM notification_events n
+             JOIN records r ON r.did=n.source_did AND r.collection=n.source_collection AND r.rkey=n.source_rkey
+             WHERE n.subject_did=?1 AND (?2 IS NULL OR n.time_us < ?2)
+             ORDER BY n.time_us DESC, n.source_uri DESC, n.reason DESC
+             LIMIT ?3",
+        )?;
+        statement
+            .query_map(
+                params![
+                    did,
+                    before.map(|time| time.min(i64::MAX as u64) as i64),
+                    limit.clamp(1, 101) as i64,
+                ],
+                |row| {
+                    Ok(IndexedNotification {
+                        record: row_to_record(row)?,
+                        reason: row.get(7)?,
+                        reason_subject: row.get(8)?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    fn notification_count(&self, did: &str) -> Result<usize, StorageError> {
+        Ok(self.conn()?.query_row(
+            "SELECT COUNT(*) FROM notification_events WHERE subject_did=?1",
+            [did],
+            |row| row.get(0),
+        )?)
     }
 
     fn post_interaction_summary(
@@ -1163,6 +1377,62 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedRecord> {
         time_us: row.get(5)?,
         record,
     })
+}
+
+fn write_notification_events(
+    connection: &Connection,
+    record: &IndexedRecord,
+) -> Result<(), StorageError> {
+    connection.execute(
+        "DELETE FROM notification_events WHERE source_did=?1 AND source_collection=?2 AND source_rkey=?3",
+        params![record.did, record.collection, record.rkey],
+    )?;
+    for (record, subject_did, reason, reason_subject) in notification_edges(record) {
+        connection.execute(
+            "INSERT OR IGNORE INTO notification_events
+             (source_did, source_collection, source_rkey, source_uri, reason, subject_did, reason_subject, time_us)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                record.did,
+                record.collection,
+                record.rkey,
+                record.uri,
+                reason,
+                subject_did,
+                reason_subject,
+                record.time_us.min(i64::MAX as u64) as i64,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_notification_events(connection: &Connection) -> Result<(), StorageError> {
+    let current: Option<String> = connection
+        .query_row(
+            "SELECT value FROM appview_state WHERE key='notification_events_v1'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if current.is_some() {
+        return Ok(());
+    }
+    let records = {
+        let mut statement = connection
+            .prepare("SELECT did, collection, rkey, uri, cid, time_us, record_json FROM records")?;
+        statement
+            .query_map([], row_to_record)?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for record in &records {
+        write_notification_events(connection, record)?;
+    }
+    connection.execute(
+        "INSERT INTO appview_state(key,value) VALUES('notification_events_v1','1')",
+        [],
+    )?;
+    Ok(())
 }
 
 #[derive(Debug, Error)]
