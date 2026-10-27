@@ -23,7 +23,12 @@ fn config_loads_toml_and_environment_overrides() {
 #[tokio::test]
 async fn health_endpoint_returns_json_ok() {
     let response = router()
-        .oneshot(Request::builder().uri("/xrpc/_health").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/xrpc/_health")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), 200);

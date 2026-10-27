@@ -1,0 +1,104 @@
+use serde::Deserialize;
+use std::{env, fs, path::PathBuf};
+use thiserror::Error;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct Config {
+    #[serde(default = "default_listen")]
+    pub listen: String,
+    #[serde(default = "default_data_dir")]
+    pub data_dir: String,
+    #[serde(default = "default_log_filter")]
+    pub log_filter: String,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            listen: default_listen(),
+            data_dir: default_data_dir(),
+            log_filter: default_log_filter(),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("invalid TOML configuration: {0}")]
+    Toml(#[from] toml::de::Error),
+    #[error("could not read config file {path}: {source}")]
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+impl Config {
+    pub fn from_toml_and_env<I, K, V>(toml_source: &str, values: I) -> Result<Self, ConfigError>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let mut config: Self = toml::from_str(toml_source)?;
+        for (key, value) in values {
+            match key.as_ref() {
+                "APPVIEW_LISTEN" => config.listen = value.as_ref().to_owned(),
+                "APPVIEW_DATA_DIR" => config.data_dir = value.as_ref().to_owned(),
+                "APPVIEW_LOG_FILTER" => config.log_filter = value.as_ref().to_owned(),
+                _ => {}
+            }
+        }
+        Ok(config)
+    }
+
+    pub fn load() -> Result<Self, ConfigError> {
+        let path = env::var_os("APPVIEW_CONFIG").map(PathBuf::from);
+        let source = match path {
+            Some(path) => {
+                fs::read_to_string(&path).map_err(|source| ConfigError::Read { path, source })?
+            }
+            None => String::new(),
+        };
+        let values = [
+            (
+                "APPVIEW_LISTEN",
+                env::var("APPVIEW_LISTEN").unwrap_or_default(),
+            ),
+            (
+                "APPVIEW_DATA_DIR",
+                env::var("APPVIEW_DATA_DIR").unwrap_or_default(),
+            ),
+            (
+                "APPVIEW_LOG_FILTER",
+                env::var("APPVIEW_LOG_FILTER").unwrap_or_default(),
+            ),
+        ];
+        let nonempty = values.into_iter().filter(|(_, value)| !value.is_empty());
+        if source.is_empty() && env::var_os("APPVIEW_CONFIG").is_none() {
+            let mut config = Self::default();
+            for (key, value) in nonempty {
+                match key {
+                    "APPVIEW_LISTEN" => config.listen = value,
+                    "APPVIEW_DATA_DIR" => config.data_dir = value,
+                    "APPVIEW_LOG_FILTER" => config.log_filter = value,
+                    _ => unreachable!(),
+                }
+            }
+            return Ok(config);
+        }
+        Self::from_toml_and_env(&source, nonempty)
+    }
+}
+
+fn default_listen() -> String {
+    "127.0.0.1:3000".to_owned()
+}
+
+fn default_data_dir() -> String {
+    "./data".to_owned()
+}
+
+fn default_log_filter() -> String {
+    "info".to_owned()
+}
