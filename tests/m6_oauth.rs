@@ -1,9 +1,48 @@
-use appview_rs::config::Config;
 use appview_rs::router;
+use appview_rs::{
+    config::Config,
+    ingest::{MemoryStorage, Storage},
+    oauth::{OAuthAccount, OAuthCallback, OAuthFlow, OAuthPublic},
+};
 use axum::{body::Body, http::Request, http::StatusCode};
 use http_body_util::BodyExt;
 use serde_json::Value;
+use std::{future::Future, pin::Pin, sync::Arc};
 use tower::ServiceExt;
+
+#[derive(Clone)]
+struct FakeOAuthFlow;
+
+impl OAuthFlow for FakeOAuthFlow {
+    fn authorize<'a>(
+        &'a self,
+        login: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async move { Ok(format!("https://auth.example/authorize?login={login}")) })
+    }
+
+    fn callback<'a>(
+        &'a self,
+        params: OAuthCallback,
+    ) -> Pin<Box<dyn Future<Output = Result<OAuthAccount, String>> + Send + 'a>> {
+        Box::pin(async move {
+            if params.code != "valid-code" || params.state != "valid-state" {
+                return Err("invalid OAuth state or code".to_owned());
+            }
+            Ok(OAuthAccount {
+                did: "did:plc:alice".to_owned(),
+                verified_handle: Some("alice.test".to_owned()),
+            })
+        })
+    }
+
+    fn logout<'a>(
+        &'a self,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+}
 
 #[test]
 fn public_oauth_origin_is_configurable() {
@@ -89,4 +128,64 @@ async fn authorization_and_callback_reject_missing_protocol_parameters() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
     }
+}
+
+#[tokio::test]
+async fn oauth_callback_registers_account_and_logout_clears_its_session() {
+    let public = OAuthPublic::new("https://appview.example").unwrap();
+    let storage = Arc::new(MemoryStorage::default());
+    let app = public.router_with_flow(FakeOAuthFlow, storage.clone());
+
+    let authorization = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/authorize?handle=alice.test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authorization.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        authorization.headers()["location"],
+        "https://auth.example/authorize?login=alice.test"
+    );
+
+    let callback = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?code=valid-code&state=valid-state")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(callback.status(), StatusCode::SEE_OTHER);
+    assert_eq!(callback.headers()["location"], "/app");
+    let cookie = callback.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(cookie.contains("HttpOnly"));
+    assert!(storage.is_registered("did:plc:alice").unwrap());
+    assert_eq!(
+        storage.verified_handle("did:plc:alice").unwrap().as_deref(),
+        Some("alice.test")
+    );
+
+    let logout = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/logout")
+                .header("cookie", cookie.split(';').next().unwrap())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(logout.status(), StatusCode::SEE_OTHER);
+    assert!(!storage.is_registered("did:plc:alice").unwrap());
 }
