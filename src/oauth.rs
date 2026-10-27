@@ -1396,6 +1396,21 @@ fn create_key_file(path: &Path) -> Result<fs::File, std::io::Error> {
         .open(path)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cookie_hmac_key_is_distinct_from_the_oauth_signing_scalar() {
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        let serialized = serde_json::to_value(public.private_key()).unwrap();
+        let signing_scalar = URL_SAFE_NO_PAD
+            .decode(serialized.get("d").and_then(Value::as_str).unwrap())
+            .unwrap();
+        assert_ne!(public.cookie_key(), signing_scalar);
+    }
+}
+
 #[cfg(not(unix))]
 fn create_key_file(path: &Path) -> Result<fs::File, std::io::Error> {
     fs::OpenOptions::new()
