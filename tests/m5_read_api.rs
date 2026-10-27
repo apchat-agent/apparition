@@ -588,6 +588,92 @@ async fn post_thread_returns_parent_chain_and_time_ordered_nested_replies() {
 }
 
 #[tokio::test]
+async fn notifications_include_likes_reposts_replies_mentions_quotes_and_follows() {
+    let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
+    let post_uri = format!("at://{ALICE}/app.bsky.feed.post/own");
+    let notifications = [
+        (
+            "like",
+            "app.bsky.feed.like",
+            json!({"subject":{"uri":post_uri,"cid":"cid-own"}}),
+        ),
+        (
+            "repost",
+            "app.bsky.feed.repost",
+            json!({"subject":{"uri":post_uri,"cid":"cid-own"}}),
+        ),
+        (
+            "reply",
+            "app.bsky.feed.post",
+            json!({"text":"reply","reply":{"parent":{"uri":post_uri,"cid":"cid-own"},"root":{"uri":post_uri,"cid":"cid-own"}}}),
+        ),
+        (
+            "mention",
+            "app.bsky.feed.post",
+            json!({"text":"hello","facets":[{"features":[{"$type":"app.bsky.richtext.facet#mention","did":ALICE}]}]}),
+        ),
+        (
+            "quote",
+            "app.bsky.feed.post",
+            json!({"text":"quote","embed":{"$type":"app.bsky.embed.record","record":{"uri":post_uri,"cid":"cid-own"}}}),
+        ),
+        ("follow", "app.bsky.graph.follow", json!({"subject":ALICE})),
+    ];
+    storage
+        .put_record(&IndexedRecord {
+            did: ALICE.into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "own".into(),
+            uri: post_uri,
+            cid: Some("cid-own".into()),
+            time_us: 10,
+            record: json!({"text":"my post"}),
+        })
+        .unwrap();
+    for (index, (rkey, collection, record)) in notifications.into_iter().enumerate() {
+        storage
+            .put_record(&IndexedRecord {
+                did: FRIEND.into(),
+                collection: collection.into(),
+                rkey: rkey.into(),
+                uri: format!("at://{FRIEND}/{collection}/{rkey}"),
+                cid: Some(format!("cid-{rkey}")),
+                time_us: 100 + index as u64,
+                record,
+            })
+            .unwrap();
+    }
+    let (router, signing_key) = api_for_storage(storage);
+    let jwt = token(
+        &signing_key,
+        APPVIEW,
+        "app.bsky.notification.listNotifications",
+        expiry(60),
+        Some(ALICE),
+    );
+    let (status, body) = request(
+        router,
+        "/xrpc/app.bsky.notification.listNotifications?limit=20",
+        Some(&jwt),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let notifications = body["notifications"].as_array().unwrap();
+    let reasons = notifications
+        .iter()
+        .filter_map(|notice| notice["reason"].as_str())
+        .collect::<Vec<_>>();
+    for expected in ["like", "repost", "reply", "mention", "quote", "follow"] {
+        assert!(
+            reasons.contains(&expected),
+            "missing {expected}: {reasons:?}"
+        );
+    }
+    assert_eq!(reasons.first().copied(), Some("follow"));
+    assert_eq!(body["seenAt"].as_str().is_some(), true);
+}
+
+#[tokio::test]
 async fn proxy_jwt_requires_signature_audience_method_and_expiration() {
     let (router, signing_key) = api();
     let protected = "/xrpc/app.bsky.feed.getTimeline";
