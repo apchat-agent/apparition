@@ -1624,6 +1624,73 @@ async fn notifications_page_is_linked_and_shows_all_local_notification_reasons()
 }
 
 #[tokio::test]
+async fn timeline_profile_and_notification_pages_offer_older_cursor_links() {
+    let storage = Arc::new(MemoryStorage::default());
+    let post_a = "at://did:plc:alice/app.bsky.feed.post/a";
+    let post_b = "at://did:plc:alice/app.bsky.feed.post/b";
+    for (rkey, uri, time_us) in [("a", post_a, 20), ("b", post_b, 10)] {
+        storage
+            .put_record(&IndexedRecord {
+                did: "did:plc:alice".into(),
+                collection: "app.bsky.feed.post".into(),
+                rkey: rkey.into(),
+                uri: uri.into(),
+                cid: Some(format!("cid-{rkey}")),
+                time_us,
+                record: serde_json::json!({"text":format!("post {rkey}")}),
+            })
+            .unwrap();
+        storage
+            .put_record(&IndexedRecord {
+                did: "did:plc:friend".into(),
+                collection: "app.bsky.feed.like".into(),
+                rkey: format!("like-{rkey}"),
+                uri: format!("at://did:plc:friend/app.bsky.feed.like/like-{rkey}"),
+                cid: Some(format!("cid-like-{rkey}")),
+                time_us: time_us + 100,
+                record: serde_json::json!({"subject":{"uri":uri,"cid":format!("cid-{rkey}")}}),
+            })
+            .unwrap();
+    }
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage);
+    let cookie = finish_login(&app).await;
+    for uri in [
+        "/app?limit=1",
+        "/profile?did=did%3Aplc%3Aalice&limit=1",
+        "/notifications?limit=1",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let html = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            html.contains("rel=\"next\"") && html.contains(">Older</a>"),
+            "{uri}: {html}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn web_posts_show_hydrated_authors_and_times_on_timeline_profile_and_thread() {
     let storage = Arc::new(MemoryStorage::default());
     storage.register_user("did:plc:alice").unwrap();

@@ -674,6 +674,96 @@ async fn notifications_include_likes_reposts_replies_mentions_quotes_and_follows
 }
 
 #[tokio::test]
+async fn timeline_paginates_by_cursor_and_author_feed_filters_replies() {
+    let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
+    for (did, collection, rkey, time_us, record) in [
+        (
+            ALICE,
+            "app.bsky.feed.post",
+            "alice-new",
+            300,
+            json!({"text":"alice newest"}),
+        ),
+        (
+            FRIEND,
+            "app.bsky.feed.post",
+            "friend-mid",
+            250,
+            json!({"text":"friend middle"}),
+        ),
+        (
+            ALICE,
+            "app.bsky.feed.post",
+            "alice-reply",
+            200,
+            json!({"text":"alice reply","reply":{"parent":{"uri":"at://did:plc:friend/app.bsky.feed.post/friend-mid"}}}),
+        ),
+        (
+            ALICE,
+            "app.bsky.feed.post",
+            "alice-old",
+            100,
+            json!({"text":"alice oldest"}),
+        ),
+        (
+            ALICE,
+            "app.bsky.graph.follow",
+            "follow",
+            50,
+            json!({"subject":FRIEND}),
+        ),
+    ] {
+        storage
+            .put_record(&IndexedRecord {
+                did: did.into(),
+                collection: collection.into(),
+                rkey: rkey.into(),
+                uri: format!("at://{did}/{collection}/{rkey}"),
+                cid: Some(format!("cid-{rkey}")),
+                time_us,
+                record,
+            })
+            .unwrap();
+    }
+    let (router, signing_key) = api_for_storage(storage);
+    let timeline_jwt = token(
+        &signing_key,
+        APPVIEW,
+        "app.bsky.feed.getTimeline",
+        expiry(60),
+        Some(ALICE),
+    );
+    let (status, first) = request(
+        router.clone(),
+        "/xrpc/app.bsky.feed.getTimeline?limit=2",
+        Some(&timeline_jwt),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["feed"][0]["post"]["record"]["text"], "alice newest");
+    assert_eq!(first["feed"][1]["post"]["record"]["text"], "friend middle");
+    let cursor = first["cursor"].as_str().expect("timeline cursor");
+    let (status, second) = request(
+        router.clone(),
+        &format!("/xrpc/app.bsky.feed.getTimeline?limit=2&cursor={cursor}"),
+        Some(&timeline_jwt),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["feed"][0]["post"]["record"]["text"], "alice reply");
+
+    let (status, author_feed) = request(router,
+        "/xrpc/app.bsky.feed.getAuthorFeed?actor=did%3Aplc%3Aalice&filter=posts_no_replies&limit=10", None).await;
+    assert_eq!(status, StatusCode::OK, "{author_feed}");
+    let feed = author_feed["feed"].as_array().unwrap();
+    assert_eq!(feed.len(), 2);
+    assert!(
+        feed.iter()
+            .all(|item| item["post"]["record"].get("reply").is_none())
+    );
+}
+
+#[tokio::test]
 async fn proxy_jwt_requires_signature_audience_method_and_expiration() {
     let (router, signing_key) = api();
     let protected = "/xrpc/app.bsky.feed.getTimeline";
