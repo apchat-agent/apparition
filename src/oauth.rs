@@ -1211,10 +1211,16 @@ where
                 return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
             }
         };
+        let failed = match state.storage.backfill_failure_count(&did) {
+            Ok(failed) => failed,
+            Err(error) => {
+                return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+            }
+        };
         if total > done {
             let account_word = if total == 1 { "account" } else { "accounts" };
             format!(
-                "<p role=\"status\">Indexing {total} {account_word}, {done} done. The timeline will fill as repositories finish.</p>"
+                "<p role=\"status\">Indexing {total} {account_word}, {done} done, {failed} failed. The timeline will fill as repositories finish.</p>"
             )
         } else {
             let account_word = if total == 1 { "account" } else { "accounts" };
