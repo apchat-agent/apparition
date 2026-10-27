@@ -209,3 +209,30 @@ async fn get_repo_car_is_verified_and_reconciled_with_a_per_host_rate_limit() {
             .is_some()
     );
 }
+
+#[test]
+fn entering_scope_queues_registered_and_newly_followed_repositories() {
+    use appview_rs::ingest::{Ingestor, ScopeMode};
+
+    let storage = Arc::new(MemoryStorage::default());
+    storage.register_user("did:plc:root").unwrap();
+    assert_eq!(storage.pending_backfills().unwrap(), ["did:plc:root"]);
+    let ingestor = Ingestor::new(storage.clone(), ScopeMode::Scoped);
+    let follow = json!({
+        "did":"did:plc:root",
+        "time_us":9,
+        "kind":"commit",
+        "commit":{
+            "operation":"create",
+            "collection":"app.bsky.graph.follow",
+            "rkey":"follow1",
+            "cid":"follow-cid",
+            "record":{"subject":"did:plc:friend"}
+        }
+    });
+    ingestor.process_json(&follow.to_string()).unwrap();
+    assert_eq!(
+        storage.pending_backfills().unwrap(),
+        ["did:plc:friend", "did:plc:root"]
+    );
+}
