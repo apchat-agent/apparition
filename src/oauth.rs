@@ -93,6 +93,29 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
         &'a self,
         did: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+    fn create_post<'a>(
+        &'a self,
+        _did: &'a str,
+        _text: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Err("post action is not available".to_owned()) })
+    }
+    fn like<'a>(
+        &'a self,
+        _did: &'a str,
+        _uri: &'a str,
+        _cid: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Err("like action is not available".to_owned()) })
+    }
+    fn repost<'a>(
+        &'a self,
+        _did: &'a str,
+        _uri: &'a str,
+        _cid: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Err("repost action is not available".to_owned()) })
+    }
 }
 
 #[derive(Clone)]
