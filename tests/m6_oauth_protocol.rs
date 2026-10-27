@@ -284,7 +284,8 @@ async fn production_oauth_flow_accepts_standard_callback_and_binds_subject_and_s
     assert_eq!(shared.lock().unwrap().token_count, 1);
     server.abort();
 
-    let (flow, shared, server) = production_flow(Some("did:plc:attacker"), Some("atproto")).await;
+    let (flow, shared, server) =
+        production_flow(Some("did:plc:zyxwvutsrqponmlkjihgfedcba"), Some("atproto")).await;
     flow.authorize(DID).await.unwrap();
     let state = latest_state(&shared);
     let result = flow
@@ -415,11 +416,11 @@ async fn serve_one(mut stream: TcpStream, origin: &str, state: Arc<Mutex<FakeSer
         let mut state = state.lock().unwrap();
         state.requests.push(request.clone());
         match request.path.as_str() {
-            path if path == format!("/{DID}") => (
+            path if path.starts_with("/did:plc:") => (
                 200,
                 vec![],
                 json!({
-                    "id":DID,
+                    "id":path.trim_start_matches('/'),
                     "alsoKnownAs":[],
                     "verificationMethod":[],
                     "service":[{"id":"#atproto_pds","type":"AtprotoPersonalDataServer","serviceEndpoint":origin}]

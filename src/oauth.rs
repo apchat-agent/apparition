@@ -652,13 +652,6 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
         params: OAuthCallback,
     ) -> Pin<Box<dyn Future<Output = Result<OAuthAccount, String>> + Send + 'a>> {
         Box::pin(async move {
-            if !params
-                .scope
-                .as_deref()
-                .is_some_and(|scope| scope.split_whitespace().any(|value| value == "atproto"))
-            {
-                return Err("OAuth authorization response did not grant the atproto scope".into());
-            }
             let (session, app_state) = self
                 .client
                 .callback(atrium_oauth::CallbackParams {
