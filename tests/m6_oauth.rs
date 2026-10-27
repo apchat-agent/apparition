@@ -242,3 +242,38 @@ async fn oauth_authorization_state_and_tokens_survive_store_reopen() {
     assert_eq!(reopened.get(&did).await.unwrap(), Some(session));
     let _ = std::fs::remove_file(&file);
 }
+
+#[tokio::test]
+async fn web_views_and_write_actions_require_a_login_session() {
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router();
+    for path in [
+        "/profile?did=did%3Aplc%3Aalice",
+        "/thread?uri=at%3A%2F%2Fdid%3Aplc%3Aalice%2Fapp.bsky.feed.post%2Fr1",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER, "{path}");
+        assert_eq!(response.headers()["location"], "/login");
+    }
+    for path in ["/post", "/like", "/repost"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("text=hello&uri=at%3A%2F%2Fdid%3Aplc%3Aalice%2Fapp.bsky.feed.post%2Fr1&cid=bafyreifake"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER, "{path}");
+        assert_eq!(response.headers()["location"], "/login");
+    }
+}
