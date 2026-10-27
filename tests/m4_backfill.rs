@@ -138,10 +138,7 @@ async fn signed_repo_car_with_media(did: &str) -> (Vec<u8>, String, String) {
                 (
                     "embed".into(),
                     map([
-                        (
-                            "$type".into(),
-                            Ipld::String("app.bsky.embed.images".into()),
-                        ),
+                        ("$type".into(), Ipld::String("app.bsky.embed.images".into())),
                         (
                             "images".into(),
                             Ipld::List(vec![map([
@@ -151,10 +148,7 @@ async fn signed_repo_car_with_media(did: &str) -> (Vec<u8>, String, String) {
                                     map([
                                         ("$type".into(), Ipld::String("blob".into())),
                                         ("ref".into(), Ipld::Link(blob_cid)),
-                                        (
-                                            "mimeType".into(),
-                                            Ipld::String("image/jpeg".into()),
-                                        ),
+                                        ("mimeType".into(), Ipld::String("image/jpeg".into())),
                                         ("size".into(), Ipld::Integer(16)),
                                     ]),
                                 ),
@@ -213,6 +207,95 @@ async fn signed_repo_car_with_media(did: &str) -> (Vec<u8>, String, String) {
     (car, signing_did_key, blob_cid.to_string())
 }
 
+async fn signed_repo_car_with_bad_record(did: &str) -> (Vec<u8>, String, String) {
+    let mut rng = rand::thread_rng();
+    let key = P256Keypair::create(&mut rng);
+    let signing_did_key = key.did();
+    let repo_builder =
+        Repository::create(MemoryBlockStore::new(), Did::new(did.to_owned()).unwrap())
+            .await
+            .unwrap();
+    let root_sig = key.sign(&repo_builder.bytes()).unwrap();
+    let mut repo = repo_builder.finalize(root_sig).await.unwrap();
+
+    let (commit, bad_cid) = repo
+        .add_raw(
+            "app.bsky.feed.post/bad",
+            BadLinkRecord {
+                type_name: "app.bsky.feed.post",
+                text: "contains an invalid CID tag",
+                bad_link: InvalidCid,
+            },
+        )
+        .await
+        .unwrap();
+    let signature = key.sign(&commit.bytes()).unwrap();
+    commit.finalize(signature).await.unwrap();
+    let (commit, _) = repo
+        .add_raw(
+            "app.bsky.feed.post/good",
+            json!({"text":"keep me", "createdAt":"2026-10-27T00:00:00Z"}),
+        )
+        .await
+        .unwrap();
+    let signature = key.sign(&commit.bytes()).unwrap();
+    commit.finalize(signature).await.unwrap();
+
+    let root = repo.root();
+    let cids = repo.export().await.unwrap().collect::<Vec<_>>();
+    let mut export_store = MemoryBlockStore::new();
+    repo.export_into(&mut export_store).await.unwrap();
+    let mut car = Vec::new();
+    let header = serde_ipld_dagcbor::to_vec(&CarHeader {
+        roots: vec![root],
+        version: 1,
+    })
+    .unwrap();
+    write_varint(header.len(), &mut car);
+    car.extend(header);
+    for cid in cids {
+        let block = export_store.read_block(cid).await.unwrap();
+        let cid_bytes = cid.to_bytes();
+        write_varint(cid_bytes.len() + block.len(), &mut car);
+        car.extend(cid_bytes);
+        car.extend(block);
+    }
+    (car, signing_did_key, bad_cid.to_string())
+}
+
+#[derive(Serialize)]
+struct BadLinkRecord<'a> {
+    #[serde(rename = "$type")]
+    type_name: &'a str,
+    text: &'a str,
+    bad_link: InvalidCid,
+}
+
+struct InvalidCid;
+
+impl Serialize for InvalidCid {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_newtype_struct(
+            ipld_core::cid::serde::CID_SERDE_PRIVATE_IDENTIFIER,
+            &InvalidCidBytes,
+        )
+    }
+}
+
+struct InvalidCidBytes;
+
+impl Serialize for InvalidCidBytes {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_bytes(&[0xff])
+    }
+}
+
 #[tokio::test]
 async fn backfill_decodes_cid_links_and_bytes_into_atproto_json() {
     let did = "did:plc:media";
@@ -239,6 +322,20 @@ async fn backfill_decodes_cid_links_and_bytes_into_atproto_json() {
         .find(|record| record.collection == "app.bsky.actor.profile")
         .unwrap();
     assert_eq!(profile.record["avatar"]["ref"]["$link"], blob_cid);
+}
+
+#[tokio::test]
+async fn verifier_skips_an_undecodable_record_and_keeps_the_rest_of_the_repo() {
+    let did = "did:plc:onebadrecord";
+    let (car, signing_did_key, bad_cid) = signed_repo_car_with_bad_record(did).await;
+    let verified = AtriumRepoVerifier
+        .verify(&car, did, &signing_did_key)
+        .await
+        .unwrap();
+
+    assert_eq!(verified.records.len(), 1);
+    assert_eq!(verified.records[0].rkey, "good");
+    assert_ne!(verified.records[0].cid, bad_cid);
 }
 
 #[tokio::test]
