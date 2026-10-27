@@ -120,6 +120,12 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async { Err("repost action is not available".to_owned()) })
     }
+    fn timeline<'a>(
+        &'a self,
+        _did: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Value>, String>> + Send + 'a>> {
+        Box::pin(async { Err("timeline is not available".to_owned()) })
+    }
 }
 
 #[derive(Clone)]
