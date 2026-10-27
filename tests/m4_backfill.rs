@@ -1,5 +1,5 @@
 use appview_rs::{
-    backfill::{AtriumRepoVerifier, HostRateLimiter, HttpRepoSource, RepoBackfiller},
+    backfill::{AtriumRepoVerifier, HostRateLimiter, HttpRepoSource, RepoBackfiller, RepoVerifier},
     identity::{DidDocument, DidService, VerificationMethod},
     ingest::{MemoryStorage, Storage},
 };
@@ -7,7 +7,7 @@ use atrium_api::types::string::Did;
 use atrium_crypto::keypair::{Did as _, P256Keypair};
 use atrium_repo::{
     Repository,
-    blockstore::{AsyncBlockStoreRead, MemoryBlockStore},
+    blockstore::{AsyncBlockStoreRead, AsyncBlockStoreWrite, MemoryBlockStore, SHA2_256},
 };
 use axum::{
     Router,
@@ -20,7 +20,7 @@ use axum::{
 use serde::Serialize;
 use serde_json::json;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -102,6 +102,143 @@ async fn signed_repo_car(did: &str) -> (Vec<u8>, String) {
         car.extend(block);
     }
     (car, signing_did_key)
+}
+
+async fn signed_repo_car_with_media(did: &str) -> (Vec<u8>, String, String) {
+    use ipld_core::ipld::Ipld;
+
+    fn map(entries: impl IntoIterator<Item = (String, Ipld)>) -> Ipld {
+        Ipld::Map(entries.into_iter().collect::<BTreeMap<_, _>>())
+    }
+
+    let mut rng = rand::thread_rng();
+    let key = P256Keypair::create(&mut rng);
+    let signing_did_key = key.did();
+    let mut store = MemoryBlockStore::new();
+    let blob_cid = store
+        .write_block(0x55, SHA2_256, b"fake image bytes")
+        .await
+        .unwrap();
+    let repo_builder = Repository::create(store, Did::new(did.to_owned()).unwrap())
+        .await
+        .unwrap();
+    let root_sig = key.sign(&repo_builder.bytes()).unwrap();
+    let mut repo = repo_builder.finalize(root_sig).await.unwrap();
+
+    let records = [
+        (
+            "app.bsky.feed.post/post1",
+            map([
+                ("$type".into(), Ipld::String("app.bsky.feed.post".into())),
+                ("text".into(), Ipld::String("photo".into())),
+                (
+                    "createdAt".into(),
+                    Ipld::String("2026-10-27T00:00:00Z".into()),
+                ),
+                (
+                    "embed".into(),
+                    map([
+                        (
+                            "$type".into(),
+                            Ipld::String("app.bsky.embed.images".into()),
+                        ),
+                        (
+                            "images".into(),
+                            Ipld::List(vec![map([
+                                ("alt".into(), Ipld::String("a photo".into())),
+                                (
+                                    "image".into(),
+                                    map([
+                                        ("$type".into(), Ipld::String("blob".into())),
+                                        ("ref".into(), Ipld::Link(blob_cid)),
+                                        (
+                                            "mimeType".into(),
+                                            Ipld::String("image/jpeg".into()),
+                                        ),
+                                        ("size".into(), Ipld::Integer(16)),
+                                    ]),
+                                ),
+                            ])]),
+                        ),
+                    ]),
+                ),
+                ("byteFixture".into(), Ipld::Bytes(vec![0xfb, 0xff])),
+            ]),
+        ),
+        (
+            "app.bsky.actor.profile/self",
+            map([
+                (
+                    "$type".into(),
+                    Ipld::String("app.bsky.actor.profile".into()),
+                ),
+                (
+                    "avatar".into(),
+                    map([
+                        ("$type".into(), Ipld::String("blob".into())),
+                        ("ref".into(), Ipld::Link(blob_cid)),
+                        ("mimeType".into(), Ipld::String("image/jpeg".into())),
+                        ("size".into(), Ipld::Integer(16)),
+                    ]),
+                ),
+            ]),
+        ),
+    ];
+
+    for (path, record) in records {
+        let (commit, _) = repo.add_raw(path, record).await.unwrap();
+        let signature = key.sign(&commit.bytes()).unwrap();
+        commit.finalize(signature).await.unwrap();
+    }
+
+    let root = repo.root();
+    let cids = repo.export().await.unwrap().collect::<Vec<_>>();
+    let mut export_store = MemoryBlockStore::new();
+    repo.export_into(&mut export_store).await.unwrap();
+    let mut car = Vec::new();
+    let header = serde_ipld_dagcbor::to_vec(&CarHeader {
+        roots: vec![root],
+        version: 1,
+    })
+    .unwrap();
+    write_varint(header.len(), &mut car);
+    car.extend(header);
+    for cid in cids {
+        let block = export_store.read_block(cid).await.unwrap();
+        let cid_bytes = cid.to_bytes();
+        write_varint(cid_bytes.len() + block.len(), &mut car);
+        car.extend(cid_bytes);
+        car.extend(block);
+    }
+    (car, signing_did_key, blob_cid.to_string())
+}
+
+#[tokio::test]
+async fn backfill_decodes_cid_links_and_bytes_into_atproto_json() {
+    let did = "did:plc:media";
+    let (car, signing_did_key, blob_cid) = signed_repo_car_with_media(did).await;
+    let verified = AtriumRepoVerifier
+        .verify(&car, did, &signing_did_key)
+        .await
+        .unwrap();
+
+    let post = verified
+        .records
+        .iter()
+        .find(|record| record.collection == "app.bsky.feed.post")
+        .unwrap();
+    assert_eq!(
+        post.record["embed"]["images"][0]["image"]["ref"]["$link"],
+        blob_cid
+    );
+    assert_eq!(post.record["byteFixture"]["$bytes"], "+/8");
+
+    let profile = verified
+        .records
+        .iter()
+        .find(|record| record.collection == "app.bsky.actor.profile")
+        .unwrap();
+    assert_eq!(profile.record["avatar"]["ref"]["$link"], blob_cid);
 }
 
 #[tokio::test]
