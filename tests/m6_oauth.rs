@@ -1499,6 +1499,131 @@ async fn web_thread_renders_the_parent_chain_and_nested_replies_in_time_order() 
 }
 
 #[tokio::test]
+async fn notifications_page_is_linked_and_shows_all_local_notification_reasons() {
+    let storage = Arc::new(MemoryStorage::default());
+    storage
+        .set_verified_handle("did:plc:friend", "friend.test")
+        .unwrap();
+    let own_uri = "at://did:plc:alice/app.bsky.feed.post/own";
+    let events = [
+        (
+            "like",
+            "app.bsky.feed.like",
+            serde_json::json!({"subject":{"uri":own_uri,"cid":"cid-own"}}),
+        ),
+        (
+            "repost",
+            "app.bsky.feed.repost",
+            serde_json::json!({"subject":{"uri":own_uri,"cid":"cid-own"}}),
+        ),
+        (
+            "reply",
+            "app.bsky.feed.post",
+            serde_json::json!({"text":"reply body","reply":{"parent":{"uri":own_uri,"cid":"cid-own"},"root":{"uri":own_uri,"cid":"cid-own"}}}),
+        ),
+        (
+            "mention",
+            "app.bsky.feed.post",
+            serde_json::json!({"text":"mention body","facets":[{"features":[{"$type":"app.bsky.richtext.facet#mention","did":"did:plc:alice"}]}]}),
+        ),
+        (
+            "quote",
+            "app.bsky.feed.post",
+            serde_json::json!({"text":"quote body","embed":{"$type":"app.bsky.embed.record","record":{"uri":own_uri,"cid":"cid-own"}}}),
+        ),
+        (
+            "follow",
+            "app.bsky.graph.follow",
+            serde_json::json!({"subject":"did:plc:alice"}),
+        ),
+    ];
+    storage
+        .put_record(&IndexedRecord {
+            did: "did:plc:alice".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "own".into(),
+            uri: own_uri.into(),
+            cid: Some("cid-own".into()),
+            time_us: 10,
+            record: serde_json::json!({"text":"my post"}),
+        })
+        .unwrap();
+    for (index, (rkey, collection, record)) in events.into_iter().enumerate() {
+        storage
+            .put_record(&IndexedRecord {
+                did: "did:plc:friend".into(),
+                collection: collection.into(),
+                rkey: rkey.into(),
+                uri: format!("at://did:plc:friend/{collection}/{rkey}"),
+                cid: Some(format!("cid-{rkey}")),
+                time_us: 100 + index as u64,
+                record,
+            })
+            .unwrap();
+    }
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage);
+    let cookie = finish_login(&app).await;
+    let home = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let home_html = String::from_utf8(
+        home.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        home_html.contains("href=\"/notifications\">Notifications</a>"),
+        "{home_html}"
+    );
+
+    let page = app
+        .oneshot(
+            Request::builder()
+                .uri("/notifications")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let html = String::from_utf8(
+        page.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    for reason in [
+        "liked your post",
+        "reposted your post",
+        "replied to your post",
+        "mentioned you",
+        "quoted your post",
+        "started following you",
+    ] {
+        assert!(html.contains(reason), "missing {reason}: {html}");
+    }
+    assert!(html.find("started following you").unwrap() < html.find("quoted your post").unwrap());
+}
+
+#[tokio::test]
 async fn web_posts_show_hydrated_authors_and_times_on_timeline_profile_and_thread() {
     let storage = Arc::new(MemoryStorage::default());
     storage.register_user("did:plc:alice").unwrap();
