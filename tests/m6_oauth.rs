@@ -1412,6 +1412,93 @@ async fn timeline_replies_name_the_parent_author_and_link_to_the_thread() {
 }
 
 #[tokio::test]
+async fn web_thread_renders_the_parent_chain_and_nested_replies_in_time_order() {
+    let storage = Arc::new(MemoryStorage::default());
+    storage
+        .set_verified_handle("did:plc:friend", "friend.test")
+        .unwrap();
+    let root_uri = "at://did:plc:friend/app.bsky.feed.post/root";
+    let parent_uri = "at://did:plc:friend/app.bsky.feed.post/parent";
+    let focus_uri = "at://did:plc:friend/app.bsky.feed.post/focus";
+    let early_uri = "at://did:plc:friend/app.bsky.feed.post/early";
+    for (rkey, time_us, text, parent, root) in [
+        ("root", 10, "root post", None, None),
+        ("parent", 20, "parent post", Some(root_uri), Some(root_uri)),
+        (
+            "focus",
+            30,
+            "focused post",
+            Some(parent_uri),
+            Some(root_uri),
+        ),
+        ("late", 50, "late reply", Some(focus_uri), Some(root_uri)),
+        ("early", 40, "early reply", Some(focus_uri), Some(root_uri)),
+        (
+            "nested",
+            60,
+            "nested reply",
+            Some(early_uri),
+            Some(root_uri),
+        ),
+    ] {
+        let reply = parent.map(
+            |parent| serde_json::json!({"parent":{"uri":parent},"root":{"uri":root.unwrap()}}),
+        );
+        let record = if let Some(reply) = reply {
+            serde_json::json!({"text":text,"reply":reply})
+        } else {
+            serde_json::json!({"text":text})
+        };
+        storage
+            .put_record(&IndexedRecord {
+                did: "did:plc:friend".into(),
+                collection: "app.bsky.feed.post".into(),
+                rkey: rkey.into(),
+                uri: format!("at://did:plc:friend/app.bsky.feed.post/{rkey}"),
+                cid: Some(format!("cid-{rkey}")),
+                time_us,
+                record,
+            })
+            .unwrap();
+    }
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage);
+    let cookie = finish_login(&app).await;
+    let uri = url::form_urlencoded::byte_serialize(focus_uri.as_bytes()).collect::<String>();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/thread?uri={uri}"))
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    let root = html.find("root post").unwrap();
+    let parent = html.find("parent post").unwrap();
+    let focus = html.find("focused post").unwrap();
+    let early = html.find("early reply").unwrap();
+    let nested = html.find("nested reply").unwrap();
+    let late = html.find("late reply").unwrap();
+    assert!(
+        root < parent && parent < focus && focus < early && early < nested && nested < late,
+        "{html}"
+    );
+}
+
+#[tokio::test]
 async fn web_posts_show_hydrated_authors_and_times_on_timeline_profile_and_thread() {
     let storage = Arc::new(MemoryStorage::default());
     storage.register_user("did:plc:alice").unwrap();

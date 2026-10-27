@@ -499,6 +499,95 @@ async fn post_views_count_indexed_interactions_and_include_the_viewers_own_recor
 }
 
 #[tokio::test]
+async fn post_thread_returns_parent_chain_and_time_ordered_nested_replies() {
+    let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
+    let root_uri = format!("at://{ALICE}/app.bsky.feed.post/root");
+    let parent_uri = format!("at://{ALICE}/app.bsky.feed.post/parent");
+    let focus_uri = format!("at://{ALICE}/app.bsky.feed.post/focus");
+    let early_reply_uri = format!("at://{ALICE}/app.bsky.feed.post/early");
+    for (rkey, time_us, text, parent, root) in [
+        ("root", 10, "root", None, None),
+        (
+            "parent",
+            20,
+            "parent",
+            Some(root_uri.as_str()),
+            Some(root_uri.as_str()),
+        ),
+        (
+            "focus",
+            30,
+            "focus",
+            Some(parent_uri.as_str()),
+            Some(root_uri.as_str()),
+        ),
+        (
+            "late",
+            50,
+            "late reply",
+            Some(focus_uri.as_str()),
+            Some(root_uri.as_str()),
+        ),
+        (
+            "early",
+            40,
+            "early reply",
+            Some(focus_uri.as_str()),
+            Some(root_uri.as_str()),
+        ),
+        (
+            "nested",
+            60,
+            "nested reply",
+            Some(early_reply_uri.as_str()),
+            Some(root_uri.as_str()),
+        ),
+    ] {
+        let reply =
+            parent.map(|parent| json!({"parent":{"uri":parent},"root":{"uri":root.unwrap()}}));
+        let record = if let Some(reply) = reply {
+            json!({"text":text,"reply":reply})
+        } else {
+            json!({"text":text})
+        };
+        storage
+            .put_record(&IndexedRecord {
+                did: ALICE.into(),
+                collection: "app.bsky.feed.post".into(),
+                rkey: rkey.into(),
+                uri: format!("at://{ALICE}/app.bsky.feed.post/{rkey}"),
+                cid: Some(format!("cid-{rkey}")),
+                time_us,
+                record,
+            })
+            .unwrap();
+    }
+    let (router, _) = api_for_storage(storage);
+    let encoded_uri =
+        url::form_urlencoded::byte_serialize(focus_uri.as_bytes()).collect::<String>();
+    let (status, body) = request(
+        router,
+        &format!("/xrpc/app.bsky.feed.getPostThread?uri={encoded_uri}&depth=2&parentHeight=2"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let thread = &body["thread"];
+    assert_eq!(thread["post"]["record"]["text"], "focus");
+    assert_eq!(thread["parent"]["post"]["record"]["text"], "parent");
+    assert_eq!(thread["parent"]["parent"]["post"]["record"]["text"], "root");
+    assert_eq!(
+        thread["replies"][0]["post"]["record"]["text"],
+        "early reply"
+    );
+    assert_eq!(thread["replies"][1]["post"]["record"]["text"], "late reply");
+    assert_eq!(
+        thread["replies"][0]["replies"][0]["post"]["record"]["text"],
+        "nested reply"
+    );
+}
+
+#[tokio::test]
 async fn proxy_jwt_requires_signature_audience_method_and_expiration() {
     let (router, signing_key) = api();
     let protected = "/xrpc/app.bsky.feed.getTimeline";
