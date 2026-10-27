@@ -236,3 +236,96 @@ fn entering_scope_queues_registered_and_newly_followed_repositories() {
         ["did:plc:friend", "did:plc:root"]
     );
 }
+
+#[tokio::test]
+async fn backfill_worker_drains_new_scope_entries_from_resolved_did_docs() {
+    use appview_rs::{
+        backfill::BackfillWorker,
+        identity::{IdentityBackend, IdentityResolver, ResolutionError},
+    };
+
+    #[derive(Clone)]
+    struct FakeIdentity(DidDocument);
+    impl IdentityBackend for FakeIdentity {
+        async fn did_document(&self, did: &str) -> Result<Option<DidDocument>, ResolutionError> {
+            Ok((self.0.id == did).then(|| self.0.clone()))
+        }
+        async fn dns_txt_did(&self, _: &str) -> Result<Option<String>, ResolutionError> {
+            Ok(None)
+        }
+        async fn well_known_did(&self, _: &str) -> Result<Option<String>, ResolutionError> {
+            Ok(None)
+        }
+    }
+
+    let did = "did:plc:worker";
+    let (car, signing_did_key) = signed_repo_car(did).await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let state = FakePds {
+        car: Arc::new(car),
+        requests: Arc::new(AtomicUsize::new(0)),
+        dids: Arc::new(Mutex::new(Vec::new())),
+    };
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/xrpc/com.atproto.sync.getRepo", get(get_repo))
+                .with_state(state),
+        )
+        .await
+        .unwrap();
+    });
+    let key_multibase = signing_did_key.strip_prefix("did:key:").unwrap();
+    let document = DidDocument {
+        id: did.into(),
+        also_known_as: vec![],
+        verification_method: vec![VerificationMethod {
+            id: "#atproto".into(),
+            type_name: "Multikey".into(),
+            controller: did.into(),
+            public_key_multibase: key_multibase.into(),
+        }],
+        service: vec![DidService {
+            id: "#atproto_pds".into(),
+            type_name: "AtprotoPersonalDataServer".into(),
+            service_endpoint: format!("http://{address}"),
+        }],
+    };
+    let resolver = IdentityResolver::new(FakeIdentity(document), Duration::from_secs(30));
+    let storage = Arc::new(MemoryStorage::default());
+    storage.register_user(did).unwrap();
+    let backfiller = RepoBackfiller::new(
+        storage.clone(),
+        HttpRepoSource::default(),
+        AtriumRepoVerifier,
+        HostRateLimiter::new(Duration::ZERO),
+    );
+    let worker = BackfillWorker::new(
+        storage.clone(),
+        resolver,
+        backfiller,
+        Duration::from_millis(5),
+    );
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move { worker.run(shutdown_rx).await });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if storage
+                .get_record(did, "app.bsky.feed.post", "post1")
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let _ = shutdown_tx.send(true);
+    task.await.unwrap().unwrap();
+    assert!(storage.pending_backfills().unwrap().is_empty());
+}
