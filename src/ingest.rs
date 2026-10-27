@@ -106,6 +106,7 @@ pub trait Storage: Send + Sync {
         collection: &str,
         uri: &str,
     ) -> Result<Option<IndexedRecord>, StorageError>;
+    fn replies_to(&self, parent_uri: &str) -> Result<Vec<IndexedRecord>, StorageError>;
     fn post_interaction_summary(
         &self,
         uri: &str,
@@ -281,6 +282,31 @@ impl Storage for MemoryStorage {
             .values()
             .find(|record| record.collection == collection && record.uri == uri)
             .cloned())
+    }
+
+    fn replies_to(&self, parent_uri: &str) -> Result<Vec<IndexedRecord>, StorageError> {
+        let mut replies = self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .records
+            .values()
+            .filter(|record| {
+                record.collection == "app.bsky.feed.post"
+                    && record
+                        .record
+                        .pointer("/reply/parent/uri")
+                        .and_then(Value::as_str)
+                        == Some(parent_uri)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        replies.sort_by(|left, right| {
+            left.time_us
+                .cmp(&right.time_us)
+                .then_with(|| left.uri.cmp(&right.uri))
+        });
+        Ok(replies)
     }
 
     fn post_interaction_summary(
@@ -600,6 +626,8 @@ impl SqliteStorage {
                  ON records(collection, json_extract(record_json, '$.subject.uri'), time_us DESC);
              CREATE INDEX IF NOT EXISTS records_collection_parent_uri
                  ON records(collection, json_extract(record_json, '$.reply.parent.uri'), time_us DESC);
+             CREATE INDEX IF NOT EXISTS records_replies_order
+                 ON records(collection, json_extract(record_json, '$.reply.parent.uri'), time_us, uri);
              CREATE INDEX IF NOT EXISTS records_author_subject_uri
                  ON records(collection, did, json_extract(record_json, '$.subject.uri'));
              CREATE TABLE IF NOT EXISTS appview_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -765,6 +793,19 @@ impl Storage for SqliteStorage {
                 row_to_record,
             )
             .optional()
+            .map_err(Into::into)
+    }
+
+    fn replies_to(&self, parent_uri: &str) -> Result<Vec<IndexedRecord>, StorageError> {
+        let conn = self.conn()?;
+        let mut statement = conn.prepare(
+            "SELECT did, collection, rkey, uri, cid, time_us, record_json FROM records
+             WHERE collection='app.bsky.feed.post' AND json_extract(record_json, '$.reply.parent.uri')=?1
+             ORDER BY time_us ASC, uri ASC",
+        )?;
+        statement
+            .query_map([parent_uri], row_to_record)?
+            .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
 

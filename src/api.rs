@@ -264,38 +264,96 @@ async fn get_post_thread<S: Storage, B: IdentityBackend>(
 ) -> Result<Json<Value>, ApiError> {
     let claims = authorize(&state, &headers, "app.bsky.feed.getPostThread", false).await?;
     let uri = required(&query, "uri")?;
-    let records = state.storage.records().map_err(|_| ApiError::internal())?;
-    let post = records
-        .iter()
-        .find(|record| record.collection == POST && record.uri == uri)
+    let post = state
+        .storage
+        .record_by_uri(POST, uri)
+        .map_err(|_| ApiError::internal())?
         .ok_or_else(|| ApiError::not_found("post not found"))?;
-    let parent_record = post
-        .record
-        .pointer("/reply/parent/uri")
-        .and_then(Value::as_str)
-        .and_then(|parent_uri| {
-            records
-                .iter()
-                .find(|record| record.collection == POST && record.uri == parent_uri)
-        });
-    let parent = if let Some(parent) = parent_record {
-        json!({
+    let depth = query
+        .get("depth")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(6)
+        .min(100);
+    let parent_height = query
+        .get("parentHeight")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(80)
+        .min(100);
+    let viewer_did = claims.as_ref().map(|claims| claims.iss.as_str());
+    let thread = thread_view(
+        &state,
+        &post,
+        depth,
+        parent_height,
+        viewer_did,
+        &mut HashSet::new(),
+    )?;
+    Ok(Json(json!({"thread":thread})))
+}
+
+fn thread_view<S: Storage, B: IdentityBackend>(
+    state: &ApiState<S, B>,
+    record: &IndexedRecord,
+    depth: usize,
+    parent_height: usize,
+    viewer_did: Option<&str>,
+    visited: &mut HashSet<String>,
+) -> Result<Value, ApiError> {
+    if !visited.insert(record.uri.clone()) {
+        return Ok(json!({
             "$type":"app.bsky.feed.defs#threadViewPost",
-            "post":post_view(&state, parent, claims.as_ref().map(|claims| claims.iss.as_str()))?,
-            "parent":null,
-            "replies":[],
-            "threadContext":null
-        })
+            "post":post_view(state, record, viewer_did)?,
+            "parent":null,"replies":[],"threadContext":null
+        }));
+    }
+    let parent = if parent_height > 0 {
+        if let Some(parent_uri) = record
+            .record
+            .pointer("/reply/parent/uri")
+            .and_then(Value::as_str)
+        {
+            let parent = state
+                .storage
+                .record_by_uri(POST, parent_uri)
+                .map_err(|_| ApiError::internal())?;
+            if let Some(parent) = parent {
+                Some(thread_view(
+                    state,
+                    &parent,
+                    0,
+                    parent_height - 1,
+                    viewer_did,
+                    visited,
+                )?)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     } else {
-        Value::Null
+        None
+    }
+    .unwrap_or(Value::Null);
+    let replies = if depth > 0 {
+        state
+            .storage
+            .replies_to(&record.uri)
+            .map_err(|_| ApiError::internal())?
+            .into_iter()
+            .map(|reply| thread_view(state, &reply, depth - 1, 0, viewer_did, visited))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
     };
-    let replies = records.iter().filter(|record| record.collection == POST
-        && record.record.pointer("/reply/parent/uri").and_then(Value::as_str) == Some(uri))
-        .map(|record| post_view(&state, record, claims.as_ref().map(|claims| claims.iss.as_str())).map(|post| json!({"$type":"app.bsky.feed.defs#threadViewPost","post":post,"parent":null,"replies":[],"threadContext":null})))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Json(
-        json!({"thread":{"$type":"app.bsky.feed.defs#threadViewPost","post":post_view(&state, post, claims.as_ref().map(|claims| claims.iss.as_str()))?,"parent":parent,"replies":replies,"threadContext":null}}),
-    ))
+    visited.remove(&record.uri);
+    Ok(json!({
+        "$type":"app.bsky.feed.defs#threadViewPost",
+        "post":post_view(state, record, viewer_did)?,
+        "parent":parent,
+        "replies":replies,
+        "threadContext":null
+    }))
 }
 
 async fn get_timeline<S: Storage, B: IdentityBackend>(

@@ -1,7 +1,7 @@
 use crate::identity::{HttpIdentityBackend, IdentityResolver};
 use crate::{
     api::{profile_view_from_storage, timeline_records},
-    ingest::{IndexedRecord, MemoryStorage, Storage},
+    ingest::{IndexedRecord, MemoryStorage, Storage, StorageError},
 };
 use atrium_api::{
     agent::{Agent, SessionManager},
@@ -1372,18 +1372,128 @@ where
     let Some(uri) = query.get("uri") else {
         return oauth_error(StatusCode::BAD_REQUEST, "uri is required");
     };
-    let record = match state.storage.records() {
-        Ok(records) => records.into_iter().find(|record| record.uri == *uri),
+    let record = match state.storage.record_by_uri("app.bsky.feed.post", uri) {
+        Ok(record) => record,
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
     let Some(record) = record else {
         return oauth_error(StatusCode::NOT_FOUND, "post not found");
     };
+    let write_forms_enabled =
+        verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
+    let parent_height = query
+        .get("parentHeight")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(80)
+        .min(100);
+    let depth = query
+        .get("depth")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(3)
+        .min(20);
+    let ancestors = match thread_ancestors(state.storage.as_ref(), &record, parent_height) {
+        Ok(ancestors) => ancestors,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    let ancestors_html = ancestors
+        .iter()
+        .map(|ancestor| {
+            format!(
+                "<li>{}</li>",
+                render_web_post(
+                    state.storage.as_ref(),
+                    ancestor,
+                    &viewer_did,
+                    write_forms_enabled,
+                    false,
+                )
+            )
+        })
+        .collect::<String>();
+    let replies_html = match render_thread_replies(
+        state.storage.as_ref(),
+        &record,
+        &viewer_did,
+        write_forms_enabled,
+        depth,
+    ) {
+        Ok(replies) => replies,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    let read_only_message = if write_forms_enabled {
+        String::new()
+    } else {
+        "<p role=\"status\">Read-only: write permissions were not granted.</p>".to_owned()
+    };
     Html(format!(
-        "<!doctype html><html><head><title>Post</title></head><body><main>{}<a href=\"/app\">Timeline</a></main></body></html>",
-        render_web_post(state.storage.as_ref(), &record, &viewer_did, verified_cookie_write_access(&state.public, &headers, state.storage.as_ref()), false)
+        "<!doctype html><html><head><title>Post</title></head><body><main>{read_only_message}<section class=\"thread-ancestors\"><ol>{ancestors_html}</ol></section>{}<section class=\"thread-replies\"><h2>Replies</h2>{replies_html}</section><a href=\"/app\">Timeline</a></main></body></html>",
+        render_web_post(
+            state.storage.as_ref(),
+            &record,
+            &viewer_did,
+            write_forms_enabled,
+            false
+        )
     ))
     .into_response()
+}
+
+fn thread_ancestors<S: Storage>(
+    storage: &S,
+    record: &IndexedRecord,
+    parent_height: usize,
+) -> Result<Vec<IndexedRecord>, StorageError> {
+    let mut ancestors = Vec::new();
+    let mut visited = HashSet::from([record.uri.clone()]);
+    let mut parent_uri = record
+        .record
+        .pointer("/reply/parent/uri")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    for _ in 0..parent_height {
+        let Some(uri) = parent_uri else { break };
+        if !visited.insert(uri.clone()) {
+            break;
+        }
+        let Some(parent) = storage.record_by_uri("app.bsky.feed.post", &uri)? else {
+            break;
+        };
+        parent_uri = parent
+            .record
+            .pointer("/reply/parent/uri")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        ancestors.push(parent);
+    }
+    ancestors.reverse();
+    Ok(ancestors)
+}
+
+fn render_thread_replies<S: Storage>(
+    storage: &S,
+    record: &IndexedRecord,
+    viewer_did: &str,
+    write_forms_enabled: bool,
+    depth: usize,
+) -> Result<String, StorageError> {
+    if depth == 0 {
+        return Ok(String::new());
+    }
+    let replies = storage.replies_to(&record.uri)?;
+    if replies.is_empty() {
+        return Ok(String::new());
+    }
+    let mut html = String::from("<ol>");
+    for reply in replies {
+        let nested =
+            render_thread_replies(storage, &reply, viewer_did, write_forms_enabled, depth - 1)?;
+        html.push_str(&format!(
+            "<li>{}{nested}</li>",
+            render_web_post(storage, &reply, viewer_did, write_forms_enabled, false)
+        ));
+    }
+    html.push_str("</ol>");
+    Ok(html)
 }
 
 async fn write_post<F, S>(
