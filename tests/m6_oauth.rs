@@ -1227,6 +1227,115 @@ async fn logged_in_web_views_render_from_the_local_index_without_pds_reads() {
 }
 
 #[tokio::test]
+async fn web_posts_show_local_counts_and_liked_state_and_submit_unlike() {
+    let storage = Arc::new(MemoryStorage::default());
+    let post_uri = "at://did:plc:friend/app.bsky.feed.post/p1";
+    for record in [
+        IndexedRecord {
+            did: "did:plc:friend".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "p1".into(),
+            uri: post_uri.into(),
+            cid: Some("cid-p1".into()),
+            time_us: 50,
+            record: serde_json::json!({"$type":"app.bsky.feed.post","text":"indexed post","createdAt":"2026-10-27T00:00:00Z"}),
+        },
+        IndexedRecord {
+            did: "did:plc:alice".into(),
+            collection: "app.bsky.feed.like".into(),
+            rkey: "like-p1".into(),
+            uri: "at://did:plc:alice/app.bsky.feed.like/like-p1".into(),
+            cid: Some("cid-like-p1".into()),
+            time_us: 40,
+            record: serde_json::json!({"subject":{"uri":post_uri,"cid":"cid-p1"}}),
+        },
+        IndexedRecord {
+            did: "did:plc:alice".into(),
+            collection: "app.bsky.feed.repost".into(),
+            rkey: "repost-p1".into(),
+            uri: "at://did:plc:alice/app.bsky.feed.repost/repost-p1".into(),
+            cid: Some("cid-repost-p1".into()),
+            time_us: 30,
+            record: serde_json::json!({"subject":{"uri":post_uri,"cid":"cid-p1"}}),
+        },
+        IndexedRecord {
+            did: "did:plc:friend".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "reply-p1".into(),
+            uri: "at://did:plc:friend/app.bsky.feed.post/reply-p1".into(),
+            cid: Some("cid-reply-p1".into()),
+            time_us: 20,
+            record: serde_json::json!({"text":"reply","reply":{"parent":{"uri":post_uri},"root":{"uri":post_uri}}}),
+        },
+        IndexedRecord {
+            did: "did:plc:alice".into(),
+            collection: "app.bsky.graph.follow".into(),
+            rkey: "follow-friend".into(),
+            uri: "at://did:plc:alice/app.bsky.graph.follow/follow-friend".into(),
+            cid: Some("cid-follow".into()),
+            time_us: 10,
+            record: serde_json::json!({"subject":"did:plc:friend"}),
+        },
+    ] {
+        storage.put_record(&record).unwrap();
+    }
+    storage
+        .set_follow("did:plc:alice", "did:plc:friend", true)
+        .unwrap();
+    let flow = FakeOAuthFlow::default();
+    let actions = flow.actions.clone();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage);
+    let cookie = finish_login(&app).await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("1 like"), "{html}");
+    assert!(html.contains("1 repost"), "{html}");
+    assert!(html.contains("1 reply"), "{html}");
+    assert!(html.contains(">Liked</button>"), "{html}");
+
+    let response = app.oneshot(
+        Request::builder()
+            .method("POST")
+            .uri("/like")
+            .header("origin", "https://appview.example")
+            .header("sec-fetch-site", "same-origin")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", &cookie)
+            .body(Body::from("uri=at%3A%2F%2Fdid%3Aplc%3Afriend%2Fapp.bsky.feed.post%2Fp1&cid=cid-p1&intent=delete"))
+            .unwrap(),
+    ).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert!(
+        actions
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|action| action.starts_with("unlike:"))
+    );
+}
+
+#[tokio::test]
 async fn web_posts_show_hydrated_authors_and_times_on_timeline_profile_and_thread() {
     let storage = Arc::new(MemoryStorage::default());
     storage.register_user("did:plc:alice").unwrap();
