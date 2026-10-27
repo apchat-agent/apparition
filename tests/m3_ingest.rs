@@ -1,7 +1,7 @@
 use appview_rs::ingest::{
     Ingestor, JetstreamConsumer, MemoryStorage, ScopeMode, SqliteStorage, Storage,
 };
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::{sync::Arc, time::Duration};
 use tokio::{net::TcpListener, time::timeout};
@@ -212,6 +212,79 @@ async fn websocket_consumer_processes_events_and_persists_cursor_to_sqlite() {
     );
     drop(reopened);
     let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn consumer_reconnects_after_a_silent_websocket_and_rotates_urls() {
+    let storage = Arc::new(MemoryStorage::default());
+    let ingestor = Ingestor::new(storage.clone(), ScopeMode::Full);
+
+    let silent_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let silent_address = silent_listener.local_addr().unwrap();
+    let silent_server = tokio::spawn(async move {
+        let (stream, _) = silent_listener.accept().await.unwrap();
+        let mut websocket = accept_async(stream).await.unwrap();
+        let _ = websocket.next().await;
+    });
+
+    let live_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let live_address = live_listener.local_addr().unwrap();
+    let live_server = tokio::spawn(async move {
+        let (stream, _) = live_listener.accept().await.unwrap();
+        let mut websocket = accept_async(stream).await.unwrap();
+        websocket
+            .send(Message::Text(
+                event(
+                    "did:plc:root",
+                    1234,
+                    "create",
+                    "app.bsky.feed.post",
+                    "recovered",
+                    Some(post("after reconnect")),
+                )
+                .into(),
+            ))
+            .await
+            .unwrap();
+        websocket.close(None).await.unwrap();
+    });
+
+    let consumer = JetstreamConsumer::new(ingestor, Duration::from_millis(1))
+        .with_idle_timeout(Duration::from_millis(25));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let run_task = tokio::spawn(async move {
+        consumer
+            .run(
+                &[
+                    format!("ws://{silent_address}/subscribe"),
+                    format!("ws://{live_address}/subscribe"),
+                ],
+                shutdown_rx,
+            )
+            .await
+    });
+
+    timeout(Duration::from_secs(2), async {
+        while storage.cursor().unwrap() != Some(1234) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("consumer should reconnect to the second URL and ingest its event");
+    shutdown_tx.send(true).unwrap();
+    timeout(Duration::from_secs(2), run_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    silent_server.await.unwrap();
+    live_server.await.unwrap();
+    assert!(
+        storage
+            .get_record("did:plc:root", "app.bsky.feed.post", "recovered")
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]
