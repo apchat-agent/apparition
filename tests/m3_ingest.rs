@@ -279,3 +279,20 @@ fn scope_mode_defaults_to_scoped_and_can_be_configured() {
         ScopeMode::Full
     );
 }
+
+#[test]
+fn jetstream_urls_are_configurable_from_environment() {
+    use appview_rs::config::Config;
+    let config = Config::from_toml_and_env(
+        "",
+        [(
+            "APPVIEW_JETSTREAM_URLS",
+            "ws://one.test/subscribe,ws://two.test/subscribe",
+        )],
+    )
+    .unwrap();
+    assert_eq!(
+        config.jetstream_urls,
+        ["ws://one.test/subscribe", "ws://two.test/subscribe"]
+    );
+}
