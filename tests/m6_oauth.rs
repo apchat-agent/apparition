@@ -561,6 +561,8 @@ async fn oauth_callback_registers_account_and_logout_clears_its_session() {
             Request::builder()
                 .method("POST")
                 .uri("/logout")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
                 .header("cookie", cookie.split(';').next().unwrap())
                 .body(Body::empty())
                 .unwrap(),
@@ -667,6 +669,8 @@ async fn web_views_and_write_actions_require_a_login_session() {
                 Request::builder()
                     .method("POST")
                     .uri(path)
+                    .header("origin", "https://appview.example")
+                    .header("sec-fetch-site", "same-origin")
                     .header("content-type", "application/x-www-form-urlencoded")
                     .body(Body::from("text=hello&uri=at%3A%2F%2Fdid%3Aplc%3Aalice%2Fapp.bsky.feed.post%2Fr1&cid=bafyreifake"))
                     .unwrap(),
@@ -721,6 +725,8 @@ async fn logged_in_write_forms_use_the_account_oauth_flow() {
                 Request::builder()
                     .method("POST")
                     .uri(path)
+                    .header("origin", "https://appview.example")
+                    .header("sec-fetch-site", "same-origin")
                     .header("cookie", &cookie)
                     .header("content-type", "application/x-www-form-urlencoded")
                     .body(Body::from(body))
@@ -872,6 +878,8 @@ async fn logging_in_again_invalidates_a_cookie_from_before_logout() {
             Request::builder()
                 .method("POST")
                 .uri("/logout")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
                 .header("cookie", &old_session_cookie)
                 .body(Body::empty())
                 .unwrap(),

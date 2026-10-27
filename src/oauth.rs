@@ -1067,6 +1067,9 @@ where
     F: OAuthFlow,
     S: Storage,
 {
+    if !same_origin_request(&headers, &state.public.public_url) {
+        return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
+    }
     let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return clear_session_cookie(Redirect::to("/login").into_response());
     };
@@ -1209,6 +1212,9 @@ where
     F: OAuthFlow,
     S: Storage,
 {
+    if !same_origin_request(&headers, &state.public.public_url) {
+        return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
+    }
     let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return Redirect::to("/login").into_response();
     };
@@ -1234,6 +1240,9 @@ where
     F: OAuthFlow,
     S: Storage,
 {
+    if !same_origin_request(&headers, &state.public.public_url) {
+        return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
+    }
     let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return Redirect::to("/login").into_response();
     };
@@ -1258,6 +1267,9 @@ where
     F: OAuthFlow,
     S: Storage,
 {
+    if !same_origin_request(&headers, &state.public.public_url) {
+        return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
+    }
     let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return Redirect::to("/login").into_response();
     };
