@@ -621,6 +621,91 @@ async fn session_cookie_rejects_a_tampered_hmac() {
 }
 
 #[tokio::test]
+async fn logging_in_again_invalidates_a_cookie_from_before_logout() {
+    let public = OAuthPublic::new("https://appview.example").unwrap();
+    let storage = Arc::new(MemoryStorage::default());
+    let app = public.router_with_flow(FakeOAuthFlow::default(), storage);
+
+    let first_login_cookie = prelogin_cookie(&app).await;
+    let first_callback = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?code=valid-code&state=valid-state&scope=atproto")
+                .header("cookie", first_login_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let old_session_cookie = first_callback.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/logout")
+                .header("cookie", &old_session_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let second_login_cookie = prelogin_cookie(&app).await;
+    let second_callback = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?code=valid-code&state=valid-state&scope=atproto")
+                .header("cookie", second_login_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let new_session_cookie = second_callback.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    let old_session = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", old_session_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(old_session.status(), StatusCode::SEE_OTHER);
+    assert_eq!(old_session.headers()["location"], "/login");
+
+    let new_session = app
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", new_session_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(new_session.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn logged_in_timeline_comes_from_the_oauth_account_pds() {
     let app = OAuthPublic::new("https://appview.example")
         .unwrap()
