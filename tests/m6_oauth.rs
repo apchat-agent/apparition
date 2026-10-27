@@ -170,6 +170,33 @@ async fn start_login(app: &Router) -> axum::response::Response {
         .unwrap()
 }
 
+async fn finish_login(app: &Router) -> String {
+    let login_cookie = prelogin_cookie(app).await;
+    let callback = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?code=valid-code&state=valid-state&scope=atproto")
+                .header("cookie", login_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(callback.status(), StatusCode::SEE_OTHER);
+    callback
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .find_map(|header| {
+            let value = header.to_str().ok()?;
+            value
+                .starts_with("appview_session=")
+                .then(|| value.split(';').next().unwrap().to_owned())
+        })
+        .unwrap()
+}
+
 #[derive(Clone)]
 struct PanicCallbackFlow;
 
@@ -932,6 +959,30 @@ async fn logging_in_again_invalidates_a_cookie_from_before_logout() {
         .await
         .unwrap();
     assert_eq!(new_session.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn logging_in_on_another_device_keeps_the_first_session_valid() {
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), Arc::new(MemoryStorage::default()));
+    let first_device_cookie = finish_login(&app).await;
+    let second_device_cookie = finish_login(&app).await;
+
+    for cookie in [first_device_cookie, second_device_cookie] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/app")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }
 
 #[tokio::test]
