@@ -95,6 +95,21 @@ impl OAuthFlow for FakeOAuthFlow {
             Ok(())
         })
     }
+
+    fn timeline<'a>(
+        &'a self,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Value>, String>> + Send + 'a>> {
+        Box::pin(async {
+            Ok(vec![serde_json::json!({
+                "post": {
+                    "uri":"at://did:plc:author/app.bsky.feed.post/r1",
+                    "cid":"bafyreifake",
+                    "record":{"text":"from OAuth timeline"}
+                }
+            })])
+        })
+    }
 }
 
 #[test]
@@ -387,6 +402,46 @@ async fn logged_in_write_forms_use_the_account_oauth_flow() {
             "repost:did:plc:alice:at://did:plc:author/app.bsky.feed.post/r1:bafyreifake",
         ]
     );
+}
+
+#[tokio::test]
+async fn logged_in_timeline_comes_from_the_oauth_account_pds() {
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), Arc::new(MemoryStorage::default()));
+    let callback = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?code=valid-code&state=valid-state&scope=atproto")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cookie = callback.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(html.contains("from OAuth timeline"));
+    assert!(html.contains("/like"));
+    assert!(html.contains("/repost"));
 }
 
 #[tokio::test]
