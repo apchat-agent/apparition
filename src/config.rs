@@ -15,6 +15,8 @@ pub struct Config {
     pub scope_mode: ScopeMode,
     #[serde(default = "default_jetstream_urls")]
     pub jetstream_urls: Vec<String>,
+    #[serde(default = "default_appview_did")]
+    pub appview_did: String,
 }
 
 impl Default for Config {
@@ -25,6 +27,7 @@ impl Default for Config {
             log_filter: default_log_filter(),
             scope_mode: ScopeMode::default(),
             jetstream_urls: default_jetstream_urls(),
+            appview_did: default_appview_did(),
         }
     }
 }
@@ -71,6 +74,7 @@ impl Config {
                         .map(str::to_owned)
                         .collect();
                 }
+                "APPVIEW_DID" => config.appview_did = value.to_owned(),
                 _ => {}
             }
         }
@@ -132,6 +136,7 @@ impl Config {
                             .map(str::to_owned)
                             .collect();
                     }
+                    "APPVIEW_DID" => config.appview_did = value,
                     _ => unreachable!(),
                 }
             }
@@ -155,4 +160,8 @@ fn default_log_filter() -> String {
 
 fn default_jetstream_urls() -> Vec<String> {
     vec!["wss://jetstream1.us-east.bsky.network/subscribe".to_owned()]
+}
+
+fn default_appview_did() -> String {
+    "did:web:localhost".to_owned()
 }

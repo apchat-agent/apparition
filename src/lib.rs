@@ -1,7 +1,9 @@
+pub mod api;
 pub mod backfill;
 pub mod config;
 pub mod identity;
 pub mod ingest;
+pub mod jwt;
 
 use axum::{Json, Router, routing::get};
 use serde::Serialize;

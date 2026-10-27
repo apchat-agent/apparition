@@ -78,6 +78,10 @@ pub trait Storage: Send + Sync {
     fn enqueue_backfill(&self, did: &str) -> Result<(), StorageError>;
     fn pending_backfills(&self) -> Result<Vec<String>, StorageError>;
     fn complete_backfill(&self, did: &str) -> Result<(), StorageError>;
+    fn set_verified_handle(&self, did: &str, handle: &str) -> Result<(), StorageError>;
+    fn clear_verified_handle(&self, did: &str) -> Result<(), StorageError>;
+    fn verified_handle(&self, did: &str) -> Result<Option<String>, StorageError>;
+    fn did_by_verified_handle(&self, handle: &str) -> Result<Option<String>, StorageError>;
     fn bytes_on_disk(&self) -> u64;
 }
 
@@ -93,6 +97,7 @@ struct MemoryState {
     registered: HashSet<String>,
     follows: HashSet<(String, String)>,
     backfill_queue: HashSet<String>,
+    verified_handles: HashMap<String, (String, Instant)>,
 }
 
 impl Storage for MemoryStorage {
@@ -252,6 +257,45 @@ impl Storage for MemoryStorage {
         Ok(())
     }
 
+    fn set_verified_handle(&self, did: &str, handle: &str) -> Result<(), StorageError> {
+        self.inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .verified_handles
+            .insert(did.to_owned(), (handle.to_owned(), Instant::now()));
+        Ok(())
+    }
+
+    fn clear_verified_handle(&self, did: &str) -> Result<(), StorageError> {
+        self.inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .verified_handles
+            .remove(did);
+        Ok(())
+    }
+
+    fn verified_handle(&self, did: &str) -> Result<Option<String>, StorageError> {
+        let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        Ok(inner
+            .verified_handles
+            .get(did)
+            .filter(|(_, verified_at)| verified_at.elapsed() < Duration::from_secs(1800))
+            .map(|(handle, _)| handle.clone()))
+    }
+
+    fn did_by_verified_handle(&self, handle: &str) -> Result<Option<String>, StorageError> {
+        let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        Ok(inner
+            .verified_handles
+            .iter()
+            .find(|(_, (stored, verified_at))| {
+                verified_at.elapsed() < Duration::from_secs(1800)
+                    && stored.eq_ignore_ascii_case(handle)
+            })
+            .map(|(did, _)| did.clone()))
+    }
+
     fn bytes_on_disk(&self) -> u64 {
         0
     }
@@ -293,6 +337,11 @@ impl SqliteStorage {
              CREATE TABLE IF NOT EXISTS backfill_queue (
                  did TEXT PRIMARY KEY,
                  enqueued_at INTEGER NOT NULL DEFAULT (unixepoch())
+             );
+             CREATE TABLE IF NOT EXISTS verified_handles (
+                 did TEXT PRIMARY KEY,
+                 handle TEXT NOT NULL,
+                 updated_at INTEGER NOT NULL DEFAULT (unixepoch())
              );",
         )?;
         Ok(Self {
@@ -482,6 +531,42 @@ impl Storage for SqliteStorage {
         self.conn()?
             .execute("DELETE FROM backfill_queue WHERE did=?1", [did])?;
         Ok(())
+    }
+
+    fn set_verified_handle(&self, did: &str, handle: &str) -> Result<(), StorageError> {
+        self.conn()?.execute(
+            "INSERT INTO verified_handles(did,handle,updated_at) VALUES(?1,?2,unixepoch())
+             ON CONFLICT(did) DO UPDATE SET handle=excluded.handle,updated_at=unixepoch()",
+            params![did, handle],
+        )?;
+        Ok(())
+    }
+
+    fn clear_verified_handle(&self, did: &str) -> Result<(), StorageError> {
+        self.conn()?
+            .execute("DELETE FROM verified_handles WHERE did=?1", [did])?;
+        Ok(())
+    }
+
+    fn verified_handle(&self, did: &str) -> Result<Option<String>, StorageError> {
+        self.conn()?
+            .query_row(
+                "SELECT handle FROM verified_handles WHERE did=?1 AND updated_at>=unixepoch()-1800",
+                [did],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn did_by_verified_handle(&self, handle: &str) -> Result<Option<String>, StorageError> {
+        self.conn()?
+            .query_row(
+                "SELECT did FROM verified_handles WHERE lower(handle)=lower(?1) AND updated_at>=unixepoch()-1800",
+                [handle], |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     fn bytes_on_disk(&self) -> u64 {

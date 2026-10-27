@@ -180,6 +180,20 @@ impl<B: IdentityBackend> IdentityResolver<B> {
         Ok(document)
     }
 
+    pub async fn verified_handle_for_document(&self, document: &DidDocument) -> Option<String> {
+        for alias in &document.also_known_as {
+            if let Some(candidate) = alias.strip_prefix("at://")
+                && let Ok(handle) = normalize_handle(candidate)
+            {
+                return match self.resolve_handle_assertion(&handle).await {
+                    Ok(asserted_did) if asserted_did == document.id => Some(handle),
+                    _ => None,
+                };
+            }
+        }
+        None
+    }
+
     pub async fn resolve_did(&self, did: &str) -> Result<Identity, ResolutionError> {
         validate_did(did)?;
         let key = format!("did:{did}");
@@ -199,25 +213,7 @@ impl<B: IdentityBackend> IdentityResolver<B> {
             )));
         }
 
-        // AT Protocol uses the first syntactically valid handle claim in order.
-        let mut claimed_handle = None;
-        for alias in &doc.also_known_as {
-            if let Some(candidate) = alias.strip_prefix("at://")
-                && let Ok(handle) = normalize_handle(candidate)
-            {
-                claimed_handle = Some(handle);
-                break;
-            }
-        }
-
-        let verified_handle = if let Some(handle) = claimed_handle {
-            match self.resolve_handle_assertion(&handle).await {
-                Ok(asserted_did) if asserted_did == did => Some(handle),
-                _ => None,
-            }
-        } else {
-            None
-        };
+        let verified_handle = self.verified_handle_for_document(&doc).await;
         let identity = Identity {
             did: did.to_owned(),
             handle: verified_handle,

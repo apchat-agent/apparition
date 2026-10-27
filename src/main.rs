@@ -1,11 +1,14 @@
 use appview_rs::{
+    api::api_router,
     backfill::{
         AtriumRepoVerifier, BackfillWorker, HostRateLimiter, HttpRepoSource, RepoBackfiller,
     },
     config::Config,
     identity::{HttpIdentityBackend, IdentityResolver},
     ingest::{Ingestor, JetstreamConsumer, SqliteStorage},
-    init_tracing, router,
+    init_tracing,
+    jwt::ServiceJwtVerifier,
+    router,
 };
 use std::{error::Error, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
@@ -23,13 +26,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let consumer = JetstreamConsumer::new(ingestor, Duration::from_secs(1));
     let jetstream_urls = config.jetstream_urls.clone();
     let resolver = IdentityResolver::new(HttpIdentityBackend::default(), Duration::from_secs(1800));
+    let jwt_resolver = Arc::new(IdentityResolver::new(
+        HttpIdentityBackend::default(),
+        Duration::from_secs(1800),
+    ));
+    let jwt = Arc::new(ServiceJwtVerifier::new(
+        jwt_resolver,
+        config.appview_did.clone(),
+    ));
+    let app_router = router().merge(api_router(storage.clone(), jwt, config.appview_did.clone()));
     let backfiller = RepoBackfiller::new(
         storage.clone(),
         HttpRepoSource::default(),
         AtriumRepoVerifier,
         HostRateLimiter::new(Duration::from_millis(500)),
     );
-    let worker = BackfillWorker::new(storage, resolver, backfiller, Duration::from_secs(5));
+    let worker = BackfillWorker::new(
+        storage.clone(),
+        resolver,
+        backfiller,
+        Duration::from_secs(5),
+    );
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let ingestion_shutdown = shutdown_rx.clone();
@@ -51,7 +68,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         scope = ?config.scope_mode,
         "starting appview-rs"
     );
-    axum::serve(listener, router())
+    axum::serve(listener, app_router)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     let _ = shutdown_tx.send(true);

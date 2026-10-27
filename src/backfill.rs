@@ -428,6 +428,10 @@ where
             .resolve_did_document(did)
             .await
             .map_err(|error| BackfillError::Verify(error.to_string()))?;
+        match self.resolver.verified_handle_for_document(&document).await {
+            Some(handle) => self.storage.set_verified_handle(did, &handle)?,
+            None => self.storage.clear_verified_handle(did)?,
+        }
         let pds = document.pds_endpoint().ok_or_else(|| {
             BackfillError::InvalidPds(format!("no valid PDS endpoint in {did} DID document"))
         })?;
