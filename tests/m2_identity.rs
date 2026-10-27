@@ -1,5 +1,5 @@
 use appview_rs::identity::{
-    DidDocument, Identity, IdentityBackend, IdentityResolver, ResolutionError,
+    DidDocument, HttpIdentityBackend, Identity, IdentityBackend, IdentityResolver, ResolutionError,
 };
 use std::{
     collections::HashMap,
@@ -119,4 +119,55 @@ async fn successful_handle_resolution_is_cached_for_the_configured_ttl() {
     resolver.resolve_handle("alice.test").await.unwrap();
     resolver.resolve_handle("alice.test").await.unwrap();
     assert_eq!(dns_lookups.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn http_identity_backend_reaches_fake_plc_server_using_did_path() {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    const DID: &str = "did:plc:2iz7444ugycwhibyy3z5vord";
+    let body = format!(r#"{{"id":"{DID}","alsoKnownAs":[],"verificationMethod":[],"service":[]}}"#);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0; 1024];
+            let count = stream.read(&mut chunk).await.unwrap();
+            assert_ne!(
+                count, 0,
+                "client disconnected before sending request headers"
+            );
+            request.extend_from_slice(&chunk[..count]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+        String::from_utf8(request).unwrap()
+    });
+
+    let backend = HttpIdentityBackend::new(
+        &format!("http://{address}/plc"),
+        "https://dns.example/query",
+    )
+    .unwrap();
+    let document = backend.did_document(DID).await.unwrap().unwrap();
+    assert_eq!(document.id, DID);
+
+    let request = server.await.unwrap();
+    assert!(
+        request.starts_with(&format!("GET /plc/{DID} HTTP/1.1\r\n")),
+        "unexpected fake PLC request: {request}"
+    );
 }

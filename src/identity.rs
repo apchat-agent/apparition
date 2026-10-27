@@ -442,3 +442,37 @@ impl IdentityBackend for HttpIdentityBackend {
 fn backend_error(error: impl std::fmt::Display) -> ResolutionError {
     ResolutionError::Backend(error.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::HttpIdentityBackend;
+
+    #[test]
+    fn plc_did_is_appended_as_a_path_segment_for_each_base_shape() {
+        const DID: &str = "did:plc:2iz7444ugycwhibyy3z5vord";
+        let cases = [
+            (
+                "https://plc.example",
+                "https://plc.example/did:plc:2iz7444ugycwhibyy3z5vord",
+            ),
+            (
+                "https://plc.example/",
+                "https://plc.example/did:plc:2iz7444ugycwhibyy3z5vord",
+            ),
+            (
+                "https://proxy.example/plc",
+                "https://proxy.example/plc/did:plc:2iz7444ugycwhibyy3z5vord",
+            ),
+            (
+                "https://proxy.example/plc/",
+                "https://proxy.example/plc/did:plc:2iz7444ugycwhibyy3z5vord",
+            ),
+        ];
+
+        for (base, expected) in cases {
+            let backend = HttpIdentityBackend::new(base, "https://dns.example/query").unwrap();
+            let actual = backend.plc_directory.join(DID).unwrap();
+            assert_eq!(actual.as_str(), expected, "base URL: {base}");
+        }
+    }
+}
