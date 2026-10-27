@@ -143,16 +143,7 @@ impl OAuthFlow for FakeOAuthFlow {
 }
 
 async fn prelogin_cookie(app: &Router) -> String {
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/oauth/authorize?handle=alice.test")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let response = start_login(app).await;
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
     response.headers()["set-cookie"]
         .to_str()
@@ -161,6 +152,22 @@ async fn prelogin_cookie(app: &Router) -> String {
         .next()
         .unwrap()
         .to_owned()
+}
+
+async fn start_login(app: &Router) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/authorize")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("handle=alice.test"))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
 }
 
 #[derive(Clone)]
@@ -362,10 +369,19 @@ async fn authorize_rejects_cross_origin_and_cross_site_requests() {
 #[tokio::test]
 async fn authorization_and_callback_reject_missing_protocol_parameters() {
     for path in ["/oauth/authorize", "/oauth/callback"] {
-        let response = router()
-            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
-            .await
-            .unwrap();
+        let request = if path == "/oauth/authorize" {
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("handle="))
+                .unwrap()
+        } else {
+            Request::builder().uri(path).body(Body::empty()).unwrap()
+        };
+        let response = router().oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
     }
 }
@@ -454,15 +470,7 @@ async fn authorize_turns_an_upstream_panic_into_an_error_page() {
     let app = OAuthPublic::new("https://appview.example")
         .unwrap()
         .router_with_flow(PanicAuthorizeFlow, Arc::new(MemoryStorage::default()));
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/oauth/authorize?handle=alice.test")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let response = start_login(&app).await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert!(
         response.headers()["content-type"]
@@ -510,16 +518,7 @@ async fn oauth_callback_registers_account_and_logout_clears_its_session() {
     let storage = Arc::new(MemoryStorage::default());
     let app = public.router_with_flow(FakeOAuthFlow::default(), storage.clone());
 
-    let authorization = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/oauth/authorize?handle=alice.test")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let authorization = start_login(&app).await;
     assert_eq!(authorization.status(), StatusCode::SEE_OTHER);
     assert_eq!(
         authorization.headers()["location"],

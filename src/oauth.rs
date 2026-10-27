@@ -247,7 +247,7 @@ impl OAuthPublic {
         Router::new()
             .route(METADATA_PATH, get(metadata::<F, S>))
             .route("/login", get(login))
-            .route("/oauth/authorize", get(authorize::<F, S>))
+            .route("/oauth/authorize", post(authorize::<F, S>))
             .route("/oauth/callback", get(callback::<F, S>))
             .route("/logout", post(logout::<F, S>))
             .route("/app", get(app_home::<F, S>))
@@ -905,19 +905,26 @@ where
 
 async fn login() -> Html<&'static str> {
     Html(
-        "<!doctype html><html><head><title>Sign in</title></head><body><main><h1>Sign in to your AppView</h1><form action=\"/oauth/authorize\" method=\"get\"><label>AT Protocol handle or DID <input name=\"handle\" autocomplete=\"username\" required></label><button type=\"submit\">Continue</button></form></main></body></html>",
+        "<!doctype html><html><head><title>Sign in</title></head><body><main><h1>Sign in to your AppView</h1><form action=\"/oauth/authorize\" method=\"post\"><label>AT Protocol handle or DID <input name=\"handle\" autocomplete=\"username\" required></label><button type=\"submit\">Continue</button></form></main></body></html>",
     )
 }
 
 async fn authorize<F, S>(
     State(state): State<Arc<OAuthWebState<F, S>>>,
-    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
 ) -> Response
 where
     F: OAuthFlow,
     S: Storage,
 {
-    if query
+    if !same_origin_request(&headers, &state.public.public_url) {
+        return oauth_error(
+            StatusCode::FORBIDDEN,
+            "authorization must start from this origin",
+        );
+    }
+    if form
         .get("handle")
         .is_none_or(|handle| handle.trim().is_empty())
     {
@@ -931,7 +938,7 @@ where
     thread_rng().fill_bytes(&mut binding_bytes);
     let browser_binding = URL_SAFE_NO_PAD.encode(binding_bytes);
     let authorize_result = std::panic::AssertUnwindSafe(state.flow.authorize(
-        query.get("handle").expect("validated above"),
+        form.get("handle").expect("validated above"),
         &browser_binding,
     ))
     .catch_unwind()
@@ -1274,6 +1281,31 @@ fn verified_cookie_did<S: Storage>(
     let (did, generation) =
         cookie_value(headers).and_then(|value| public.verify_session_cookie(value))?;
     (storage.web_session_generation(&did).ok().flatten() == Some(generation)).then_some(did)
+}
+
+fn same_origin_request(headers: &HeaderMap, public_url: &str) -> bool {
+    if headers
+        .get("sec-fetch-site")
+        .is_some_and(|site| site.to_str().ok() != Some("same-origin"))
+    {
+        return false;
+    }
+    let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| reqwest::Url::parse(value).ok())
+    else {
+        return false;
+    };
+    let Ok(expected) = reqwest::Url::parse(public_url) else {
+        return false;
+    };
+    origin.username().is_empty()
+        && origin.password().is_none()
+        && origin.path() == "/"
+        && origin.query().is_none()
+        && origin.fragment().is_none()
+        && origin.origin() == expected.origin()
 }
 
 fn cookie_value(headers: &HeaderMap) -> Option<&str> {
