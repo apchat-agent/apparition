@@ -742,6 +742,66 @@ async fn logged_in_write_forms_use_the_account_oauth_flow() {
 }
 
 #[tokio::test]
+async fn web_post_actions_and_logout_reject_same_site_cross_origin_requests() {
+    let flow = FakeOAuthFlow::default();
+    let actions = flow.actions.clone();
+    let storage = Arc::new(MemoryStorage::default());
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage.clone());
+    let login_cookie = prelogin_cookie(&app).await;
+    let callback = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?code=valid-code&state=valid-state&scope=atproto")
+                .header("cookie", login_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cookie = callback.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    for (path, body) in [
+        ("/post", "text=csrf+attempt"),
+        (
+            "/like",
+            "uri=at%3A%2F%2Fdid%3Aplc%3Aauthor%2Fapp.bsky.feed.post%2Fr1&cid=bafyreifake",
+        ),
+        (
+            "/repost",
+            "uri=at%3A%2F%2Fdid%3Aplc%3Aauthor%2Fapp.bsky.feed.post%2Fr1&cid=bafyreifake",
+        ),
+        ("/logout", ""),
+    ] {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("origin", "https://sibling.appview.example")
+            .header("sec-fetch-site", "same-site")
+            .header("cookie", &cookie);
+        if path != "/logout" {
+            request = request.header("content-type", "application/x-www-form-urlencoded");
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+    assert!(actions.lock().unwrap().is_empty());
+    assert!(storage.is_registered("did:plc:alice").unwrap());
+}
+
+#[tokio::test]
 async fn session_cookie_rejects_a_tampered_hmac() {
     let public = OAuthPublic::new("https://appview.example").unwrap();
     let app = public.router_with_flow(FakeOAuthFlow::default(), Arc::new(MemoryStorage::default()));
