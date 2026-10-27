@@ -1,5 +1,5 @@
 use appview_rs::ingest::{
-    IndexedRecord, Ingestor, JetstreamConsumer, MemoryStorage, ScopeMode, SqliteStorage, Storage,
+    Ingestor, JetstreamConsumer, MemoryStorage, ScopeMode, SqliteStorage, Storage,
 };
 use futures_util::SinkExt;
 use serde_json::json;
@@ -178,9 +178,7 @@ async fn websocket_consumer_processes_events_and_persists_cursor_to_sqlite() {
     let consumer = JetstreamConsumer::new(ingestor, Duration::from_millis(1));
     timeout(
         Duration::from_secs(3),
-        consumer
-            .consume_connection(&format!("ws://{address}/subscribe"))
-            .await,
+        consumer.consume_connection(&format!("ws://{address}/subscribe")),
     )
     .await
     .unwrap()
@@ -263,11 +261,13 @@ fn full_scope_accepts_supported_collections_and_updates_existing_records() {
 fn scope_mode_defaults_to_scoped_and_can_be_configured() {
     use appview_rs::config::Config;
     assert_eq!(
-        Config::from_toml_and_env("", []).unwrap().scope_mode,
+        Config::from_toml_and_env("", std::iter::empty::<(&str, &str)>())
+            .unwrap()
+            .scope_mode,
         ScopeMode::Scoped
     );
     assert_eq!(
-        Config::from_toml_and_env("scope_mode = 'full'", [])
+        Config::from_toml_and_env("scope_mode = 'full'", std::iter::empty::<(&str, &str)>())
             .unwrap()
             .scope_mode,
         ScopeMode::Full

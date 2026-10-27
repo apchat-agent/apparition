@@ -1,3 +1,4 @@
+use crate::ingest::ScopeMode;
 use serde::Deserialize;
 use std::{env, fs, path::PathBuf};
 use thiserror::Error;
@@ -10,6 +11,10 @@ pub struct Config {
     pub data_dir: String,
     #[serde(default = "default_log_filter")]
     pub log_filter: String,
+    #[serde(default)]
+    pub scope_mode: ScopeMode,
+    #[serde(default = "default_jetstream_urls")]
+    pub jetstream_urls: Vec<String>,
 }
 
 impl Default for Config {
@@ -18,6 +23,8 @@ impl Default for Config {
             listen: default_listen(),
             data_dir: default_data_dir(),
             log_filter: default_log_filter(),
+            scope_mode: ScopeMode::default(),
+            jetstream_urls: default_jetstream_urls(),
         }
     }
 }
@@ -31,6 +38,8 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("APPVIEW_SCOPE must be 'scoped' or 'full', got {0}")]
+    InvalidScope(String),
 }
 
 impl Config {
@@ -42,10 +51,26 @@ impl Config {
     {
         let mut config: Self = toml::from_str(toml_source)?;
         for (key, value) in values {
+            let value = value.as_ref();
             match key.as_ref() {
-                "APPVIEW_LISTEN" => config.listen = value.as_ref().to_owned(),
-                "APPVIEW_DATA_DIR" => config.data_dir = value.as_ref().to_owned(),
-                "APPVIEW_LOG_FILTER" => config.log_filter = value.as_ref().to_owned(),
+                "APPVIEW_LISTEN" => config.listen = value.to_owned(),
+                "APPVIEW_DATA_DIR" => config.data_dir = value.to_owned(),
+                "APPVIEW_LOG_FILTER" => config.log_filter = value.to_owned(),
+                "APPVIEW_SCOPE" => {
+                    config.scope_mode = match value {
+                        "scoped" => ScopeMode::Scoped,
+                        "full" => ScopeMode::Full,
+                        _ => return Err(ConfigError::InvalidScope(value.to_owned())),
+                    }
+                }
+                "APPVIEW_JETSTREAM_URLS" => {
+                    config.jetstream_urls = value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|url| !url.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                }
                 _ => {}
             }
         }
@@ -60,7 +85,7 @@ impl Config {
             }
             None => String::new(),
         };
-        let values = [
+        let env_values = [
             (
                 "APPVIEW_LISTEN",
                 env::var("APPVIEW_LISTEN").unwrap_or_default(),
@@ -73,8 +98,18 @@ impl Config {
                 "APPVIEW_LOG_FILTER",
                 env::var("APPVIEW_LOG_FILTER").unwrap_or_default(),
             ),
+            (
+                "APPVIEW_SCOPE",
+                env::var("APPVIEW_SCOPE").unwrap_or_default(),
+            ),
+            (
+                "APPVIEW_JETSTREAM_URLS",
+                env::var("APPVIEW_JETSTREAM_URLS").unwrap_or_default(),
+            ),
         ];
-        let nonempty = values.into_iter().filter(|(_, value)| !value.is_empty());
+        let nonempty = env_values
+            .into_iter()
+            .filter(|(_, value)| !value.is_empty());
         if source.is_empty() && env::var_os("APPVIEW_CONFIG").is_none() {
             let mut config = Self::default();
             for (key, value) in nonempty {
@@ -82,6 +117,21 @@ impl Config {
                     "APPVIEW_LISTEN" => config.listen = value,
                     "APPVIEW_DATA_DIR" => config.data_dir = value,
                     "APPVIEW_LOG_FILTER" => config.log_filter = value,
+                    "APPVIEW_SCOPE" => {
+                        config.scope_mode = match value.as_str() {
+                            "scoped" => ScopeMode::Scoped,
+                            "full" => ScopeMode::Full,
+                            _ => return Err(ConfigError::InvalidScope(value)),
+                        }
+                    }
+                    "APPVIEW_JETSTREAM_URLS" => {
+                        config.jetstream_urls = value
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|url| !url.is_empty())
+                            .map(str::to_owned)
+                            .collect();
+                    }
                     _ => unreachable!(),
                 }
             }
@@ -101,4 +151,8 @@ fn default_data_dir() -> String {
 
 fn default_log_filter() -> String {
     "info".to_owned()
+}
+
+fn default_jetstream_urls() -> Vec<String> {
+    vec!["wss://jetstream1.us-east.bsky.network/subscribe".to_owned()]
 }
