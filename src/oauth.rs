@@ -423,6 +423,7 @@ impl SqliteOAuthStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        crate::ingest::ensure_private_database_file(path)?;
         let connection = Connection::open(path)?;
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;

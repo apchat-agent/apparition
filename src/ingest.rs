@@ -86,6 +86,34 @@ pub trait Storage: Send + Sync {
     fn bytes_on_disk(&self) -> u64;
 }
 
+pub(crate) fn ensure_private_database_file(path: &Path) -> Result<(), std::io::Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+        {
+            Ok(file) => drop(file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "SQLite database path must not be a symlink",
+            ));
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 #[derive(Default)]
 pub struct MemoryStorage {
     inner: Mutex<MemoryState>,
@@ -327,6 +355,7 @@ impl SqliteStorage {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        ensure_private_database_file(&path)?;
         let connection = Connection::open(&path)?;
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;
