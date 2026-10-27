@@ -1299,6 +1299,53 @@ async fn callback_keeps_partial_write_grants_read_only_and_blocks_actions() {
 }
 
 #[tokio::test]
+async fn empty_timeline_reports_backfill_progress_for_registered_account() {
+    let storage = Arc::new(MemoryStorage::default());
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage.clone());
+    let login_cookie = prelogin_cookie(&app).await;
+    let callback = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?code=valid-code&state=valid-state&scope=atproto")
+                .header("cookie", login_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cookie = callback.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let home = app
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = String::from_utf8(
+        home.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("Indexing 1 account, 0 done"));
+}
+
+#[tokio::test]
 async fn callback_rejects_sessions_without_the_required_atproto_scope() {
     let storage = Arc::new(MemoryStorage::default());
     let app = OAuthPublic::new("https://appview.example")

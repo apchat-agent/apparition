@@ -237,6 +237,30 @@ fn entering_scope_queues_registered_and_newly_followed_repositories() {
     );
 }
 
+#[test]
+fn registered_repo_backfill_queues_followed_accounts_and_tracks_completion() {
+    fn check<S: Storage>(storage: &S) {
+        storage.register_user("did:plc:root").unwrap();
+        storage
+            .replace_repo_snapshot(
+                "did:plc:root",
+                &[],
+                &["did:plc:friend".to_owned(), "did:plc:other".to_owned()],
+            )
+            .unwrap();
+        assert_eq!(
+            storage.pending_backfills().unwrap(),
+            ["did:plc:friend", "did:plc:other", "did:plc:root"]
+        );
+        storage.complete_backfill("did:plc:root").unwrap();
+        storage.complete_backfill("did:plc:friend").unwrap();
+        assert_eq!(storage.pending_backfills().unwrap(), ["did:plc:other"]);
+    }
+
+    check(&MemoryStorage::default());
+    check(&appview_rs::ingest::SqliteStorage::open(":memory:").unwrap());
+}
+
 #[tokio::test]
 async fn backfill_worker_drains_new_scope_entries_from_resolved_did_docs() {
     use appview_rs::{
