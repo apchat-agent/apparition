@@ -1457,6 +1457,17 @@ fn create_key_file(path: &Path) -> Result<fs::File, std::io::Error> {
 mod tests {
     use super::*;
 
+    fn signed_cookie(public: &OAuthPublic, domain: &str, value: &str) -> String {
+        let payload = URL_SAFE_NO_PAD.encode(value.as_bytes());
+        let mut mac = HmacSha256::new_from_slice(&public.cookie_key()).unwrap();
+        mac.update(domain.as_bytes());
+        mac.update(payload.as_bytes());
+        format!(
+            "{payload}.{}",
+            URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+        )
+    }
+
     #[test]
     fn cookie_hmac_key_is_distinct_from_the_oauth_signing_scalar() {
         let public = OAuthPublic::new("https://appview.example").unwrap();
@@ -1465,6 +1476,28 @@ mod tests {
             .decode(serialized.get("d").and_then(Value::as_str).unwrap())
             .unwrap();
         assert_ne!(public.cookie_key(), signing_scalar);
+    }
+
+    #[test]
+    fn expired_login_cookie_is_rejected() {
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        let cookie = signed_cookie(
+            &public,
+            "login:",
+            &format!("binding\n{}", unix_time().saturating_sub(1)),
+        );
+        assert!(public.verify_login_cookie(&cookie).is_none());
+    }
+
+    #[test]
+    fn expired_session_cookie_is_rejected() {
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        let cookie = signed_cookie(
+            &public,
+            "session:",
+            &format!("did:plc:alice\n{}\n1", unix_time().saturating_sub(1)),
+        );
+        assert!(public.verify_session_cookie(&cookie).is_none());
     }
 }
 

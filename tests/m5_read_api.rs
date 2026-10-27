@@ -138,7 +138,19 @@ fn api_for_storage<S: Storage + 'static>(storage: Arc<S>) -> (axum::Router, P256
 }
 
 fn token(key: &P256Keypair, aud: &str, lxm: &str, exp: u64, sub: Option<&str>) -> String {
-    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","typ":"JWT"}"#);
+    token_with_algorithm(key, "ES256", aud, lxm, exp, sub)
+}
+
+fn token_with_algorithm(
+    key: &P256Keypair,
+    algorithm: &str,
+    aud: &str,
+    lxm: &str,
+    exp: u64,
+    sub: Option<&str>,
+) -> String {
+    let header =
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&json!({"alg":algorithm,"typ":"JWT"})).unwrap());
     let payload = json!({"iss":ISSUER,"aud":aud,"exp":exp,"iat":expiry(0),"lxm":lxm,"sub":sub});
     let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
     let message = format!("{header}.{payload}");
@@ -449,6 +461,21 @@ async fn proxy_jwt_rejects_a_valid_claim_set_signed_by_another_key() {
         Some(ALICE),
     );
     let (status, _) = request(router, "/xrpc/app.bsky.feed.getTimeline", Some(&forged)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn proxy_jwt_rejects_an_algorithm_that_does_not_match_the_issuer_key() {
+    let (router, signing_key) = api();
+    let mismatched = token_with_algorithm(
+        &signing_key,
+        "ES256K",
+        APPVIEW,
+        "app.bsky.feed.getTimeline",
+        expiry(60),
+        Some(ALICE),
+    );
+    let (status, _) = request(router, "/xrpc/app.bsky.feed.getTimeline", Some(&mismatched)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
