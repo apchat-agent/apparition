@@ -4,8 +4,10 @@ use atrium_repo::{
     Repository,
     blockstore::{AsyncBlockStoreRead, CarStore},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use futures_util::TryStreamExt;
 use ipld_core::cid::Cid;
+use ipld_core::ipld::Ipld;
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
@@ -232,10 +234,11 @@ impl RepoVerifier for AtriumRepoVerifier {
                 continue;
             }
             let record = repository
-                .get_raw::<Value>(&path)
+                .get_raw::<Ipld>(&path)
                 .await
                 .map_err(|error| BackfillError::Verify(error.to_string()))?
                 .ok_or_else(|| BackfillError::Verify(format!("record block {cid} is missing")))?;
+            let record = ipld_to_atproto_json(record).map_err(BackfillError::Verify)?;
             records.push(RepoRecord {
                 collection: collection.to_owned(),
                 rkey: rkey.to_owned(),
@@ -244,6 +247,38 @@ impl RepoVerifier for AtriumRepoVerifier {
             });
         }
         Ok(VerifiedRepo { records })
+    }
+}
+
+fn ipld_to_atproto_json(value: Ipld) -> Result<Value, String> {
+    match value {
+        Ipld::Null => Ok(Value::Null),
+        Ipld::Bool(value) => Ok(Value::Bool(value)),
+        Ipld::Integer(value) => {
+            if let Ok(value) = i64::try_from(value) {
+                Ok(Value::Number(value.into()))
+            } else if let Ok(value) = u64::try_from(value) {
+                Ok(Value::Number(value.into()))
+            } else {
+                Err("integer is outside the ATProto JSON range".into())
+            }
+        }
+        Ipld::Float(_) => Err("ATProto data model does not permit floating point values".into()),
+        Ipld::String(value) => Ok(Value::String(value)),
+        Ipld::Bytes(value) => Ok(serde_json::json!({
+            "$bytes": STANDARD_NO_PAD.encode(value),
+        })),
+        Ipld::List(values) => values
+            .into_iter()
+            .map(ipld_to_atproto_json)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
+        Ipld::Map(values) => values
+            .into_iter()
+            .map(|(key, value)| Ok((key, ipld_to_atproto_json(value)?)))
+            .collect::<Result<serde_json::Map<_, _>, String>>()
+            .map(Value::Object),
+        Ipld::Link(cid) => Ok(serde_json::json!({ "$link": cid.to_string() })),
     }
 }
 
