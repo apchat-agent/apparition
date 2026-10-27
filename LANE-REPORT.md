@@ -122,3 +122,22 @@ F7 and F9–F13 were not addressed in av2: write-route CSRF, DID-document cachin
 - `cargo clippy --locked --offline --all-targets -- -D warnings`: passed.
 - `cargo deny check licenses`: passed (`licenses ok`).
 - Red and green changes are committed locally. No live-account login was attempted, and nothing was pushed.
+
+## av6 local-index web UI and granular OAuth permissions (2026-10-27)
+
+| Item | Status | Evidence |
+| --- | --- | --- |
+| Web timeline, profile, and thread reads | Complete | `/app` shares the local timeline selection with XRPC `getTimeline`; profile and thread read indexed records. `logged_in_web_views_render_from_the_local_index_without_pds_reads` seeds the index and asserts the OAuth/PDS timeline read path is never called. |
+| Registration and followed-account backfill | Complete | OAuth registration queues the signed-in DID. A verified repo snapshot for a registered DID queues the accounts it follows. `registered_repo_backfill_queues_followed_accounts_and_tracks_completion` covers both memory and SQLite storage. |
+| Empty timeline progress | Complete | `/app` shows the in-scope account count and completed backfills while its local timeline is empty. `empty_timeline_reports_backfill_progress_for_registered_account` checks the initial `Indexing 1 account, 0 done` state. |
+| Requested OAuth scope | Complete | Exact scope in confidential metadata, loopback client ID, and confidential/loopback PAR requests: `atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete`. No `transition:generic` or RPC scopes are requested. |
+| Partial permission grant | Complete | `callback_keeps_partial_write_grants_read_only_and_blocks_actions` verifies an `atproto`-only grant signs in read-only, explains the missing repo grants, hides write controls, and blocks writes with 403. |
+
+### av6 verification
+
+- Red/green commits were made for local web reads, granular scopes/read-only fallback, and backfill/progress behavior.
+- `cargo fmt --check`: passed.
+- `cargo test --locked --offline`: passed, 68 tests (unit: 4, M1: 2, M2: 5, M3: 7, M4: 4, M5 config: 5, M5 read API: 11, M6 web OAuth: 26, M6 protocol: 4).
+- `cargo clippy --locked --offline -- -D warnings`: passed.
+- `cargo deny check licenses`: passed (`licenses ok`).
+- No external live-account OAuth run was made in this lane; the web and OAuth protocol checks use local fakes. Nothing was pushed.

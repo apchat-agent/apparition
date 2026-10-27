@@ -37,7 +37,9 @@ Response shapes are checked against recorded public API fixtures. The API is a s
 
 The web client publishes confidential OAuth metadata with a stable P-256 key. It resolves the login handle or DID and PDS, discovers OAuth metadata, then delegates PAR, PKCE, DPoP proofs and nonce retries, code exchange, issuer validation, and token refresh to Atrium OAuth. Authorization state and refreshable sessions are persisted in SQLite. The callback validates the returned token scope and subject DID before registering the account. Browser sessions use an HMAC-signed, HttpOnly, SameSite cookie; HTTPS deployments also mark it Secure. Each browser login gets a random session ID and its own generation counter, so signing in on another device does not invalidate existing sessions. Logout advances only the current session's counter.
 
-The `/login` and `/app` pages provide login, timeline, post, like, and repost actions. Profile and thread pages read from the local indexed store. Record writes go through the logged-in user's OAuth session to their PDS.
+The `/app` timeline uses the same local indexed-record query as `app.bsky.feed.getTimeline`; profile and thread pages also read only the local index. An empty timeline reports the number of in-scope accounts and completed repo backfills. Successful login registers the account and queues its repo; importing that repo queues each followed account for backfill.
+
+OAuth requests `atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete` in both confidential and loopback modes. `atproto` supplies the AT Protocol account identity; the other scopes grant only the repo record actions used by the UI. The callback accepts a valid `atproto` session with partial repo grants as read-only. Posting, liking, and reposting are enabled only when every requested repo scope was granted. Record writes go through the logged-in user's OAuth session to their PDS.
 
 ## Current limits
 

@@ -67,7 +67,7 @@ The API also publishes the `did:web` document with the `#bsky_appview` service e
 
 The upstream Bluesky social-app currently points public reads at its hosted AppView. A social-app fork or development build must configure both its AppView host and AppView DID to use this service; setting only the host does not configure service-proxy authentication. The current source has a development URL override named `EXPO_PUBLIC_DEV_ENV_APPVIEW_URL`; production builds can change the `PUBLIC_APPVIEW` and `PUBLIC_APPVIEW_DID` constants and the proxy DID configuration in the fork. This repo does not build or patch the social-app client.
 
-The built-in UI is available at `/login`. It resolves a handle or DID, starts OAuth, shows the signed-in account's timeline, and sends post, like, and repost records to that account's PDS.
+The built-in UI is available at `/login`. It resolves a handle or DID, starts OAuth, and shows the signed-in account's timeline from this AppView's local index. The initial account and its followed accounts are backfilled from their PDS repos; while the timeline is empty, `/app` reports backfill progress. Posting, liking, and reposting send records to the user's PDS. If the authorization server grants `atproto` but omits any requested repo write scope, the session stays read-only and the UI explains why.
 
 ## Checks
 
