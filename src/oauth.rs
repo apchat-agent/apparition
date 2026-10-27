@@ -1,5 +1,8 @@
-use crate::identity::{HttpIdentityBackend, IdentityResolver};
 use crate::ingest::{MemoryStorage, Storage};
+use crate::{
+    api::timeline_records,
+    identity::{HttpIdentityBackend, IdentityResolver},
+};
 use atrium_api::{
     agent::{Agent, SessionManager},
     types::string::{AtIdentifier, Datetime, Did},
@@ -1157,20 +1160,17 @@ where
     let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return Redirect::to("/login").into_response();
     };
-    let timeline = match state.flow.timeline(&did).await {
-        Ok(timeline) => timeline,
-        Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
+    let records = match state.storage.records() {
+        Ok(records) => records,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
+    let timeline = timeline_records(&records, &did, 50);
     let posts = timeline
         .iter()
-        .map(|item| {
-            let post = item.get("post").unwrap_or(item);
-            let uri = post.get("uri").and_then(Value::as_str).unwrap_or("");
-            let cid = post.get("cid").and_then(Value::as_str).unwrap_or("");
-            let text = post
-                .pointer("/record/text")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+        .map(|record| {
+            let uri = record.uri.as_str();
+            let cid = record.cid.as_deref().unwrap_or("");
+            let text = record.record.get("text").and_then(Value::as_str).unwrap_or("");
             format!(
                 "<li><a href=\"/thread?uri={}\">{}</a><form action=\"/like\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{}\"><input type=\"hidden\" name=\"cid\" value=\"{}\"><button>Like</button></form><form action=\"/repost\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{}\"><input type=\"hidden\" name=\"cid\" value=\"{}\"><button>Repost</button></form></li>",
                 html_escape(uri), html_escape(text), html_escape(uri), html_escape(cid),
@@ -1178,6 +1178,11 @@ where
             )
         })
         .collect::<String>();
+    let posts = if posts.is_empty() {
+        "<li>No indexed posts yet.</li>".to_owned()
+    } else {
+        posts
+    };
     Html(format!(
         "<!doctype html><html><head><title>AppView</title></head><body><main><h1>Timeline for {}</h1><nav><a href=\"/profile?did={}\">Profile</a> <form action=\"/logout\" method=\"post\"><button>Log out</button></form></nav><ol>{posts}</ol><form action=\"/post\" method=\"post\"><textarea name=\"text\" required></textarea><button>Post</button></form></main></body></html>",
         html_escape(&did), html_escape(&did)

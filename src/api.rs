@@ -294,17 +294,28 @@ async fn get_timeline<S: Storage, B: IdentityBackend>(
         .ok_or_else(|| ApiError::unauthorized("service JWT required"))?;
     let actor = claims.iss;
     let records = state.storage.records().map_err(|_| ApiError::internal())?;
-    let followed = follow_subjects(&records, &actor);
-    let limit = query_limit(&query, 50);
-    let feed = records
+    let feed = timeline_records(&records, &actor, query_limit(&query, 50))
+        .into_iter()
+        .map(|record| json!({"post":post_view(&state, record, &records)}))
+        .collect::<Vec<_>>();
+    Ok(Json(json!({"feed":feed})))
+}
+
+/// Select posts for one account's local timeline. The web UI and XRPC API use
+/// this same query so neither needs to proxy reads through the account's PDS.
+pub fn timeline_records<'a>(
+    records: &'a [IndexedRecord],
+    actor: &str,
+    limit: usize,
+) -> Vec<&'a IndexedRecord> {
+    let followed = follow_subjects(records, actor);
+    records
         .iter()
         .filter(|record| {
             record.collection == POST && (record.did == actor || followed.contains(&record.did))
         })
-        .take(limit)
-        .map(|record| json!({"post":post_view(&state, record, &records)}))
-        .collect::<Vec<_>>();
-    Ok(Json(json!({"feed":feed})))
+        .take(limit.clamp(1, 100))
+        .collect()
 }
 
 async fn get_likes<S: Storage, B: IdentityBackend>(

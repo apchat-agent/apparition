@@ -1081,8 +1081,12 @@ async fn logging_in_on_another_device_keeps_the_first_session_valid() {
 async fn logged_in_web_views_render_from_the_local_index_without_pds_reads() {
     let storage = Arc::new(MemoryStorage::default());
     storage.register_user("did:plc:alice").unwrap();
-    storage.set_verified_handle("did:plc:alice", "alice.test").unwrap();
-    storage.set_follow("did:plc:alice", "did:plc:friend", true).unwrap();
+    storage
+        .set_verified_handle("did:plc:alice", "alice.test")
+        .unwrap();
+    storage
+        .set_follow("did:plc:alice", "did:plc:friend", true)
+        .unwrap();
     for record in [
         IndexedRecord {
             did: "did:plc:alice".into(),
@@ -1110,6 +1114,15 @@ async fn logged_in_web_views_render_from_the_local_index_without_pds_reads() {
             cid: Some("friend-cid".into()),
             time_us: 1,
             record: serde_json::json!({"text":"followed account from local index"}),
+        },
+        IndexedRecord {
+            did: "did:plc:alice".into(),
+            collection: "app.bsky.graph.follow".into(),
+            rkey: "friend-follow".into(),
+            uri: "at://did:plc:alice/app.bsky.graph.follow/friend-follow".into(),
+            cid: Some("follow-cid".into()),
+            time_us: 0,
+            record: serde_json::json!({"subject":"did:plc:friend"}),
         },
     ] {
         storage.put_record(&record).unwrap();
@@ -1155,7 +1168,13 @@ async fn logged_in_web_views_render_from_the_local_index_without_pds_reads() {
     assert!(html.contains("post from local index"));
     assert!(html.contains("followed account from local index"));
     assert!(!html.contains("from OAuth timeline"));
-    assert!(!actions.lock().unwrap().iter().any(|action| action == "timeline"));
+    assert!(
+        !actions
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|action| action == "timeline")
+    );
 
     let profile = app
         .clone()
@@ -1169,7 +1188,13 @@ async fn logged_in_web_views_render_from_the_local_index_without_pds_reads() {
         .await
         .unwrap();
     let profile_html = String::from_utf8(
-        profile.into_body().collect().await.unwrap().to_bytes().to_vec(),
+        profile
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
     )
     .unwrap();
     assert!(profile_html.contains("Alice from local index"));
@@ -1185,11 +1210,23 @@ async fn logged_in_web_views_render_from_the_local_index_without_pds_reads() {
         .await
         .unwrap();
     let thread_html = String::from_utf8(
-        thread.into_body().collect().await.unwrap().to_bytes().to_vec(),
+        thread
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
     )
     .unwrap();
     assert!(thread_html.contains("post from local index"));
-    assert!(!actions.lock().unwrap().iter().any(|action| action == "timeline"));
+    assert!(
+        !actions
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|action| action == "timeline")
+    );
 }
 
 #[tokio::test]
