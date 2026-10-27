@@ -10,7 +10,10 @@ use atrium_api::{
     did_doc::{DidDocument, Service},
     types::string::{Did, Handle},
 };
-use atrium_common::{resolver::Resolver, store::memory::MemoryStore};
+use atrium_common::{
+    resolver::Resolver,
+    store::{Store, memory::MemoryStore},
+};
 use atrium_oauth::store::{session::Session, state::InternalStateData};
 use atrium_oauth::{
     AtprotoClientMetadata, AuthMethod, AuthorizeOptions, CallbackParams, GrantType, KnownScope,
@@ -266,7 +269,7 @@ async fn oauth_protocol_checks_state_issuer_nonce_and_refresh_against_fake_pds()
 
 #[tokio::test]
 async fn production_oauth_flow_accepts_standard_callback_and_binds_subject_and_scope() {
-    let (flow, shared, server) = production_flow(None, None).await;
+    let (flow, _, shared, server) = production_flow(None, None).await;
     flow.authorize(DID, "browser-binding-one").await.unwrap();
     let state = latest_state(&shared);
     let result = flow
@@ -285,7 +288,7 @@ async fn production_oauth_flow_accepts_standard_callback_and_binds_subject_and_s
     assert_eq!(shared.lock().unwrap().token_count, 1);
     server.abort();
 
-    let (flow, shared, server) =
+    let (flow, _, shared, server) =
         production_flow(Some("did:plc:zyxwvutsrqponmlkjihgfedcba"), Some("atproto")).await;
     flow.authorize(DID, "browser-binding-two").await.unwrap();
     let state = latest_state(&shared);
@@ -301,7 +304,7 @@ async fn production_oauth_flow_accepts_standard_callback_and_binds_subject_and_s
     assert!(result.unwrap_err().contains("subject DID"));
     server.abort();
 
-    let (flow, shared, server) = production_flow(Some(DID), Some("profile")).await;
+    let (flow, _, shared, server) = production_flow(Some(DID), Some("profile")).await;
     flow.authorize(DID, "browser-binding-three").await.unwrap();
     let state = latest_state(&shared);
     let result = flow
@@ -319,7 +322,7 @@ async fn production_oauth_flow_accepts_standard_callback_and_binds_subject_and_s
 
 #[tokio::test]
 async fn production_oauth_flow_rejects_a_foreign_browser_binding() {
-    let (flow, shared, server) = production_flow(None, Some("atproto")).await;
+    let (flow, store, shared, server) = production_flow(None, Some("atproto")).await;
     flow.authorize(DID, "browser-binding-expected")
         .await
         .unwrap();
@@ -337,6 +340,23 @@ async fn production_oauth_flow_rejects_a_foreign_browser_binding() {
         result.unwrap_err().contains("browser binding"),
         "production callback must reject a state bound to another browser"
     );
+    assert!(
+        store
+            .get(&DID.parse::<Did>().unwrap())
+            .await
+            .unwrap()
+            .is_none(),
+        "production callback must delete the exchanged OAuth session on a binding mismatch"
+    );
+    assert!(
+        shared
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|request| request.path == "/revoke"),
+        "production callback must revoke the exchanged OAuth tokens on a binding mismatch"
+    );
     server.abort();
 }
 
@@ -345,6 +365,7 @@ async fn production_flow(
     token_scope: Option<&str>,
 ) -> (
     appview_rs::oauth::AtriumOAuthFlow<ProductionFlowIdentity>,
+    SqliteOAuthStore,
     Arc<Mutex<FakeServerState>>,
     tokio::task::JoinHandle<()>,
 ) {
@@ -385,14 +406,11 @@ async fn production_flow(
     };
     let resolver = Arc::new(IdentityResolver::new(identity, Duration::from_secs(30)));
     let public = OAuthPublic::new("https://appview.example").unwrap();
+    let store = SqliteOAuthStore::open(":memory:").unwrap();
     let flow = public
-        .atrium_flow_with_plc_directory(
-            resolver,
-            SqliteOAuthStore::open(":memory:").unwrap(),
-            &format!("{origin}/"),
-        )
+        .atrium_flow_with_plc_directory(resolver, store.clone(), &format!("{origin}/"))
         .unwrap();
-    (flow, shared, server)
+    (flow, store, shared, server)
 }
 
 fn server_origin(shared: &Arc<Mutex<FakeServerState>>) -> String {
@@ -510,6 +528,7 @@ async fn serve_one(mut stream: TcpStream, origin: &str, state: Arc<Mutex<FakeSer
                     )
                 }
             }
+            "/revoke" => (200, vec![], "{}".to_owned()),
             path if path.starts_with("/xrpc/app.bsky.feed.getTimeline") => {
                 state.timeline_count += 1;
                 match state.timeline_count {
