@@ -1,10 +1,17 @@
-use axum::{Json, Router, response::Html, routing::get};
+use crate::ingest::{MemoryStorage, Storage};
+use axum::{
+    Json, Router,
+    extract::{Query, State},
+    http::StatusCode,
+    response::{Html, IntoResponse},
+    routing::{get, post},
+};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jose_jwk::{Ec, EcCurves, Jwk, Key, Parameters};
 use p256::{SecretKey, elliptic_curve::sec1::ToEncodedPoint};
 use rand::thread_rng;
 use serde_json::{Value, json};
-use std::{fs, io::Write, path::Path};
+use std::{collections::HashMap, fs, future::Future, io::Write, path::Path, pin::Pin, sync::Arc};
 use thiserror::Error;
 
 const METADATA_PATH: &str = "/.well-known/oauth-client-metadata.json";
@@ -27,6 +34,64 @@ pub struct OAuthPublic {
     public_url: String,
     private_key: Jwk,
     metadata: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OAuthCallback {
+    pub code: String,
+    pub state: String,
+    pub issuer: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OAuthAccount {
+    pub did: String,
+    pub verified_handle: Option<String>,
+}
+
+pub trait OAuthFlow: Clone + Send + Sync + 'static {
+    fn authorize<'a>(
+        &'a self,
+        login: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
+    fn callback<'a>(
+        &'a self,
+        params: OAuthCallback,
+    ) -> Pin<Box<dyn Future<Output = Result<OAuthAccount, String>> + Send + 'a>>;
+    fn logout<'a>(
+        &'a self,
+        did: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+}
+
+#[derive(Clone)]
+pub struct DisabledOAuthFlow;
+
+impl OAuthFlow for DisabledOAuthFlow {
+    fn authorize<'a>(
+        &'a self,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async { Err("OAuth flow is not configured".to_owned()) })
+    }
+    fn callback<'a>(
+        &'a self,
+        _: OAuthCallback,
+    ) -> Pin<Box<dyn Future<Output = Result<OAuthAccount, String>> + Send + 'a>> {
+        Box::pin(async { Err("OAuth flow is not configured".to_owned()) })
+    }
+    fn logout<'a>(
+        &'a self,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Err("OAuth flow is not configured".to_owned()) })
+    }
+}
+
+pub struct OAuthWebState<F, S> {
+    pub public: OAuthPublic,
+    pub flow: F,
+    pub storage: Arc<S>,
 }
 
 impl OAuthPublic {
@@ -80,10 +145,25 @@ impl OAuthPublic {
     }
 
     pub fn router(&self) -> Router {
+        self.router_with_flow(DisabledOAuthFlow, Arc::new(MemoryStorage::default()))
+    }
+
+    pub fn router_with_flow<F, S>(&self, flow: F, storage: Arc<S>) -> Router
+    where
+        F: OAuthFlow,
+        S: Storage + 'static,
+    {
         Router::new()
-            .route(METADATA_PATH, get(metadata))
+            .route(METADATA_PATH, get(metadata::<F, S>))
             .route("/login", get(login))
-            .with_state(self.clone())
+            .route("/oauth/authorize", get(authorize::<F, S>))
+            .route("/oauth/callback", get(callback::<F, S>))
+            .route("/logout", post(logout::<F, S>))
+            .with_state(Arc::new(OAuthWebState {
+                public: self.clone(),
+                flow,
+                storage,
+            }))
     }
 
     fn from_key(public_url: &str, private_key: Jwk) -> Result<Self, OAuthConfigError> {
@@ -124,14 +204,76 @@ impl OAuthPublic {
     }
 }
 
-async fn metadata(axum::extract::State(state): axum::extract::State<OAuthPublic>) -> Json<Value> {
-    Json(state.metadata)
+async fn metadata<F, S>(State(state): State<Arc<OAuthWebState<F, S>>>) -> Json<Value>
+where
+    F: OAuthFlow,
+    S: Storage,
+{
+    Json(state.public.metadata.clone())
 }
 
 async fn login() -> Html<&'static str> {
     Html(
         "<!doctype html><html><head><title>Sign in</title></head><body><main><h1>Sign in to your AppView</h1><form action=\"/oauth/authorize\" method=\"get\"><label>AT Protocol handle or DID <input name=\"handle\" autocomplete=\"username\" required></label><button type=\"submit\">Continue</button></form></main></body></html>",
     )
+}
+
+async fn authorize<F, S>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> impl IntoResponse
+where
+    F: OAuthFlow,
+    S: Storage,
+{
+    if query
+        .get("handle")
+        .is_none_or(|handle| handle.trim().is_empty())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"invalid_request","message":"handle is required"})),
+        );
+    }
+    let _ = &state.flow;
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error":"temporarily_unavailable","message":"OAuth flow is not configured"})),
+    )
+}
+
+async fn callback<F, S>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> impl IntoResponse
+where
+    F: OAuthFlow,
+    S: Storage,
+{
+    if query.get("code").is_none_or(|code| code.trim().is_empty())
+        || query
+            .get("state")
+            .is_none_or(|state| state.trim().is_empty())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"invalid_request","message":"code and state are required"})),
+        );
+    }
+    let _ = &state.storage;
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error":"temporarily_unavailable","message":"OAuth flow is not configured"})),
+    )
+}
+
+async fn logout<F, S>(State(state): State<Arc<OAuthWebState<F, S>>>) -> impl IntoResponse
+where
+    F: OAuthFlow,
+    S: Storage,
+{
+    let _ = (&state.flow, &state.storage, &state.public);
+    StatusCode::SERVICE_UNAVAILABLE
 }
 
 fn create_key() -> Jwk {
