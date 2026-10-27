@@ -26,6 +26,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::FutureExt;
+use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use jose_jwk::{Ec, EcCurves, Jwk, Key, Parameters};
 use p256::{SecretKey, elliptic_curve::sec1::ToEncodedPoint};
@@ -305,6 +306,7 @@ impl OAuthPublic {
         let encoded = URL_SAFE_NO_PAD.encode(payload.as_bytes());
         let mut mac = HmacSha256::new_from_slice(&self.cookie_key())
             .expect("HMAC accepts keys of any length");
+        mac.update(b"session:");
         mac.update(encoded.as_bytes());
         format!(
             "{encoded}.{}",
@@ -345,6 +347,7 @@ impl OAuthPublic {
         let (payload, signature) = token.split_once('.')?;
         let signature = URL_SAFE_NO_PAD.decode(signature).ok()?;
         let mut mac = HmacSha256::new_from_slice(&self.cookie_key()).ok()?;
+        mac.update(b"session:");
         mac.update(payload.as_bytes());
         mac.verify_slice(&signature).ok()?;
         let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
@@ -362,14 +365,19 @@ impl OAuthPublic {
     fn cookie_key(&self) -> Vec<u8> {
         let serialized =
             serde_json::to_value(&self.private_key).expect("the validated JWK is serializable");
-        URL_SAFE_NO_PAD
+        let secret = URL_SAFE_NO_PAD
             .decode(
                 serialized
                     .get("d")
                     .and_then(Value::as_str)
                     .unwrap_or_default(),
             )
-            .expect("the validated JWK has a valid private key")
+            .expect("the validated JWK has a valid private key");
+        let hkdf = Hkdf::<Sha256>::new(Some(b"appview-cookie-hmac-v1"), &secret);
+        let mut derived = [0u8; 32];
+        hkdf.expand(b"web-session-cookie", &mut derived)
+            .expect("a 32-byte HKDF output is valid for SHA-256");
+        derived.to_vec()
     }
 }
 
