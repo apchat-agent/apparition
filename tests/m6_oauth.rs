@@ -79,3 +79,14 @@ async fn login_page_accepts_an_atproto_handle_or_did() {
     assert!(html.contains("name=\"handle\""));
     assert!(html.contains("/oauth/authorize"));
 }
+
+#[tokio::test]
+async fn authorization_and_callback_reject_missing_protocol_parameters() {
+    for path in ["/oauth/authorize", "/oauth/callback"] {
+        let response = router()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+    }
+}
