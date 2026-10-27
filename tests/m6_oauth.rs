@@ -209,7 +209,7 @@ async fn oauth_callback_registers_account_and_logout_clears_its_session() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/oauth/callback?code=valid-code&state=valid-state")
+                .uri("/oauth/callback?code=valid-code&state=valid-state&scope=atproto")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -338,7 +338,7 @@ async fn logged_in_write_forms_use_the_account_oauth_flow() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/oauth/callback?code=valid-code&state=valid-state")
+                .uri("/oauth/callback?code=valid-code&state=valid-state&scope=atproto")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -387,4 +387,23 @@ async fn logged_in_write_forms_use_the_account_oauth_flow() {
             "repost:did:plc:alice:at://did:plc:author/app.bsky.feed.post/r1:bafyreifake",
         ]
     );
+}
+
+#[tokio::test]
+async fn callback_rejects_sessions_without_the_required_atproto_scope() {
+    let storage = Arc::new(MemoryStorage::default());
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage.clone());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?code=valid-code&state=valid-state&scope=profile")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(!storage.is_registered("did:plc:alice").unwrap());
 }
