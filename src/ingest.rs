@@ -1203,7 +1203,7 @@ impl<S: Storage + 'static> JetstreamConsumer<S> {
             .map_err(|error| IngestError::WebSocket(error.to_string()))?;
         tracing::info!(%url, "Jetstream connected");
         let _connection_log = JetstreamConnectionLog(url.to_owned());
-        let result = async {
+        async {
             loop {
                 let message = tokio::time::timeout(self.idle_timeout, websocket.next())
                     .await
@@ -1229,8 +1229,7 @@ impl<S: Storage + 'static> JetstreamConsumer<S> {
             }
             Ok(())
         }
-        .await;
-        result
+        .await
     }
 
     async fn process_event_text(&self, text: String) -> Result<(), IngestError> {
