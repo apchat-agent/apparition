@@ -17,6 +17,8 @@ pub struct Config {
     pub jetstream_urls: Vec<String>,
     #[serde(default = "default_appview_did")]
     pub appview_did: String,
+    #[serde(default = "default_public_url")]
+    pub public_url: String,
 }
 
 impl Default for Config {
@@ -28,6 +30,7 @@ impl Default for Config {
             scope_mode: ScopeMode::default(),
             jetstream_urls: default_jetstream_urls(),
             appview_did: default_appview_did(),
+            public_url: default_public_url(),
         }
     }
 }
@@ -75,6 +78,7 @@ impl Config {
                         .collect();
                 }
                 "APPVIEW_DID" => config.appview_did = value.to_owned(),
+                "APPVIEW_PUBLIC_URL" => config.public_url = value.to_owned(),
                 _ => {}
             }
         }
@@ -110,6 +114,11 @@ impl Config {
                 "APPVIEW_JETSTREAM_URLS",
                 env::var("APPVIEW_JETSTREAM_URLS").unwrap_or_default(),
             ),
+            ("APPVIEW_DID", env::var("APPVIEW_DID").unwrap_or_default()),
+            (
+                "APPVIEW_PUBLIC_URL",
+                env::var("APPVIEW_PUBLIC_URL").unwrap_or_default(),
+            ),
         ];
         let nonempty = env_values
             .into_iter()
@@ -137,6 +146,7 @@ impl Config {
                             .collect();
                     }
                     "APPVIEW_DID" => config.appview_did = value,
+                    "APPVIEW_PUBLIC_URL" => config.public_url = value,
                     _ => unreachable!(),
                 }
             }
@@ -164,4 +174,8 @@ fn default_jetstream_urls() -> Vec<String> {
 
 fn default_appview_did() -> String {
     "did:web:localhost".to_owned()
+}
+
+fn default_public_url() -> String {
+    "https://appview.example".to_owned()
 }

@@ -8,7 +8,8 @@ use appview_rs::{
     ingest::{Ingestor, JetstreamConsumer, SqliteStorage},
     init_tracing,
     jwt::ServiceJwtVerifier,
-    router,
+    oauth::OAuthPublic,
+    router_with_oauth,
 };
 use std::{error::Error, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
@@ -22,6 +23,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let storage = Arc::new(SqliteStorage::open(
         PathBuf::from(&config.data_dir).join("appview.db"),
     )?);
+    let oauth = OAuthPublic::load_or_create(
+        &config.public_url,
+        PathBuf::from(&config.data_dir).join("oauth-client-key.json"),
+    )?;
     let ingestor = Ingestor::new(storage.clone(), config.scope_mode);
     let consumer = JetstreamConsumer::new(ingestor, Duration::from_secs(1));
     let jetstream_urls = config.jetstream_urls.clone();
@@ -34,7 +39,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         jwt_resolver,
         config.appview_did.clone(),
     ));
-    let app_router = router().merge(api_router(storage.clone(), jwt, config.appview_did.clone()));
+    let app_router = router_with_oauth(oauth).merge(api_router(
+        storage.clone(),
+        jwt,
+        config.appview_did.clone(),
+    ));
     let backfiller = RepoBackfiller::new(
         storage.clone(),
         HttpRepoSource::default(),

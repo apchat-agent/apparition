@@ -4,13 +4,22 @@ pub mod config;
 pub mod identity;
 pub mod ingest;
 pub mod jwt;
+pub mod oauth;
 
 use axum::{Json, Router, routing::get};
 use serde::Serialize;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 pub fn router() -> Router {
-    Router::new().route("/xrpc/_health", get(health))
+    let oauth = oauth::OAuthPublic::new("https://appview.example")
+        .expect("default OAuth public origin is valid");
+    router_with_oauth(oauth)
+}
+
+pub fn router_with_oauth(oauth: oauth::OAuthPublic) -> Router {
+    Router::new()
+        .route("/xrpc/_health", get(health))
+        .merge(oauth.router())
 }
 
 #[derive(Serialize)]
