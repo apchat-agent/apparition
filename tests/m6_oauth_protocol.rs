@@ -267,7 +267,7 @@ async fn oauth_protocol_checks_state_issuer_nonce_and_refresh_against_fake_pds()
 #[tokio::test]
 async fn production_oauth_flow_accepts_standard_callback_and_binds_subject_and_scope() {
     let (flow, shared, server) = production_flow(None, None).await;
-    flow.authorize(DID).await.unwrap();
+    flow.authorize(DID, "browser-binding-one").await.unwrap();
     let state = latest_state(&shared);
     let result = flow
         .callback(OAuthCallback {
@@ -275,6 +275,7 @@ async fn production_oauth_flow_accepts_standard_callback_and_binds_subject_and_s
             state,
             issuer: Some(server_origin(&shared)),
             scope: None,
+            browser_binding: Some("browser-binding-one".to_owned()),
         })
         .await;
     assert!(
@@ -286,7 +287,7 @@ async fn production_oauth_flow_accepts_standard_callback_and_binds_subject_and_s
 
     let (flow, shared, server) =
         production_flow(Some("did:plc:zyxwvutsrqponmlkjihgfedcba"), Some("atproto")).await;
-    flow.authorize(DID).await.unwrap();
+    flow.authorize(DID, "browser-binding-two").await.unwrap();
     let state = latest_state(&shared);
     let result = flow
         .callback(OAuthCallback {
@@ -294,13 +295,14 @@ async fn production_oauth_flow_accepts_standard_callback_and_binds_subject_and_s
             state,
             issuer: Some(server_origin(&shared)),
             scope: None,
+            browser_binding: Some("browser-binding-two".to_owned()),
         })
         .await;
     assert!(result.unwrap_err().contains("subject DID"));
     server.abort();
 
     let (flow, shared, server) = production_flow(Some(DID), Some("profile")).await;
-    flow.authorize(DID).await.unwrap();
+    flow.authorize(DID, "browser-binding-three").await.unwrap();
     let state = latest_state(&shared);
     let result = flow
         .callback(OAuthCallback {
@@ -308,6 +310,7 @@ async fn production_oauth_flow_accepts_standard_callback_and_binds_subject_and_s
             state,
             issuer: Some(server_origin(&shared)),
             scope: None,
+            browser_binding: Some("browser-binding-three".to_owned()),
         })
         .await;
     assert!(result.unwrap_err().contains("atproto scope"));

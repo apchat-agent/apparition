@@ -7,7 +7,7 @@ use appview_rs::{
 use atrium_api::types::string::Did;
 use atrium_common::store::Store;
 use atrium_oauth::store::{session::Session, state::InternalStateData};
-use axum::{body::Body, http::Request, http::StatusCode};
+use axum::{Router, body::Body, http::Request, http::StatusCode};
 use http_body_util::BodyExt;
 use serde_json::Value;
 use std::{
@@ -21,6 +21,7 @@ use tower::ServiceExt;
 struct FakeOAuthFlow {
     actions: Arc<Mutex<Vec<String>>>,
     granted_scope: Option<String>,
+    browser_binding: Arc<Mutex<Option<String>>>,
 }
 
 impl Default for FakeOAuthFlow {
@@ -28,6 +29,7 @@ impl Default for FakeOAuthFlow {
         Self {
             actions: Arc::new(Mutex::new(Vec::new())),
             granted_scope: Some("atproto".to_owned()),
+            browser_binding: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -45,8 +47,12 @@ impl OAuthFlow for FakeOAuthFlow {
     fn authorize<'a>(
         &'a self,
         login: &'a str,
+        browser_binding: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
-        Box::pin(async move { Ok(format!("https://auth.example/authorize?login={login}")) })
+        Box::pin(async move {
+            *self.browser_binding.lock().unwrap() = Some(browser_binding.to_owned());
+            Ok(format!("https://auth.example/authorize?login={login}"))
+        })
     }
 
     fn callback<'a>(
@@ -54,6 +60,10 @@ impl OAuthFlow for FakeOAuthFlow {
         params: OAuthCallback,
     ) -> Pin<Box<dyn Future<Output = Result<OAuthAccount, String>> + Send + 'a>> {
         Box::pin(async move {
+            let expected_binding = self.browser_binding.lock().unwrap().clone();
+            if params.browser_binding != expected_binding {
+                return Err("invalid browser binding".to_owned());
+            }
             if params.code != "valid-code" || params.state != "valid-state" {
                 return Err("invalid OAuth state or code".to_owned());
             }
@@ -130,6 +140,27 @@ impl OAuthFlow for FakeOAuthFlow {
             })])
         })
     }
+}
+
+async fn prelogin_cookie(app: &Router) -> String {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/authorize?handle=alice.test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    response.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned()
 }
 
 #[test]
@@ -256,12 +287,20 @@ async fn oauth_callback_registers_account_and_logout_clears_its_session() {
         authorization.headers()["location"],
         "https://auth.example/authorize?login=alice.test"
     );
+    let login_cookie = authorization.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
 
     let callback = app
         .clone()
         .oneshot(
             Request::builder()
                 .uri("/oauth/callback?code=valid-code&state=valid-state&scope=atproto")
+                .header("cookie", login_cookie)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -301,10 +340,12 @@ async fn oauth_callback_accepts_scope_from_the_token_response_without_query_scop
     let app = OAuthPublic::new("https://appview.example")
         .unwrap()
         .router_with_flow(FakeOAuthFlow::default(), storage.clone());
+    let login_cookie = prelogin_cookie(&app).await;
     let response = app
         .oneshot(
             Request::builder()
                 .uri("/oauth/callback?code=valid-code&state=valid-state&iss=https%3A%2F%2Fauth.example")
+                .header("cookie", login_cookie)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -406,11 +447,13 @@ async fn logged_in_write_forms_use_the_account_oauth_flow() {
     let flow = FakeOAuthFlow::default();
     let actions = flow.actions.clone();
     let app = public.router_with_flow(flow, Arc::new(MemoryStorage::default()));
+    let login_cookie = prelogin_cookie(&app).await;
     let callback = app
         .clone()
         .oneshot(
             Request::builder()
                 .uri("/oauth/callback?code=valid-code&state=valid-state&scope=atproto")
+                .header("cookie", login_cookie)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -465,11 +508,13 @@ async fn logged_in_write_forms_use_the_account_oauth_flow() {
 async fn session_cookie_rejects_a_tampered_hmac() {
     let public = OAuthPublic::new("https://appview.example").unwrap();
     let app = public.router_with_flow(FakeOAuthFlow::default(), Arc::new(MemoryStorage::default()));
+    let login_cookie = prelogin_cookie(&app).await;
     let callback = app
         .clone()
         .oneshot(
             Request::builder()
                 .uri("/oauth/callback?code=valid-code&state=valid-state&scope=atproto")
+                .header("cookie", login_cookie)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -504,11 +549,13 @@ async fn logged_in_timeline_comes_from_the_oauth_account_pds() {
     let app = OAuthPublic::new("https://appview.example")
         .unwrap()
         .router_with_flow(FakeOAuthFlow::default(), Arc::new(MemoryStorage::default()));
+    let login_cookie = prelogin_cookie(&app).await;
     let callback = app
         .clone()
         .oneshot(
             Request::builder()
                 .uri("/oauth/callback?code=valid-code&state=valid-state&scope=atproto")
+                .header("cookie", login_cookie)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -548,10 +595,12 @@ async fn callback_rejects_sessions_without_the_required_atproto_scope() {
             FakeOAuthFlow::with_granted_scope(Some("profile")),
             storage.clone(),
         );
+    let login_cookie = prelogin_cookie(&app).await;
     let response = app
         .oneshot(
             Request::builder()
                 .uri("/oauth/callback?code=valid-code&state=valid-state&scope=profile")
+                .header("cookie", login_cookie)
                 .body(Body::empty())
                 .unwrap(),
         )

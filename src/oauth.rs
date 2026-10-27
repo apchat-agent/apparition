@@ -28,7 +28,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use jose_jwk::{Ec, EcCurves, Jwk, Key, Parameters};
 use p256::{SecretKey, elliptic_curve::sec1::ToEncodedPoint};
-use rand::thread_rng;
+use rand::{RngCore, thread_rng};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -48,7 +48,9 @@ use thiserror::Error;
 const METADATA_PATH: &str = "/.well-known/oauth-client-metadata.json";
 const CALLBACK_PATH: &str = "/oauth/callback";
 const SESSION_COOKIE: &str = "appview_session";
+const LOGIN_COOKIE: &str = "appview_login";
 const SESSION_TTL_SECONDS: u64 = 30 * 24 * 60 * 60;
+const LOGIN_COOKIE_TTL_SECONDS: u64 = 10 * 60;
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Error)]
@@ -76,6 +78,7 @@ pub struct OAuthCallback {
     pub state: String,
     pub issuer: Option<String>,
     pub scope: Option<String>,
+    pub browser_binding: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,6 +92,7 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
     fn authorize<'a>(
         &'a self,
         login: &'a str,
+        browser_binding: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
     fn callback<'a>(
         &'a self,
@@ -135,6 +139,7 @@ pub struct DisabledOAuthFlow;
 impl OAuthFlow for DisabledOAuthFlow {
     fn authorize<'a>(
         &'a self,
+        _: &'a str,
         _: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async { Err("OAuth flow is not configured".to_owned()) })
@@ -306,6 +311,35 @@ impl OAuthPublic {
         )
     }
 
+    fn issue_login_cookie(&self, binding: &str) -> String {
+        let expires = unix_time().saturating_add(LOGIN_COOKIE_TTL_SECONDS);
+        let payload = URL_SAFE_NO_PAD.encode(format!("{binding}\n{expires}").as_bytes());
+        let mut mac = HmacSha256::new_from_slice(&self.cookie_key())
+            .expect("HMAC accepts keys of any length");
+        mac.update(b"login:");
+        mac.update(payload.as_bytes());
+        format!(
+            "{payload}.{}",
+            URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+        )
+    }
+
+    fn verify_login_cookie(&self, token: &str) -> Option<String> {
+        let (payload, signature) = token.split_once('.')?;
+        let signature = URL_SAFE_NO_PAD.decode(signature).ok()?;
+        let mut mac = HmacSha256::new_from_slice(&self.cookie_key()).ok()?;
+        mac.update(b"login:");
+        mac.update(payload.as_bytes());
+        mac.verify_slice(&signature).ok()?;
+        let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
+        let value = std::str::from_utf8(&decoded).ok()?;
+        let (binding, expires) = value.split_once('\n')?;
+        if binding.is_empty() || expires.parse::<u64>().ok()? <= unix_time() {
+            return None;
+        }
+        Some(binding.to_owned())
+    }
+
     fn verify_session_cookie(&self, token: &str) -> Option<String> {
         let (payload, signature) = token.split_once('.')?;
         let signature = URL_SAFE_NO_PAD.decode(signature).ok()?;
@@ -362,6 +396,7 @@ impl<B: crate::identity::IdentityBackend> Clone for AtriumOAuthFlow<B> {
 struct ExpectedOAuthIdentity {
     did: String,
     handle: Option<String>,
+    browser_binding: String,
 }
 
 #[derive(Debug, Error)]
@@ -616,6 +651,7 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
     fn authorize<'a>(
         &'a self,
         login: &'a str,
+        browser_binding: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async move {
             let identity = if login.starts_with("did:") {
@@ -632,6 +668,7 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
             let state = serde_json::to_string(&ExpectedOAuthIdentity {
                 did: identity.did,
                 handle: identity.handle,
+                browser_binding: browser_binding.to_owned(),
             })
             .map_err(|error| error.to_string())?;
             self.client
@@ -667,6 +704,9 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
                     .ok_or_else(|| "OAuth state has no expected identity".to_owned())?,
             )
             .map_err(|error| error.to_string())?;
+            if params.browser_binding.as_deref() != Some(expected.browser_binding.as_str()) {
+                return Err("OAuth browser binding does not match the authorization state".into());
+            }
             let did = session
                 .did()
                 .await
@@ -874,12 +914,34 @@ where
         )
             .into_response();
     }
+    let mut binding_bytes = [0u8; 32];
+    thread_rng().fill_bytes(&mut binding_bytes);
+    let browser_binding = URL_SAFE_NO_PAD.encode(binding_bytes);
     match state
         .flow
-        .authorize(query.get("handle").expect("validated above"))
+        .authorize(
+            query.get("handle").expect("validated above"),
+            &browser_binding,
+        )
         .await
     {
-        Ok(url) if valid_redirect_url(&url) => Redirect::to(&url).into_response(),
+        Ok(url) if valid_redirect_url(&url) => {
+            let mut response = Redirect::to(&url).into_response();
+            let cookie = format!(
+                "{LOGIN_COOKIE}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={LOGIN_COOKIE_TTL_SECONDS}{}",
+                state.public.issue_login_cookie(&browser_binding),
+                if state.public.public_url.starts_with("https://") {
+                    "; Secure"
+                } else {
+                    ""
+                },
+            );
+            response.headers_mut().insert(
+                header::SET_COOKIE,
+                HeaderValue::from_str(&cookie).expect("login cookie token is header safe"),
+            );
+            response
+        }
         Ok(_) => oauth_error(
             StatusCode::BAD_GATEWAY,
             "invalid authorization endpoint URL",
@@ -890,6 +952,7 @@ where
 
 async fn callback<F, S>(
     State(state): State<Arc<OAuthWebState<F, S>>>,
+    headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response
 where
@@ -907,12 +970,21 @@ where
         )
             .into_response();
     }
+    let browser_binding = cookie_value_named(&headers, LOGIN_COOKIE)
+        .and_then(|value| state.public.verify_login_cookie(value));
+    let Some(browser_binding) = browser_binding else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "OAuth callback is missing its browser binding cookie",
+        );
+    };
     let scope = query.get("scope").cloned();
     let params = OAuthCallback {
         code: query.get("code").expect("validated above").clone(),
         state: query.get("state").expect("validated above").clone(),
         issuer: query.get("iss").cloned(),
         scope,
+        browser_binding: Some(browser_binding),
     };
     let account = match state.flow.callback(params).await {
         Ok(account) => account,
@@ -945,6 +1017,11 @@ where
     response.headers_mut().insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&cookie).expect("cookie token is header safe"),
+    );
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&clear_login_cookie(&state.public))
+            .expect("login cookie clearing header is valid"),
     );
     response
 }
@@ -1165,13 +1242,28 @@ fn verified_cookie_did(public: &OAuthPublic, headers: &HeaderMap) -> Option<Stri
 }
 
 fn cookie_value(headers: &HeaderMap) -> Option<&str> {
+    cookie_value_named(headers, SESSION_COOKIE)
+}
+
+fn cookie_value_named<'a>(headers: &'a HeaderMap, expected_name: &str) -> Option<&'a str> {
     headers
         .get(header::COOKIE)?
         .to_str()
         .ok()?
         .split(';')
         .filter_map(|part| part.trim().split_once('='))
-        .find_map(|(name, value)| (name == SESSION_COOKIE).then_some(value))
+        .find_map(|(name, value)| (name == expected_name).then_some(value))
+}
+
+fn clear_login_cookie(public: &OAuthPublic) -> String {
+    format!(
+        "{LOGIN_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{}",
+        if public.public_url.starts_with("https://") {
+            "; Secure"
+        } else {
+            ""
+        },
+    )
 }
 
 fn clear_session_cookie(mut response: Response) -> Response {
