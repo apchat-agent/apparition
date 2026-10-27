@@ -72,6 +72,7 @@ pub trait Storage: Send + Sync {
     fn cursor(&self) -> Result<Option<u64>, StorageError>;
     fn set_cursor(&self, cursor: u64) -> Result<(), StorageError>;
     fn register_user(&self, did: &str) -> Result<(), StorageError>;
+    fn unregister_user(&self, did: &str) -> Result<(), StorageError>;
     fn is_registered(&self, did: &str) -> Result<bool, StorageError>;
     fn set_follow(&self, actor: &str, subject: &str, following: bool) -> Result<(), StorageError>;
     fn is_followed_by_registered(&self, did: &str) -> Result<bool, StorageError>;
@@ -205,6 +206,20 @@ impl Storage for MemoryStorage {
             .map_err(|_| StorageError::Poisoned)?
             .registered
             .contains(did))
+    }
+
+    fn unregister_user(&self, did: &str) -> Result<(), StorageError> {
+        let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        inner.registered.remove(did);
+        inner.follows.retain(|(actor, _)| actor != did);
+        if !inner
+            .follows
+            .iter()
+            .any(|(actor, subject)| subject == did && inner.registered.contains(actor))
+        {
+            inner.backfill_queue.remove(did);
+        }
+        Ok(())
     }
 
     fn set_follow(&self, actor: &str, subject: &str, following: bool) -> Result<(), StorageError> {
@@ -473,6 +488,21 @@ impl Storage for SqliteStorage {
         )?;
         transaction.execute(
             "INSERT OR IGNORE INTO backfill_queue(did) VALUES(?1)",
+            [did],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn unregister_user(&self, did: &str) -> Result<(), StorageError> {
+        let mut connection = self.conn()?;
+        let transaction = connection.transaction()?;
+        transaction.execute("DELETE FROM registered_users WHERE did=?1", [did])?;
+        transaction.execute("DELETE FROM follows WHERE actor=?1", [did])?;
+        transaction.execute(
+            "DELETE FROM backfill_queue WHERE did=?1 AND NOT EXISTS (
+                 SELECT 1 FROM follows f JOIN registered_users r ON f.actor=r.did WHERE f.subject=?1
+             )",
             [did],
         )?;
         transaction.commit()?;

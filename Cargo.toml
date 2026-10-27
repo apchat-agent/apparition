@@ -37,6 +37,10 @@ atrium-oauth = "0.1.7"
 jose-jwk = "0.1.2"
 p256 = "0.13.2"
 rand = "0.8"
+hmac = "0.12"
+sha2 = "0.10"
+atrium-identity = "0.1.9"
+atrium-common = "0.1.4"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

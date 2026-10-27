@@ -22,6 +22,20 @@ pub fn router_with_oauth(oauth: oauth::OAuthPublic) -> Router {
         .merge(oauth.router())
 }
 
+pub fn router_with_oauth_flow<F, S>(
+    oauth: oauth::OAuthPublic,
+    flow: F,
+    storage: std::sync::Arc<S>,
+) -> Router
+where
+    F: oauth::OAuthFlow,
+    S: ingest::Storage + 'static,
+{
+    Router::new()
+        .route("/xrpc/_health", get(health))
+        .merge(oauth.router_with_flow(flow, storage))
+}
+
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,

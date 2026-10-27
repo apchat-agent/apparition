@@ -9,7 +9,7 @@ use appview_rs::{
     init_tracing,
     jwt::ServiceJwtVerifier,
     oauth::OAuthPublic,
-    router_with_oauth,
+    router_with_oauth_flow,
 };
 use std::{error::Error, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
@@ -27,6 +27,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         &config.public_url,
         PathBuf::from(&config.data_dir).join("oauth-client-key.json"),
     )?;
+    let oauth_identity_resolver = Arc::new(IdentityResolver::new(
+        HttpIdentityBackend::default(),
+        Duration::from_secs(1800),
+    ));
+    let oauth_flow = oauth
+        .atrium_flow(oauth_identity_resolver)
+        .map_err(std::io::Error::other)?;
     let ingestor = Ingestor::new(storage.clone(), config.scope_mode);
     let consumer = JetstreamConsumer::new(ingestor, Duration::from_secs(1));
     let jetstream_urls = config.jetstream_urls.clone();
@@ -39,7 +46,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         jwt_resolver,
         config.appview_did.clone(),
     ));
-    let app_router = router_with_oauth(oauth).merge(api_router(
+    let app_router = router_with_oauth_flow(oauth, oauth_flow, storage.clone()).merge(api_router(
         storage.clone(),
         jwt,
         config.appview_did.clone(),

@@ -1,21 +1,39 @@
+use crate::identity::{HttpIdentityBackend, IdentityResolver};
 use crate::ingest::{MemoryStorage, Storage};
+use atrium_api::{agent::SessionManager, types::string::Did};
+use atrium_identity::{
+    did::{CommonDidResolver, CommonDidResolverConfig, DEFAULT_PLC_DIRECTORY_URL},
+    handle::{AtprotoHandleResolver, AtprotoHandleResolverConfig, DnsTxtResolver},
+};
+use atrium_oauth::{
+    AtprotoClientMetadata, AuthMethod, AuthorizeOptions, DefaultHttpClient, GrantType, KnownScope,
+    OAuthClient, OAuthClientConfig, OAuthResolverConfig, Scope,
+    store::{session::MemorySessionStore, state::MemoryStateStore},
+};
 use axum::{
     Json, Router,
     extract::{Query, State},
-    http::StatusCode,
-    response::{Html, IntoResponse},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use hmac::{Hmac, Mac};
 use jose_jwk::{Ec, EcCurves, Jwk, Key, Parameters};
 use p256::{SecretKey, elliptic_curve::sec1::ToEncodedPoint};
 use rand::thread_rng;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::Sha256;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, fs, future::Future, io::Write, path::Path, pin::Pin, sync::Arc};
 use thiserror::Error;
 
 const METADATA_PATH: &str = "/.well-known/oauth-client-metadata.json";
 const CALLBACK_PATH: &str = "/oauth/callback";
+const SESSION_COOKIE: &str = "appview_session";
+const SESSION_TTL_SECONDS: u64 = 30 * 24 * 60 * 60;
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Error)]
 pub enum OAuthConfigError {
@@ -144,6 +162,13 @@ impl OAuthPublic {
         &self.public_url
     }
 
+    pub fn atrium_flow(
+        &self,
+        identity_resolver: Arc<IdentityResolver<HttpIdentityBackend>>,
+    ) -> Result<AtriumOAuthFlow, String> {
+        AtriumOAuthFlow::new(self, identity_resolver)
+    }
+
     pub fn router(&self) -> Router {
         self.router_with_flow(DisabledOAuthFlow, Arc::new(MemoryStorage::default()))
     }
@@ -159,6 +184,7 @@ impl OAuthPublic {
             .route("/oauth/authorize", get(authorize::<F, S>))
             .route("/oauth/callback", get(callback::<F, S>))
             .route("/logout", post(logout::<F, S>))
+            .route("/app", get(app_home::<F, S>))
             .with_state(Arc::new(OAuthWebState {
                 public: self.clone(),
                 flow,
@@ -202,6 +228,242 @@ impl OAuthPublic {
             metadata,
         })
     }
+
+    fn issue_session_cookie(&self, did: &str) -> String {
+        let expires = unix_time().saturating_add(SESSION_TTL_SECONDS);
+        let payload = format!("{did}\n{expires}");
+        let encoded = URL_SAFE_NO_PAD.encode(payload.as_bytes());
+        let mut mac = HmacSha256::new_from_slice(&self.cookie_key())
+            .expect("HMAC accepts keys of any length");
+        mac.update(encoded.as_bytes());
+        format!(
+            "{encoded}.{}",
+            URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+        )
+    }
+
+    fn verify_session_cookie(&self, token: &str) -> Option<String> {
+        let (payload, signature) = token.split_once('.')?;
+        let signature = URL_SAFE_NO_PAD.decode(signature).ok()?;
+        let mut mac = HmacSha256::new_from_slice(&self.cookie_key()).ok()?;
+        mac.update(payload.as_bytes());
+        mac.verify_slice(&signature).ok()?;
+        let decoded = URL_SAFE_NO_PAD.decode(payload).ok()?;
+        let value = std::str::from_utf8(&decoded).ok()?;
+        let (did, expires) = value.split_once('\n')?;
+        if expires.parse::<u64>().ok()? <= unix_time()
+            || !(did.starts_with("did:plc:") || did.starts_with("did:web:"))
+        {
+            return None;
+        }
+        Some(did.to_owned())
+    }
+
+    fn cookie_key(&self) -> Vec<u8> {
+        let serialized =
+            serde_json::to_value(&self.private_key).expect("the validated JWK is serializable");
+        URL_SAFE_NO_PAD
+            .decode(
+                serialized
+                    .get("d")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+            .expect("the validated JWK has a valid private key")
+    }
+}
+
+type OAuthDidResolver = CommonDidResolver<DefaultHttpClient>;
+type OAuthHandleResolver = AtprotoHandleResolver<CloudflareDnsTxtResolver, DefaultHttpClient>;
+type AppOAuthClient =
+    OAuthClient<MemoryStateStore, MemorySessionStore, OAuthDidResolver, OAuthHandleResolver>;
+
+#[derive(Clone)]
+pub struct AtriumOAuthFlow {
+    client: Arc<AppOAuthClient>,
+    identity_resolver: Arc<IdentityResolver<HttpIdentityBackend>>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ExpectedOAuthIdentity {
+    did: String,
+    handle: Option<String>,
+}
+
+impl AtriumOAuthFlow {
+    fn new(
+        public: &OAuthPublic,
+        identity_resolver: Arc<IdentityResolver<HttpIdentityBackend>>,
+    ) -> Result<Self, String> {
+        let http_client = Arc::new(DefaultHttpClient::default());
+        let did_resolver = CommonDidResolver::new(CommonDidResolverConfig {
+            plc_directory_url: DEFAULT_PLC_DIRECTORY_URL.to_owned(),
+            http_client: http_client.clone(),
+        });
+        let handle_resolver = AtprotoHandleResolver::new(AtprotoHandleResolverConfig {
+            dns_txt_resolver: CloudflareDnsTxtResolver::default(),
+            http_client,
+        });
+        let metadata = AtprotoClientMetadata {
+            client_id: public.metadata["client_id"]
+                .as_str()
+                .ok_or_else(|| "OAuth client metadata has no client_id".to_owned())?
+                .to_owned(),
+            client_uri: Some(public.public_url.clone()),
+            redirect_uris: vec![
+                public.metadata["redirect_uris"][0]
+                    .as_str()
+                    .ok_or_else(|| "OAuth client metadata has no redirect URI".to_owned())?
+                    .to_owned(),
+            ],
+            token_endpoint_auth_method: AuthMethod::PrivateKeyJwt,
+            grant_types: vec![GrantType::AuthorizationCode, GrantType::RefreshToken],
+            scopes: vec![Scope::Known(KnownScope::Atproto)],
+            jwks_uri: None,
+            token_endpoint_auth_signing_alg: Some("ES256".to_owned()),
+        };
+        let client = OAuthClient::new(OAuthClientConfig {
+            client_metadata: metadata,
+            keys: Some(vec![public.private_key.clone()]),
+            state_store: MemoryStateStore::default(),
+            session_store: MemorySessionStore::default(),
+            resolver: OAuthResolverConfig {
+                did_resolver,
+                handle_resolver,
+                authorization_server_metadata: Default::default(),
+                protected_resource_metadata: Default::default(),
+            },
+        })
+        .map_err(|error| error.to_string())?;
+        Ok(Self {
+            client: Arc::new(client),
+            identity_resolver,
+        })
+    }
+}
+
+impl OAuthFlow for AtriumOAuthFlow {
+    fn authorize<'a>(
+        &'a self,
+        login: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let identity = if login.starts_with("did:") {
+                self.identity_resolver
+                    .resolve_did(login)
+                    .await
+                    .map_err(|error| error.to_string())?
+            } else {
+                self.identity_resolver
+                    .resolve_handle(login)
+                    .await
+                    .map_err(|error| error.to_string())?
+            };
+            let state = serde_json::to_string(&ExpectedOAuthIdentity {
+                did: identity.did,
+                handle: identity.handle,
+            })
+            .map_err(|error| error.to_string())?;
+            self.client
+                .authorize(
+                    login,
+                    AuthorizeOptions {
+                        state: Some(state),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn callback<'a>(
+        &'a self,
+        params: OAuthCallback,
+    ) -> Pin<Box<dyn Future<Output = Result<OAuthAccount, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let (session, app_state) = self
+                .client
+                .callback(atrium_oauth::CallbackParams {
+                    code: params.code,
+                    state: Some(params.state),
+                    iss: params.issuer,
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            let expected: ExpectedOAuthIdentity = serde_json::from_str(
+                app_state
+                    .as_deref()
+                    .ok_or_else(|| "OAuth state has no expected identity".to_owned())?,
+            )
+            .map_err(|error| error.to_string())?;
+            let did = session
+                .did()
+                .await
+                .ok_or_else(|| "OAuth session has no subject DID".to_owned())?;
+            let did = did.as_ref().to_owned();
+            if did != expected.did {
+                if let Ok(did) = did.parse::<Did>() {
+                    let _ = self.client.revoke(&did).await;
+                }
+                return Err("OAuth subject DID does not match the verified login identity".into());
+            }
+            Ok(OAuthAccount {
+                did,
+                verified_handle: expected.handle,
+            })
+        })
+    }
+
+    fn logout<'a>(
+        &'a self,
+        did: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let did = did.parse::<Did>().map_err(|error| error.to_string())?;
+            self.client
+                .revoke(&did)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+}
+
+#[derive(Clone, Default)]
+struct CloudflareDnsTxtResolver {
+    client: reqwest::Client,
+}
+
+impl DnsTxtResolver for CloudflareDnsTxtResolver {
+    async fn resolve(
+        &self,
+        query: &str,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync + 'static>> {
+        #[derive(Deserialize)]
+        struct DohResponse {
+            #[serde(default, rename = "Answer")]
+            answers: Vec<DohAnswer>,
+        }
+        #[derive(Deserialize)]
+        struct DohAnswer {
+            data: String,
+        }
+        let response = self
+            .client
+            .get("https://cloudflare-dns.com/dns-query")
+            .query(&[("name", query), ("type", "TXT")])
+            .header(reqwest::header::ACCEPT, "application/dns-json")
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<DohResponse>()
+            .await?;
+        Ok(response
+            .answers
+            .into_iter()
+            .map(|answer| answer.data.trim_matches('"').to_owned())
+            .collect())
+    }
 }
 
 async fn metadata<F, S>(State(state): State<Arc<OAuthWebState<F, S>>>) -> Json<Value>
@@ -221,7 +483,7 @@ async fn login() -> Html<&'static str> {
 async fn authorize<F, S>(
     State(state): State<Arc<OAuthWebState<F, S>>>,
     Query(query): Query<HashMap<String, String>>,
-) -> impl IntoResponse
+) -> Response
 where
     F: OAuthFlow,
     S: Storage,
@@ -233,19 +495,27 @@ where
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error":"invalid_request","message":"handle is required"})),
-        );
+        )
+            .into_response();
     }
-    let _ = &state.flow;
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({"error":"temporarily_unavailable","message":"OAuth flow is not configured"})),
-    )
+    match state
+        .flow
+        .authorize(query.get("handle").expect("validated above"))
+        .await
+    {
+        Ok(url) if valid_redirect_url(&url) => Redirect::to(&url).into_response(),
+        Ok(_) => oauth_error(
+            StatusCode::BAD_GATEWAY,
+            "invalid authorization endpoint URL",
+        ),
+        Err(error) => oauth_error(StatusCode::BAD_REQUEST, &error),
+    }
 }
 
 async fn callback<F, S>(
     State(state): State<Arc<OAuthWebState<F, S>>>,
     Query(query): Query<HashMap<String, String>>,
-) -> impl IntoResponse
+) -> Response
 where
     F: OAuthFlow,
     S: Storage,
@@ -258,22 +528,154 @@ where
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error":"invalid_request","message":"code and state are required"})),
-        );
+        )
+            .into_response();
     }
-    let _ = &state.storage;
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({"error":"temporarily_unavailable","message":"OAuth flow is not configured"})),
-    )
+    let params = OAuthCallback {
+        code: query.get("code").expect("validated above").clone(),
+        state: query.get("state").expect("validated above").clone(),
+        issuer: query.get("iss").cloned(),
+    };
+    let account = match state.flow.callback(params).await {
+        Ok(account) => account,
+        Err(error) => return oauth_error(StatusCode::BAD_REQUEST, &error),
+    };
+    if let Err(error) = state.storage.register_user(&account.did) {
+        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+    }
+    if let Some(handle) = account.verified_handle.as_deref()
+        && let Err(error) = state.storage.set_verified_handle(&account.did, handle)
+    {
+        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+    }
+    let mut response = Redirect::to("/app").into_response();
+    let cookie = format!(
+        "{SESSION_COOKIE}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL_SECONDS}{}",
+        state.public.issue_session_cookie(&account.did),
+        if state.public.public_url.starts_with("https://") {
+            "; Secure"
+        } else {
+            ""
+        },
+    );
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&cookie).expect("cookie token is header safe"),
+    );
+    response
 }
 
-async fn logout<F, S>(State(state): State<Arc<OAuthWebState<F, S>>>) -> impl IntoResponse
+async fn logout<F, S>(State(state): State<Arc<OAuthWebState<F, S>>>, headers: HeaderMap) -> Response
 where
     F: OAuthFlow,
     S: Storage,
 {
-    let _ = (&state.flow, &state.storage, &state.public);
-    StatusCode::SERVICE_UNAVAILABLE
+    let cookie = cookie_value(&headers);
+    let Some(did) = cookie.and_then(|value| state.public.verify_session_cookie(value)) else {
+        return clear_session_cookie(Redirect::to("/login").into_response());
+    };
+    let remote_result = state.flow.logout(&did).await;
+    if let Err(error) = state.storage.unregister_user(&did) {
+        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+    }
+    let response = clear_session_cookie(Redirect::to("/login").into_response());
+    if remote_result.is_err() {
+        return response;
+    }
+    response
+}
+
+async fn app_home<F, S>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    headers: HeaderMap,
+) -> Response
+where
+    F: OAuthFlow,
+    S: Storage,
+{
+    let Some(did) =
+        cookie_value(&headers).and_then(|value| state.public.verify_session_cookie(value))
+    else {
+        return Redirect::to("/login").into_response();
+    };
+    let records = match state.storage.records() {
+        Ok(records) => records,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    let posts = records
+        .iter()
+        .filter(|record| record.did == did && record.collection == "app.bsky.feed.post")
+        .take(25)
+        .map(|record| {
+            let text = record
+                .record
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            format!(
+                "<li><a href=\"/thread?uri={}\">{}</a></li>",
+                html_escape(&record.uri),
+                html_escape(text)
+            )
+        })
+        .collect::<String>();
+    Html(format!(
+        "<!doctype html><html><head><title>AppView</title></head><body><main><h1>Timeline for {}</h1><nav><a href=\"/profile?did={}\">Profile</a> <form action=\"/logout\" method=\"post\"><button>Log out</button></form></nav><ol>{posts}</ol><form action=\"/post\" method=\"post\"><textarea name=\"text\" required></textarea><button>Post</button></form></main></body></html>",
+        html_escape(&did), html_escape(&did)
+    ))
+    .into_response()
+}
+
+fn cookie_value(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .filter_map(|part| part.trim().split_once('='))
+        .find_map(|(name, value)| (name == SESSION_COOKIE).then_some(value))
+}
+
+fn clear_session_cookie(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_static("appview_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
+    );
+    response
+}
+
+fn oauth_error(status: StatusCode, message: &str) -> Response {
+    (
+        status,
+        Json(json!({"error":"OAuthError","message":message})),
+    )
+        .into_response()
+}
+
+fn valid_redirect_url(value: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(value) else {
+        return false;
+    };
+    let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
+    (url.scheme() == "https" || (local && url.scheme() == "http"))
+        && url.username().is_empty()
+        && url.password().is_none()
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn unix_time() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn create_key() -> Jwk {
