@@ -2,8 +2,13 @@ use appview_rs::ingest::{
     Ingestor, JetstreamConsumer, MemoryStorage, ScopeMode, SqliteStorage, Storage,
 };
 use futures_util::{SinkExt, StreamExt};
+use rusqlite::Connection;
 use serde_json::json;
-use std::{sync::Arc, time::Duration};
+use std::{
+    io::{self, Write},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tokio::{net::TcpListener, time::timeout};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
@@ -287,6 +292,145 @@ async fn consumer_reconnects_after_a_silent_websocket_and_rotates_urls() {
     );
 }
 
+#[tokio::test]
+async fn event_processing_timeout_releases_connection_and_logs_event_identity() {
+    let db_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("av9-event-timeout-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&db_path);
+    let storage = Arc::new(SqliteStorage::open(&db_path).unwrap());
+    let writer_connection = Connection::open(&db_path).unwrap();
+    writer_connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let ingestor = Ingestor::new(storage.clone(), ScopeMode::Full);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_async(stream).await.unwrap();
+        websocket
+            .send(Message::Text(
+                event(
+                    "did:plc:slow",
+                    4321,
+                    "create",
+                    "app.bsky.feed.post",
+                    "blocked-write",
+                    Some(post("blocked")),
+                )
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let _ = websocket.next().await;
+    });
+
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(CapturedMakeWriter(output.clone()))
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let _guard = tracing::dispatcher::set_default(&dispatch);
+
+    let consumer = JetstreamConsumer::new(ingestor, Duration::from_millis(1))
+        .with_event_timeout(Duration::from_millis(25));
+    let result = timeout(
+        Duration::from_secs(1),
+        consumer.consume_connection(&format!("ws://{address}/subscribe")),
+    )
+    .await
+    .expect("event processing should be bounded")
+    .unwrap_err();
+    assert!(result.to_string().contains("event processing timed out"));
+    let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("did:plc:slow"), "{logs}");
+    assert!(logs.contains("app.bsky.feed.post"), "{logs}");
+    assert!(logs.contains("blocked-write"), "{logs}");
+
+    writer_connection.execute_batch("COMMIT").unwrap();
+    server.await.unwrap();
+    timeout(Duration::from_secs(1), async {
+        while storage.cursor().unwrap() != Some(4321) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("timed out blocking worker should finish after SQLite unlocks");
+    drop(storage);
+    drop(writer_connection);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn metrics_are_emitted_during_idle_periods_with_zero_events_and_cursor_lag() {
+    let storage = Arc::new(MemoryStorage::default());
+    let ingestor = Ingestor::new(storage, ScopeMode::Full);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_async(stream).await.unwrap();
+        let _ = websocket.next().await;
+    });
+
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(CapturedMakeWriter(output.clone()))
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let _guard = tracing::dispatcher::set_default(&dispatch);
+
+    let consumer = JetstreamConsumer::new(ingestor, Duration::from_millis(1))
+        .with_idle_timeout(Duration::from_millis(200))
+        .with_metrics_interval(Duration::from_millis(10));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let run_task = tokio::spawn(async move {
+        consumer
+            .run(&[format!("ws://{address}/subscribe")], shutdown_rx)
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(35)).await;
+    shutdown_tx.send(true).unwrap();
+    run_task.await.unwrap().unwrap();
+    server.await.unwrap();
+
+    let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("Jetstream ingestion metrics"), "{logs}");
+    assert!(logs.contains("events=0"), "{logs}");
+    assert!(logs.contains("cursor_lag_seconds="), "{logs}");
+    assert!(logs.contains("Jetstream connected"), "{logs}");
+    assert!(logs.contains("Jetstream disconnected"), "{logs}");
+}
+
+struct CapturedMakeWriter(Arc<Mutex<Vec<u8>>>);
+
+struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedMakeWriter {
+    type Writer = CapturedWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        CapturedWriter(self.0.clone())
+    }
+}
+
+impl Write for CapturedWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[test]
 fn full_scope_accepts_supported_collections_and_updates_existing_records() {
     let storage = Arc::new(MemoryStorage::default());
@@ -377,4 +521,32 @@ fn jetstream_urls_are_configurable_from_environment() {
         config.jetstream_urls,
         ["ws://one.test/subscribe", "ws://two.test/subscribe"]
     );
+}
+
+#[test]
+fn jetstream_timeouts_default_to_sixty_seconds_and_are_configurable() {
+    use appview_rs::config::Config;
+
+    let defaults = Config::from_toml_and_env("", std::iter::empty::<(&str, &str)>()).unwrap();
+    assert_eq!(defaults.jetstream_idle_timeout_secs, 60);
+    assert_eq!(defaults.jetstream_event_timeout_secs, 60);
+
+    let from_toml = Config::from_toml_and_env(
+        "jetstream_idle_timeout_secs = 7\njetstream_event_timeout_secs = 9",
+        std::iter::empty::<(&str, &str)>(),
+    )
+    .unwrap();
+    assert_eq!(from_toml.jetstream_idle_timeout_secs, 7);
+    assert_eq!(from_toml.jetstream_event_timeout_secs, 9);
+
+    let from_env = Config::from_toml_and_env(
+        "",
+        [
+            ("APPVIEW_JETSTREAM_IDLE_TIMEOUT_SECS", "12"),
+            ("APPVIEW_JETSTREAM_EVENT_TIMEOUT_SECS", "4"),
+        ],
+    )
+    .unwrap();
+    assert_eq!(from_env.jetstream_idle_timeout_secs, 12);
+    assert_eq!(from_env.jetstream_event_timeout_secs, 4);
 }
