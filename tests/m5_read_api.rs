@@ -944,6 +944,34 @@ async fn profile_records_cannot_claim_unverified_handles() {
 }
 
 #[tokio::test]
+async fn profile_shows_the_did_while_initial_handle_verification_is_pending() {
+    let storage = Arc::new(MemoryStorage::default());
+    storage
+        .put_record(&IndexedRecord {
+            did: ALICE.into(),
+            collection: "app.bsky.actor.profile".into(),
+            rkey: "self".into(),
+            uri: format!("at://{ALICE}/app.bsky.actor.profile/self"),
+            cid: Some("profile-cid".into()),
+            time_us: 1,
+            record: json!({"displayName":"Alice"}),
+        })
+        .unwrap();
+    let (router, _) = api_for_storage(storage.clone());
+
+    let (status, profile) = request(
+        router,
+        "/xrpc/app.bsky.actor.getProfile?actor=did%3Aplc%3Aalice",
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(profile["handle"], ALICE);
+    assert_eq!(storage.pending_handle_refreshes(10).unwrap(), [ALICE]);
+}
+
+#[tokio::test]
 async fn remaining_read_responses_preserve_recorded_public_api_keys() {
     let (router, _) = api();
     let route_fixtures = [
