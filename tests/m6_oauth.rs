@@ -445,6 +445,44 @@ async fn logged_in_write_forms_use_the_account_oauth_flow() {
 }
 
 #[tokio::test]
+async fn session_cookie_rejects_a_tampered_hmac() {
+    let public = OAuthPublic::new("https://appview.example").unwrap();
+    let app = public.router_with_flow(FakeOAuthFlow::default(), Arc::new(MemoryStorage::default()));
+    let callback = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?code=valid-code&state=valid-state&scope=atproto")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(callback.status(), StatusCode::SEE_OTHER);
+    let cookie = callback.headers()["set-cookie"].to_str().unwrap();
+    let session_cookie = cookie
+        .split(';')
+        .next()
+        .unwrap()
+        .strip_prefix("appview_session=")
+        .unwrap();
+    let payload = session_cookie.split_once('.').unwrap().0;
+    let forged_cookie = format!("appview_session={payload}.AAAA");
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", forged_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers()["location"], "/login");
+}
+
+#[tokio::test]
 async fn logged_in_timeline_comes_from_the_oauth_account_pds() {
     let app = OAuthPublic::new("https://appview.example")
         .unwrap()

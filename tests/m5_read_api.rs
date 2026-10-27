@@ -360,6 +360,21 @@ async fn proxy_jwt_requires_signature_audience_method_and_expiration() {
 }
 
 #[tokio::test]
+async fn proxy_jwt_rejects_a_valid_claim_set_signed_by_another_key() {
+    let (router, _) = api();
+    let forged_key = P256Keypair::create(&mut rand::thread_rng());
+    let forged = token(
+        &forged_key,
+        APPVIEW,
+        "app.bsky.feed.getTimeline",
+        expiry(60),
+        Some(ALICE),
+    );
+    let (status, _) = request(router, "/xrpc/app.bsky.feed.getTimeline", Some(&forged)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn profile_handles_are_taken_from_verified_identity_data() {
     let storage = Arc::new(MemoryStorage::default());
     storage.set_verified_handle(ALICE, "alice.test").unwrap();
