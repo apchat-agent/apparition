@@ -81,6 +81,32 @@ pub struct IndexedNotification {
     pub reason_subject: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordCursor {
+    pub time_us: u64,
+    pub uri: String,
+}
+
+impl RecordCursor {
+    pub fn parse(value: &str) -> Option<Self> {
+        if let Some((time, uri)) = value.split_once(':') {
+            Some(Self {
+                time_us: time.parse().ok()?,
+                uri: uri.to_owned(),
+            })
+        } else {
+            Some(Self {
+                time_us: value.parse().ok()?,
+                uri: String::new(),
+            })
+        }
+    }
+
+    pub fn encode(&self) -> String {
+        format!("{}:{}", self.time_us, self.uri)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("SQLite error: {0}")]
@@ -185,6 +211,13 @@ fn at_uri_did(uri: &str) -> Option<&str> {
     did.starts_with("did:").then_some(did)
 }
 
+fn record_matches_cursor(record: &IndexedRecord, cursor: Option<&RecordCursor>) -> bool {
+    cursor.is_none_or(|cursor| {
+        record.time_us < cursor.time_us
+            || (record.time_us == cursor.time_us && record.uri < cursor.uri)
+    })
+}
+
 pub trait Storage: Send + Sync {
     fn put_record(&self, record: &IndexedRecord) -> Result<(), StorageError>;
     fn replace_repo_snapshot(
@@ -213,6 +246,19 @@ pub trait Storage: Send + Sync {
         limit: usize,
     ) -> Result<Vec<IndexedNotification>, StorageError>;
     fn notification_count(&self, did: &str) -> Result<usize, StorageError>;
+    fn author_posts(
+        &self,
+        did: &str,
+        cursor: Option<&RecordCursor>,
+        limit: usize,
+        include_replies: bool,
+    ) -> Result<Vec<IndexedRecord>, StorageError>;
+    fn timeline_posts(
+        &self,
+        actor: &str,
+        cursor: Option<&RecordCursor>,
+        limit: usize,
+    ) -> Result<Vec<IndexedRecord>, StorageError>;
     fn post_interaction_summary(
         &self,
         uri: &str,
@@ -455,6 +501,74 @@ impl Storage for MemoryStorage {
             .flat_map(notification_edges)
             .filter(|(_, subject_did, _, _)| subject_did == did)
             .count())
+    }
+
+    fn author_posts(
+        &self,
+        did: &str,
+        cursor: Option<&RecordCursor>,
+        limit: usize,
+        include_replies: bool,
+    ) -> Result<Vec<IndexedRecord>, StorageError> {
+        let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut posts = inner
+            .records
+            .values()
+            .filter(|record| {
+                record.collection == "app.bsky.feed.post"
+                    && record.did == did
+                    && (include_replies || record.record.get("reply").is_none())
+                    && record_matches_cursor(record, cursor)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        posts.sort_by(|left, right| {
+            right
+                .time_us
+                .cmp(&left.time_us)
+                .then_with(|| right.uri.cmp(&left.uri))
+        });
+        posts.truncate(limit.clamp(1, 101));
+        Ok(posts)
+    }
+
+    fn timeline_posts(
+        &self,
+        actor: &str,
+        cursor: Option<&RecordCursor>,
+        limit: usize,
+    ) -> Result<Vec<IndexedRecord>, StorageError> {
+        let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut followed = inner
+            .follows
+            .iter()
+            .filter(|(follow_actor, _)| follow_actor == actor)
+            .map(|(_, subject)| subject.clone())
+            .collect::<HashSet<_>>();
+        followed.extend(inner.records.values().filter_map(|record| {
+            (record.collection == "app.bsky.graph.follow" && record.did == actor)
+                .then(|| record.record.get("subject").and_then(Value::as_str))
+                .flatten()
+                .map(str::to_owned)
+        }));
+        let mut posts = inner
+            .records
+            .values()
+            .filter(|record| {
+                record.collection == "app.bsky.feed.post"
+                    && (record.did == actor || followed.contains(&record.did))
+                    && record_matches_cursor(record, cursor)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        posts.sort_by(|left, right| {
+            right
+                .time_us
+                .cmp(&left.time_us)
+                .then_with(|| right.uri.cmp(&left.uri))
+        });
+        posts.truncate(limit.clamp(1, 101));
+        Ok(posts)
     }
 
     fn post_interaction_summary(
@@ -770,6 +884,11 @@ impl SqliteStorage {
              );
              CREATE INDEX IF NOT EXISTS records_collection_time ON records(collection, time_us DESC);
              CREATE INDEX IF NOT EXISTS records_collection_uri ON records(collection, uri);
+             CREATE INDEX IF NOT EXISTS records_author_time ON records(collection, did, time_us DESC, uri DESC);
+             CREATE INDEX IF NOT EXISTS records_author_reply_time
+                 ON records(collection, did, json_type(record_json, '$.reply'), time_us DESC, uri DESC);
+             CREATE INDEX IF NOT EXISTS records_follow_actor_subject
+                 ON records(collection, did, json_extract(record_json, '$.subject'));
              CREATE INDEX IF NOT EXISTS records_collection_subject_uri
                  ON records(collection, json_extract(record_json, '$.subject.uri'), time_us DESC);
              CREATE INDEX IF NOT EXISTS records_collection_parent_uri
@@ -1021,6 +1140,71 @@ impl Storage for SqliteStorage {
             [did],
             |row| row.get(0),
         )?)
+    }
+
+    fn author_posts(
+        &self,
+        did: &str,
+        cursor: Option<&RecordCursor>,
+        limit: usize,
+        include_replies: bool,
+    ) -> Result<Vec<IndexedRecord>, StorageError> {
+        let conn = self.conn()?;
+        let reply_filter = if include_replies {
+            ""
+        } else {
+            " AND json_type(record_json, '$.reply') IS NULL"
+        };
+        let sql = format!(
+            "SELECT did, collection, rkey, uri, cid, time_us, record_json FROM records
+             WHERE collection='app.bsky.feed.post' AND did=?1{reply_filter}
+             AND (?2 IS NULL OR time_us < ?2 OR (time_us=?2 AND uri < ?3))
+             ORDER BY time_us DESC, uri DESC LIMIT ?4"
+        );
+        let mut statement = conn.prepare(&sql)?;
+        statement
+            .query_map(
+                params![
+                    did,
+                    cursor.map(|cursor| cursor.time_us.min(i64::MAX as u64) as i64),
+                    cursor.map(|cursor| cursor.uri.as_str()).unwrap_or(""),
+                    limit.clamp(1, 101) as i64,
+                ],
+                row_to_record,
+            )?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    fn timeline_posts(
+        &self,
+        actor: &str,
+        cursor: Option<&RecordCursor>,
+        limit: usize,
+    ) -> Result<Vec<IndexedRecord>, StorageError> {
+        let conn = self.conn()?;
+        let mut statement = conn.prepare(
+            "SELECT did, collection, rkey, uri, cid, time_us, record_json FROM records
+             WHERE collection='app.bsky.feed.post'
+               AND (did=?1 OR did IN (
+                   SELECT json_extract(record_json, '$.subject') FROM records
+                   WHERE collection='app.bsky.graph.follow' AND did=?1
+               ))
+               AND (?2 IS NULL OR time_us < ?2 OR (time_us=?2 AND uri < ?3))
+             ORDER BY time_us DESC, uri DESC LIMIT ?4",
+        )?;
+        statement
+            .query_map(
+                params![
+                    actor,
+                    cursor.map(|cursor| cursor.time_us.min(i64::MAX as u64) as i64),
+                    cursor.map(|cursor| cursor.uri.as_str()).unwrap_or(""),
+                    limit.clamp(1, 101) as i64,
+                ],
+                row_to_record,
+            )?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     fn post_interaction_summary(

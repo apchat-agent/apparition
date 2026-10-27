@@ -1,6 +1,6 @@
 use crate::{
     identity::IdentityBackend,
-    ingest::{IndexedRecord, Storage, StorageError},
+    ingest::{IndexedRecord, RecordCursor, Storage, StorageError},
     jwt::{ServiceClaims, ServiceJwtVerifier},
 };
 use axum::{
@@ -194,23 +194,19 @@ async fn get_author_feed<S: Storage, B: IdentityBackend>(
     let claims = authorize(&state, &headers, "app.bsky.feed.getAuthorFeed", false).await?;
     let actor = actor_to_did(&state, required(&query, "actor")?)?;
     let limit = query_limit(&query, 50);
-    let before = query
+    let cursor = query
         .get("cursor")
-        .and_then(|cursor| cursor.parse::<u64>().ok());
-    let records = state.storage.records().map_err(|_| ApiError::internal())?;
-    let page_records = records
-        .iter()
-        .filter(|record| record.did == actor && record.collection == POST)
-        .filter(|record| before.is_none_or(|cursor| record.time_us < cursor))
-        .take(limit)
-        .collect::<Vec<_>>();
-    let next_cursor = if page_records.len() == limit {
-        page_records.last().map(|record| record.time_us.to_string())
-    } else {
-        None
-    };
+        .and_then(|cursor| RecordCursor::parse(cursor));
+    let include_replies = query
+        .get("filter")
+        .is_none_or(|filter| filter != "posts_no_replies");
+    let page_records = state
+        .storage
+        .author_posts(&actor, cursor.as_ref(), limit + 1, include_replies)
+        .map_err(|_| ApiError::internal())?;
     let feed = page_records
         .iter()
+        .take(limit)
         .map(|record| {
             post_view(
                 &state,
@@ -221,8 +217,16 @@ async fn get_author_feed<S: Storage, B: IdentityBackend>(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut result = json!({"feed":feed});
-    if let Some(next_cursor) = next_cursor {
-        result["cursor"] = json!(next_cursor);
+    if page_records.len() > limit {
+        if let Some(last) = page_records.get(limit - 1) {
+            result["cursor"] = json!(
+                RecordCursor {
+                    time_us: last.time_us,
+                    uri: last.uri.clone(),
+                }
+                .encode()
+            );
+        }
     }
     Ok(Json(result))
 }
@@ -365,12 +369,32 @@ async fn get_timeline<S: Storage, B: IdentityBackend>(
         .await?
         .ok_or_else(|| ApiError::unauthorized("service JWT required"))?;
     let actor = claims.iss;
-    let records = state.storage.records().map_err(|_| ApiError::internal())?;
-    let feed = timeline_records(&records, &actor, query_limit(&query, 50))
-        .into_iter()
+    let limit = query_limit(&query, 50);
+    let cursor = query
+        .get("cursor")
+        .and_then(|cursor| RecordCursor::parse(cursor));
+    let page_records = state
+        .storage
+        .timeline_posts(&actor, cursor.as_ref(), limit + 1)
+        .map_err(|_| ApiError::internal())?;
+    let feed = page_records
+        .iter()
+        .take(limit)
         .map(|record| post_view(&state, record, Some(&actor)).map(|post| json!({"post":post})))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Json(json!({"feed":feed})))
+    let mut result = json!({"feed":feed});
+    if page_records.len() > limit {
+        if let Some(last) = page_records.get(limit - 1) {
+            result["cursor"] = json!(
+                RecordCursor {
+                    time_us: last.time_us,
+                    uri: last.uri.clone(),
+                }
+                .encode()
+            );
+        }
+    }
+    Ok(Json(result))
 }
 
 /// Select posts for one account's local timeline. The web UI and XRPC API use
@@ -501,7 +525,7 @@ async fn list_notifications<S: Storage, B: IdentityBackend>(
     })}).collect::<Vec<_>>();
     let mut result = json!({"notifications":notifications,"seenAt":now_rfc3339()});
     if has_more {
-        if let Some(last) = page.get(limit) {
+        if let Some(last) = page.get(limit - 1) {
             result["cursor"] = json!(last.record.time_us.to_string());
         }
     }

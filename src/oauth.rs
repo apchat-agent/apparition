@@ -1,7 +1,9 @@
 use crate::identity::{HttpIdentityBackend, IdentityResolver};
 use crate::{
-    api::{profile_view_from_storage, timeline_records},
-    ingest::{IndexedNotification, IndexedRecord, MemoryStorage, Storage, StorageError},
+    api::profile_view_from_storage,
+    ingest::{
+        IndexedNotification, IndexedRecord, MemoryStorage, RecordCursor, Storage, StorageError,
+    },
 };
 use atrium_api::{
     agent::{Agent, SessionManager},
@@ -1221,6 +1223,7 @@ where
 async fn app_home<F, S>(
     State(state): State<Arc<OAuthWebState<F, S>>>,
     headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
 ) -> Response
 where
     F: OAuthFlow,
@@ -1229,11 +1232,23 @@ where
     let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return Redirect::to("/login").into_response();
     };
-    let records = match state.storage.records() {
+    let limit = query
+        .get("limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(50)
+        .clamp(1, 100);
+    let cursor = query
+        .get("cursor")
+        .and_then(|cursor| RecordCursor::parse(cursor));
+    let timeline_page = match state
+        .storage
+        .timeline_posts(&did, cursor.as_ref(), limit + 1)
+    {
         Ok(records) => records,
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
-    let timeline = timeline_records(&records, &did, 50);
+    let has_more = timeline_page.len() > limit;
+    let timeline = timeline_page.iter().take(limit).collect::<Vec<_>>();
     let write_forms_enabled =
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
     let posts = timeline
@@ -1293,8 +1308,27 @@ where
     } else {
         ""
     };
+    let older = if has_more {
+        timeline
+            .last()
+            .map(|last| {
+                let cursor = RecordCursor {
+                    time_us: last.time_us,
+                    uri: last.uri.clone(),
+                }
+                .encode();
+                let encoded =
+                    url::form_urlencoded::byte_serialize(cursor.as_bytes()).collect::<String>();
+                format!(
+                    "<a rel=\"next\" href=\"/app?limit={limit}&amp;cursor={encoded}\">Older</a>"
+                )
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     Html(format!(
-        "<!doctype html><html><head><title>AppView</title></head><body><main><h1>Timeline for {}</h1><nav><a href=\"/profile?did={}\">Profile</a> <a href=\"/notifications\">Notifications</a> <form action=\"/logout\" method=\"post\"><button>Log out</button></form></nav>{read_only_message}{indexing_status}<ol>{posts}</ol>{post_form}</main></body></html>",
+        "<!doctype html><html><head><title>AppView</title></head><body><main><h1>Timeline for {}</h1><nav><a href=\"/profile?did={}\">Profile</a> <a href=\"/notifications\">Notifications</a> <form action=\"/logout\" method=\"post\"><button>Log out</button></form></nav>{read_only_message}{indexing_status}<ol>{posts}</ol>{older}{post_form}</main></body></html>",
         html_escape(&did), html_escape(&did)
     ))
     .into_response()
@@ -1336,7 +1370,7 @@ where
         items
     };
     let older = if has_more {
-        page.get(limit)
+        page.get(limit - 1)
             .map(|notification| {
                 let cursor = notification.record.time_us.to_string();
                 format!(
@@ -1425,12 +1459,23 @@ where
         .get("displayName")
         .and_then(Value::as_str)
         .unwrap_or(&handle);
-    let mut records = match state.storage.records() {
+    let limit = query
+        .get("limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(50)
+        .clamp(1, 100);
+    let cursor = query
+        .get("cursor")
+        .and_then(|cursor| RecordCursor::parse(cursor));
+    let records = match state
+        .storage
+        .author_posts(subject, cursor.as_ref(), limit + 1, true)
+    {
         Ok(records) => records,
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
-    records.retain(|record| record.collection == "app.bsky.feed.post" && record.did == subject);
-    records.sort_by_key(|record| std::cmp::Reverse(record.time_us));
+    let has_more = records.len() > limit;
+    let records = records.iter().take(limit).collect::<Vec<_>>();
     let write_forms_enabled =
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
     let posts = records
@@ -1453,8 +1498,29 @@ where
     } else {
         posts
     };
+    let older = if has_more {
+        records
+            .last()
+            .map(|last| {
+                let cursor = RecordCursor {
+                    time_us: last.time_us,
+                    uri: last.uri.clone(),
+                }
+                .encode();
+                let encoded_did =
+                    url::form_urlencoded::byte_serialize(subject.as_bytes()).collect::<String>();
+                let encoded_cursor =
+                    url::form_urlencoded::byte_serialize(cursor.as_bytes()).collect::<String>();
+                format!(
+                    "<a rel=\"next\" href=\"/profile?did={encoded_did}&amp;limit={limit}&amp;cursor={encoded_cursor}\">Older</a>"
+                )
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     Html(format!(
-        "<!doctype html><html><head><title>Profile</title></head><body><main><h1>{}</h1><p>@{}</p><a href=\"/app\">Timeline</a><ol>{posts}</ol></main></body></html>",
+        "<!doctype html><html><head><title>Profile</title></head><body><main><h1>{}</h1><p>@{}</p><a href=\"/app\">Timeline</a><ol>{posts}</ol>{older}</main></body></html>",
         html_escape(display_name), html_escape(&handle)
     ))
     .into_response()
