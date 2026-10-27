@@ -158,3 +158,21 @@ F7 and F9–F13 were not addressed in av2: write-route CSRF, DID-document cachin
 - `cargo clippy --locked --offline --all-targets -- -D warnings`: passed.
 - `cargo deny check licenses`: passed (`licenses ok`).
 - All CAR and backoff tests use local in-memory or local fake components; no live PDS request was made. Changes are committed locally and nothing was pushed.
+
+## av8 web post authors and embeds (2026-10-27)
+
+| Item | Status | Evidence |
+| --- | --- | --- |
+| Post authors and times | Complete | `web_posts_show_hydrated_authors_and_times_on_timeline_profile_and_thread` verifies display name, verified handle, profile link, and timestamp on timeline, profile, and thread pages. The web renderer shares `profile_view_from_storage` with XRPC profile/post hydration; unknown handles fall back to the DID. |
+| Images and record-with-media | Complete | `web_embeds_render_images_cards_quotes_and_escape_user_content` checks image-only and `recordWithMedia` blobs render as CDN full-size `<img>` URLs with escaped alt text. |
+| External cards and quoted posts | Complete | The same test checks external title/URL and locally indexed quoted text are displayed. |
+| HTML escaping | Complete | The embed regression includes markup in alt, title, and quoted text, and verifies it stays escaped. External links are restricted to HTTP(S). |
+
+### av8 verification
+
+- Author and embed behaviors were added in red/green commits. Their initial failing checks reproduced the missing author and image rendering.
+- `cargo test --locked --offline`: passed, 75 tests (unit: 4, M1: 2, M2: 5, M3: 7, M4: 8, M5 config: 5, M5 read API: 11, M6 web OAuth: 29, M6 protocol: 4).
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy --locked --offline --all-targets -- -D warnings`: passed.
+- `cargo deny check licenses`: passed (`licenses ok`).
+- Tests use local indexed records and in-memory storage. No live account or network check was made; nothing was pushed.

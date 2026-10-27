@@ -1626,7 +1626,145 @@ fn render_web_post<S: Storage>(
     } else {
         String::new()
     };
-    format!("<article><header>{author}</header>{time}<p>{text}</p>{actions}</article>")
+    let embed = record
+        .record
+        .get("embed")
+        .map(|embed| render_web_embed(storage, &record.did, embed))
+        .unwrap_or_default();
+    format!("<article><header>{author}</header>{time}<p>{text}</p>{embed}{actions}</article>")
+}
+
+fn render_web_embed<S: Storage>(storage: &S, author_did: &str, embed: &Value) -> String {
+    match embed.get("$type").and_then(Value::as_str) {
+        Some("app.bsky.embed.images") => render_web_images(author_did, embed),
+        Some("app.bsky.embed.external") => render_web_external(embed),
+        Some("app.bsky.embed.record") => render_web_quote(storage, embed),
+        Some("app.bsky.embed.recordWithMedia") => {
+            let media = embed
+                .get("media")
+                .map(|media| render_web_embed(storage, author_did, media))
+                .unwrap_or_default();
+            let quote = embed
+                .get("record")
+                .map(|record| render_web_quote(storage, record))
+                .unwrap_or_default();
+            format!("<section class=\"record-with-media\">{media}{quote}</section>")
+        }
+        _ => String::new(),
+    }
+}
+
+fn render_web_images(author_did: &str, embed: &Value) -> String {
+    let Some(images) = embed.get("images").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let images = images
+        .iter()
+        .filter_map(|image| {
+            let cid = image
+                .pointer("/image/ref/$link")
+                .or_else(|| image.pointer("/image/ref"))
+                .and_then(Value::as_str)?;
+            let alt = image.get("alt").and_then(Value::as_str).unwrap_or("");
+            Some(format!(
+                "<img src=\"https://cdn.bsky.app/img/feed_fullsize/plain/{}/{}\" alt=\"{}\" loading=\"lazy\">",
+                html_escape(author_did),
+                html_escape(cid),
+                html_escape(alt)
+            ))
+        })
+        .collect::<String>();
+    if images.is_empty() {
+        String::new()
+    } else {
+        format!("<div class=\"post-images\">{images}</div>")
+    }
+}
+
+fn render_web_external(embed: &Value) -> String {
+    let Some(external) = embed.get("external") else {
+        return String::new();
+    };
+    let uri = external.get("uri").and_then(Value::as_str).unwrap_or("");
+    let title = external.get("title").and_then(Value::as_str).unwrap_or(uri);
+    let description = external
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if uri.is_empty() && title.is_empty() && description.is_empty() {
+        return String::new();
+    }
+    let title = html_escape(title);
+    let uri_markup = if safe_external_url(uri) {
+        format!("<a href=\"{}\">{}</a>", html_escape(uri), html_escape(uri))
+    } else {
+        html_escape(uri)
+    };
+    format!(
+        "<aside class=\"external-card\"><p>{title}</p><p>{}</p><p>{uri_markup}</p></aside>",
+        html_escape(description)
+    )
+}
+
+fn safe_external_url(uri: &str) -> bool {
+    url::Url::parse(uri).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+}
+
+fn render_web_quote<S: Storage>(storage: &S, embed: &Value) -> String {
+    let Some(reference) = embed
+        .pointer("/record/record")
+        .or_else(|| embed.get("record"))
+    else {
+        return String::new();
+    };
+    let uri = reference.get("uri").and_then(Value::as_str).unwrap_or("");
+    let quoted = if uri.is_empty() {
+        None
+    } else {
+        storage
+            .records()
+            .ok()
+            .and_then(|records| records.into_iter().find(|record| record.uri == uri))
+    };
+    if let Some(quoted) = quoted {
+        let profile = profile_view_from_storage(storage, &quoted.did)
+            .unwrap_or_else(|_| json!({"did":quoted.did,"handle":quoted.did}));
+        let handle = profile_handle(&profile, &quoted.did);
+        let display_name = profile
+            .get("displayName")
+            .and_then(Value::as_str)
+            .unwrap_or(&handle);
+        let text = quoted
+            .record
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let profile_uri = format!(
+            "/profile?did={}",
+            url::form_urlencoded::byte_serialize(quoted.did.as_bytes()).collect::<String>()
+        );
+        format!(
+            "<blockquote class=\"quoted-post\"><p><a href=\"{}\">{} @{}</a></p><p>{}</p></blockquote>",
+            html_escape(&profile_uri),
+            html_escape(display_name),
+            html_escape(&handle),
+            html_escape(text)
+        )
+    } else {
+        let text = reference
+            .pointer("/value/text")
+            .or_else(|| reference.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or(uri);
+        if text.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<blockquote class=\"quoted-post\"><p>{}</p></blockquote>",
+                html_escape(text)
+            )
+        }
+    }
 }
 
 fn has_atproto_scope(scope: Option<&str>) -> bool {
