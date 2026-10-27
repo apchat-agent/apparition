@@ -1,6 +1,6 @@
 use crate::ingest::ScopeMode;
 use serde::Deserialize;
-use std::{env, fs, path::PathBuf};
+use std::{env, fs, net::SocketAddr, path::PathBuf};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -19,6 +19,16 @@ pub struct Config {
     pub appview_did: String,
     #[serde(default = "default_public_url")]
     pub public_url: String,
+    #[serde(default)]
+    pub oauth_mode: OAuthMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OAuthMode {
+    #[default]
+    Confidential,
+    Loopback,
 }
 
 impl Default for Config {
@@ -31,6 +41,7 @@ impl Default for Config {
             jetstream_urls: default_jetstream_urls(),
             appview_did: default_appview_did(),
             public_url: default_public_url(),
+            oauth_mode: OAuthMode::default(),
         }
     }
 }
@@ -46,6 +57,10 @@ pub enum ConfigError {
     },
     #[error("APPVIEW_SCOPE must be 'scoped' or 'full', got {0}")]
     InvalidScope(String),
+    #[error("APPVIEW_OAUTH_MODE must be 'confidential' or 'loopback', got {0}")]
+    InvalidOAuthMode(String),
+    #[error("loopback OAuth requires APPVIEW_LISTEN to be a loopback socket address, got {0}")]
+    UnsafeLoopbackListen(String),
 }
 
 impl Config {
@@ -79,10 +94,26 @@ impl Config {
                 }
                 "APPVIEW_DID" => config.appview_did = value.to_owned(),
                 "APPVIEW_PUBLIC_URL" => config.public_url = value.to_owned(),
+                "APPVIEW_OAUTH_MODE" => {
+                    config.oauth_mode = parse_oauth_mode(value)?;
+                }
                 _ => {}
             }
         }
+        config.validate()?;
         Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.oauth_mode == OAuthMode::Loopback
+            && !self
+                .listen
+                .parse::<SocketAddr>()
+                .is_ok_and(|address| address.ip().is_loopback())
+        {
+            return Err(ConfigError::UnsafeLoopbackListen(self.listen.clone()));
+        }
+        Ok(())
     }
 
     pub fn load() -> Result<Self, ConfigError> {
@@ -119,6 +150,10 @@ impl Config {
                 "APPVIEW_PUBLIC_URL",
                 env::var("APPVIEW_PUBLIC_URL").unwrap_or_default(),
             ),
+            (
+                "APPVIEW_OAUTH_MODE",
+                env::var("APPVIEW_OAUTH_MODE").unwrap_or_default(),
+            ),
         ];
         let nonempty = env_values
             .into_iter()
@@ -147,12 +182,22 @@ impl Config {
                     }
                     "APPVIEW_DID" => config.appview_did = value,
                     "APPVIEW_PUBLIC_URL" => config.public_url = value,
+                    "APPVIEW_OAUTH_MODE" => config.oauth_mode = parse_oauth_mode(&value)?,
                     _ => unreachable!(),
                 }
             }
+            config.validate()?;
             return Ok(config);
         }
         Self::from_toml_and_env(&source, nonempty)
+    }
+}
+
+fn parse_oauth_mode(value: &str) -> Result<OAuthMode, ConfigError> {
+    match value {
+        "confidential" => Ok(OAuthMode::Confidential),
+        "loopback" => Ok(OAuthMode::Loopback),
+        _ => Err(ConfigError::InvalidOAuthMode(value.to_owned())),
     }
 }
 
