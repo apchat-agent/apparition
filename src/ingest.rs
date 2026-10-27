@@ -107,6 +107,36 @@ impl RecordCursor {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotificationCursor {
+    pub time_us: u64,
+    pub uri: String,
+    pub reason: String,
+}
+
+impl NotificationCursor {
+    pub fn parse(value: &str) -> Option<Self> {
+        if let Some((time, rest)) = value.split_once('|') {
+            let (uri, reason) = rest.split_once('|')?;
+            Some(Self {
+                time_us: time.parse().ok()?,
+                uri: uri.to_owned(),
+                reason: reason.to_owned(),
+            })
+        } else {
+            Some(Self {
+                time_us: value.parse().ok()?,
+                uri: String::new(),
+                reason: String::new(),
+            })
+        }
+    }
+
+    pub fn encode(&self) -> String {
+        format!("{}|{}|{}", self.time_us, self.uri, self.reason)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("SQLite error: {0}")]
@@ -140,18 +170,17 @@ fn notification_edges(
                 .record
                 .pointer("/subject/uri")
                 .and_then(Value::as_str)
+                && let Some(did) = at_uri_did(uri)
             {
-                if let Some(did) = at_uri_did(uri) {
-                    add(
-                        did,
-                        if record.collection == "app.bsky.feed.like" {
-                            "like"
-                        } else {
-                            "repost"
-                        },
-                        Some(uri),
-                    );
-                }
+                add(
+                    did,
+                    if record.collection == "app.bsky.feed.like" {
+                        "like"
+                    } else {
+                        "repost"
+                    },
+                    Some(uri),
+                );
             }
         }
         "app.bsky.graph.follow" => {
@@ -164,10 +193,9 @@ fn notification_edges(
                 .record
                 .pointer("/reply/parent/uri")
                 .and_then(Value::as_str)
+                && let Some(did) = at_uri_did(uri)
             {
-                if let Some(did) = at_uri_did(uri) {
-                    add(did, "reply", Some(uri));
-                }
+                add(did, "reply", Some(uri));
             }
             if let Some(facets) = record.record.get("facets").and_then(Value::as_array) {
                 for did in facets
@@ -218,6 +246,19 @@ fn record_matches_cursor(record: &IndexedRecord, cursor: Option<&RecordCursor>) 
     })
 }
 
+fn notification_matches_cursor(
+    record: &IndexedRecord,
+    reason: &str,
+    cursor: Option<&NotificationCursor>,
+) -> bool {
+    cursor.is_none_or(|cursor| {
+        record.time_us < cursor.time_us
+            || (record.time_us == cursor.time_us
+                && (record.uri < cursor.uri
+                    || (record.uri == cursor.uri && reason < cursor.reason.as_str())))
+    })
+}
+
 pub trait Storage: Send + Sync {
     fn put_record(&self, record: &IndexedRecord) -> Result<(), StorageError>;
     fn replace_repo_snapshot(
@@ -242,7 +283,7 @@ pub trait Storage: Send + Sync {
     fn notifications_for(
         &self,
         did: &str,
-        before: Option<u64>,
+        before: Option<&NotificationCursor>,
         limit: usize,
     ) -> Result<Vec<IndexedNotification>, StorageError>;
     fn notification_count(&self, did: &str) -> Result<usize, StorageError>;
@@ -464,21 +505,21 @@ impl Storage for MemoryStorage {
     fn notifications_for(
         &self,
         did: &str,
-        before: Option<u64>,
+        before: Option<&NotificationCursor>,
         limit: usize,
     ) -> Result<Vec<IndexedNotification>, StorageError> {
         let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
         let mut notifications = inner
             .records
             .values()
-            .filter(|record| before.is_none_or(|cursor| record.time_us < cursor))
             .flat_map(notification_edges)
             .filter_map(|(record, subject_did, reason, reason_subject)| {
-                (subject_did == did).then(|| IndexedNotification {
-                    record,
-                    reason,
-                    reason_subject,
-                })
+                (subject_did == did && notification_matches_cursor(&record, &reason, before))
+                    .then_some(IndexedNotification {
+                        record,
+                        reason,
+                        reason_subject,
+                    })
             })
             .collect::<Vec<_>>();
         notifications.sort_by(|left, right| {
@@ -1102,7 +1143,7 @@ impl Storage for SqliteStorage {
     fn notifications_for(
         &self,
         did: &str,
-        before: Option<u64>,
+        before: Option<&NotificationCursor>,
         limit: usize,
     ) -> Result<Vec<IndexedNotification>, StorageError> {
         let conn = self.conn()?;
@@ -1111,15 +1152,20 @@ impl Storage for SqliteStorage {
                     n.reason, n.reason_subject
              FROM notification_events n
              JOIN records r ON r.did=n.source_did AND r.collection=n.source_collection AND r.rkey=n.source_rkey
-             WHERE n.subject_did=?1 AND (?2 IS NULL OR n.time_us < ?2)
+             WHERE n.subject_did=?1 AND (
+                 ?2 IS NULL OR n.time_us < ?2 OR
+                 (n.time_us=?2 AND (n.source_uri < ?3 OR (n.source_uri=?3 AND n.reason < ?4)))
+             )
              ORDER BY n.time_us DESC, n.source_uri DESC, n.reason DESC
-             LIMIT ?3",
+             LIMIT ?5",
         )?;
         statement
             .query_map(
                 params![
                     did,
-                    before.map(|time| time.min(i64::MAX as u64) as i64),
+                    before.map(|cursor| cursor.time_us.min(i64::MAX as u64) as i64),
+                    before.map(|cursor| cursor.uri.as_str()).unwrap_or(""),
+                    before.map(|cursor| cursor.reason.as_str()).unwrap_or(""),
                     limit.clamp(1, 101) as i64,
                 ],
                 |row| {

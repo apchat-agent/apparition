@@ -1,6 +1,6 @@
 use crate::{
     identity::IdentityBackend,
-    ingest::{IndexedRecord, RecordCursor, Storage, StorageError},
+    ingest::{IndexedRecord, NotificationCursor, RecordCursor, Storage, StorageError},
     jwt::{ServiceClaims, ServiceJwtVerifier},
 };
 use axum::{
@@ -217,16 +217,16 @@ async fn get_author_feed<S: Storage, B: IdentityBackend>(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut result = json!({"feed":feed});
-    if page_records.len() > limit {
-        if let Some(last) = page_records.get(limit - 1) {
-            result["cursor"] = json!(
-                RecordCursor {
-                    time_us: last.time_us,
-                    uri: last.uri.clone(),
-                }
-                .encode()
-            );
-        }
+    if page_records.len() > limit
+        && let Some(last) = page_records.get(limit - 1)
+    {
+        result["cursor"] = json!(
+            RecordCursor {
+                time_us: last.time_us,
+                uri: last.uri.clone(),
+            }
+            .encode()
+        );
     }
     Ok(Json(result))
 }
@@ -383,16 +383,16 @@ async fn get_timeline<S: Storage, B: IdentityBackend>(
         .map(|record| post_view(&state, record, Some(&actor)).map(|post| json!({"post":post})))
         .collect::<Result<Vec<_>, _>>()?;
     let mut result = json!({"feed":feed});
-    if page_records.len() > limit {
-        if let Some(last) = page_records.get(limit - 1) {
-            result["cursor"] = json!(
-                RecordCursor {
-                    time_us: last.time_us,
-                    uri: last.uri.clone(),
-                }
-                .encode()
-            );
-        }
+    if page_records.len() > limit
+        && let Some(last) = page_records.get(limit - 1)
+    {
+        result["cursor"] = json!(
+            RecordCursor {
+                time_us: last.time_us,
+                uri: last.uri.clone(),
+            }
+            .encode()
+        );
     }
     Ok(Json(result))
 }
@@ -509,10 +509,10 @@ async fn list_notifications<S: Storage, B: IdentityBackend>(
     let limit = query_limit(&query, 50);
     let before = query
         .get("cursor")
-        .and_then(|cursor| cursor.parse::<u64>().ok());
+        .and_then(|cursor| NotificationCursor::parse(cursor));
     let page = state
         .storage
-        .notifications_for(&actor, before, limit + 1)
+        .notifications_for(&actor, before.as_ref(), limit + 1)
         .map_err(|_| ApiError::internal())?;
     let has_more = page.len() > limit;
     let notifications = page.iter().take(limit).map(|notice| {
@@ -524,10 +524,15 @@ async fn list_notifications<S: Storage, B: IdentityBackend>(
         "indexedAt":record.record.get("createdAt").cloned().unwrap_or_else(|| json!(timestamp_us_to_rfc3339(record.time_us)))
     })}).collect::<Vec<_>>();
     let mut result = json!({"notifications":notifications,"seenAt":now_rfc3339()});
-    if has_more {
-        if let Some(last) = page.get(limit - 1) {
-            result["cursor"] = json!(last.record.time_us.to_string());
-        }
+    if has_more && let Some(last) = page.get(limit - 1) {
+        result["cursor"] = json!(
+            NotificationCursor {
+                time_us: last.record.time_us,
+                uri: last.record.uri.clone(),
+                reason: last.reason.clone(),
+            }
+            .encode()
+        );
     }
     Ok(Json(result))
 }

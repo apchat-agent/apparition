@@ -2,7 +2,8 @@ use crate::identity::{HttpIdentityBackend, IdentityResolver};
 use crate::{
     api::profile_view_from_storage,
     ingest::{
-        IndexedNotification, IndexedRecord, MemoryStorage, RecordCursor, Storage, StorageError,
+        IndexedNotification, IndexedRecord, MemoryStorage, NotificationCursor, RecordCursor,
+        Storage, StorageError,
     },
 };
 use atrium_api::{
@@ -1353,8 +1354,11 @@ where
         .clamp(1, 100);
     let before = query
         .get("cursor")
-        .and_then(|cursor| cursor.parse::<u64>().ok());
-    let page = match state.storage.notifications_for(&did, before, limit + 1) {
+        .and_then(|cursor| NotificationCursor::parse(cursor));
+    let page = match state
+        .storage
+        .notifications_for(&did, before.as_ref(), limit + 1)
+    {
         Ok(page) => page,
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
@@ -1372,7 +1376,14 @@ where
     let older = if has_more {
         page.get(limit - 1)
             .map(|notification| {
-                let cursor = notification.record.time_us.to_string();
+                let cursor = NotificationCursor {
+                    time_us: notification.record.time_us,
+                    uri: notification.record.uri.clone(),
+                    reason: notification.reason.clone(),
+                }
+                .encode();
+                let cursor =
+                    url::form_urlencoded::byte_serialize(cursor.as_bytes()).collect::<String>();
                 format!(
                     "<a rel=\"next\" href=\"/notifications?cursor={}\">Older</a>",
                     html_escape(&cursor)

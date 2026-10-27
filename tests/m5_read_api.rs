@@ -670,7 +670,7 @@ async fn notifications_include_likes_reposts_replies_mentions_quotes_and_follows
         );
     }
     assert_eq!(reasons.first().copied(), Some("follow"));
-    assert_eq!(body["seenAt"].as_str().is_some(), true);
+    assert!(body["seenAt"].as_str().is_some());
 }
 
 #[tokio::test]
