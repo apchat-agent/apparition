@@ -104,6 +104,10 @@ fn fixture_storage() -> Arc<MemoryStorage> {
 }
 
 fn api() -> (axum::Router, P256Keypair) {
+    api_for_storage(fixture_storage())
+}
+
+fn api_for_storage(storage: Arc<MemoryStorage>) -> (axum::Router, P256Keypair) {
     let key = P256Keypair::create(&mut rand::thread_rng());
     let signing_did_key = key.did();
     let issuer_doc = DidDocument {
@@ -123,7 +127,7 @@ fn api() -> (axum::Router, P256Keypair) {
     ));
     (
         api_router(
-            fixture_storage(),
+            storage,
             Arc::new(ServiceJwtVerifier::new(resolver, APPVIEW)),
             APPVIEW,
         ),
@@ -132,7 +136,7 @@ fn api() -> (axum::Router, P256Keypair) {
 }
 
 fn token(key: &P256Keypair, aud: &str, lxm: &str, exp: u64, sub: Option<&str>) -> String {
-    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256K","typ":"JWT"}"#);
+    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","typ":"JWT"}"#);
     let payload = json!({"iss":ISSUER,"aud":aud,"exp":exp,"lxm":lxm,"sub":sub});
     let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
     let message = format!("{header}.{payload}");
@@ -274,7 +278,6 @@ async fn posts_threads_graph_notifications_and_appview_did_are_served() {
         format!("{APPVIEW}#bsky_appview")
     );
 
-    let signing_key = P256Keypair::create(&mut rand::thread_rng());
     let good = token(
         &signing_key,
         APPVIEW,
@@ -352,4 +355,31 @@ async fn proxy_jwt_requires_signature_audience_method_and_expiration() {
     }
     let (status, _) = request(router, protected, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn profile_handles_are_taken_from_verified_identity_data() {
+    let storage = Arc::new(MemoryStorage::default());
+    storage.set_verified_handle(ALICE, "alice.test").unwrap();
+    storage
+        .put_record(&IndexedRecord {
+            did: ALICE.into(),
+            collection: "app.bsky.actor.profile".into(),
+            rkey: "self".into(),
+            uri: format!("at://{ALICE}/app.bsky.actor.profile/self"),
+            cid: Some("profile-cid".into()),
+            time_us: 1,
+            record: json!({"displayName":"Alice"}),
+        })
+        .unwrap();
+    let (router, _) = api_for_storage(storage);
+    let (status, profile) = request(
+        router,
+        "/xrpc/app.bsky.actor.getProfile?actor=alice.test",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{profile}");
+    assert_eq!(profile["did"], ALICE);
+    assert_eq!(profile["handle"], "alice.test");
 }
