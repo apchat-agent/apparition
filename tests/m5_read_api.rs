@@ -764,6 +764,63 @@ async fn timeline_paginates_by_cursor_and_author_feed_filters_replies() {
 }
 
 #[tokio::test]
+async fn notification_cursor_keeps_same_timestamp_events_on_later_pages() {
+    let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
+    for rkey in ["a", "b", "c"] {
+        storage
+            .put_record(&IndexedRecord {
+                did: FRIEND.into(),
+                collection: "app.bsky.graph.follow".into(),
+                rkey: rkey.into(),
+                uri: format!("at://{FRIEND}/app.bsky.graph.follow/{rkey}"),
+                cid: Some(format!("cid-{rkey}")),
+                time_us: 500,
+                record: json!({"subject":ALICE}),
+            })
+            .unwrap();
+    }
+    let (router, signing_key) = api_for_storage(storage);
+    let jwt = token(
+        &signing_key,
+        APPVIEW,
+        "app.bsky.notification.listNotifications",
+        expiry(60),
+        Some(ALICE),
+    );
+    let (status, first) = request(
+        router.clone(),
+        "/xrpc/app.bsky.notification.listNotifications?limit=1",
+        Some(&jwt),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let cursor = first["cursor"].as_str().expect("notification cursor");
+    let first_uri = first["notifications"][0]["uri"].as_str().unwrap();
+    let (status, second) = request(
+        router.clone(),
+        &format!("/xrpc/app.bsky.notification.listNotifications?limit=1&cursor={cursor}"),
+        Some(&jwt),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["notifications"].as_array().unwrap().len(), 1);
+    assert_ne!(second["notifications"][0]["uri"], first_uri);
+    let cursor = second["cursor"].as_str().expect("next notification cursor");
+    let (status, third) = request(
+        router,
+        &format!("/xrpc/app.bsky.notification.listNotifications?limit=1&cursor={cursor}"),
+        Some(&jwt),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{third}");
+    assert_eq!(third["notifications"].as_array().unwrap().len(), 1);
+    assert_ne!(
+        third["notifications"][0]["uri"],
+        second["notifications"][0]["uri"]
+    );
+}
+
+#[tokio::test]
 async fn proxy_jwt_requires_signature_audience_method_and_expiration() {
     let (router, signing_key) = api();
     let protected = "/xrpc/app.bsky.feed.getTimeline";
