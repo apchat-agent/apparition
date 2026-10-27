@@ -1,6 +1,9 @@
 use crate::identity::{HttpIdentityBackend, IdentityResolver};
 use crate::ingest::{MemoryStorage, Storage};
-use atrium_api::{agent::SessionManager, types::string::Did};
+use atrium_api::{
+    agent::{Agent, SessionManager},
+    types::string::{AtIdentifier, Datetime, Did},
+};
 use atrium_common::store::Store;
 use atrium_identity::{
     did::{CommonDidResolver, CommonDidResolverConfig, DEFAULT_PLC_DIRECTORY_URL},
@@ -541,6 +544,41 @@ impl AtriumOAuthFlow {
             identity_resolver,
         })
     }
+
+    async fn create_record(
+        &self,
+        did: &str,
+        collection: &str,
+        record: Value,
+    ) -> Result<(), String> {
+        let did = did.parse::<Did>().map_err(|error| error.to_string())?;
+        let session = self
+            .client
+            .restore(&did)
+            .await
+            .map_err(|error| error.to_string())?;
+        let agent = Agent::new(session);
+        let input = atrium_api::com::atproto::repo::create_record::InputData {
+            collection: collection
+                .parse()
+                .map_err(|error| format!("invalid collection: {error}"))?,
+            record: serde_json::from_value(record).map_err(|error| error.to_string())?,
+            repo: AtIdentifier::Did(did),
+            rkey: None,
+            swap_commit: None,
+            validate: None,
+        }
+        .into();
+        agent
+            .api
+            .com
+            .atproto
+            .repo
+            .create_record(input)
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("PDS createRecord failed: {error:?}"))
+    }
 }
 
 impl OAuthFlow for AtriumOAuthFlow {
@@ -626,6 +664,65 @@ impl OAuthFlow for AtriumOAuthFlow {
                 .revoke(&did)
                 .await
                 .map_err(|error| error.to_string())
+        })
+    }
+
+    fn create_post<'a>(
+        &'a self,
+        did: &'a str,
+        text: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.create_record(
+                did,
+                "app.bsky.feed.post",
+                json!({
+                    "$type":"app.bsky.feed.post",
+                    "text":text,
+                    "createdAt":Datetime::now()
+                }),
+            )
+            .await
+        })
+    }
+
+    fn like<'a>(
+        &'a self,
+        did: &'a str,
+        uri: &'a str,
+        cid: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.create_record(
+                did,
+                "app.bsky.feed.like",
+                json!({
+                    "$type":"app.bsky.feed.like",
+                    "subject":{"uri":uri,"cid":cid},
+                    "createdAt":Datetime::now()
+                }),
+            )
+            .await
+        })
+    }
+
+    fn repost<'a>(
+        &'a self,
+        did: &'a str,
+        uri: &'a str,
+        cid: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.create_record(
+                did,
+                "app.bsky.feed.repost",
+                json!({
+                    "$type":"app.bsky.feed.repost",
+                    "subject":{"uri":uri,"cid":cid},
+                    "createdAt":Datetime::now()
+                }),
+            )
+            .await
         })
     }
 }
@@ -907,49 +1004,74 @@ where
 async fn write_post<F, S>(
     State(state): State<Arc<OAuthWebState<F, S>>>,
     headers: HeaderMap,
-    Form(_form): Form<HashMap<String, String>>,
+    Form(form): Form<HashMap<String, String>>,
 ) -> Response
 where
     F: OAuthFlow,
     S: Storage,
 {
-    if verified_cookie_did(&state.public, &headers).is_none() {
+    let Some(did) = verified_cookie_did(&state.public, &headers) else {
         return Redirect::to("/login").into_response();
+    };
+    let text = form.get("text").map(String::as_str).unwrap_or("").trim();
+    if text.is_empty() || text.chars().count() > 300 {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "post text must contain 1 to 300 characters",
+        );
     }
-    oauth_error(StatusCode::NOT_IMPLEMENTED, "post action is not available")
+    match state.flow.create_post(&did, text).await {
+        Ok(()) => Redirect::to("/app").into_response(),
+        Err(error) => oauth_error(StatusCode::BAD_GATEWAY, &error),
+    }
 }
 
 async fn write_like<F, S>(
     State(state): State<Arc<OAuthWebState<F, S>>>,
     headers: HeaderMap,
-    Form(_form): Form<HashMap<String, String>>,
+    Form(form): Form<HashMap<String, String>>,
 ) -> Response
 where
     F: OAuthFlow,
     S: Storage,
 {
-    if verified_cookie_did(&state.public, &headers).is_none() {
+    let Some(did) = verified_cookie_did(&state.public, &headers) else {
         return Redirect::to("/login").into_response();
+    };
+    let (Some(uri), Some(cid)) = (form.get("uri"), form.get("cid")) else {
+        return oauth_error(StatusCode::BAD_REQUEST, "uri and cid are required");
+    };
+    if !uri.starts_with("at://") || cid.is_empty() {
+        return oauth_error(StatusCode::BAD_REQUEST, "uri and cid are invalid");
     }
-    oauth_error(StatusCode::NOT_IMPLEMENTED, "like action is not available")
+    match state.flow.like(&did, uri, cid).await {
+        Ok(()) => Redirect::to("/app").into_response(),
+        Err(error) => oauth_error(StatusCode::BAD_GATEWAY, &error),
+    }
 }
 
 async fn write_repost<F, S>(
     State(state): State<Arc<OAuthWebState<F, S>>>,
     headers: HeaderMap,
-    Form(_form): Form<HashMap<String, String>>,
+    Form(form): Form<HashMap<String, String>>,
 ) -> Response
 where
     F: OAuthFlow,
     S: Storage,
 {
-    if verified_cookie_did(&state.public, &headers).is_none() {
+    let Some(did) = verified_cookie_did(&state.public, &headers) else {
         return Redirect::to("/login").into_response();
+    };
+    let (Some(uri), Some(cid)) = (form.get("uri"), form.get("cid")) else {
+        return oauth_error(StatusCode::BAD_REQUEST, "uri and cid are required");
+    };
+    if !uri.starts_with("at://") || cid.is_empty() {
+        return oauth_error(StatusCode::BAD_REQUEST, "uri and cid are invalid");
     }
-    oauth_error(
-        StatusCode::NOT_IMPLEMENTED,
-        "repost action is not available",
-    )
+    match state.flow.repost(&did, uri, cid).await {
+        Ok(()) => Redirect::to("/app").into_response(),
+        Err(error) => oauth_error(StatusCode::BAD_GATEWAY, &error),
+    }
 }
 
 fn verified_cookie_did(public: &OAuthPublic, headers: &HeaderMap) -> Option<String> {
