@@ -28,6 +28,15 @@ fn event(
     json!({"did": did, "time_us": time_us, "kind": "commit", "commit": commit}).to_string()
 }
 
+#[test]
+fn sqlite_memory_storage_does_not_create_a_disk_file() {
+    let path = std::path::Path::new(":memory:");
+    assert!(!path.exists());
+    let storage = SqliteStorage::open(path).unwrap();
+    assert!(!path.exists());
+    drop(storage);
+}
+
 fn post(text: &str) -> serde_json::Value {
     json!({"$type":"app.bsky.feed.post", "text":text, "createdAt":"2026-10-27T00:00:00Z"})
 }
