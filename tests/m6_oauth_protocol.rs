@@ -271,6 +271,19 @@ async fn oauth_protocol_checks_state_issuer_nonce_and_refresh_against_fake_pds()
 async fn production_oauth_flow_accepts_standard_callback_and_binds_subject_and_scope() {
     let (flow, _, shared, server) = production_flow(None, None).await;
     flow.authorize(DID, "browser-binding-one").await.unwrap();
+    let confidential_par = shared
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .find(|request| request.path == "/par")
+        .unwrap()
+        .clone();
+    assert!(decoded_form_field(&confidential_par.body, "client_assertion").is_some());
+    assert_eq!(
+        decoded_form_field(&confidential_par.body, "client_id").as_deref(),
+        Some("https://appview.example/.well-known/oauth-client-metadata.json")
+    );
     let state = latest_state(&shared);
     let result = flow
         .callback(OAuthCallback {
@@ -317,6 +330,66 @@ async fn production_oauth_flow_accepts_standard_callback_and_binds_subject_and_s
         })
         .await;
     assert!(result.unwrap_err().contains("atproto scope"));
+    server.abort();
+}
+
+#[tokio::test]
+async fn loopback_production_oauth_completes_a_public_client_login() {
+    let (flow, _, shared, server) = production_loopback_flow().await;
+    let callback_uri = "http://127.0.0.1:43123/oauth/callback";
+    let browser_binding = "loopback-browser-binding";
+    let authorize_url = flow.authorize(DID, browser_binding).await.unwrap();
+    assert!(authorize_url.starts_with(&format!("{}/authorize?", server_origin(&shared))));
+
+    let par = shared
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .find(|request| request.path == "/par")
+        .unwrap()
+        .clone();
+    let client_id = decoded_form_field(&par.body, "client_id").unwrap();
+    let client_id_url = reqwest::Url::parse(&client_id).unwrap();
+    assert_eq!(client_id_url.scheme(), "http");
+    assert_eq!(client_id_url.host_str(), Some("localhost"));
+    assert_eq!(
+        decoded_form_field(&par.body, "redirect_uri").as_deref(),
+        Some(callback_uri)
+    );
+    assert_eq!(
+        decoded_form_field(&par.body, "code_challenge_method").as_deref(),
+        Some("S256")
+    );
+    assert_eq!(decoded_form_field(&par.body, "scope").as_deref(), Some("atproto"));
+    assert!(decoded_form_field(&par.body, "client_assertion").is_none());
+    assert!(par.headers.contains_key("dpop"));
+    assert!(!shared.lock().unwrap().requests.iter().any(|request| {
+        request.path == "/.well-known/oauth-client-metadata.json"
+    }));
+
+    let state = latest_state(&shared);
+    let account = flow
+        .callback(OAuthCallback {
+            code: "valid-code".to_owned(),
+            state,
+            issuer: Some(server_origin(&shared)),
+            scope: None,
+            browser_binding: Some(browser_binding.to_owned()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(account.did, DID);
+    assert_eq!(account.granted_scope.as_deref(), Some("atproto"));
+
+    let requests = shared.lock().unwrap().requests.clone();
+    let token = requests
+        .iter()
+        .find(|request| request.path == "/token")
+        .unwrap();
+    assert!(decoded_form_field(&token.body, "client_assertion").is_none());
+    assert!(decoded_form_field(&token.body, "code_verifier").is_some());
+    assert!(token.headers.contains_key("dpop"));
     server.abort();
 }
 
@@ -369,6 +442,30 @@ async fn production_flow(
     Arc<Mutex<FakeServerState>>,
     tokio::task::JoinHandle<()>,
 ) {
+    let public = OAuthPublic::new("https://appview.example").unwrap();
+    production_flow_with_public(public, token_sub, token_scope).await
+}
+
+async fn production_loopback_flow() -> (
+    appview_rs::oauth::AtriumOAuthFlow<ProductionFlowIdentity>,
+    SqliteOAuthStore,
+    Arc<Mutex<FakeServerState>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let public = OAuthPublic::new_loopback("127.0.0.1:43123".parse().unwrap()).unwrap();
+    production_flow_with_public(public, None, None).await
+}
+
+async fn production_flow_with_public(
+    public: OAuthPublic,
+    token_sub: Option<&str>,
+    token_scope: Option<&str>,
+) -> (
+    appview_rs::oauth::AtriumOAuthFlow<ProductionFlowIdentity>,
+    SqliteOAuthStore,
+    Arc<Mutex<FakeServerState>>,
+    tokio::task::JoinHandle<()>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let origin = format!("http://{address}");
@@ -405,7 +502,6 @@ async fn production_flow(
         },
     };
     let resolver = Arc::new(IdentityResolver::new(identity, Duration::from_secs(30)));
-    let public = OAuthPublic::new("https://appview.example").unwrap();
     let store = SqliteOAuthStore::open(":memory:").unwrap();
     let flow = public
         .atrium_flow_with_plc_directory(resolver, store.clone(), &format!("{origin}/"))
@@ -442,6 +538,11 @@ fn form_field(body: &str, key: &str) -> Option<String> {
         let (candidate, value) = pair.split_once('=')?;
         (candidate == key).then(|| value.replace('+', " "))
     })
+}
+
+fn decoded_form_field(body: &str, key: &str) -> Option<String> {
+    url::form_urlencoded::parse(body.as_bytes())
+        .find_map(|(candidate, value)| (candidate == key).then(|| value.into_owned()))
 }
 
 fn jwt_claim(jwt: &str, claim: &str) -> Option<String> {
@@ -487,7 +588,7 @@ async fn serve_one(mut stream: TcpStream, origin: &str, state: Arc<Mutex<FakeSer
                     "scopes_supported":["atproto"],
                     "response_types_supported":["code"],
                     "grant_types_supported":["authorization_code","refresh_token"],
-                    "token_endpoint_auth_methods_supported":["private_key_jwt"],
+                    "token_endpoint_auth_methods_supported":["none","private_key_jwt"],
                     "token_endpoint_auth_signing_alg_values_supported":["ES256"],
                     "authorization_response_iss_parameter_supported":true,
                     "dpop_signing_alg_values_supported":["ES256"],
