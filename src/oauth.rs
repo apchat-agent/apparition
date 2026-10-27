@@ -25,6 +25,7 @@ use axum::{
     routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use futures_util::FutureExt;
 use hmac::{Hmac, Mac};
 use jose_jwk::{Ec, EcCurves, Jwk, Key, Parameters};
 use p256::{SecretKey, elliptic_curve::sec1::ToEncodedPoint};
@@ -986,9 +987,18 @@ where
         scope,
         browser_binding: Some(browser_binding),
     };
-    let account = match state.flow.callback(params).await {
-        Ok(account) => account,
-        Err(error) => return oauth_error(StatusCode::BAD_REQUEST, &error),
+    let callback_result = std::panic::AssertUnwindSafe(state.flow.callback(params))
+        .catch_unwind()
+        .await;
+    let account = match callback_result {
+        Ok(Ok(account)) => account,
+        Ok(Err(error)) => return oauth_error(StatusCode::BAD_REQUEST, &error),
+        Err(_) => {
+            return oauth_error_page(
+                StatusCode::BAD_GATEWAY,
+                "Sign-in could not be completed. Please start again.",
+            );
+        }
     };
     if !has_atproto_scope(account.granted_scope.as_deref()) {
         return oauth_error(
@@ -1278,6 +1288,17 @@ fn oauth_error(status: StatusCode, message: &str) -> Response {
     (
         status,
         Json(json!({"error":"OAuthError","message":message})),
+    )
+        .into_response()
+}
+
+fn oauth_error_page(status: StatusCode, message: &str) -> Response {
+    (
+        status,
+        Html(format!(
+            "<!doctype html><html><head><title>Sign-in error</title></head><body><main><h1>Sign-in error</h1><p>{}</p><a href=\"/login\">Try again</a></main></body></html>",
+            html_escape(message)
+        )),
     )
         .into_response()
 }
