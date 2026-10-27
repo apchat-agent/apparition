@@ -101,6 +101,11 @@ pub trait Storage: Send + Sync {
         collection: &str,
         rkey: &str,
     ) -> Result<Option<IndexedRecord>, StorageError>;
+    fn record_by_uri(
+        &self,
+        collection: &str,
+        uri: &str,
+    ) -> Result<Option<IndexedRecord>, StorageError>;
     fn post_interaction_summary(
         &self,
         uri: &str,
@@ -260,6 +265,21 @@ impl Storage for MemoryStorage {
             .map_err(|_| StorageError::Poisoned)?
             .records
             .get(&(did.to_owned(), collection.to_owned(), rkey.to_owned()))
+            .cloned())
+    }
+
+    fn record_by_uri(
+        &self,
+        collection: &str,
+        uri: &str,
+    ) -> Result<Option<IndexedRecord>, StorageError> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .records
+            .values()
+            .find(|record| record.collection == collection && record.uri == uri)
             .cloned())
     }
 
@@ -575,6 +595,7 @@ impl SqliteStorage {
                  PRIMARY KEY (did, collection, rkey)
              );
              CREATE INDEX IF NOT EXISTS records_collection_time ON records(collection, time_us DESC);
+             CREATE INDEX IF NOT EXISTS records_collection_uri ON records(collection, uri);
              CREATE INDEX IF NOT EXISTS records_collection_subject_uri
                  ON records(collection, json_extract(record_json, '$.subject.uri'), time_us DESC);
              CREATE INDEX IF NOT EXISTS records_collection_parent_uri
@@ -726,6 +747,21 @@ impl Storage for SqliteStorage {
                 "SELECT did, collection, rkey, uri, cid, time_us, record_json
                  FROM records WHERE did=?1 AND collection=?2 AND rkey=?3",
                 params![did, collection, rkey],
+                row_to_record,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn record_by_uri(
+        &self,
+        collection: &str,
+        uri: &str,
+    ) -> Result<Option<IndexedRecord>, StorageError> {
+        self.conn()?
+            .query_row(
+                "SELECT did, collection, rkey, uri, cid, time_us, record_json FROM records WHERE collection=?1 AND uri=?2",
+                params![collection, uri],
                 row_to_record,
             )
             .optional()

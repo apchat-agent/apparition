@@ -1656,6 +1656,31 @@ fn render_web_post<S: Storage>(
         html_escape(display_name),
         html_escape(&handle)
     );
+    let reply_context = record
+        .record
+        .pointer("/reply/parent/uri")
+        .and_then(Value::as_str)
+        .and_then(|parent_uri| {
+            storage
+                .record_by_uri("app.bsky.feed.post", parent_uri)
+                .ok()
+                .flatten()
+        })
+        .map(|parent| {
+            let parent_profile = profile_view_from_storage(storage, &parent.did)
+                .unwrap_or_else(|_| json!({"did":parent.did,"handle":parent.did}));
+            let parent_handle = profile_handle(&parent_profile, &parent.did);
+            let thread_uri = format!(
+                "/thread?uri={}",
+                url::form_urlencoded::byte_serialize(record.uri.as_bytes()).collect::<String>()
+            );
+            format!(
+                "<p class=\"reply-context\"><a href=\"{}\">replying to @{}</a></p>",
+                html_escape(&thread_uri),
+                html_escape(&parent_handle)
+            )
+        })
+        .unwrap_or_default();
     let time = record
         .record
         .get("createdAt")
@@ -1738,7 +1763,7 @@ fn render_web_post<S: Storage>(
         .map(|embed| render_web_embed(storage, &record.did, embed))
         .unwrap_or_default();
     format!(
-        "<article><header>{author}</header>{time}<p>{text}</p><p class=\"counts\">{counts}</p>{embed}{actions}</article>"
+        "<article><header>{author}</header>{reply_context}{time}<p>{text}</p><p class=\"counts\">{counts}</p>{embed}{actions}</article>"
     )
 }
 
