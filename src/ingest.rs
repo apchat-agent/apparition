@@ -89,6 +89,9 @@ pub trait Storage: Send + Sync {
 }
 
 pub(crate) fn ensure_private_database_file(path: &Path) -> Result<(), std::io::Error> {
+    if path == Path::new(":memory:") {
+        return Ok(());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
