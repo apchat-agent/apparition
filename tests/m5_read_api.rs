@@ -3,7 +3,7 @@ use appview_rs::{
     identity::{
         DidDocument, IdentityBackend, IdentityResolver, ResolutionError, VerificationMethod,
     },
-    ingest::{IndexedRecord, MemoryStorage, Storage},
+    ingest::{IndexedRecord, MemoryStorage, SqliteStorage, Storage},
     jwt::ServiceJwtVerifier,
 };
 use atrium_crypto::keypair::{Did as _, P256Keypair};
@@ -109,7 +109,7 @@ fn api() -> (axum::Router, P256Keypair) {
     api_for_storage(fixture_storage())
 }
 
-fn api_for_storage(storage: Arc<MemoryStorage>) -> (axum::Router, P256Keypair) {
+fn api_for_storage<S: Storage + 'static>(storage: Arc<S>) -> (axum::Router, P256Keypair) {
     let key = P256Keypair::create(&mut rand::thread_rng());
     let signing_did_key = key.did();
     let issuer_doc = DidDocument {
@@ -345,6 +345,62 @@ async fn repeated_xrpc_array_parameters_return_all_values() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(posts["posts"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn author_feed_cursor_advances_between_pages() {
+    let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
+    for (rkey, time_us) in [("a", 300), ("b", 200), ("c", 100)] {
+        storage
+            .put_record(&IndexedRecord {
+                did: ALICE.to_owned(),
+                collection: "app.bsky.feed.post".to_owned(),
+                rkey: rkey.to_owned(),
+                uri: format!("at://{ALICE}/app.bsky.feed.post/{rkey}"),
+                cid: Some(format!("cid-{rkey}")),
+                time_us,
+                record: json!({"text":rkey}),
+            })
+            .unwrap();
+    }
+    let (router, _) = api_for_storage(storage);
+    let (status, first) = request(
+        router.clone(),
+        "/xrpc/app.bsky.feed.getAuthorFeed?actor=did%3Aplc%3Aalice&limit=1",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let first_cursor = first["cursor"].as_str().unwrap();
+    let first_uri = first["feed"][0]["post"]["uri"].as_str().unwrap();
+
+    let (status, second) = request(
+        router.clone(),
+        &format!(
+            "/xrpc/app.bsky.feed.getAuthorFeed?actor=did%3Aplc%3Aalice&limit=1&cursor={first_cursor}"
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!second["feed"].as_array().unwrap().is_empty());
+    assert_ne!(second["feed"][0]["post"]["uri"], first_uri);
+    let second_cursor = second["cursor"].as_str().unwrap();
+    assert_ne!(second_cursor, first_cursor);
+
+    let (status, third) = request(
+        router,
+        &format!(
+            "/xrpc/app.bsky.feed.getAuthorFeed?actor=did%3Aplc%3Aalice&limit=1&cursor={second_cursor}"
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_ne!(
+        third["feed"][0]["post"]["uri"],
+        second["feed"][0]["post"]["uri"]
+    );
 }
 
 #[tokio::test]
