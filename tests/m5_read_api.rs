@@ -22,7 +22,7 @@ use tower::ServiceExt;
 
 const ALICE: &str = "did:plc:alice";
 const FRIEND: &str = "did:plc:friend";
-const ISSUER: &str = "did:plc:issuer";
+const ISSUER: &str = ALICE;
 const APPVIEW: &str = "did:web:appview.test";
 
 #[derive(Clone)]
@@ -456,12 +456,31 @@ async fn remaining_read_responses_preserve_recorded_public_api_keys() {
             assert!(body.get(key).is_some(), "{uri} omitted fixture key {key}");
         }
         assert!(body[list_key].is_array());
-        if let Some(fixture_item) = fixture[list_key].as_array().and_then(|items| items.first()) {
+        if fixture[list_key]
+            .as_array()
+            .and_then(|items| items.first())
+            .is_some()
+        {
             let response_item = body[list_key].as_array().unwrap().first().unwrap();
-            for key in fixture_item.as_object().unwrap().keys() {
+            let required_item_keys: &[&str] = match list_key {
+                "posts" => &[
+                    "uri",
+                    "cid",
+                    "author",
+                    "record",
+                    "replyCount",
+                    "repostCount",
+                    "likeCount",
+                    "quoteCount",
+                    "labels",
+                ],
+                "likes" => &["actor", "createdAt", "indexedAt"],
+                _ => &["did", "handle", "labels"],
+            };
+            for key in required_item_keys {
                 assert!(
-                    response_item.get(key).is_some(),
-                    "{uri} item omitted fixture key {key}"
+                    response_item.get(*key).is_some(),
+                    "{uri} item omitted required fixture key {key}"
                 );
             }
         }
@@ -482,4 +501,40 @@ async fn remaining_read_responses_preserve_recorded_public_api_keys() {
             "thread omitted fixture key {key}"
         );
     }
+}
+
+#[tokio::test]
+async fn proxied_timeline_uses_the_jwt_issuer_as_the_account_did() {
+    let storage = Arc::new(MemoryStorage::default());
+    storage.register_user(ALICE).unwrap();
+    for (index, did) in [ALICE, FRIEND].into_iter().enumerate() {
+        storage
+            .put_record(&IndexedRecord {
+                did: did.into(),
+                collection: "app.bsky.feed.post".into(),
+                rkey: "post".into(),
+                uri: format!("at://{did}/app.bsky.feed.post/post"),
+                cid: Some(format!("cid-{did}")),
+                time_us: 1_800_000_000_000_000 - index as u64,
+                record: json!({"text":"test"}),
+            })
+            .unwrap();
+    }
+    let (router, signing_key) = api_for_storage(storage);
+    let jwt = token(
+        &signing_key,
+        APPVIEW,
+        "app.bsky.feed.getTimeline",
+        expiry(60),
+        Some(FRIEND),
+    );
+    let (status, timeline) = request(router, "/xrpc/app.bsky.feed.getTimeline", Some(&jwt)).await;
+    assert_eq!(status, StatusCode::OK, "{timeline}");
+    assert!(
+        timeline["feed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| { item["post"]["author"]["did"] == ALICE })
+    );
 }
