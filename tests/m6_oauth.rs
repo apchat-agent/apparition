@@ -1,7 +1,7 @@
 use appview_rs::router;
 use appview_rs::{
     config::Config,
-    ingest::{MemoryStorage, Storage},
+    ingest::{MemoryStorage, SqliteStorage, Storage},
     oauth::{OAuthAccount, OAuthCallback, OAuthFlow, OAuthPublic, SqliteOAuthStore},
 };
 use atrium_api::types::string::Did;
@@ -310,6 +310,36 @@ async fn callback_turns_an_upstream_panic_into_an_error_response() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+}
+
+#[cfg(unix)]
+#[test]
+fn sqlite_databases_are_created_with_owner_only_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let file = std::env::temp_dir().join(format!(
+        "appview-private-db-{}-{}.sqlite",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let storage = SqliteStorage::open(&file).unwrap();
+    assert_eq!(
+        std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    drop(storage);
+    std::fs::remove_file(&file).unwrap();
+
+    let store = SqliteOAuthStore::open(&file).unwrap();
+    assert_eq!(
+        std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    drop(store);
+    std::fs::remove_file(&file).unwrap();
 }
 
 #[tokio::test]
