@@ -1,3 +1,85 @@
 # appview-rs
-A small, self-hostable Bluesky (ATProto) AppView in Rust with ATProto OAuth login. Work in progress; see TASK.md.
+
+A small, self-hostable AT Protocol AppView written in Rust. It indexes selected Jetstream events into SQLite, serves Bluesky read XRPCs, and includes a browser UI that signs in with ATProto OAuth and writes records to the user's PDS.
+
+This is an early implementation, not a feature-complete replacement for Bluesky's hosted AppView. See [DESIGN.md](DESIGN.md) for implemented routes, scope rules, and current limits.
+
 Licence: MIT OR Apache-2.0.
+
+## Build and run
+
+Rust stable is required. Build and run from the repository root:
+
+```sh
+cargo build --release --locked
+cp appview.example.toml appview.toml
+APPVIEW_CONFIG=./appview.toml ./target/release/appview-rs
+```
+
+The sample config uses the public east Jetstream and indexes in `scoped` mode. The server binds to `127.0.0.1:3000`; put it behind a TLS reverse proxy for a public deployment. Keep the SQLite database and OAuth client key in a persistent, private data directory. Back up `appview.db` and `oauth-client-key.json` together. The OAuth key is created with owner-only permissions on Unix and must remain stable across restarts.
+
+Check the server and public service documents:
+
+```sh
+curl http://127.0.0.1:3000/xrpc/_health
+curl http://127.0.0.1:3000/.well-known/did.json
+curl http://127.0.0.1:3000/.well-known/oauth-client-metadata.json
+```
+
+Set `APPVIEW_PUBLIC_URL` to the externally reachable HTTPS origin and `APPVIEW_DID` to its `did:web` identifier. The DID hostname, public URL hostname, and reverse proxy host must agree. For example, `did:web:appview.example.com` should be served at `https://appview.example.com/.well-known/did.json`. Terminate TLS at the proxy and forward requests to the configured local listen address.
+
+## Configuration
+
+`APPVIEW_CONFIG` selects a TOML file. Non-empty environment variables override its values.
+
+| TOML field | Environment variable | Default | Purpose |
+| --- | --- | --- | --- |
+| `listen` | `APPVIEW_LISTEN` | `127.0.0.1:3000` | HTTP bind address |
+| `data_dir` | `APPVIEW_DATA_DIR` | `./data` | SQLite database and OAuth client key |
+| `log_filter` | `APPVIEW_LOG_FILTER` | `info` | `tracing` filter |
+| `scope_mode` | `APPVIEW_SCOPE` | `scoped` | `scoped` or `full` indexing |
+| `jetstream_urls` | `APPVIEW_JETSTREAM_URLS` | east Jetstream URL | TOML string array, or comma-separated URLs in the environment |
+| `appview_did` | `APPVIEW_DID` | `did:web:localhost` | AppView service identity |
+| `public_url` | `APPVIEW_PUBLIC_URL` | `https://appview.example` | Public origin and OAuth client ID origin |
+
+Use `scoped` for a small self-hosted instance. It indexes registered users, their follows, and interactions on their posts. `full` indexes every supported account and will use substantially more disk as the firehose continues. Neither mode currently has a retention or compaction policy.
+
+## Point a client at the AppView
+
+An XRPC client that allows a configurable service URL can use the AppView origin directly for public reads. For example:
+
+```sh
+curl 'https://appview.example.com/xrpc/app.bsky.feed.getAuthorFeed?actor=bsky.app&limit=10'
+```
+
+The API also publishes the `did:web` document with the `#bsky_appview` service entry. Authenticated home-timeline and notification methods require a service JWT from the user's PDS. The client obtains it with `com.atproto.server.getServiceAuth`, using this AppView's DID as the audience and the requested XRPC method as `lxm`, then sends it as a Bearer token to this AppView. Other public read methods can be called without that token.
+
+The upstream Bluesky social-app currently points public reads at its hosted AppView. A social-app fork or development build must configure both its AppView host and AppView DID to use this service; setting only the host does not configure service-proxy authentication. The current source has a development URL override named `EXPO_PUBLIC_DEV_ENV_APPVIEW_URL`; production builds can change the `PUBLIC_APPVIEW` and `PUBLIC_APPVIEW_DID` constants and the proxy DID configuration in the fork. This repo does not build or patch the social-app client.
+
+The built-in UI is available at `/login`. It resolves a handle or DID, starts OAuth, shows the signed-in account's timeline, and sends post, like, and repost records to that account's PDS.
+
+## Checks
+
+Run the offline suite and static checks with:
+
+```sh
+cargo test --locked --offline
+cargo fmt --all -- --check
+cargo clippy --locked --offline -- -D warnings
+cargo deny check licenses
+```
+
+The OAuth protocol test uses a local fake PDS and authorization server; tests do not need live Bluesky credentials or network access.
+
+## Measured starting footprint
+
+One idle-start sample was taken on Darwin 25.5.0 arm64 using the optimized release binary. Jetstream pointed to an unavailable loopback port, the database had no indexed events, and the process was sampled about six seconds after launch:
+
+| Measurement | Sample |
+| --- | ---: |
+| Release executable on disk | 15,207,792 bytes (14.5 MiB) |
+| Process RSS | 12,000 KiB (about 11.7 MiB) |
+| Empty data directory while running | 148 KiB allocated (SQLite DB/WAL/SHM plus OAuth key) |
+| SQLite DB after clean shutdown | 73,728 bytes |
+
+This is a single idle sample, not a load benchmark. It says nothing about disk growth under `full` ingestion or memory under concurrent traffic. Ingest logs include event-rate and database/WAL byte measurements for an active instance.

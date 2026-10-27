@@ -1,0 +1,7 @@
+listen = "127.0.0.1:3000"
+data_dir = "./data"
+log_filter = "info"
+scope_mode = "scoped"
+jetstream_urls = ["wss://jetstream1.us-east.bsky.network/subscribe"]
+appview_did = "did:web:appview.example.com"
+public_url = "https://appview.example.com"
