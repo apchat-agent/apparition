@@ -7,7 +7,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tokio::sync::watch;
@@ -21,6 +21,20 @@ const SUPPORTED_COLLECTIONS: &[&str] = &[
     "app.bsky.graph.block",
     "app.bsky.actor.profile",
 ];
+const BACKFILL_RETRY_BASE: Duration = Duration::from_secs(5);
+const BACKFILL_RETRY_MAX: Duration = Duration::from_secs(60 * 60);
+
+fn backfill_retry_delay(_failures: u32) -> Duration {
+    BACKFILL_RETRY_BASE.min(BACKFILL_RETRY_MAX)
+}
+
+fn epoch_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -86,7 +100,9 @@ pub trait Storage: Send + Sync {
     fn enqueue_backfill_for(&self, owner_did: &str, did: &str) -> Result<(), StorageError>;
     fn pending_backfills(&self) -> Result<Vec<String>, StorageError>;
     fn complete_backfill(&self, did: &str) -> Result<(), StorageError>;
+    fn record_backfill_failure(&self, did: &str) -> Result<Duration, StorageError>;
     fn backfill_progress(&self, owner_did: &str) -> Result<(usize, usize), StorageError>;
+    fn backfill_failure_count(&self, owner_did: &str) -> Result<usize, StorageError>;
     fn set_verified_handle(&self, did: &str, handle: &str) -> Result<(), StorageError>;
     fn clear_verified_handle(&self, did: &str) -> Result<(), StorageError>;
     fn verified_handle(&self, did: &str) -> Result<Option<String>, StorageError>;
@@ -138,9 +154,15 @@ struct MemoryState {
     web_session_generations: HashMap<(String, String), u64>,
     follows: HashSet<(String, String)>,
     backfill_queue: HashSet<String>,
+    backfill_retries: HashMap<String, BackfillRetry>,
     backfill_owners: HashSet<(String, String)>,
     backfill_completed: HashSet<String>,
     verified_handles: HashMap<String, (String, Instant)>,
+}
+
+struct BackfillRetry {
+    failures: u32,
+    retry_at: Instant,
 }
 
 impl Storage for MemoryStorage {
@@ -348,12 +370,17 @@ impl Storage for MemoryStorage {
     }
 
     fn pending_backfills(&self) -> Result<Vec<String>, StorageError> {
-        let mut pending = self
-            .inner
-            .lock()
-            .map_err(|_| StorageError::Poisoned)?
+        let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        let now = Instant::now();
+        let mut pending = inner
             .backfill_queue
             .iter()
+            .filter(|did| {
+                inner
+                    .backfill_retries
+                    .get(*did)
+                    .is_none_or(|retry| retry.retry_at <= now)
+            })
             .cloned()
             .collect::<Vec<_>>();
         pending.sort();
@@ -363,8 +390,24 @@ impl Storage for MemoryStorage {
     fn complete_backfill(&self, did: &str) -> Result<(), StorageError> {
         let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
         inner.backfill_queue.remove(did);
+        inner.backfill_retries.remove(did);
         inner.backfill_completed.insert(did.to_owned());
         Ok(())
+    }
+
+    fn record_backfill_failure(&self, did: &str) -> Result<Duration, StorageError> {
+        let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        let retry = inner
+            .backfill_retries
+            .entry(did.to_owned())
+            .or_insert_with(|| BackfillRetry {
+                failures: 0,
+                retry_at: Instant::now(),
+            });
+        retry.failures = retry.failures.saturating_add(1);
+        let delay = backfill_retry_delay(retry.failures);
+        retry.retry_at = Instant::now() + delay;
+        Ok(delay)
     }
 
     fn backfill_progress(&self, owner_did: &str) -> Result<(usize, usize), StorageError> {
@@ -380,6 +423,19 @@ impl Storage for MemoryStorage {
             .filter(|target| inner.backfill_completed.contains(target.as_str()))
             .count();
         Ok((accounts.len(), done))
+    }
+
+    fn backfill_failure_count(&self, owner_did: &str) -> Result<usize, StorageError> {
+        let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        Ok(inner
+            .backfill_owners
+            .iter()
+            .filter(|(owner, target)| {
+                owner == owner_did
+                    && inner.backfill_retries.contains_key(target)
+                    && !inner.backfill_completed.contains(target)
+            })
+            .count())
     }
 
     fn set_verified_handle(&self, did: &str, handle: &str) -> Result<(), StorageError> {
@@ -477,6 +533,11 @@ impl SqliteStorage {
              CREATE TABLE IF NOT EXISTS backfill_status (
                  did TEXT PRIMARY KEY,
                  done INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE IF NOT EXISTS backfill_retry (
+                 did TEXT PRIMARY KEY,
+                 failures INTEGER NOT NULL,
+                 retry_at_ms INTEGER NOT NULL
              );
              CREATE TABLE IF NOT EXISTS backfill_scope (
                  owner_did TEXT NOT NULL,
@@ -751,10 +812,14 @@ impl Storage for SqliteStorage {
 
     fn pending_backfills(&self) -> Result<Vec<String>, StorageError> {
         let conn = self.conn()?;
-        let mut statement =
-            conn.prepare("SELECT did FROM backfill_queue ORDER BY enqueued_at,did")?;
+        let mut statement = conn.prepare(
+            "SELECT q.did FROM backfill_queue q
+             LEFT JOIN backfill_retry r ON r.did=q.did
+             WHERE r.did IS NULL OR r.retry_at_ms<=?1
+             ORDER BY q.enqueued_at,q.did",
+        )?;
         Ok(statement
-            .query_map([], |row| row.get(0))?
+            .query_map([epoch_millis()], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -762,6 +827,7 @@ impl Storage for SqliteStorage {
         let mut connection = self.conn()?;
         let transaction = connection.transaction()?;
         transaction.execute("DELETE FROM backfill_queue WHERE did=?1", [did])?;
+        transaction.execute("DELETE FROM backfill_retry WHERE did=?1", [did])?;
         transaction.execute(
             "INSERT INTO backfill_status(did,done) VALUES(?1,1)
              ON CONFLICT(did) DO UPDATE SET done=1",
@@ -769,6 +835,29 @@ impl Storage for SqliteStorage {
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    fn record_backfill_failure(&self, did: &str) -> Result<Duration, StorageError> {
+        let mut connection = self.conn()?;
+        let transaction = connection.transaction()?;
+        let failures = transaction
+            .query_row(
+                "SELECT failures FROM backfill_retry WHERE did=?1",
+                [did],
+                |row| row.get::<_, u32>(0),
+            )
+            .optional()?
+            .unwrap_or(0_u32)
+            .saturating_add(1);
+        let delay = backfill_retry_delay(failures);
+        let retry_at_ms = epoch_millis().saturating_add(delay.as_millis() as i64);
+        transaction.execute(
+            "INSERT INTO backfill_retry(did,failures,retry_at_ms) VALUES(?1,?2,?3)
+             ON CONFLICT(did) DO UPDATE SET failures=excluded.failures,retry_at_ms=excluded.retry_at_ms",
+            params![did, failures, retry_at_ms],
+        )?;
+        transaction.commit()?;
+        Ok(delay)
     }
 
     fn backfill_progress(&self, owner_did: &str) -> Result<(usize, usize), StorageError> {
@@ -780,6 +869,18 @@ impl Storage for SqliteStorage {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         Ok((total as usize, done as usize))
+    }
+
+    fn backfill_failure_count(&self, owner_did: &str) -> Result<usize, StorageError> {
+        let count: i64 = self.conn()?.query_row(
+            "SELECT COUNT(*) FROM backfill_scope b
+             JOIN backfill_retry r ON r.did=b.target_did
+             LEFT JOIN backfill_status s ON s.did=b.target_did
+             WHERE b.owner_did=?1 AND COALESCE(s.done,0)=0",
+            [owner_did],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
     }
 
     fn set_verified_handle(&self, did: &str, handle: &str) -> Result<(), StorageError> {

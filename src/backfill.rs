@@ -471,7 +471,20 @@ where
                 }
                 let result = self.backfill_one(&did).await;
                 if let Err(error) = result {
-                    tracing::warn!(%did, %error, "queued repository backfill will retry");
+                    match self.storage.record_backfill_failure(&did) {
+                        Ok(retry_after) => tracing::warn!(
+                            %did,
+                            %error,
+                            retry_after_seconds = retry_after.as_secs(),
+                            "queued repository backfill failed; retry scheduled"
+                        ),
+                        Err(status_error) => tracing::warn!(
+                            %did,
+                            %error,
+                            %status_error,
+                            "queued repository backfill failed and retry could not be scheduled"
+                        ),
+                    }
                 }
             }
             tokio::select! {

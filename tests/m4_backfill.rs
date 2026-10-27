@@ -657,5 +657,7 @@ async fn backfill_worker_backs_off_after_a_failed_repository_fetch() {
     task.await.unwrap().unwrap();
 
     assert_eq!(fetches.load(Ordering::SeqCst), 1);
-    assert_eq!(storage.pending_backfills().unwrap(), [did]);
+    assert!(storage.pending_backfills().unwrap().is_empty());
+    assert_eq!(storage.backfill_progress(did).unwrap(), (1, 0));
+    assert_eq!(storage.backfill_failure_count(did).unwrap(), 1);
 }
