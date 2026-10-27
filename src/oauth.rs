@@ -715,15 +715,17 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
                     .ok_or_else(|| "OAuth state has no expected identity".to_owned())?,
             )
             .map_err(|error| error.to_string())?;
-            if params.browser_binding.as_deref() != Some(expected.browser_binding.as_str()) {
-                return Err("OAuth browser binding does not match the authorization state".into());
-            }
             let did = session
                 .did()
                 .await
                 .ok_or_else(|| "OAuth session has no subject DID".to_owned())?;
             let did = did.as_ref().to_owned();
             let parsed_did = did.parse::<Did>().map_err(|error| error.to_string())?;
+            if params.browser_binding.as_deref() != Some(expected.browser_binding.as_str()) {
+                let _ = self.client.revoke(&parsed_did).await;
+                let _ = self.store.del(&parsed_did).await;
+                return Err("OAuth browser binding does not match the authorization state".into());
+            }
             let stored_session = self
                 .store
                 .get(&parsed_did)
