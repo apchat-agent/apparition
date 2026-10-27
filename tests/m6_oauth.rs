@@ -661,6 +661,7 @@ async fn oauth_callback_registers_account_and_logout_clears_its_session() {
         .to_owned();
     assert!(cookie.contains("HttpOnly"));
     assert!(storage.is_registered("did:plc:alice").unwrap());
+    assert_eq!(storage.pending_backfills().unwrap(), ["did:plc:alice"]);
     assert_eq!(
         storage.verified_handle("did:plc:alice").unwrap().as_deref(),
         Some("alice.test")

@@ -1204,6 +1204,27 @@ where
     } else {
         posts
     };
+    let indexing_status = if timeline.is_empty() {
+        let (total, done) = match state.storage.backfill_progress(&did) {
+            Ok(progress) => progress,
+            Err(error) => {
+                return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+            }
+        };
+        if total > done {
+            let account_word = if total == 1 { "account" } else { "accounts" };
+            format!(
+                "<p role=\"status\">Indexing {total} {account_word}, {done} done. The timeline will fill as repositories finish.</p>"
+            )
+        } else {
+            let account_word = if total == 1 { "account" } else { "accounts" };
+            format!(
+                "<p role=\"status\">Indexed {done} of {total} {account_word}; no posts are available yet.</p>"
+            )
+        }
+    } else {
+        String::new()
+    };
     let read_only_message = if write_forms_enabled {
         String::new()
     } else {
@@ -1215,7 +1236,7 @@ where
         ""
     };
     Html(format!(
-        "<!doctype html><html><head><title>AppView</title></head><body><main><h1>Timeline for {}</h1><nav><a href=\"/profile?did={}\">Profile</a> <form action=\"/logout\" method=\"post\"><button>Log out</button></form></nav>{read_only_message}<ol>{posts}</ol>{post_form}</main></body></html>",
+        "<!doctype html><html><head><title>AppView</title></head><body><main><h1>Timeline for {}</h1><nav><a href=\"/profile?did={}\">Profile</a> <form action=\"/logout\" method=\"post\"><button>Log out</button></form></nav>{read_only_message}{indexing_status}<ol>{posts}</ol>{post_form}</main></body></html>",
         html_escape(&did), html_escape(&did)
     ))
     .into_response()

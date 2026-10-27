@@ -83,8 +83,10 @@ pub trait Storage: Send + Sync {
     fn set_follow(&self, actor: &str, subject: &str, following: bool) -> Result<(), StorageError>;
     fn is_followed_by_registered(&self, did: &str) -> Result<bool, StorageError>;
     fn enqueue_backfill(&self, did: &str) -> Result<(), StorageError>;
+    fn enqueue_backfill_for(&self, owner_did: &str, did: &str) -> Result<(), StorageError>;
     fn pending_backfills(&self) -> Result<Vec<String>, StorageError>;
     fn complete_backfill(&self, did: &str) -> Result<(), StorageError>;
+    fn backfill_progress(&self, owner_did: &str) -> Result<(usize, usize), StorageError>;
     fn set_verified_handle(&self, did: &str, handle: &str) -> Result<(), StorageError>;
     fn clear_verified_handle(&self, did: &str) -> Result<(), StorageError>;
     fn verified_handle(&self, did: &str) -> Result<Option<String>, StorageError>;
@@ -136,6 +138,8 @@ struct MemoryState {
     web_session_generations: HashMap<(String, String), u64>,
     follows: HashSet<(String, String)>,
     backfill_queue: HashSet<String>,
+    backfill_owners: HashSet<(String, String)>,
+    backfill_completed: HashSet<String>,
     verified_handles: HashMap<String, (String, Instant)>,
 }
 
@@ -165,6 +169,9 @@ impl Storage for MemoryStorage {
             .records
             .retain(|(record_did, _, _), _| record_did != did);
         inner.follows.retain(|(actor, _)| actor != did);
+        inner
+            .backfill_owners
+            .retain(|(owner, target)| owner != did || target == did);
         for record in records {
             let key = (
                 record.did.clone(),
@@ -175,6 +182,13 @@ impl Storage for MemoryStorage {
         }
         for subject in following {
             inner.follows.insert((did.to_owned(), subject.clone()));
+            if inner.registered.contains(did) {
+                inner
+                    .backfill_owners
+                    .insert((did.to_owned(), subject.clone()));
+                inner.backfill_queue.insert(subject.clone());
+                inner.backfill_completed.remove(subject);
+            }
         }
         Ok(())
     }
@@ -234,6 +248,10 @@ impl Storage for MemoryStorage {
         let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
         inner.registered.insert(did.to_owned());
         inner.backfill_queue.insert(did.to_owned());
+        inner
+            .backfill_owners
+            .insert((did.to_owned(), did.to_owned()));
+        inner.backfill_completed.remove(did);
         Ok(())
     }
 
@@ -274,6 +292,7 @@ impl Storage for MemoryStorage {
         let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
         inner.registered.remove(did);
         inner.follows.retain(|(actor, _)| actor != did);
+        inner.backfill_owners.retain(|(owner, _)| owner != did);
         if !inner
             .follows
             .iter()
@@ -289,8 +308,16 @@ impl Storage for MemoryStorage {
         let edge = (actor.to_owned(), subject.to_owned());
         if following {
             inner.follows.insert(edge);
+            if inner.registered.contains(actor) {
+                inner
+                    .backfill_owners
+                    .insert((actor.to_owned(), subject.to_owned()));
+            }
         } else {
             inner.follows.remove(&edge);
+            inner
+                .backfill_owners
+                .remove(&(actor.to_owned(), subject.to_owned()));
         }
         Ok(())
     }
@@ -304,11 +331,19 @@ impl Storage for MemoryStorage {
     }
 
     fn enqueue_backfill(&self, did: &str) -> Result<(), StorageError> {
-        self.inner
-            .lock()
-            .map_err(|_| StorageError::Poisoned)?
-            .backfill_queue
-            .insert(did.to_owned());
+        let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        inner.backfill_queue.insert(did.to_owned());
+        inner.backfill_completed.remove(did);
+        Ok(())
+    }
+
+    fn enqueue_backfill_for(&self, owner_did: &str, did: &str) -> Result<(), StorageError> {
+        let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        inner
+            .backfill_owners
+            .insert((owner_did.to_owned(), did.to_owned()));
+        inner.backfill_queue.insert(did.to_owned());
+        inner.backfill_completed.remove(did);
         Ok(())
     }
 
@@ -326,12 +361,25 @@ impl Storage for MemoryStorage {
     }
 
     fn complete_backfill(&self, did: &str) -> Result<(), StorageError> {
-        self.inner
-            .lock()
-            .map_err(|_| StorageError::Poisoned)?
-            .backfill_queue
-            .remove(did);
+        let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        inner.backfill_queue.remove(did);
+        inner.backfill_completed.insert(did.to_owned());
         Ok(())
+    }
+
+    fn backfill_progress(&self, owner_did: &str) -> Result<(usize, usize), StorageError> {
+        let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        let accounts = inner
+            .backfill_owners
+            .iter()
+            .filter(|(owner, _)| owner == owner_did)
+            .map(|(_, target)| target)
+            .collect::<Vec<_>>();
+        let done = accounts
+            .iter()
+            .filter(|target| inner.backfill_completed.contains(target.as_str()))
+            .count();
+        Ok((accounts.len(), done))
     }
 
     fn set_verified_handle(&self, did: &str, handle: &str) -> Result<(), StorageError> {
@@ -426,6 +474,15 @@ impl SqliteStorage {
                  did TEXT PRIMARY KEY,
                  enqueued_at INTEGER NOT NULL DEFAULT (unixepoch())
              );
+             CREATE TABLE IF NOT EXISTS backfill_status (
+                 did TEXT PRIMARY KEY,
+                 done INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE IF NOT EXISTS backfill_scope (
+                 owner_did TEXT NOT NULL,
+                 target_did TEXT NOT NULL,
+                 PRIMARY KEY (owner_did, target_did)
+             );
              CREATE TABLE IF NOT EXISTS verified_handles (
                  did TEXT PRIMARY KEY,
                  handle TEXT NOT NULL,
@@ -466,6 +523,15 @@ impl Storage for SqliteStorage {
         let transaction = connection.transaction()?;
         transaction.execute("DELETE FROM records WHERE did=?1", [did])?;
         transaction.execute("DELETE FROM follows WHERE actor=?1", [did])?;
+        transaction.execute(
+            "DELETE FROM backfill_scope WHERE owner_did=?1 AND target_did!=?1",
+            [did],
+        )?;
+        let is_registered: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM registered_users WHERE did=?1)",
+            [did],
+            |row| row.get(0),
+        )?;
         {
             let mut insert = transaction.prepare(
                 "INSERT INTO records (did, collection, rkey, uri, cid, time_us, record_json)
@@ -486,8 +552,22 @@ impl Storage for SqliteStorage {
         {
             let mut insert_follow = transaction
                 .prepare("INSERT OR IGNORE INTO follows(actor,subject) VALUES(?1,?2)")?;
+            let mut insert_scope = transaction.prepare(
+                "INSERT OR IGNORE INTO backfill_scope(owner_did,target_did) VALUES(?1,?2)",
+            )?;
+            let mut enqueue =
+                transaction.prepare("INSERT OR IGNORE INTO backfill_queue(did) VALUES(?1)")?;
+            let mut set_pending = transaction.prepare(
+                "INSERT INTO backfill_status(did,done) VALUES(?1,0)
+                 ON CONFLICT(did) DO UPDATE SET done=0",
+            )?;
             for subject in following {
                 insert_follow.execute(params![did, subject])?;
+                if is_registered {
+                    insert_scope.execute(params![did, subject])?;
+                    enqueue.execute([subject])?;
+                    set_pending.execute([subject])?;
+                }
             }
         }
         transaction.commit()?;
@@ -563,6 +643,15 @@ impl Storage for SqliteStorage {
             "INSERT OR IGNORE INTO backfill_queue(did) VALUES(?1)",
             [did],
         )?;
+        transaction.execute(
+            "INSERT INTO backfill_status(did,done) VALUES(?1,0)
+             ON CONFLICT(did) DO UPDATE SET done=0",
+            [did],
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO backfill_scope(owner_did,target_did) VALUES(?1,?1)",
+            [did],
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -572,6 +661,7 @@ impl Storage for SqliteStorage {
         let transaction = connection.transaction()?;
         transaction.execute("DELETE FROM registered_users WHERE did=?1", [did])?;
         transaction.execute("DELETE FROM follows WHERE actor=?1", [did])?;
+        transaction.execute("DELETE FROM backfill_scope WHERE owner_did=?1", [did])?;
         transaction.execute(
             "DELETE FROM backfill_queue WHERE did=?1 AND NOT EXISTS (
                  SELECT 1 FROM follows f JOIN registered_users r ON f.actor=r.did WHERE f.subject=?1
@@ -591,14 +681,24 @@ impl Storage for SqliteStorage {
     }
 
     fn set_follow(&self, actor: &str, subject: &str, following: bool) -> Result<(), StorageError> {
+        let connection = self.conn()?;
         if following {
-            self.conn()?.execute(
+            connection.execute(
                 "INSERT OR IGNORE INTO follows(actor,subject) VALUES(?1,?2)",
                 params![actor, subject],
             )?;
+            connection.execute(
+                "INSERT OR IGNORE INTO backfill_scope(owner_did,target_did)
+                 SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM registered_users WHERE did=?1)",
+                params![actor, subject],
+            )?;
         } else {
-            self.conn()?.execute(
+            connection.execute(
                 "DELETE FROM follows WHERE actor=?1 AND subject=?2",
+                params![actor, subject],
+            )?;
+            connection.execute(
+                "DELETE FROM backfill_scope WHERE owner_did=?1 AND target_did=?2",
                 params![actor, subject],
             )?;
         }
@@ -614,10 +714,38 @@ impl Storage for SqliteStorage {
     }
 
     fn enqueue_backfill(&self, did: &str) -> Result<(), StorageError> {
-        self.conn()?.execute(
+        let mut connection = self.conn()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
             "INSERT OR IGNORE INTO backfill_queue(did) VALUES(?1)",
             [did],
         )?;
+        transaction.execute(
+            "INSERT INTO backfill_status(did,done) VALUES(?1,0)
+             ON CONFLICT(did) DO UPDATE SET done=0",
+            [did],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn enqueue_backfill_for(&self, owner_did: &str, did: &str) -> Result<(), StorageError> {
+        let mut connection = self.conn()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO backfill_scope(owner_did,target_did) VALUES(?1,?2)",
+            params![owner_did, did],
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO backfill_queue(did) VALUES(?1)",
+            [did],
+        )?;
+        transaction.execute(
+            "INSERT INTO backfill_status(did,done) VALUES(?1,0)
+             ON CONFLICT(did) DO UPDATE SET done=0",
+            [did],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -631,9 +759,27 @@ impl Storage for SqliteStorage {
     }
 
     fn complete_backfill(&self, did: &str) -> Result<(), StorageError> {
-        self.conn()?
-            .execute("DELETE FROM backfill_queue WHERE did=?1", [did])?;
+        let mut connection = self.conn()?;
+        let transaction = connection.transaction()?;
+        transaction.execute("DELETE FROM backfill_queue WHERE did=?1", [did])?;
+        transaction.execute(
+            "INSERT INTO backfill_status(did,done) VALUES(?1,1)
+             ON CONFLICT(did) DO UPDATE SET done=1",
+            [did],
+        )?;
+        transaction.commit()?;
         Ok(())
+    }
+
+    fn backfill_progress(&self, owner_did: &str) -> Result<(usize, usize), StorageError> {
+        let (total, done): (i64, i64) = self.conn()?.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN s.done=1 THEN 1 ELSE 0 END),0)
+             FROM backfill_scope b LEFT JOIN backfill_status s ON s.did=b.target_did
+             WHERE b.owner_did=?1",
+            [owner_did],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((total as usize, done as usize))
     }
 
     fn set_verified_handle(&self, did: &str, handle: &str) -> Result<(), StorageError> {
@@ -861,7 +1007,7 @@ impl<S: Storage> Ingestor<S> {
             {
                 self.storage.set_follow(&did, subject, true)?;
                 if self.scope == ScopeMode::Scoped {
-                    self.storage.enqueue_backfill(subject)?;
+                    self.storage.enqueue_backfill_for(&did, subject)?;
                 }
             }
         }

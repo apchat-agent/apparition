@@ -254,6 +254,7 @@ fn registered_repo_backfill_queues_followed_accounts_and_tracks_completion() {
         );
         storage.complete_backfill("did:plc:root").unwrap();
         storage.complete_backfill("did:plc:friend").unwrap();
+        assert_eq!(storage.backfill_progress("did:plc:root").unwrap(), (3, 2));
         assert_eq!(storage.pending_backfills().unwrap(), ["did:plc:other"]);
     }
 
