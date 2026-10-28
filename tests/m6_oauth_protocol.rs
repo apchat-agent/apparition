@@ -551,6 +551,53 @@ async fn fake_pds_receives_correct_reply_root_and_parent_strong_refs() {
 }
 
 #[tokio::test]
+async fn fake_pds_receives_quote_post_with_record_embed_strong_ref() {
+    let (flow, _, shared, server) = production_flow(None, Some(EXPECTED_OAUTH_SCOPE)).await;
+    flow.authorize(DID, "quote-test-binding").await.unwrap();
+    let state = latest_state(&shared);
+    flow.callback(OAuthCallback {
+        code: "valid-code".to_owned(),
+        state,
+        issuer: Some(server_origin(&shared)),
+        scope: None,
+        browser_binding: Some("quote-test-binding".to_owned()),
+    })
+    .await
+    .unwrap();
+
+    let quoted = PostStrongRef {
+        uri: format!("at://{DID}/app.bsky.feed.post/original"),
+        cid: "original-cid".to_owned(),
+    };
+    flow.create_quote(DID, "with some context", quoted.clone())
+        .await
+        .unwrap();
+
+    let request = shared
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .find(|request| {
+            request
+                .path
+                .starts_with("/xrpc/com.atproto.repo.createRecord")
+        })
+        .cloned()
+        .unwrap();
+    let body: Value = serde_json::from_str(&request.body).unwrap();
+    assert_eq!(body["collection"], "app.bsky.feed.post");
+    assert_eq!(body["record"]["$type"], "app.bsky.feed.post");
+    assert_eq!(body["record"]["text"], "with some context");
+    assert_eq!(body["record"]["embed"]["$type"], "app.bsky.embed.record");
+    assert_eq!(
+        body["record"]["embed"]["record"],
+        json!({"uri":quoted.uri,"cid":quoted.cid})
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn loopback_production_oauth_completes_a_public_client_login() {
     let (flow, _, shared, server) = production_loopback_flow().await;
     let callback_uri = "http://127.0.0.1:43123/oauth/callback";

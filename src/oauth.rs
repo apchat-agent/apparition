@@ -169,6 +169,14 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
         Box::pin(async { Err("reply action is not available".to_owned()) })
     }
+    fn create_quote<'a>(
+        &'a self,
+        _did: &'a str,
+        _text: &'a str,
+        _quoted: PostStrongRef,
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+        Box::pin(async { Err("quote action is not available".to_owned()) })
+    }
     fn fetch_post<'a>(
         &'a self,
         _uri: &'a str,
