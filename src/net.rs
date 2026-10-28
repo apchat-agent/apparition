@@ -1,9 +1,9 @@
+use std::collections::HashSet;
 use std::{
-    collections::VecDeque,
     future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 use url::Url;
 
@@ -66,26 +66,52 @@ pub trait HostResolver: Send + Sync {
 
 pub struct SafeHttpClient {
     resolver: Arc<dyn HostResolver>,
+    http_test_hosts: HashSet<String>,
 }
 
 impl SafeHttpClient {
     pub fn with_resolver(resolver: impl HostResolver + 'static) -> Self {
         Self {
             resolver: Arc::new(resolver),
+            http_test_hosts: HashSet::new(),
         }
+    }
+
+    pub fn with_http_test_hosts(mut self, hosts: impl IntoIterator<Item = String>) -> Self {
+        self.http_test_hosts = hosts
+            .into_iter()
+            .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+            .collect();
+        self
     }
 
     pub async fn resolve_safe(&self, url: &Url) -> Result<Vec<SocketAddr>, String> {
         let host = url.host_str().ok_or_else(|| "URL has no host".to_owned())?;
+        let normalized_host = host.trim_end_matches('.').to_ascii_lowercase();
+        let test_host = self.http_test_hosts.contains(&normalized_host);
+        if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+            return Err("URL contains forbidden components".to_owned());
+        }
+        if url.scheme() != "https" && !(url.scheme() == "http" && test_host) {
+            return Err("outbound URL must use HTTPS".to_owned());
+        }
         let port = url
             .port_or_known_default()
             .ok_or_else(|| "URL has no port".to_owned())?;
-        self.resolver.resolve(host, port).await.map(|addresses| {
-            addresses
-                .into_iter()
-                .map(|address| SocketAddr::new(address, port))
-                .collect()
-        })
+        let addresses = match host.parse::<IpAddr>() {
+            Ok(address) => vec![address],
+            Err(_) => self.resolver.resolve(host, port).await?,
+        };
+        if addresses.is_empty() {
+            return Err("host has no addresses".to_owned());
+        }
+        if !test_host && addresses.iter().copied().any(is_forbidden_ip) {
+            return Err("host resolved to a forbidden address".to_owned());
+        }
+        Ok(addresses
+            .into_iter()
+            .map(|address| SocketAddr::new(address, port))
+            .collect())
     }
 }
 
