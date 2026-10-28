@@ -631,10 +631,7 @@ async fn websocket_connection_lifecycle_is_logged_at_info() {
         Duration::from_millis(1),
     );
     let secret_endpoint = format!("ws://{address}/subscribe?access_token=do-not-log");
-    consumer
-        .consume_connection(&secret_endpoint)
-        .await
-        .unwrap();
+    consumer.consume_connection(&secret_endpoint).await.unwrap();
     server.await.unwrap();
 
     let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
