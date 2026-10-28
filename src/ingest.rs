@@ -1408,6 +1408,10 @@ impl SqliteStorage {
              );",
         )?;
         migrate_follow_state(&connection)?;
+        connection.execute_batch(
+            "CREATE INDEX IF NOT EXISTS follows_active_subject_actor
+             ON follows(subject, actor) WHERE following=1;",
+        )?;
         connection.execute(
             "DELETE FROM backfill_queue
              WHERE did NOT IN (
