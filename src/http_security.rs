@@ -155,11 +155,83 @@ mod tests {
         body::{Body, Bytes},
         extract::ConnectInfo,
         http::Request,
-        routing::post,
+        routing::{get, post},
     };
-    use std::net::SocketAddr;
-    use std::time::Instant;
+    use std::{
+        io::Write,
+        net::SocketAddr,
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
     use tower::ServiceExt;
+
+    struct CapturedMakeWriter(Arc<Mutex<Vec<u8>>>);
+
+    struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedMakeWriter {
+        type Writer = CapturedWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedWriter(self.0.clone())
+        }
+    }
+
+    impl Write for CapturedWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn request_timing_logs_safe_path_status_and_slow_warning() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(CapturedMakeWriter(output.clone()))
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+
+        let app = protect(
+            axum::Router::new().route(
+                "/slow",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_millis(2_050)).await;
+                    "done"
+                }),
+            ),
+            false,
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/slow?secret=query-secret")
+                    .header("cookie", "session=cookie-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("HTTP request"), "{logs}");
+        assert!(logs.contains("method=GET"), "{logs}");
+        assert!(logs.contains("path=\"/slow\""), "{logs}");
+        assert!(logs.contains("status=200"), "{logs}");
+        assert!(logs.contains("duration_ms="), "{logs}");
+        assert!(logs.contains("HTTP request exceeded duration threshold"), "{logs}");
+        assert!(!logs.contains("query-secret"), "{logs}");
+        assert!(!logs.contains("cookie-secret"), "{logs}");
+    }
 
     #[tokio::test]
     async fn eleventh_login_attempt_from_one_ip_is_rate_limited() {
