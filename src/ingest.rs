@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -1126,6 +1126,33 @@ const SNAPSHOT_BATCH: usize = 500;
 pub struct SqliteStorage {
     connection: Mutex<Connection>,
     path: PathBuf,
+    checkpointer_stop: Arc<AtomicBool>,
+}
+
+impl Drop for SqliteStorage {
+    fn drop(&mut self) {
+        self.checkpointer_stop.store(true, Ordering::Relaxed);
+    }
+}
+
+const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
+
+fn spawn_checkpointer(path: PathBuf, stop: Arc<AtomicBool>) -> Result<(), StorageError> {
+    let connection = Connection::open(&path)?;
+    connection.execute_batch("PRAGMA busy_timeout = 5000;")?;
+    std::thread::Builder::new()
+        .name("sqlite-checkpoint".to_owned())
+        .spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(CHECKPOINT_INTERVAL);
+                if let Err(error) =
+                    connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))
+                {
+                    tracing::warn!(%error, "WAL checkpoint failed");
+                }
+            }
+        })?;
+    Ok(())
 }
 
 impl SqliteStorage {
@@ -1236,10 +1263,26 @@ impl SqliteStorage {
             [MAX_BACKFILL_QUEUE],
         )?;
         migrate_notification_events(&connection)?;
+        // SQLite's automatic checkpoint runs inside a commit, i.e. under our one
+        // connection lock; on appview-host's disk a 1 GB WAL took minutes and froze every
+        // request. A side connection checkpoints instead (PASSIVE never blocks writers).
+        connection.execute_batch("PRAGMA wal_autocheckpoint = 0; PRAGMA busy_timeout = 5000;")?;
+        let stop = Arc::new(AtomicBool::new(false));
+        if path.as_os_str() != ":memory:" {
+            spawn_checkpointer(path.clone(), Arc::clone(&stop))?;
+        }
         Ok(Self {
             connection: Mutex::new(connection),
             path,
+            checkpointer_stop: stop,
         })
+    }
+
+    /// The main connection's automatic-checkpoint threshold (0 = off).
+    pub fn wal_autocheckpoint(&self) -> Result<i64, StorageError> {
+        Ok(self
+            .conn()?
+            .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))?)
     }
 
     fn conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StorageError> {

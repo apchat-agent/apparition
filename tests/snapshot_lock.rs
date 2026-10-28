@@ -49,3 +49,37 @@ fn large_snapshot_lets_other_storage_calls_in_between_batches() {
         Some("r59999".to_owned())
     );
 }
+
+// SQLite's automatic checkpoint runs inside the committing write, i.e. under the
+// connection lock; on appview-host's disk a 1 GB WAL checkpoint held it for minutes.
+#[test]
+fn record_writes_never_run_the_wal_checkpoint_under_the_lock() {
+    let dir = std::env::temp_dir().join(format!("appview-ckpt-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("appview.db");
+    let storage = SqliteStorage::open(&path).unwrap();
+    assert_eq!(storage.wal_autocheckpoint().unwrap(), 0);
+
+    // ...and the side checkpointer still drains the WAL so it doesn't grow forever.
+    let record = |i: u64| IndexedRecord {
+        did: "did:plc:a".to_owned(),
+        collection: "app.bsky.feed.post".to_owned(),
+        rkey: format!("r{i}"),
+        uri: format!("at://did:plc:a/app.bsky.feed.post/r{i}"),
+        cid: None,
+        time_us: i,
+        record: serde_json::json!({"text": "hello"}),
+    };
+    // Only a checkpoint copies pages from the WAL into the main file.
+    let before = std::fs::metadata(&path).unwrap().len();
+    for i in 0..2000 {
+        storage.put_record(&record(i)).unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while std::fs::metadata(&path).unwrap().len() <= before {
+        assert!(Instant::now() < deadline, "main database file never grew: WAL not checkpointed");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    drop(storage);
+    let _ = std::fs::remove_dir_all(&dir);
+}
