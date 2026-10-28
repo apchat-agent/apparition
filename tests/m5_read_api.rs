@@ -915,8 +915,9 @@ async fn proxy_jwt_rejects_a_valid_claim_set_signed_by_another_key() {
         expiry(60),
         Some(ALICE),
     );
-    let (status, _) = request(router, "/xrpc/app.bsky.feed.getTimeline", Some(&forged)).await;
+    let (status, body) = request(router, "/xrpc/app.bsky.feed.getTimeline", Some(&forged)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["message"], "invalid service JWT");
 }
 
 #[tokio::test]
