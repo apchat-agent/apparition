@@ -1128,7 +1128,10 @@ where
             StatusCode::BAD_GATEWAY,
             "invalid authorization endpoint URL",
         ),
-        Ok(Err(error)) => oauth_error(StatusCode::BAD_REQUEST, &error),
+        Ok(Err(_)) => oauth_error(
+            StatusCode::BAD_REQUEST,
+            "Sign-in could not be started. Please try again.",
+        ),
         Err(_) => oauth_error_page(
             StatusCode::BAD_GATEWAY,
             "Sign-in could not be completed. Please start again.",
@@ -1177,7 +1180,12 @@ where
         .await;
     let account = match callback_result {
         Ok(Ok(account)) => account,
-        Ok(Err(error)) => return oauth_error(StatusCode::BAD_REQUEST, &error),
+        Ok(Err(_)) => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "Sign-in could not be completed. Please start again.",
+            );
+        }
         Err(_) => {
             return oauth_error_page(
                 StatusCode::BAD_GATEWAY,
@@ -1937,6 +1945,11 @@ fn clear_session_cookie(mut response: Response, secure: bool) -> Response {
 }
 
 fn oauth_error(status: StatusCode, message: &str) -> Response {
+    let message = match status {
+        StatusCode::INTERNAL_SERVER_ERROR => "internal server error",
+        StatusCode::BAD_GATEWAY => "the request could not be completed",
+        _ => message,
+    };
     (
         status,
         Json(json!({"error":"OAuthError","message":message})),
