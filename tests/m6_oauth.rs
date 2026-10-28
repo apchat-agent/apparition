@@ -2,7 +2,9 @@ use appview_rs::router;
 use appview_rs::{
     config::Config,
     ingest::{IndexedRecord, Ingestor, MemoryStorage, ScopeMode, SqliteStorage, Storage},
-    oauth::{OAuthAccount, OAuthCallback, OAuthFlow, OAuthPublic, SqliteOAuthStore},
+    oauth::{
+        OAuthAccount, OAuthCallback, OAuthFlow, OAuthPublic, PdsCreatedRecord, SqliteOAuthStore,
+    },
 };
 use atrium_api::types::string::Did;
 use atrium_common::store::Store;
@@ -48,6 +50,24 @@ impl FakeOAuthFlow {
             granted_scope: scope.map(str::to_owned),
             ..Self::default()
         }
+    }
+}
+
+fn fake_pds_create_record(
+    did: &str,
+    collection: &str,
+    rkey: &str,
+    cid: &str,
+    record: Value,
+) -> PdsCreatedRecord {
+    PdsCreatedRecord {
+        uri: format!("at://{did}/{collection}/{rkey}"),
+        cid: cid.to_owned(),
+        record,
+        time_us: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64,
     }
 }
 
@@ -97,7 +117,7 @@ impl OAuthFlow for FakeOAuthFlow {
         &'a self,
         did: &'a str,
         text: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
         Box::pin(async move {
             if let Some(error) = &self.action_failure {
                 return Err(error.clone());
@@ -106,7 +126,13 @@ impl OAuthFlow for FakeOAuthFlow {
                 .lock()
                 .unwrap()
                 .push(format!("post:{did}:{text}"));
-            Ok(())
+            Ok(fake_pds_create_record(
+                did,
+                "app.bsky.feed.post",
+                "pds-post-r1",
+                "pds-post-cid",
+                serde_json::json!({"$type":"app.bsky.feed.post","text":text,"createdAt":"2026-10-28T00:00:00Z"}),
+            ))
         })
     }
 
@@ -115,13 +141,23 @@ impl OAuthFlow for FakeOAuthFlow {
         did: &'a str,
         uri: &'a str,
         cid: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
         Box::pin(async move {
             self.actions
                 .lock()
                 .unwrap()
                 .push(format!("like:{did}:{uri}:{cid}"));
-            Ok(())
+            Ok(fake_pds_create_record(
+                did,
+                "app.bsky.feed.like",
+                "pds-like-r1",
+                "pds-like-cid",
+                serde_json::json!({
+                    "$type":"app.bsky.feed.like",
+                    "subject":{"uri":uri,"cid":cid},
+                    "createdAt":"2026-10-28T00:00:00Z"
+                }),
+            ))
         })
     }
 
@@ -144,13 +180,23 @@ impl OAuthFlow for FakeOAuthFlow {
         did: &'a str,
         uri: &'a str,
         cid: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
         Box::pin(async move {
             self.actions
                 .lock()
                 .unwrap()
                 .push(format!("repost:{did}:{uri}:{cid}"));
-            Ok(())
+            Ok(fake_pds_create_record(
+                did,
+                "app.bsky.feed.repost",
+                "pds-repost-r1",
+                "pds-repost-cid",
+                serde_json::json!({
+                    "$type":"app.bsky.feed.repost",
+                    "subject":{"uri":uri,"cid":cid},
+                    "createdAt":"2026-10-28T00:00:00Z"
+                }),
+            ))
         })
     }
 

@@ -218,7 +218,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn request_timing_logs_safe_path_status_and_slow_warning() {
         let output = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::fmt()
@@ -230,13 +230,7 @@ mod tests {
         let _guard = tracing::dispatcher::set_default(&dispatch);
 
         let app = protect(
-            axum::Router::new().route(
-                "/slow",
-                get(|| async {
-                    tokio::time::sleep(Duration::from_millis(2_050)).await;
-                    "done"
-                }),
-            ),
+            axum::Router::new().route("/slow", get(|| async { "done" })),
             false,
         );
         let response = app
@@ -261,19 +255,41 @@ mod tests {
         );
         assert_eq!(
             logs.lines().filter(|line| line.contains(" WARN ")).count(),
-            1,
+            0,
             "{logs}"
         );
         assert!(logs.contains("method=\"GET\""), "{logs}");
         assert!(logs.contains("path=\"/slow\""), "{logs}");
         assert!(logs.contains("status=200"), "{logs}");
         assert!(logs.contains("duration_ms="), "{logs}");
+        assert!(!logs.contains("query-secret"), "{logs}");
+        assert!(!logs.contains("cookie-secret"), "{logs}");
+    }
+
+    #[test]
+    fn requests_over_two_seconds_emit_a_warning() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(CapturedMakeWriter(output.clone()))
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+
+        super::log_request(
+            "GET",
+            "/slow",
+            Instant::now() - Duration::from_secs(3),
+            axum::http::StatusCode::OK,
+        );
+
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
         assert!(
             logs.contains("HTTP request exceeded duration threshold"),
             "{logs}"
         );
-        assert!(!logs.contains("query-secret"), "{logs}");
-        assert!(!logs.contains("cookie-secret"), "{logs}");
+        assert!(logs.contains("duration_ms=3000"), "{logs}");
     }
 
     #[tokio::test]

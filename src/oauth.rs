@@ -116,6 +116,14 @@ pub struct OAuthAccount {
     pub granted_scope: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct PdsCreatedRecord {
+    pub uri: String,
+    pub cid: String,
+    pub record: Value,
+    pub time_us: u64,
+}
+
 pub trait OAuthFlow: Clone + Send + Sync + 'static {
     fn authorize<'a>(
         &'a self,
@@ -134,7 +142,7 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
         &'a self,
         _did: &'a str,
         _text: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
         Box::pin(async { Err("post action is not available".to_owned()) })
     }
     fn like<'a>(
@@ -142,7 +150,7 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
         _did: &'a str,
         _uri: &'a str,
         _cid: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
         Box::pin(async { Err("like action is not available".to_owned()) })
     }
     fn delete_like<'a>(
@@ -157,7 +165,7 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
         _did: &'a str,
         _uri: &'a str,
         _cid: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
         Box::pin(async { Err("repost action is not available".to_owned()) })
     }
     fn timeline<'a>(
@@ -740,7 +748,13 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         did: &str,
         collection: &str,
         record: Value,
-    ) -> Result<(), String> {
+    ) -> Result<PdsCreatedRecord, String> {
+        let indexed_record = record.clone();
+        let time_us = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros()
+            .min(u64::MAX as u128) as u64;
         let did = did.parse::<Did>().map_err(|error| error.to_string())?;
         let session = self
             .client
@@ -759,15 +773,25 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             validate: None,
         }
         .into();
-        agent
+        let output = agent
             .api
             .com
             .atproto
             .repo
             .create_record(input)
             .await
-            .map(|_| ())
-            .map_err(|error| format!("PDS createRecord failed: {error:?}"))
+            .map_err(|error| format!("PDS createRecord failed: {error:?}"))?;
+        let cid = serde_json::to_value(output.cid.clone())
+            .map_err(|error| error.to_string())?
+            .as_str()
+            .ok_or_else(|| "PDS createRecord returned an invalid CID".to_owned())?
+            .to_owned();
+        Ok(PdsCreatedRecord {
+            uri: output.uri.to_string(),
+            cid,
+            record: indexed_record,
+            time_us,
+        })
     }
 
     async fn delete_like_record(&self, did: &str, like_uri: &str) -> Result<(), String> {
@@ -919,7 +943,7 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
         &'a self,
         did: &'a str,
         text: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
         Box::pin(async move {
             self.create_record(
                 did,
@@ -939,7 +963,7 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
         did: &'a str,
         uri: &'a str,
         cid: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
         Box::pin(async move {
             self.create_record(
                 did,
@@ -967,7 +991,7 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
         did: &'a str,
         uri: &'a str,
         cid: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
         Box::pin(async move {
             self.create_record(
                 did,
@@ -1065,7 +1089,7 @@ impl DnsTxtResolver for CloudflareDnsTxtResolver {
 async fn metadata<F, S>(State(state): State<Arc<OAuthWebState<F, S>>>) -> Json<Value>
 where
     F: OAuthFlow,
-    S: Storage,
+    S: Storage + 'static,
 {
     Json(state.public.metadata.clone())
 }
@@ -1154,7 +1178,7 @@ async fn authorize<F, S>(
 ) -> Response
 where
     F: OAuthFlow,
-    S: Storage,
+    S: Storage + 'static,
 {
     if !same_origin_request(&headers, &state.public.public_url) {
         return oauth_error(
@@ -1420,7 +1444,7 @@ async fn app_home<F, S>(
 ) -> Response
 where
     F: OAuthFlow,
-    S: Storage,
+    S: Storage + 'static,
 {
     let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return Redirect::to("/login").into_response();
@@ -1907,7 +1931,7 @@ async fn write_post<F, S>(
 ) -> Response
 where
     F: OAuthFlow,
-    S: Storage,
+    S: Storage + 'static,
 {
     if !same_origin_request(&headers, &state.public.public_url) {
         return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
@@ -1926,9 +1950,66 @@ where
         );
     }
     match state.flow.create_post(&did, text).await {
-        Ok(()) => Redirect::to("/app").into_response(),
+        Ok(created) => {
+            match persist_created_record(state.storage.clone(), &did, "app.bsky.feed.post", created)
+                .await
+            {
+                Ok(()) => Redirect::to("/app").into_response(),
+                Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+            }
+        }
         Err(error) => oauth_error(StatusCode::BAD_GATEWAY, &error),
     }
+}
+
+async fn persist_created_record<S: Storage + 'static>(
+    storage: Arc<S>,
+    did: &str,
+    collection: &str,
+    created: PdsCreatedRecord,
+) -> Result<(), String> {
+    let prefix = format!("at://{did}/{collection}/");
+    let rkey = created
+        .uri
+        .strip_prefix(&prefix)
+        .filter(|rkey| !rkey.is_empty() && !rkey.contains('/'))
+        .ok_or_else(|| {
+            "PDS createRecord returned a URI outside the expected repo/collection".to_owned()
+        })?
+        .to_owned();
+    let record = IndexedRecord {
+        did: did.to_owned(),
+        collection: collection.to_owned(),
+        rkey,
+        uri: created.uri,
+        cid: Some(created.cid),
+        time_us: created.time_us,
+        record: created.record,
+    };
+    tokio::task::spawn_blocking(move || storage.put_record(&record))
+        .await
+        .map_err(|error| format!("index write task failed: {error}"))?
+        .map_err(|error| format!("could not index PDS record: {error}"))
+}
+
+async fn remove_deleted_record<S: Storage + 'static>(
+    storage: Arc<S>,
+    did: &str,
+    collection: &str,
+    uri: &str,
+) -> Result<(), String> {
+    let prefix = format!("at://{did}/{collection}/");
+    let rkey = uri
+        .strip_prefix(&prefix)
+        .filter(|rkey| !rkey.is_empty() && !rkey.contains('/'))
+        .ok_or_else(|| "PDS deleteRecord URI is outside the expected repo/collection".to_owned())?
+        .to_owned();
+    let did = did.to_owned();
+    let collection = collection.to_owned();
+    tokio::task::spawn_blocking(move || storage.delete_record(&did, &collection, &rkey))
+        .await
+        .map_err(|error| format!("index delete task failed: {error}"))?
+        .map_err(|error| format!("could not remove deleted PDS record: {error}"))
 }
 
 async fn write_like<F, S>(
@@ -1938,7 +2019,7 @@ async fn write_like<F, S>(
 ) -> Response
 where
     F: OAuthFlow,
-    S: Storage,
+    S: Storage + 'static,
 {
     if !same_origin_request(&headers, &state.public.public_url) {
         return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
@@ -1969,12 +2050,29 @@ where
             );
         };
         return match state.flow.delete_like(&did, &like_uri).await {
-            Ok(()) => Redirect::to("/app").into_response(),
+            Ok(()) => match remove_deleted_record(
+                state.storage.clone(),
+                &did,
+                "app.bsky.feed.like",
+                &like_uri,
+            )
+            .await
+            {
+                Ok(()) => Redirect::to("/app").into_response(),
+                Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+            },
             Err(error) => oauth_error(StatusCode::BAD_GATEWAY, &error),
         };
     }
     match state.flow.like(&did, uri, cid).await {
-        Ok(()) => Redirect::to("/app").into_response(),
+        Ok(created) => {
+            match persist_created_record(state.storage.clone(), &did, "app.bsky.feed.like", created)
+                .await
+            {
+                Ok(()) => Redirect::to("/app").into_response(),
+                Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+            }
+        }
         Err(error) => oauth_error(StatusCode::BAD_GATEWAY, &error),
     }
 }
@@ -1986,7 +2084,7 @@ async fn write_repost<F, S>(
 ) -> Response
 where
     F: OAuthFlow,
-    S: Storage,
+    S: Storage + 'static,
 {
     if !same_origin_request(&headers, &state.public.public_url) {
         return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
@@ -2004,7 +2102,17 @@ where
         return oauth_error(StatusCode::BAD_REQUEST, "uri and cid are invalid");
     }
     match state.flow.repost(&did, uri, cid).await {
-        Ok(()) => Redirect::to("/app").into_response(),
+        Ok(created) => match persist_created_record(
+            state.storage.clone(),
+            &did,
+            "app.bsky.feed.repost",
+            created,
+        )
+        .await
+        {
+            Ok(()) => Redirect::to("/app").into_response(),
+            Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+        },
         Err(error) => oauth_error(StatusCode::BAD_GATEWAY, &error),
     }
 }
