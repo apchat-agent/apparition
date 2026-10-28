@@ -14,6 +14,18 @@ pub struct ResolvedFeed {
     pub endpoint: String,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct FeedSkeletonEntry {
+    pub post_uri: String,
+    pub reason: Option<Value>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FeedSkeletonPage {
+    pub feed: Vec<FeedSkeletonEntry>,
+    pub cursor: Option<String>,
+}
+
 pub struct FeedClient<B: IdentityBackend> {
     identity: Arc<IdentityResolver<B>>,
     http: SafeHttpClient,
@@ -112,6 +124,15 @@ impl<B: IdentityBackend> FeedClient<B> {
         );
         Ok(feed)
     }
+
+    pub async fn get_skeleton(
+        &self,
+        _feed: &ResolvedFeed,
+        _cursor: Option<&str>,
+        _service_jwt: Option<&str>,
+    ) -> Result<FeedSkeletonPage, String> {
+        Err("feed skeleton requests are not implemented".to_owned())
+    }
 }
 
 fn parse_feed_uri(uri: &str) -> Result<(String, String, String), String> {
@@ -207,11 +228,11 @@ pub fn parse_saved_feed_preferences(response: &Value) -> Vec<SavedFeedPreference
 
 #[cfg(test)]
 mod tests {
-    use super::{FeedClient, parse_saved_feed_preferences};
+    use super::{FeedClient, ResolvedFeed, parse_saved_feed_preferences};
     use crate::{identity::{DidDocument, DidService, IdentityBackend, IdentityResolver, ResolutionError}, net::{HostResolver, SafeHttpClient}};
-    use axum::{Router, http::Uri, response::IntoResponse, routing::any};
+    use axum::{Router, http::{HeaderMap, Uri}, response::IntoResponse, routing::{any, get}};
     use serde_json::json;
-    use std::{collections::HashMap, future::Future, net::{IpAddr, Ipv4Addr}, pin::Pin, sync::Arc, time::Duration};
+    use std::{collections::HashMap, future::Future, net::{IpAddr, Ipv4Addr}, pin::Pin, sync::{Arc, Mutex}, time::Duration};
     use tokio::net::TcpListener;
 
     const CREATOR: &str = "did:web:creator.test";
@@ -299,6 +320,38 @@ mod tests {
         // An empty service endpoint is invalid and must produce a clear resolution error.
         let error = client(no_service).resolve_feed(&format!("at://{CREATOR}/app.bsky.feed.generator/web")).await.unwrap_err();
         assert!(error.contains("bsky_fg"), "{error}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn skeleton_request_uses_service_jwt_cursor_and_expected_xrpc_path() {
+        let captured = Arc::new(Mutex::new(None::<(String, String)>));
+        let capture = captured.clone();
+        let app = Router::new().route("/fg/xrpc/app.bsky.feed.getFeedSkeleton", get(move |uri: Uri, headers: HeaderMap| {
+            let capture = capture.clone();
+            async move {
+                *capture.lock().unwrap() = Some((headers.get("authorization").and_then(|value| value.to_str().ok()).unwrap_or("").to_owned(), uri.to_string()));
+                axum::Json(json!({"feed":[{"post":"at://did:plc:author/app.bsky.feed.post/a"}],"cursor":"next"}))
+            }
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let feed = ResolvedFeed {
+            uri: "at://did:plc:creator/app.bsky.feed.generator/feed".into(),
+            display_name: "Example".into(), description: None, avatar: None,
+            service_did: "did:plc:service".into(), endpoint: format!("http://localhost:{}/fg", address.port()),
+        };
+        let client = client(resolver("".to_owned(), "".to_owned()));
+        let page = client.get_skeleton(&feed, Some("older + cursor"), Some("jwt-secret-test")).await.unwrap();
+        assert_eq!(page.cursor.as_deref(), Some("next"));
+        assert_eq!(page.feed.len(), 1);
+        let captured = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(captured.0, "Bearer jwt-secret-test");
+        assert!(captured.1.starts_with("/fg/xrpc/app.bsky.feed.getFeedSkeleton?"));
+        assert!(captured.1.contains("feed=at%3A%2F%2Fdid%3Aplc%3Acreator"));
+        assert!(captured.1.contains("cursor=older+%2B+cursor"));
+        assert!(captured.1.contains("limit=30"));
         server.abort();
     }
 
