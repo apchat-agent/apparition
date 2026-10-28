@@ -1,7 +1,52 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 
-pub fn is_forbidden_ip(_ip: IpAddr) -> bool {
-    false
+pub fn is_forbidden_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => forbidden_v4(ip),
+        IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return forbidden_v4(mapped);
+            }
+            let segments = ip.segments();
+            let global_unicast = segments[0] & 0xe000 == 0x2000;
+            let documentation =
+                segments[0] == 0x2001 && ((segments[1] == 0x0db8) || segments[1] & 0xfe00 == 0);
+            ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || ip.is_multicast()
+                || !global_unicast
+                || documentation
+                || segments[0] == 0x2002 // 6to4 embeds an unchecked IPv4 destination.
+                || (segments[0] == 0x3fff && segments[1] & 0xfff0 == 0)
+        }
+    }
+}
+
+fn forbidden_v4(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    let shared_address_space = octets[0] == 100 && (64..=127).contains(&octets[1]);
+    let protocol_assignments = octets[0] == 192 && octets[1] == 0 && octets[2] == 0;
+    let documentation = (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+        || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+        || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113);
+    let benchmark = octets[0] == 198 && (18..=19).contains(&octets[1]);
+    let old_relay = octets[0] == 192 && octets[1] == 88 && octets[2] == 99;
+
+    ip.is_unspecified()
+        || ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+        || octets[0] == 0
+        || shared_address_space
+        || protocol_assignments
+        || documentation
+        || benchmark
+        || old_relay
+        || octets[0] >= 240
 }
 
 #[cfg(test)]
