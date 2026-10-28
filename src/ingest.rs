@@ -27,6 +27,8 @@ const SUPPORTED_COLLECTIONS: &[&str] = &[
 ];
 const BACKFILL_RETRY_BASE: Duration = Duration::from_secs(5);
 const BACKFILL_RETRY_MAX: Duration = Duration::from_secs(60 * 60);
+const MAX_BACKFILL_QUEUE: usize = 1_000;
+const BACKFILL_BATCH_SIZE: usize = 8;
 
 fn backfill_retry_delay(failures: u32) -> Duration {
     let exponent = failures.saturating_sub(1).min(63);
@@ -458,7 +460,10 @@ impl Storage for MemoryStorage {
         }
         for subject in following {
             inner.follows.insert((did.to_owned(), subject.clone()));
-            if inner.registered.contains(did) {
+            if inner.registered.contains(did)
+                && (inner.backfill_queue.contains(subject)
+                    || inner.backfill_queue.len() < MAX_BACKFILL_QUEUE)
+            {
                 inner
                     .backfill_owners
                     .insert((did.to_owned(), subject.clone()));
@@ -808,11 +813,13 @@ impl Storage for MemoryStorage {
     fn register_user(&self, did: &str) -> Result<(), StorageError> {
         let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
         inner.registered.insert(did.to_owned());
-        inner.backfill_queue.insert(did.to_owned());
-        inner
-            .backfill_owners
-            .insert((did.to_owned(), did.to_owned()));
-        inner.backfill_completed.remove(did);
+        if inner.backfill_queue.contains(did) || inner.backfill_queue.len() < MAX_BACKFILL_QUEUE {
+            inner.backfill_queue.insert(did.to_owned());
+            inner
+                .backfill_owners
+                .insert((did.to_owned(), did.to_owned()));
+            inner.backfill_completed.remove(did);
+        }
         Ok(())
     }
 
@@ -869,11 +876,6 @@ impl Storage for MemoryStorage {
         let edge = (actor.to_owned(), subject.to_owned());
         if following {
             inner.follows.insert(edge);
-            if inner.registered.contains(actor) {
-                inner
-                    .backfill_owners
-                    .insert((actor.to_owned(), subject.to_owned()));
-            }
         } else {
             inner.follows.remove(&edge);
             inner
@@ -893,13 +895,33 @@ impl Storage for MemoryStorage {
 
     fn enqueue_backfill(&self, did: &str) -> Result<(), StorageError> {
         let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
-        inner.backfill_queue.insert(did.to_owned());
-        inner.backfill_completed.remove(did);
+        let tracked = inner.registered.contains(did)
+            || inner
+                .follows
+                .iter()
+                .any(|(actor, subject)| subject == did && inner.registered.contains(actor));
+        if tracked
+            && (inner.backfill_queue.contains(did)
+                || inner.backfill_queue.len() < MAX_BACKFILL_QUEUE)
+        {
+            inner.backfill_queue.insert(did.to_owned());
+            inner.backfill_completed.remove(did);
+        }
         Ok(())
     }
 
     fn enqueue_backfill_for(&self, owner_did: &str, did: &str) -> Result<(), StorageError> {
         let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        if !inner.registered.contains(owner_did)
+            || (did != owner_did
+                && !inner
+                    .follows
+                    .contains(&(owner_did.to_owned(), did.to_owned())))
+            || (!inner.backfill_queue.contains(did)
+                && inner.backfill_queue.len() >= MAX_BACKFILL_QUEUE)
+        {
+            return Ok(());
+        }
         inner
             .backfill_owners
             .insert((owner_did.to_owned(), did.to_owned()));
@@ -923,6 +945,7 @@ impl Storage for MemoryStorage {
             .cloned()
             .collect::<Vec<_>>();
         pending.sort();
+        pending.truncate(BACKFILL_BATCH_SIZE);
         Ok(pending)
     }
 
@@ -1273,8 +1296,11 @@ impl Storage for SqliteStorage {
             let mut insert_scope = transaction.prepare(
                 "INSERT OR IGNORE INTO backfill_scope(owner_did,target_did) VALUES(?1,?2)",
             )?;
-            let mut enqueue =
-                transaction.prepare("INSERT OR IGNORE INTO backfill_queue(did) VALUES(?1)")?;
+            let mut enqueue = transaction.prepare(
+                "INSERT OR IGNORE INTO backfill_queue(did)
+                 SELECT ?1 WHERE (SELECT COUNT(*) FROM backfill_queue) < ?2
+                    OR EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
+            )?;
             let mut set_pending = transaction.prepare(
                 "INSERT INTO backfill_status(did,done) VALUES(?1,0)
                  ON CONFLICT(did) DO UPDATE SET done=0",
@@ -1282,9 +1308,15 @@ impl Storage for SqliteStorage {
             for subject in following {
                 insert_follow.execute(params![did, subject])?;
                 if is_registered {
-                    insert_scope.execute(params![did, subject])?;
-                    enqueue.execute([subject])?;
-                    set_pending.execute([subject])?;
+                    enqueue.execute(params![subject, MAX_BACKFILL_QUEUE])?;
+                    if transaction.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
+                        [subject],
+                        |row| row.get::<_, bool>(0),
+                    )? {
+                        insert_scope.execute(params![did, subject])?;
+                        set_pending.execute([subject])?;
+                    }
                 }
             }
         }
@@ -1612,16 +1644,20 @@ impl Storage for SqliteStorage {
             [did],
         )?;
         transaction.execute(
-            "INSERT OR IGNORE INTO backfill_queue(did) VALUES(?1)",
-            [did],
+            "INSERT OR IGNORE INTO backfill_queue(did)
+             SELECT ?1 WHERE (SELECT COUNT(*) FROM backfill_queue) < ?2
+                OR EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
+            params![did, MAX_BACKFILL_QUEUE],
         )?;
         transaction.execute(
             "INSERT INTO backfill_status(did,done) VALUES(?1,0)
-             ON CONFLICT(did) DO UPDATE SET done=0",
+             ON CONFLICT(did) DO UPDATE SET done=0
+             WHERE EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
             [did],
         )?;
         transaction.execute(
-            "INSERT OR IGNORE INTO backfill_scope(owner_did,target_did) VALUES(?1,?1)",
+            "INSERT OR IGNORE INTO backfill_scope(owner_did,target_did)
+             SELECT ?1,?1 WHERE EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
             [did],
         )?;
         transaction.commit()?;
@@ -1659,11 +1695,6 @@ impl Storage for SqliteStorage {
                 "INSERT OR IGNORE INTO follows(actor,subject) VALUES(?1,?2)",
                 params![actor, subject],
             )?;
-            connection.execute(
-                "INSERT OR IGNORE INTO backfill_scope(owner_did,target_did)
-                 SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM registered_users WHERE did=?1)",
-                params![actor, subject],
-            )?;
         } else {
             connection.execute(
                 "DELETE FROM follows WHERE actor=?1 AND subject=?2",
@@ -1689,12 +1720,19 @@ impl Storage for SqliteStorage {
         let mut connection = self.conn()?;
         let transaction = connection.transaction()?;
         transaction.execute(
-            "INSERT OR IGNORE INTO backfill_queue(did) VALUES(?1)",
-            [did],
+            "INSERT OR IGNORE INTO backfill_queue(did)
+             SELECT ?1
+             WHERE ((SELECT COUNT(*) FROM backfill_queue) < ?2
+                    OR EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1))
+               AND (EXISTS(SELECT 1 FROM registered_users WHERE did=?1)
+                    OR EXISTS(SELECT 1 FROM follows f JOIN registered_users r ON r.did=f.actor
+                              WHERE f.subject=?1))",
+            params![did, MAX_BACKFILL_QUEUE],
         )?;
         transaction.execute(
             "INSERT INTO backfill_status(did,done) VALUES(?1,0)
-             ON CONFLICT(did) DO UPDATE SET done=0",
+             ON CONFLICT(did) DO UPDATE SET done=0
+             WHERE EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
             [did],
         )?;
         transaction.commit()?;
@@ -1705,16 +1743,25 @@ impl Storage for SqliteStorage {
         let mut connection = self.conn()?;
         let transaction = connection.transaction()?;
         transaction.execute(
-            "INSERT OR IGNORE INTO backfill_scope(owner_did,target_did) VALUES(?1,?2)",
+            "INSERT OR IGNORE INTO backfill_queue(did)
+             SELECT ?2
+             WHERE ((SELECT COUNT(*) FROM backfill_queue) < ?3
+                    OR EXISTS(SELECT 1 FROM backfill_queue WHERE did=?2))
+               AND EXISTS(SELECT 1 FROM registered_users WHERE did=?1)
+               AND (?1=?2 OR EXISTS(SELECT 1 FROM follows WHERE actor=?1 AND subject=?2))",
+            params![owner_did, did, MAX_BACKFILL_QUEUE],
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO backfill_scope(owner_did,target_did)
+             SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM backfill_queue WHERE did=?2)
+               AND EXISTS(SELECT 1 FROM registered_users WHERE did=?1)
+               AND (?1=?2 OR EXISTS(SELECT 1 FROM follows WHERE actor=?1 AND subject=?2))",
             params![owner_did, did],
         )?;
         transaction.execute(
-            "INSERT OR IGNORE INTO backfill_queue(did) VALUES(?1)",
-            [did],
-        )?;
-        transaction.execute(
             "INSERT INTO backfill_status(did,done) VALUES(?1,0)
-             ON CONFLICT(did) DO UPDATE SET done=0",
+             ON CONFLICT(did) DO UPDATE SET done=0
+             WHERE EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
             [did],
         )?;
         transaction.commit()?;
@@ -1727,10 +1774,12 @@ impl Storage for SqliteStorage {
             "SELECT q.did FROM backfill_queue q
              LEFT JOIN backfill_retry r ON r.did=q.did
              WHERE r.did IS NULL OR r.retry_at_ms<=?1
-             ORDER BY q.enqueued_at,q.did",
+             ORDER BY q.enqueued_at,q.did LIMIT ?2",
         )?;
         Ok(statement
-            .query_map([epoch_millis()], |row| row.get(0))?
+            .query_map(params![epoch_millis(), BACKFILL_BATCH_SIZE], |row| {
+                row.get(0)
+            })?
             .collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -2464,7 +2513,13 @@ mod backfill_resource_tests {
             .unwrap()
             .query_row("SELECT COUNT(*) FROM backfill_queue", [], |row| row.get(0))
             .unwrap();
-        assert!(memory_count <= 1_000, "memory queue has {memory_count} items");
-        assert!(sqlite_count <= 1_000, "SQLite queue has {sqlite_count} items");
+        assert!(
+            memory_count <= 1_000,
+            "memory queue has {memory_count} items"
+        );
+        assert!(
+            sqlite_count <= 1_000,
+            "SQLite queue has {sqlite_count} items"
+        );
     }
 }
