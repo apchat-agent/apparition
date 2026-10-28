@@ -1,8 +1,16 @@
-use crate::{identity::{IdentityBackend, IdentityResolver}, ingest::{IndexedRecord, Storage}, net::SafeHttpClient};
-use http::HeaderMap;
+use crate::{
+    identity::{IdentityBackend, IdentityResolver},
+    ingest::{IndexedRecord, Storage},
+    net::SafeHttpClient,
+};
 use futures_util::{StreamExt, stream};
+use http::HeaderMap;
 use serde_json::Value;
-use std::{collections::{HashMap, HashSet}, sync::{Arc, Mutex, OnceLock}, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex, OnceLock},
+    time::Duration,
+};
 use url::Url;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,6 +46,12 @@ pub struct HydratedFeedPage {
     pub feed: Vec<HydratedFeedPost>,
     pub cursor: Option<String>,
     pub dropped_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FeedTimeline {
+    pub generator: ResolvedFeed,
+    pub timeline: HydratedFeedPage,
 }
 
 pub struct FeedClient<B: IdentityBackend> {
@@ -110,7 +124,9 @@ impl<B: IdentityBackend> FeedClient<B> {
                     && service.type_name == "BskyFeedGenerator"
             })
             .map(|service| service.service_endpoint.clone())
-            .ok_or_else(|| "feed generator DID document is missing the #bsky_fg service".to_owned())?;
+            .ok_or_else(|| {
+                "feed generator DID document is missing the #bsky_fg service".to_owned()
+            })?;
         let endpoint_url = Url::parse(&endpoint)
             .map_err(|_| "feed generator #bsky_fg endpoint URL is invalid".to_owned())?;
         if endpoint_url.query().is_some()
@@ -129,14 +145,23 @@ impl<B: IdentityBackend> FeedClient<B> {
                 .and_then(Value::as_str)
                 .unwrap_or("Untitled feed")
                 .to_owned(),
-            description: value.get("description").and_then(Value::as_str).map(str::to_owned),
-            avatar: value.get("avatar").and_then(Value::as_str).map(str::to_owned),
+            description: value
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            avatar: value
+                .get("avatar")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             service_did,
             endpoint: endpoint.trim_end_matches('/').to_owned(),
         };
         self.generator_cache.lock().await.insert(
             uri.to_owned(),
-            (tokio::time::Instant::now() + Duration::from_secs(60 * 60), feed.clone()),
+            (
+                tokio::time::Instant::now() + Duration::from_secs(60 * 60),
+                feed.clone(),
+            ),
         );
         Ok(feed)
     }
@@ -195,7 +220,10 @@ impl<B: IdentityBackend> FeedClient<B> {
             .collect();
         Ok(FeedSkeletonPage {
             feed: items,
-            cursor: body.get("cursor").and_then(Value::as_str).map(str::to_owned),
+            cursor: body
+                .get("cursor")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         })
     }
 
@@ -210,20 +238,21 @@ impl<B: IdentityBackend> FeedClient<B> {
         let cursor = skeleton.cursor;
         let deadline = tokio::time::Instant::now() + PAGE_BUDGET;
         let mut pending = stream::iter(skeleton.feed.into_iter().enumerate())
-            .map(|(index, item)| async move {
-                self.hydrate_one(index, item, storage).await
-            })
+            .map(|(index, item)| async move { self.hydrate_one(index, item, storage).await })
             .buffer_unordered(LIVE_FETCH_CONCURRENCY);
         let mut hydrated = Vec::with_capacity(count);
         loop {
             match tokio::time::timeout_at(deadline, pending.next()).await {
                 Ok(Some(Some(item))) => hydrated.push(item),
-                Ok(Some(None)) => {},
+                Ok(Some(None)) => {}
                 Ok(None) | Err(_) => break,
             }
         }
         hydrated.sort_by_key(|(index, _)| *index);
-        let feed = hydrated.into_iter().map(|(_, post)| post).collect::<Vec<_>>();
+        let feed = hydrated
+            .into_iter()
+            .map(|(_, post)| post)
+            .collect::<Vec<_>>();
         Ok(HydratedFeedPage {
             dropped_count: count.saturating_sub(feed.len()),
             feed,
@@ -264,7 +293,13 @@ impl<B: IdentityBackend> FeedClient<B> {
                 .map(|identity| identity.handle.unwrap_or(identity.did)),
             None => None,
         };
-        Some((index, HydratedFeedPost { record, reposted_by }))
+        Some((
+            index,
+            HydratedFeedPost {
+                record,
+                reposted_by,
+            },
+        ))
     }
 
     async fn fetch_live_post(&self, uri: &str) -> Result<IndexedRecord, String> {
@@ -325,7 +360,10 @@ impl<B: IdentityBackend> FeedClient<B> {
         }
         cache.insert(
             uri.to_owned(),
-            (tokio::time::Instant::now() + Duration::from_secs(10 * 60), record.clone()),
+            (
+                tokio::time::Instant::now() + Duration::from_secs(10 * 60),
+                record.clone(),
+            ),
         );
         Ok(record)
     }
@@ -334,9 +372,14 @@ impl<B: IdentityBackend> FeedClient<B> {
 fn warn_anonymous_feed_once(feed_uri: &str) {
     static WARNED_FEEDS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     let warned = WARNED_FEEDS.get_or_init(|| Mutex::new(HashSet::new()));
-    let Ok(mut warned) = warned.lock() else { return };
+    let Ok(mut warned) = warned.lock() else {
+        return;
+    };
     if warned.insert(feed_uri.to_owned()) {
-        tracing::warn!(feed_uri, "feed service auth unavailable; requesting skeleton anonymously");
+        tracing::warn!(
+            feed_uri,
+            "feed service auth unavailable; requesting skeleton anonymously"
+        );
     }
 }
 
@@ -437,7 +480,10 @@ pub fn parse_saved_feed_preferences(response: &Value) -> Vec<SavedFeedPreference
         .map(|value| (*value, true))
         .chain(saved.iter().map(|value| (*value, false)))
     {
-        if result.iter().any(|item: &SavedFeedPreference| item.value == value) {
+        if result
+            .iter()
+            .any(|item: &SavedFeedPreference| item.value == value)
+        {
             continue;
         }
         result.push(SavedFeedPreference {
@@ -453,10 +499,27 @@ pub fn parse_saved_feed_preferences(response: &Value) -> Vec<SavedFeedPreference
 #[cfg(test)]
 mod tests {
     use super::{FeedClient, ResolvedFeed, parse_saved_feed_preferences};
-    use crate::{identity::{DidDocument, DidService, IdentityBackend, IdentityResolver, ResolutionError}, ingest::IndexedRecord, net::{HostResolver, SafeHttpClient}};
-    use axum::{Router, http::{HeaderMap, Uri}, response::IntoResponse, routing::{any, get}};
+    use crate::{
+        identity::{DidDocument, DidService, IdentityBackend, IdentityResolver, ResolutionError},
+        ingest::IndexedRecord,
+        net::{HostResolver, SafeHttpClient},
+    };
+    use axum::{
+        Router,
+        http::{HeaderMap, Uri},
+        response::IntoResponse,
+        routing::{any, get},
+    };
     use serde_json::json;
-    use std::{collections::HashMap, future::Future, io::{self, Write}, net::{IpAddr, Ipv4Addr}, pin::Pin, sync::{Arc, Mutex}, time::Duration};
+    use std::{
+        collections::HashMap,
+        future::Future,
+        io::{self, Write},
+        net::{IpAddr, Ipv4Addr},
+        pin::Pin,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
     use tokio::net::TcpListener;
     use tracing::instrument::WithSubscriber;
     use tracing_subscriber::fmt::MakeWriter;
@@ -470,8 +533,12 @@ mod tests {
         async fn did_document(&self, did: &str) -> Result<Option<DidDocument>, ResolutionError> {
             Ok(self.0.get(did).cloned())
         }
-        async fn dns_txt_did(&self, _: &str) -> Result<Option<String>, ResolutionError> { Ok(None) }
-        async fn well_known_did(&self, _: &str) -> Result<Option<String>, ResolutionError> { Ok(None) }
+        async fn dns_txt_did(&self, _: &str) -> Result<Option<String>, ResolutionError> {
+            Ok(None)
+        }
+        async fn well_known_did(&self, _: &str) -> Result<Option<String>, ResolutionError> {
+            Ok(None)
+        }
     }
 
     struct TestResolver;
@@ -486,16 +553,24 @@ mod tests {
             self.0.0.lock().unwrap().extend_from_slice(bytes);
             Ok(bytes.len())
         }
-        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 
     impl<'a> MakeWriter<'a> for LogBuffer {
         type Writer = LogWriter;
-        fn make_writer(&'a self) -> Self::Writer { LogWriter(self.clone()) }
+        fn make_writer(&'a self) -> Self::Writer {
+            LogWriter(self.clone())
+        }
     }
 
     impl HostResolver for TestResolver {
-        fn resolve<'a>(&'a self, _: &'a str, _: u16) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, String>> + Send + 'a>> {
+        fn resolve<'a>(
+            &'a self,
+            _: &'a str,
+            _: u16,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, String>> + Send + 'a>> {
             Box::pin(async { Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]) })
         }
     }
@@ -503,9 +578,21 @@ mod tests {
     fn document(did: &str, pds: &str, services: Vec<DidService>) -> DidDocument {
         let mut service = services;
         if !pds.is_empty() {
-            service.insert(0, DidService { id: "#atproto_pds".into(), type_name: "AtprotoPersonalDataServer".into(), service_endpoint: pds.into() });
+            service.insert(
+                0,
+                DidService {
+                    id: "#atproto_pds".into(),
+                    type_name: "AtprotoPersonalDataServer".into(),
+                    service_endpoint: pds.into(),
+                },
+            );
         }
-        DidDocument { id: did.to_owned(), also_known_as: vec![], verification_method: vec![], service }
+        DidDocument {
+            id: did.to_owned(),
+            also_known_as: vec![],
+            verification_method: vec![],
+            service,
+        }
     }
 
     async fn fake_pds() -> (String, tokio::task::JoinHandle<()>) {
@@ -524,21 +611,60 @@ mod tests {
         }));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
         (format!("http://localhost:{}", address.port()), task)
     }
 
     fn resolver(pds: String, endpoint: String) -> Arc<IdentityResolver<FakeIdentity>> {
         let docs = HashMap::from([
             (CREATOR.to_owned(), document(CREATOR, &pds, vec![])),
-            ("did:web:generator.test".to_owned(), document("did:web:generator.test", "", if endpoint.is_empty() { vec![] } else { vec![DidService { id: "#bsky_fg".into(), type_name: "BskyFeedGenerator".into(), service_endpoint: endpoint.clone() }] })),
-            ("did:plc:generator".to_owned(), document("did:plc:generator", "", if endpoint.is_empty() { vec![] } else { vec![DidService { id: "#bsky_fg".into(), type_name: "BskyFeedGenerator".into(), service_endpoint: endpoint }] })),
+            (
+                "did:web:generator.test".to_owned(),
+                document(
+                    "did:web:generator.test",
+                    "",
+                    if endpoint.is_empty() {
+                        vec![]
+                    } else {
+                        vec![DidService {
+                            id: "#bsky_fg".into(),
+                            type_name: "BskyFeedGenerator".into(),
+                            service_endpoint: endpoint.clone(),
+                        }]
+                    },
+                ),
+            ),
+            (
+                "did:plc:generator".to_owned(),
+                document(
+                    "did:plc:generator",
+                    "",
+                    if endpoint.is_empty() {
+                        vec![]
+                    } else {
+                        vec![DidService {
+                            id: "#bsky_fg".into(),
+                            type_name: "BskyFeedGenerator".into(),
+                            service_endpoint: endpoint,
+                        }]
+                    },
+                ),
+            ),
         ]);
-        Arc::new(IdentityResolver::new(FakeIdentity(docs), Duration::from_secs(30)))
+        Arc::new(IdentityResolver::new(
+            FakeIdentity(docs),
+            Duration::from_secs(30),
+        ))
     }
 
     fn client(identity: Arc<IdentityResolver<FakeIdentity>>) -> FeedClient<FakeIdentity> {
-        FeedClient::new(identity, SafeHttpClient::with_resolver(TestResolver).with_http_test_hosts(["localhost".to_owned()]))
+        FeedClient::new(
+            identity,
+            SafeHttpClient::with_resolver(TestResolver)
+                .with_http_test_hosts(["localhost".to_owned()]),
+        )
     }
 
     #[tokio::test]
@@ -552,7 +678,14 @@ mod tests {
             let feed = client.resolve_feed(&uri).await.unwrap();
             assert_eq!(feed.display_name, "Example");
             assert!(feed.endpoint.ends_with("/feed"));
-            assert_eq!(feed.service_did, if rkey == "web" { "did:web:generator.test" } else { "did:plc:generator" });
+            assert_eq!(
+                feed.service_did,
+                if rkey == "web" {
+                    "did:web:generator.test"
+                } else {
+                    "did:plc:generator"
+                }
+            );
         }
         server.abort();
     }
@@ -563,12 +696,18 @@ mod tests {
         let endpoint = "https://blocked.test/feed";
         let identity = resolver(pds.clone(), endpoint.to_owned());
         let blocked = client(identity);
-        let error = blocked.resolve_feed(&format!("at://{CREATOR}/app.bsky.feed.generator/web")).await.unwrap_err();
+        let error = blocked
+            .resolve_feed(&format!("at://{CREATOR}/app.bsky.feed.generator/web"))
+            .await
+            .unwrap_err();
         assert!(error.contains("forbidden address"), "{error}");
 
         let no_service = resolver(pds, "".to_owned());
         // An empty service endpoint is invalid and must produce a clear resolution error.
-        let error = client(no_service).resolve_feed(&format!("at://{CREATOR}/app.bsky.feed.generator/web")).await.unwrap_err();
+        let error = client(no_service)
+            .resolve_feed(&format!("at://{CREATOR}/app.bsky.feed.generator/web"))
+            .await
+            .unwrap_err();
         assert!(error.contains("bsky_fg"), "{error}");
         server.abort();
     }
@@ -579,9 +718,18 @@ mod tests {
         let (pds, server) = fake_pds().await;
         let mut docs = HashMap::new();
         docs.insert(CREATOR.to_owned(), document(CREATOR, &pds, vec![]));
-        docs.insert("did:plc:author".to_owned(), document("did:plc:author", &pds, vec![]));
-        docs.insert("did:plc:reposter".to_owned(), document("did:plc:reposter", &pds, vec![]));
-        let identity = Arc::new(IdentityResolver::new(FakeIdentity(docs), Duration::from_secs(30)));
+        docs.insert(
+            "did:plc:author".to_owned(),
+            document("did:plc:author", &pds, vec![]),
+        );
+        docs.insert(
+            "did:plc:reposter".to_owned(),
+            document("did:plc:reposter", &pds, vec![]),
+        );
+        let identity = Arc::new(IdentityResolver::new(
+            FakeIdentity(docs),
+            Duration::from_secs(30),
+        ));
         let client = client(identity);
         let storage = MemoryStorage::default();
         let indexed_first = indexed_post("did:plc:indexed", "first", "first indexed post");
@@ -591,22 +739,47 @@ mod tests {
         let missing = "at://did:plc:author/app.bsky.feed.post/missing";
         let skeleton = super::FeedSkeletonPage {
             feed: vec![
-                super::FeedSkeletonEntry { post_uri: indexed_first.uri.clone(), reason: None },
+                super::FeedSkeletonEntry {
+                    post_uri: indexed_first.uri.clone(),
+                    reason: None,
+                },
                 super::FeedSkeletonEntry {
                     post_uri: "at://did:plc:author/app.bsky.feed.post/live".into(),
-                    reason: Some(json!({ "$type":"app.bsky.feed.defs#reasonRepost", "by":{"did":"did:plc:reposter"} })),
+                    reason: Some(
+                        json!({ "$type":"app.bsky.feed.defs#reasonRepost", "by":{"did":"did:plc:reposter"} }),
+                    ),
                 },
-                super::FeedSkeletonEntry { post_uri: missing.into(), reason: None },
-                super::FeedSkeletonEntry { post_uri: indexed_last.uri.clone(), reason: None },
+                super::FeedSkeletonEntry {
+                    post_uri: missing.into(),
+                    reason: None,
+                },
+                super::FeedSkeletonEntry {
+                    post_uri: indexed_last.uri.clone(),
+                    reason: None,
+                },
             ],
             cursor: Some("next-cursor".into()),
         };
 
         let page = client.hydrate_skeleton(skeleton, &storage).await.unwrap();
-        let uris = page.feed.iter().map(|item| item.record.uri.as_str()).collect::<Vec<_>>();
-        assert_eq!(uris, [indexed_first.uri.as_str(), "at://did:plc:author/app.bsky.feed.post/live", indexed_last.uri.as_str()]);
+        let uris = page
+            .feed
+            .iter()
+            .map(|item| item.record.uri.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            uris,
+            [
+                indexed_first.uri.as_str(),
+                "at://did:plc:author/app.bsky.feed.post/live",
+                indexed_last.uri.as_str()
+            ]
+        );
         assert_eq!(page.feed[1].record.record["text"], "live hydration");
-        assert_eq!(page.feed[1].reposted_by.as_deref(), Some("did:plc:reposter"));
+        assert_eq!(
+            page.feed[1].reposted_by.as_deref(),
+            Some("did:plc:reposter")
+        );
         assert_eq!(page.dropped_count, 1);
         assert_eq!(page.cursor.as_deref(), Some("next-cursor"));
         server.abort();
@@ -614,8 +787,12 @@ mod tests {
 
     fn indexed_post(did: &str, rkey: &str, text: &str) -> IndexedRecord {
         IndexedRecord {
-            did: did.into(), collection: "app.bsky.feed.post".into(), rkey: rkey.into(),
-            uri: format!("at://{did}/app.bsky.feed.post/{rkey}"), cid: None, time_us: 1,
+            did: did.into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: rkey.into(),
+            uri: format!("at://{did}/app.bsky.feed.post/{rkey}"),
+            cid: None,
+            time_us: 1,
             record: json!({"$type":"app.bsky.feed.post","text":text,"createdAt":"2026-10-28T12:00:00Z"}),
         }
     }
@@ -633,28 +810,61 @@ mod tests {
         }));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
         let feed = ResolvedFeed {
             uri: "at://did:plc:creator/app.bsky.feed.generator/jwt-log-test".into(),
-            display_name: "Example".into(), description: None, avatar: None,
-            service_did: "did:plc:service".into(), endpoint: format!("http://localhost:{}/fg", address.port()),
+            display_name: "Example".into(),
+            description: None,
+            avatar: None,
+            service_did: "did:plc:service".into(),
+            endpoint: format!("http://localhost:{}/fg", address.port()),
         };
         let client = client(resolver("".to_owned(), "".to_owned()));
         let logs = LogBuffer::default();
-        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false).with_writer(logs.clone()).finish();
-        let page = client.get_skeleton(&feed, Some("older + cursor"), Some("jwt-secret-test")).with_subscriber(subscriber).await.unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(logs.clone())
+            .finish();
+        let page = client
+            .get_skeleton(&feed, Some("older + cursor"), Some("jwt-secret-test"))
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
         assert_eq!(page.cursor.as_deref(), Some("next"));
         assert_eq!(page.feed.len(), 1);
         let first_capture = captured.lock().unwrap().clone().unwrap();
         assert_eq!(first_capture.0, "Bearer jwt-secret-test");
-        assert!(first_capture.1.starts_with("/fg/xrpc/app.bsky.feed.getFeedSkeleton?"));
-        assert!(first_capture.1.contains("feed=at%3A%2F%2Fdid%3Aplc%3Acreator"));
+        assert!(
+            first_capture
+                .1
+                .starts_with("/fg/xrpc/app.bsky.feed.getFeedSkeleton?")
+        );
+        assert!(
+            first_capture
+                .1
+                .contains("feed=at%3A%2F%2Fdid%3Aplc%3Acreator")
+        );
         assert!(first_capture.1.contains("cursor=older+%2B+cursor"));
         assert!(first_capture.1.contains("limit=30"));
-        let fallback_subscriber = tracing_subscriber::fmt().without_time().with_ansi(false).with_writer(logs.clone()).finish();
-        client.get_skeleton(&feed, None, None).with_subscriber(fallback_subscriber).await.unwrap();
+        let fallback_subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(logs.clone())
+            .finish();
+        client
+            .get_skeleton(&feed, None, None)
+            .with_subscriber(fallback_subscriber)
+            .await
+            .unwrap();
         assert_eq!(captured.lock().unwrap().as_ref().unwrap().0, "");
-        assert!(!String::from_utf8(logs.0.lock().unwrap().clone()).unwrap().contains("jwt-secret-test"));
+        assert!(
+            !String::from_utf8(logs.0.lock().unwrap().clone())
+                .unwrap()
+                .contains("jwt-secret-test")
+        );
         server.abort();
     }
 
@@ -689,10 +899,7 @@ mod tests {
             .filter(|item| item.feed_type == "feed" && item.pinned)
             .map(|item| item.value.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(
-            pinned_feeds,
-            ["at://did:plc:two/app.bsky.feed.generator/b"]
-        );
+        assert_eq!(pinned_feeds, ["at://did:plc:two/app.bsky.feed.generator/b"]);
         assert!(!parsed.iter().any(|item| item.value.ends_with("/old")));
     }
 

@@ -1,7 +1,9 @@
 use crate::identity::{HttpIdentityBackend, IdentityResolver};
 use crate::{
     api::profile_view_from_storage,
-    feeds::ResolvedFeed,
+    feeds::{
+        FeedClient, FeedTimeline, ResolvedFeed, SavedFeedPreference, parse_saved_feed_preferences,
+    },
     ingest::{
         IndexedNotification, IndexedRecord, MemoryStorage, NotificationCursor, RecordCursor,
         Storage, StorageError,
@@ -25,6 +27,7 @@ use atrium_oauth::{
         state::{InternalStateData, StateStore},
     },
 };
+use atrium_xrpc::{OutputDataOrBytes, XrpcClient, XrpcRequest};
 use axum::{
     Json, Router,
     extract::{Form, Query, State},
@@ -43,7 +46,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Sha256;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -64,7 +67,7 @@ const LOGIN_COOKIE: &str = "appview_login";
 const SESSION_TTL_SECONDS: u64 = 30 * 24 * 60 * 60;
 const LOGIN_COOKIE_TTL_SECONDS: u64 = 10 * 60;
 const MAX_RENDERED_REMOTE_CHARS: usize = 4096;
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=av13";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=av16";
 const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete";
 const WRITE_SCOPES: [&str; 3] = [
     "repo:app.bsky.feed.post?action=create",
@@ -174,6 +177,37 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
         _did: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Value>, String>> + Send + 'a>> {
         Box::pin(async { Err("timeline is not available".to_owned()) })
+    }
+    fn pinned_feeds<'a>(
+        &'a self,
+        _did: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ResolvedFeed>, String>> + Send + 'a>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    fn feed_timeline<'a>(
+        &'a self,
+        _did: &'a str,
+        uri: &'a str,
+        _cursor: Option<&'a str>,
+        _storage: &'a dyn Storage,
+    ) -> Pin<Box<dyn Future<Output = Result<FeedTimeline, String>> + Send + 'a>> {
+        Box::pin(async move {
+            Ok(FeedTimeline {
+                generator: ResolvedFeed {
+                    uri: uri.to_owned(),
+                    display_name: "Feed".to_owned(),
+                    description: None,
+                    avatar: None,
+                    service_did: String::new(),
+                    endpoint: String::new(),
+                },
+                timeline: crate::feeds::HydratedFeedPage {
+                    feed: Vec::new(),
+                    cursor: None,
+                    dropped_count: 0,
+                },
+            })
+        })
     }
 }
 
@@ -309,6 +343,8 @@ impl OAuthPublic {
             .route("/oauth/callback", get(callback::<F, S>))
             .route("/logout", post(logout::<F, S>))
             .route("/app", get(app_home::<F, S>))
+            .route("/feeds", get(feeds_page::<F, S>))
+            .route("/app/feed", get(feed_timeline_page::<F, S>))
             .route("/notifications", get(notifications_page::<F, S>))
             .route("/profile", get(profile_page::<F, S>))
             .route("/thread", get(thread_page::<F, S>))
@@ -495,6 +531,9 @@ pub struct AtriumOAuthFlow<B: crate::identity::IdentityBackend = HttpIdentityBac
     client: Arc<AppOAuthClient>,
     identity_resolver: Arc<IdentityResolver<B>>,
     store: SqliteOAuthStore,
+    feed_client: Arc<FeedClient<B>>,
+    saved_feed_cache:
+        Arc<tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, Vec<SavedFeedPreference>)>>>,
 }
 
 impl<B: crate::identity::IdentityBackend> Clone for AtriumOAuthFlow<B> {
@@ -503,6 +542,8 @@ impl<B: crate::identity::IdentityBackend> Clone for AtriumOAuthFlow<B> {
             client: self.client.clone(),
             identity_resolver: self.identity_resolver.clone(),
             store: self.store.clone(),
+            feed_client: self.feed_client.clone(),
+            saved_feed_cache: self.saved_feed_cache.clone(),
         }
     }
 }
@@ -681,6 +722,10 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         plc_directory_url: &str,
         guarded_client: SafeHttpClient,
     ) -> Result<Self, String> {
+        let feed_client = Arc::new(FeedClient::new(
+            Arc::clone(&identity_resolver),
+            guarded_client.clone(),
+        ));
         let http_client = Arc::new(guarded_client);
         let redirect_uri = public.metadata["redirect_uris"][0]
             .as_str()
@@ -741,7 +786,88 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             client: Arc::new(client),
             identity_resolver,
             store,
+            feed_client,
+            saved_feed_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
+    }
+
+    async fn saved_feed_preferences(&self, did: &str) -> Result<Vec<SavedFeedPreference>, String> {
+        if let Some((expires, preferences)) = self.saved_feed_cache.lock().await.get(did).cloned()
+            && expires > tokio::time::Instant::now()
+        {
+            return Ok(preferences);
+        }
+        let did = did
+            .parse::<Did>()
+            .map_err(|_| "viewer DID is invalid".to_owned())?;
+        let session = self
+            .client
+            .restore(&did)
+            .await
+            .map_err(|_| "OAuth session could not be restored".to_owned())?;
+        let request = XrpcRequest {
+            method: http::Method::GET,
+            nsid: "app.bsky.actor.getPreferences".to_owned(),
+            parameters: Some(json!({})),
+            input: None,
+            encoding: None,
+        };
+        let response: OutputDataOrBytes<Value> = session
+            .send_xrpc::<Value, Value, Value, Value>(&request)
+            .await
+            .map_err(|_| "PDS getPreferences request failed".to_owned())?;
+        let response = match response {
+            OutputDataOrBytes::Data(value) => value,
+            OutputDataOrBytes::Bytes(_) => {
+                return Err("PDS getPreferences returned a non-JSON response".to_owned());
+            }
+        };
+        let preferences = parse_saved_feed_preferences(&response);
+        self.saved_feed_cache.lock().await.insert(
+            did.to_string(),
+            (
+                tokio::time::Instant::now() + Duration::from_secs(5 * 60),
+                preferences.clone(),
+            ),
+        );
+        Ok(preferences)
+    }
+
+    async fn service_auth_token(
+        &self,
+        viewer_did: &str,
+        service_did: &str,
+    ) -> Result<String, String> {
+        let did = viewer_did
+            .parse::<Did>()
+            .map_err(|_| "viewer DID is invalid".to_owned())?;
+        let session = self
+            .client
+            .restore(&did)
+            .await
+            .map_err(|_| "OAuth session could not be restored".to_owned())?;
+        let request = XrpcRequest {
+            method: http::Method::GET,
+            nsid: "com.atproto.server.getServiceAuth".to_owned(),
+            parameters: Some(json!({"aud":service_did,"lxm":"app.bsky.feed.getFeedSkeleton"})),
+            input: None,
+            encoding: None,
+        };
+        let response: OutputDataOrBytes<Value> = session
+            .send_xrpc::<Value, Value, Value, Value>(&request)
+            .await
+            .map_err(|_| "PDS getServiceAuth request failed".to_owned())?;
+        match response {
+            OutputDataOrBytes::Data(value) => value
+                .get("token")
+                .and_then(Value::as_str)
+                .filter(|token| !token.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| "PDS getServiceAuth returned no token".to_owned()),
+            OutputDataOrBytes::Bytes(_) => {
+                Err("PDS getServiceAuth returned a non-JSON response".to_owned())
+            }
+        }
     }
 
     async fn create_record(
@@ -1040,6 +1166,50 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
                 .collect()
         })
     }
+
+    fn pinned_feeds<'a>(
+        &'a self,
+        did: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ResolvedFeed>, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let preferences = self.saved_feed_preferences(did).await?;
+            let mut feeds = Vec::new();
+            for preference in preferences
+                .iter()
+                .filter(|item| item.feed_type == "feed" && item.pinned)
+            {
+                if let Ok(feed) = self.feed_client.resolve_feed(&preference.value).await {
+                    feeds.push(feed);
+                }
+            }
+            Ok(feeds)
+        })
+    }
+
+    fn feed_timeline<'a>(
+        &'a self,
+        did: &'a str,
+        uri: &'a str,
+        cursor: Option<&'a str>,
+        storage: &'a dyn Storage,
+    ) -> Pin<Box<dyn Future<Output = Result<FeedTimeline, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let generator = self.feed_client.resolve_feed(uri).await?;
+            let service_jwt = self
+                .service_auth_token(did, &generator.service_did)
+                .await
+                .ok();
+            let skeleton = self
+                .feed_client
+                .get_skeleton(&generator, cursor, service_jwt.as_deref())
+                .await?;
+            let timeline = self.feed_client.hydrate_skeleton(skeleton, storage).await?;
+            Ok(FeedTimeline {
+                generator,
+                timeline,
+            })
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -1110,7 +1280,7 @@ async fn app_stylesheet() -> Response {
 
 fn page_shell(title: &str, content: &str, authenticated: bool) -> String {
     let navigation = if authenticated {
-        "<nav class=\"site-nav\" aria-label=\"Main navigation\"><a href=\"/app\">Timeline</a><a href=\"/notifications\">Notifications</a><a href=\"/profile\">Profile</a><form action=\"/logout\" method=\"post\"><button type=\"submit\">Sign out</button></form></nav>"
+        "<nav class=\"site-nav\" aria-label=\"Main navigation\"><a href=\"/app\">Timeline</a><a href=\"/feeds\">Feeds</a><a href=\"/notifications\">Notifications</a><a href=\"/profile\">Profile</a><form action=\"/logout\" method=\"post\"><button type=\"submit\">Sign out</button></form></nav>"
     } else {
         "<nav class=\"site-nav\" aria-label=\"Main navigation\"><a href=\"/login\">Sign in</a></nav>"
     };
@@ -1549,6 +1719,131 @@ where
         "Timeline",
         &format!(
             "<header class=\"page-heading\"><p class=\"eyebrow\">Your feed</p><h1>Timeline</h1><p class=\"page-subtitle\">Posts from accounts in your local view.</p></header>{read_only_message}{indexing_status}{post_form}<ol class=\"post-list\">{posts}</ol>{older}",
+        ),
+        true,
+    ))
+    .into_response()
+}
+
+async fn feeds_page<F, S>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    headers: HeaderMap,
+) -> Response
+where
+    F: OAuthFlow,
+    S: Storage + 'static,
+{
+    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+        return Redirect::to("/login").into_response();
+    };
+    let feeds = match state.flow.pinned_feeds(&did).await {
+        Ok(feeds) => feeds,
+        Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
+    };
+    let entries = feeds.iter().map(render_feed_card).collect::<String>();
+    let entries = if entries.is_empty() {
+        "<li class=\"empty-state\">No pinned custom feeds were found in your account preferences.</li>".to_owned()
+    } else {
+        entries
+    };
+    Html(page_shell(
+        "Feeds",
+        &format!(
+            "<header class=\"page-heading\"><p class=\"eyebrow\">Your saved algorithms</p><h1>Feeds</h1><p class=\"page-subtitle\">Pinned custom feeds from your account.</p></header><ol class=\"feed-list\">{entries}</ol>"
+        ),
+        true,
+    ))
+    .into_response()
+}
+
+async fn feed_timeline_page<F, S>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response
+where
+    F: OAuthFlow,
+    S: Storage + 'static,
+{
+    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+        return Redirect::to("/login").into_response();
+    };
+    let Some(uri) = query.get("uri").filter(|uri| !uri.is_empty()) else {
+        return oauth_error(StatusCode::BAD_REQUEST, "feed uri is required");
+    };
+    let page = match state
+        .flow
+        .feed_timeline(
+            &did,
+            uri,
+            query.get("cursor").map(String::as_str),
+            state.storage.as_ref(),
+        )
+        .await
+    {
+        Ok(page) => page,
+        Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
+    };
+    let write_forms_enabled =
+        verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
+    let posts = page
+        .timeline
+        .feed
+        .iter()
+        .map(|post| {
+            let repost = post
+                .reposted_by
+                .as_deref()
+                .map(|reposter| {
+                    format!(
+                        "<p class=\"feed-repost\">Reposted by @{}</p>",
+                        html_escape(reposter)
+                    )
+                })
+                .unwrap_or_default();
+            format!(
+                "<li class=\"post-item\">{repost}{}</li>",
+                render_web_post(
+                    state.storage.as_ref(),
+                    &post.record,
+                    &did,
+                    write_forms_enabled,
+                    true,
+                )
+            )
+        })
+        .collect::<String>();
+    let posts = if posts.is_empty() {
+        "<li class=\"empty-state\">This feed has no available posts on this page.</li>".to_owned()
+    } else {
+        posts
+    };
+    let skipped = if page.timeline.dropped_count > 0 {
+        format!(
+            "<p role=\"status\">Skipped {} feed item(s) that could not be hydrated.</p>",
+            page.timeline.dropped_count
+        )
+    } else {
+        String::new()
+    };
+    let older = page
+        .timeline
+        .cursor
+        .as_deref()
+        .map(|cursor| {
+            let uri = form_encoded(&page.generator.uri);
+            let cursor = form_encoded(cursor);
+            format!(
+                "<a class=\"pagination-link\" rel=\"next\" href=\"/app/feed?uri={uri}&amp;cursor={cursor}\">Load more</a>"
+            )
+        })
+        .unwrap_or_default();
+    Html(page_shell(
+        &page.generator.display_name,
+        &format!(
+            "{}{}<ol class=\"post-list\">{posts}</ol>{older}",
+            render_feed_heading(&page.generator),
+            skipped
         ),
         true,
     ))
@@ -2270,11 +2565,49 @@ fn html_escape(value: &str) -> String {
 }
 
 fn render_feed_card(feed: &ResolvedFeed) -> String {
-    format!("<li><a href=\"/app/feed?uri={}\">{}</a><p>{}</p></li>", feed.uri, feed.display_name, feed.description.as_deref().unwrap_or(""))
+    let href = feed_link_href(feed);
+    let avatar = feed_avatar_markup(feed);
+    format!(
+        "<li class=\"feed-item\"><a class=\"feed-card\" href=\"{href}\">{avatar}<h2>{}</h2><p>{}</p><code>{}</code></a></li>",
+        html_escape(&feed.display_name),
+        html_escape(feed.description.as_deref().unwrap_or("")),
+        html_escape(&feed.uri),
+    )
 }
 
 fn render_feed_heading(feed: &ResolvedFeed) -> String {
-    format!("<header><h1>{}</h1><p>{}</p><code>{}</code></header>", feed.display_name, feed.description.as_deref().unwrap_or(""), feed.uri)
+    let href = feed_link_href(feed);
+    let avatar = feed_avatar_markup(feed);
+    format!(
+        "<header class=\"page-heading feed-heading\">{avatar}<p class=\"eyebrow\"><a href=\"/feeds\">Feeds</a></p><h1>{}</h1><p class=\"page-subtitle\">{}</p><code>{}</code><a class=\"pagination-link\" href=\"{href}\">Feed address</a></header>",
+        html_escape(&feed.display_name),
+        html_escape(feed.description.as_deref().unwrap_or("")),
+        html_escape(&feed.uri),
+    )
+}
+
+fn feed_link_href(feed: &ResolvedFeed) -> String {
+    format!("/app/feed?uri={}", html_escape(&form_encoded(&feed.uri)))
+}
+
+fn form_encoded(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
+fn feed_avatar_markup(feed: &ResolvedFeed) -> String {
+    let Some(avatar) = feed.avatar.as_deref() else {
+        return String::new();
+    };
+    let Ok(url) = url::Url::parse(avatar) else {
+        return String::new();
+    };
+    if url.scheme() != "https" || url.username() != "" || url.password().is_some() {
+        return String::new();
+    }
+    format!(
+        "<img class=\"feed-avatar\" src=\"{}\" alt=\"\" loading=\"lazy\">",
+        html_escape(avatar)
+    )
 }
 
 #[cfg(test)]
@@ -2295,7 +2628,6 @@ mod feed_html_tests {
         for html in [render_feed_card(&feed), render_feed_heading(&feed)] {
             assert!(!html.contains("<script>"));
             assert!(!html.contains("<img src=x"));
-            assert!(!html.contains("onerror=alert"));
             assert!(html.contains("&lt;script&gt;"));
             assert!(html.contains("&lt;img src=x onerror=alert(1)&gt;"));
         }

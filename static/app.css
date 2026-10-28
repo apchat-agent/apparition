@@ -556,6 +556,76 @@ button:hover,
   text-decoration: none;
 }
 
+.feed-list {
+  display: grid;
+  gap: 0.9rem;
+  margin: 1rem 0;
+  padding: 0;
+  list-style: none;
+}
+
+.feed-card {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 0 0.9rem;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 1rem;
+  background: var(--surface);
+  color: var(--text);
+  text-decoration: none;
+}
+
+.feed-card h2,
+.feed-card p,
+.feed-card code {
+  grid-column: 2;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.feed-card h2 {
+  font-size: 1.1rem;
+}
+
+.feed-card p,
+.feed-card code,
+.feed-heading code {
+  color: var(--muted);
+}
+
+.feed-avatar {
+  width: 3.5rem;
+  height: 3.5rem;
+  grid-row: 1 / span 3;
+  border-radius: 0.85rem;
+  object-fit: cover;
+}
+
+.feed-heading {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0 1rem;
+  align-items: center;
+}
+
+.feed-heading > .feed-avatar {
+  grid-row: 1 / span 4;
+  width: 4.5rem;
+  height: 4.5rem;
+}
+
+.feed-heading > :not(.feed-avatar) {
+  grid-column: 2;
+}
+
+.feed-repost {
+  margin: 0 0 0.3rem 0.4rem;
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
 .empty-state,
 [role="status"] {
   margin: 0.8rem 0;
