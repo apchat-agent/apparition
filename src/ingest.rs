@@ -301,8 +301,10 @@ pub trait Storage: Send + Sync {
         0
     }
     fn put_record(&self, record: &IndexedRecord) -> Result<(), StorageError>;
-    fn apply_jetstream_batch(&self, updates: &[JetstreamStorageUpdate])
-    -> Result<(), StorageError>;
+    fn apply_jetstream_batch(
+        &self,
+        updates: &[JetstreamStorageUpdate],
+    ) -> Result<BatchApplyTiming, StorageError>;
     fn record_skipped_window(&self, from: u64, to: u64) -> Result<(), StorageError>;
     fn skipped_windows(&self) -> Result<Vec<SkippedCursorWindow>, StorageError>;
     fn replace_repo_snapshot(
@@ -416,6 +418,12 @@ pub trait Storage: Send + Sync {
     fn bytes_on_disk(&self) -> u64;
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BatchApplyTiming {
+    pub apply: Duration,
+    pub commit: Duration,
+}
+
 pub(crate) fn ensure_private_database_file(path: &Path) -> Result<(), std::io::Error> {
     if path == Path::new(":memory:") {
         return Ok(());
@@ -492,9 +500,10 @@ impl Storage for MemoryStorage {
     fn apply_jetstream_batch(
         &self,
         updates: &[JetstreamStorageUpdate],
-    ) -> Result<(), StorageError> {
+    ) -> Result<BatchApplyTiming, StorageError> {
+        let started = Instant::now();
         if updates.is_empty() {
-            return Ok(());
+            return Ok(BatchApplyTiming::default());
         }
         let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
         for update in updates {
@@ -542,7 +551,10 @@ impl Storage for MemoryStorage {
             }
             inner.cursor = Some(update.time_us);
         }
-        Ok(())
+        Ok(BatchApplyTiming {
+            apply: started.elapsed(),
+            commit: Duration::ZERO,
+        })
     }
 
     fn record_skipped_window(&self, from: u64, to: u64) -> Result<(), StorageError> {
@@ -1720,10 +1732,11 @@ impl Storage for SqliteStorage {
     fn apply_jetstream_batch(
         &self,
         updates: &[JetstreamStorageUpdate],
-    ) -> Result<(), StorageError> {
+    ) -> Result<BatchApplyTiming, StorageError> {
         if updates.is_empty() {
-            return Ok(());
+            return Ok(BatchApplyTiming::default());
         }
+        let apply_started = Instant::now();
         let mut connection = self.conn()?;
         let transaction = connection.transaction()?;
         for update in updates {
@@ -1809,8 +1822,13 @@ impl Storage for SqliteStorage {
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             [updates.last().expect("nonempty batch").time_us.to_string()],
         )?;
+        let apply = apply_started.elapsed();
+        let commit_started = Instant::now();
         transaction.commit()?;
-        Ok(())
+        Ok(BatchApplyTiming {
+            apply,
+            commit: commit_started.elapsed(),
+        })
     }
 
     fn record_skipped_window(&self, from: u64, to: u64) -> Result<(), StorageError> {
@@ -2730,6 +2748,74 @@ pub struct Ingestor<S: Storage> {
     scope: ScopeMode,
     cursor: AtomicU64,
     processed: AtomicU64,
+    batch_metrics: Mutex<IngestIntervalMetrics>,
+}
+
+#[derive(Default)]
+struct IngestBatchPhases {
+    parse: Duration,
+    scope_lookup: Duration,
+    record_lookup: Duration,
+    apply: Duration,
+    commit: Duration,
+    total: Duration,
+}
+
+#[derive(Default)]
+struct IngestBatchState {
+    staged_follows: HashMap<(String, String), bool>,
+    staged_records: HashMap<(String, String, String), Option<IndexedRecord>>,
+    phases: IngestBatchPhases,
+}
+
+#[derive(Default)]
+struct IngestIntervalMetrics {
+    batches: u64,
+    total_batch_ms: f64,
+    max_batch_ms: f64,
+    phase_totals_ms: [f64; 5],
+}
+
+impl IngestIntervalMetrics {
+    fn add(&mut self, phases: &IngestBatchPhases) {
+        let milliseconds = |duration: Duration| duration.as_secs_f64() * 1000.0;
+        let batch_ms = milliseconds(phases.total);
+        self.batches += 1;
+        self.total_batch_ms += batch_ms;
+        self.max_batch_ms = self.max_batch_ms.max(batch_ms);
+        for (total, phase) in self.phase_totals_ms.iter_mut().zip([
+            phases.parse,
+            phases.scope_lookup,
+            phases.record_lookup,
+            phases.apply,
+            phases.commit,
+        ]) {
+            *total += milliseconds(phase);
+        }
+    }
+
+    fn summary(&self) -> (f64, f64, &'static str, f64) {
+        let names = [
+            "parse",
+            "scope_lookup",
+            "record_lookup",
+            "apply_jetstream_batch",
+            "commit",
+        ];
+        let slowest = self
+            .phase_totals_ms
+            .iter()
+            .enumerate()
+            .max_by(|left, right| left.1.total_cmp(right.1));
+        let (slowest_phase, slowest_phase_ms) =
+            slowest.map_or(("none", 0.0), |(index, time)| (names[index], *time));
+        let average = if self.batches == 0 {
+            0.0
+        } else {
+            self.total_batch_ms / self.batches as f64
+        };
+        (average, self.max_batch_ms, slowest_phase, slowest_phase_ms)
+    }
 }
 
 impl<S: Storage> Ingestor<S> {
@@ -2740,6 +2826,7 @@ impl<S: Storage> Ingestor<S> {
             scope,
             cursor: AtomicU64::new(cursor),
             processed: AtomicU64::new(0),
+            batch_metrics: Mutex::new(IngestIntervalMetrics::default()),
         }
     }
 
@@ -2751,11 +2838,15 @@ impl<S: Storage> Ingestor<S> {
         if json_events.is_empty() {
             return Ok(());
         }
+        let batch_started = Instant::now();
+        let mut batch_state = IngestBatchState::default();
         let mut updates = Vec::with_capacity(json_events.len());
-        let mut staged_follows = HashMap::<(String, String), bool>::new();
-        let mut staged_records = HashMap::<(String, String, String), Option<IndexedRecord>>::new();
         for json in json_events {
+            let parse_started = Instant::now();
             let event: JetstreamEvent = serde_json::from_str(json)?;
+            batch_state.phases.parse += parse_started.elapsed();
+            let scope_started = Instant::now();
+            let record_lookup_before = batch_state.phases.record_lookup;
             let mut update = JetstreamStorageUpdate {
                 time_us: event.time_us,
                 ..JetstreamStorageUpdate::default()
@@ -2775,17 +2866,38 @@ impl<S: Storage> Ingestor<S> {
                     event.time_us,
                     commit,
                     &mut update,
-                    &mut staged_follows,
-                    &mut staged_records,
+                    &mut batch_state,
                 )?;
             }
+            batch_state.phases.scope_lookup += scope_started.elapsed().saturating_sub(
+                batch_state
+                    .phases
+                    .record_lookup
+                    .saturating_sub(record_lookup_before),
+            );
             updates.push(update);
         }
-        self.storage.apply_jetstream_batch(&updates)?;
+        let storage_timing = self.storage.apply_jetstream_batch(&updates)?;
+        batch_state.phases.apply = storage_timing.apply;
+        batch_state.phases.commit = storage_timing.commit;
         let last_cursor = updates.last().expect("nonempty batch").time_us;
         self.cursor.store(last_cursor, Ordering::Relaxed);
         self.processed
             .fetch_add(updates.len() as u64, Ordering::Relaxed);
+        batch_state.phases.total = batch_started.elapsed();
+        tracing::debug!(
+            batch_events = json_events.len(),
+            parse_ms = batch_state.phases.parse.as_secs_f64() * 1000.0,
+            scope_lookup_ms = batch_state.phases.scope_lookup.as_secs_f64() * 1000.0,
+            record_lookup_ms = batch_state.phases.record_lookup.as_secs_f64() * 1000.0,
+            apply_jetstream_batch_ms = batch_state.phases.apply.as_secs_f64() * 1000.0,
+            commit_ms = batch_state.phases.commit.as_secs_f64() * 1000.0,
+            total_ms = batch_state.phases.total.as_secs_f64() * 1000.0,
+            "Jetstream batch phase timing"
+        );
+        if let Ok(mut metrics) = self.batch_metrics.lock() {
+            metrics.add(&batch_state.phases);
+        }
         Ok(())
     }
 
@@ -2795,8 +2907,7 @@ impl<S: Storage> Ingestor<S> {
         time_us: u64,
         commit: JetstreamCommit,
         update: &mut JetstreamStorageUpdate,
-        staged_follows: &mut HashMap<(String, String), bool>,
-        staged_records: &mut HashMap<(String, String, String), Option<IndexedRecord>>,
+        batch_state: &mut IngestBatchState,
     ) -> Result<(), IngestError> {
         // Parse and filter target DIDs before querying records or writing anything.
         let referenced_tracked = if self.scope == ScopeMode::Full {
@@ -2809,25 +2920,27 @@ impl<S: Storage> Ingestor<S> {
                     .and_then(|record| record.pointer("/subject/uri"))
                     .and_then(Value::as_str)
                     .and_then(uri_did)
-                    .map(|target_did| self.is_tracked_in_batch(target_did, staged_follows))
+                    .map(|target_did| {
+                        self.is_tracked_in_batch(target_did, &batch_state.staged_follows)
+                    })
                     .transpose()?
                     .unwrap_or(false),
-                "app.bsky.feed.post" => {
-                    self.post_references_tracked(commit.record.as_ref(), staged_follows)?
-                }
+                "app.bsky.feed.post" => self
+                    .post_references_tracked(commit.record.as_ref(), &batch_state.staged_follows)?,
                 _ => false,
             }
         };
         let actor_tracked = match self.scope {
             ScopeMode::Full => true,
-            ScopeMode::Scoped => self.is_tracked_in_batch(&did, staged_follows)?,
+            ScopeMode::Scoped => self.is_tracked_in_batch(&did, &batch_state.staged_follows)?,
         };
         // Avoid a database record lookup for unrelated creates and updates. For a
         // delete, inspect the key so previously indexed interactions can be removed.
         let record_key = (did.clone(), commit.collection.clone(), commit.rkey.clone());
+        let record_lookup_started = Instant::now();
         let previous =
             if commit.operation == "delete" || commit.collection == "app.bsky.graph.follow" {
-                if let Some(previous) = staged_records.get(&record_key) {
+                if let Some(previous) = batch_state.staged_records.get(&record_key) {
                     previous.clone()
                 } else {
                     self.storage
@@ -2836,12 +2949,13 @@ impl<S: Storage> Ingestor<S> {
             } else {
                 None
             };
+        batch_state.phases.record_lookup += record_lookup_started.elapsed();
         let should_index = actor_tracked || referenced_tracked || previous.is_some();
 
         if should_index {
             if commit.operation == "delete" {
                 update.delete = Some((did.clone(), commit.collection.clone(), commit.rkey.clone()));
-                staged_records.insert(record_key.clone(), None);
+                batch_state.staged_records.insert(record_key.clone(), None);
             } else if let Some(record) = commit.record.as_ref() {
                 let uri = format!("at://{did}/{}/{}", commit.collection, commit.rkey);
                 let indexed = IndexedRecord {
@@ -2854,7 +2968,9 @@ impl<S: Storage> Ingestor<S> {
                     record: record.clone(),
                 };
                 update.upsert = Some(indexed.clone());
-                staged_records.insert(record_key.clone(), Some(indexed));
+                batch_state
+                    .staged_records
+                    .insert(record_key.clone(), Some(indexed));
             }
         }
 
@@ -2867,7 +2983,9 @@ impl<S: Storage> Ingestor<S> {
                     subject: subject.to_owned(),
                     following: false,
                 });
-                staged_follows.insert((did.clone(), subject.to_owned()), false);
+                batch_state
+                    .staged_follows
+                    .insert((did.clone(), subject.to_owned()), false);
             }
             if commit.operation != "delete"
                 && let Some(subject) = commit
@@ -2881,7 +2999,9 @@ impl<S: Storage> Ingestor<S> {
                     subject: subject.to_owned(),
                     following: true,
                 });
-                staged_follows.insert((did.clone(), subject.to_owned()), true);
+                batch_state
+                    .staged_follows
+                    .insert((did.clone(), subject.to_owned()), true);
                 if self.scope == ScopeMode::Scoped {
                     update.backfill_for.push((did, subject.to_owned()));
                 }
@@ -2960,6 +3080,13 @@ impl<S: Storage> Ingestor<S> {
 
     fn record_metrics(&self, interval: Duration) {
         let events = self.processed.swap(0, Ordering::Relaxed);
+        let interval_metrics = self
+            .batch_metrics
+            .lock()
+            .map(|mut metrics| std::mem::take(&mut *metrics))
+            .unwrap_or_default();
+        let (avg_batch_ms, max_batch_ms, slowest_phase, slowest_phase_ms) =
+            interval_metrics.summary();
         let seconds = interval.as_secs_f64().max(0.001);
         let cursor = self.cursor.load(Ordering::Relaxed);
         let cursor_lag_seconds = (cursor != 0).then(|| {
@@ -2973,6 +3100,11 @@ impl<S: Storage> Ingestor<S> {
         tracing::info!(
             events,
             events_per_second = events as f64 / seconds,
+            batches = interval_metrics.batches,
+            avg_batch_ms,
+            max_batch_ms,
+            slowest_phase,
+            slowest_phase_ms,
             bytes_on_disk = self.storage.bytes_on_disk(),
             cursor_lag_seconds = ?cursor_lag_seconds,
             "Jetstream ingestion metrics"

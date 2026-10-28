@@ -6,14 +6,18 @@ use rusqlite::Connection;
 use serde_json::json;
 use std::{
     io::{self, Write},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Once},
     time::Duration,
 };
 use tokio::{net::TcpListener, time::timeout};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
+use tracing_subscriber::prelude::*;
 
 #[path = "support/synthetic_db.rs"]
 mod synthetic_db;
+
+static TRACING_TEST_LOCK: Mutex<()> = Mutex::new(());
+static TRACING_TEST_INIT: Once = Once::new();
 
 fn event(
     did: &str,
@@ -84,6 +88,12 @@ fn sqlite_ingest_follow_scope_queries_do_not_scan_follows() {
 
 #[test]
 fn ingest_batches_log_parse_scope_record_apply_and_commit_phases_at_debug() {
+    let _tracing_test_guard = TRACING_TEST_LOCK.lock().unwrap();
+    TRACING_TEST_INIT.call_once(|| {
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_subscriber::filter::LevelFilter::TRACE);
+        tracing::subscriber::set_global_default(subscriber).unwrap();
+    });
     let output = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
@@ -92,6 +102,7 @@ fn ingest_batches_log_parse_scope_record_apply_and_commit_phases_at_debug() {
         .finish();
     let dispatch = tracing::Dispatch::new(subscriber);
     let _guard = tracing::dispatcher::set_default(&dispatch);
+    tracing::callsite::rebuild_interest_cache();
     let ingestor = Ingestor::new(Arc::new(MemoryStorage::default()), ScopeMode::Full);
     ingestor
         .process_json_batch(&[event(
@@ -132,6 +143,23 @@ fn jetstream_large_database_batch_ingest_benchmark() {
     println!(
         "synthetic database: generated={generated}, records={records}, follows={follows}, notifications={notifications}"
     );
+    if std::env::var_os("APPVIEW_BENCH_MEASURE_FOLLOW_INDEX").is_some() {
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("DROP INDEX IF EXISTS follows_active_subject_actor;")
+            .unwrap();
+        let index_started = std::time::Instant::now();
+        connection
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS follows_active_subject_actor
+                 ON follows(subject, actor) WHERE following=1;",
+            )
+            .unwrap();
+        println!(
+            "create_follows_active_subject_actor_ms={:.3}",
+            index_started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
 
     let startup_started = std::time::Instant::now();
     let storage = Arc::new(SqliteStorage::open(&path).unwrap());
@@ -139,6 +167,12 @@ fn jetstream_large_database_batch_ingest_benchmark() {
         "SqliteStorage::open_ms={:.3}",
         startup_started.elapsed().as_secs_f64() * 1000.0
     );
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let _guard = tracing::dispatcher::set_default(&dispatch);
     let ingestor = Ingestor::new(storage, ScopeMode::Scoped);
     let events = (0..600)
         .map(|index| {
@@ -830,6 +864,7 @@ async fn consumer_reconnects_after_a_silent_websocket_and_rotates_urls() {
 
 #[tokio::test]
 async fn event_processing_timeout_releases_connection_and_logs_event_identity() {
+    let _tracing_test_guard = TRACING_TEST_LOCK.lock().unwrap();
     let db_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
         .join(format!("av9-event-timeout-{}.db", std::process::id()));
@@ -903,6 +938,7 @@ async fn event_processing_timeout_releases_connection_and_logs_event_identity() 
 
 #[tokio::test(flavor = "current_thread")]
 async fn metrics_are_emitted_during_idle_periods_with_zero_events_and_cursor_lag() {
+    let _tracing_test_guard = TRACING_TEST_LOCK.lock().unwrap();
     let storage = Arc::new(MemoryStorage::default());
     let ingestor = Ingestor::new(storage, ScopeMode::Full);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -954,6 +990,7 @@ async fn metrics_are_emitted_during_idle_periods_with_zero_events_and_cursor_lag
 
 #[tokio::test]
 async fn websocket_connection_lifecycle_is_logged_at_info() {
+    let _tracing_test_guard = TRACING_TEST_LOCK.lock().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
