@@ -24,6 +24,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
+    io::{self, Write},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -31,6 +32,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
+use tracing_subscriber::fmt::MakeWriter;
 
 const DID: &str = "did:plc:abcdefghijklmnopqrstuvwx";
 const EXPECTED_OAUTH_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=*";
@@ -337,6 +339,62 @@ async fn production_oauth_flow_accepts_standard_callback_and_binds_subject_and_s
         })
         .await;
     assert!(result.unwrap_err().contains("atproto scope"));
+    server.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn pds_4xx_logs_safe_error_details_without_credentials() {
+    let (flow, _, shared, server) = production_flow(None, None).await;
+    flow.authorize(DID, "browser-binding-log-test")
+        .await
+        .unwrap();
+    let state = latest_state(&shared);
+    flow.callback(OAuthCallback {
+        code: "valid-code".to_owned(),
+        state,
+        issuer: Some(server_origin(&shared)),
+        scope: None,
+        browser_binding: Some("browser-binding-log-test".to_owned()),
+    })
+    .await
+    .unwrap();
+
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(CapturedMakeWriter(output.clone()))
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let _guard = tracing::dispatcher::set_default(&dispatch);
+    let result = flow.pinned_feeds(DID).await;
+    assert!(result.is_err());
+    drop(_guard);
+
+    let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("MissingPermission"), "{logs}");
+    assert!(
+        logs.contains("saved feed preferences are not permitted"),
+        "{logs}"
+    );
+    assert!(!logs.contains("access-expired"), "{logs}");
+    let request = shared
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .find(|request| {
+            request
+                .path
+                .starts_with("/xrpc/app.bsky.actor.getPreferences")
+        })
+        .cloned()
+        .unwrap();
+    assert!(
+        !logs.contains(request.headers.get("dpop").unwrap()),
+        "{logs}"
+    );
+    assert!(!logs.contains("browser-binding-log-test"), "{logs}");
     server.abort();
 }
 
@@ -664,6 +722,15 @@ async fn serve_one(mut stream: TcpStream, origin: &str, state: Arc<Mutex<FakeSer
                     _ => (200, vec![], json!({"feed":[]}).to_string()),
                 }
             }
+            path if path.starts_with("/xrpc/app.bsky.actor.getPreferences") => (
+                403,
+                vec![],
+                json!({
+                    "error":"MissingPermission",
+                    "message":"saved feed preferences are not permitted"
+                })
+                .to_string(),
+            ),
             _ => (404, vec![], json!({"error":"not_found"}).to_string()),
         }
     };
@@ -728,6 +795,7 @@ async fn write_response(stream: &mut TcpStream, status: u16, headers: &[(&str, &
         201 => "Created",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         _ => "Not Found",
     };
     let mut response = format!(
@@ -740,4 +808,27 @@ async fn write_response(stream: &mut TcpStream, status: u16, headers: &[(&str, &
     response.push_str("\r\n");
     response.push_str(body);
     let _ = stream.write_all(response.as_bytes()).await;
+}
+
+struct CapturedMakeWriter(Arc<Mutex<Vec<u8>>>);
+
+struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+impl<'a> MakeWriter<'a> for CapturedMakeWriter {
+    type Writer = CapturedWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        CapturedWriter(self.0.clone())
+    }
+}
+
+impl Write for CapturedWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
