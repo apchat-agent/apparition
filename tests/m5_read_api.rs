@@ -596,6 +596,54 @@ async fn post_views_count_indexed_interactions_and_include_the_viewers_own_recor
 }
 
 #[tokio::test]
+async fn post_quote_count_comes_from_indexed_embedded_record_references() {
+    let storage = Arc::new(MemoryStorage::default());
+    let quoted_uri = format!("at://{ALICE}/app.bsky.feed.post/original");
+    storage
+        .put_record(&IndexedRecord {
+            did: ALICE.into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "original".into(),
+            uri: quoted_uri.clone(),
+            cid: Some("original-cid".into()),
+            time_us: 10,
+            record: json!({"$type":"app.bsky.feed.post","text":"original"}),
+        })
+        .unwrap();
+    storage
+        .put_record(&IndexedRecord {
+            did: FRIEND.into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "quote".into(),
+            uri: format!("at://{FRIEND}/app.bsky.feed.post/quote"),
+            cid: Some("quote-cid".into()),
+            time_us: 11,
+            record: json!({
+                "$type":"app.bsky.feed.post",
+                "text":"adding context",
+                "embed":{"$type":"app.bsky.embed.record","record":{"uri":quoted_uri,"cid":"original-cid"}}
+            }),
+        })
+        .unwrap();
+    let (router, signing_key) = api_for_storage(storage);
+    let jwt = token(
+        &signing_key,
+        APPVIEW,
+        "app.bsky.feed.getPosts",
+        expiry(60),
+        Some(ALICE),
+    );
+    let (status, body) = request(
+        router,
+        "/xrpc/app.bsky.feed.getPosts?uris=at%3A%2F%2Fdid%3Aplc%3Aalice%2Fapp.bsky.feed.post%2Foriginal",
+        Some(&jwt),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["posts"][0]["quoteCount"], 1);
+}
+
+#[tokio::test]
 async fn post_thread_returns_parent_chain_and_time_ordered_nested_replies() {
     let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
     let root_uri = format!("at://{ALICE}/app.bsky.feed.post/root");
