@@ -63,7 +63,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         HttpRepoSource::default(),
         AtriumRepoVerifier,
         HostRateLimiter::new(Duration::from_millis(500)),
-    );
+    )
+    .with_records_per_second(config.backfill_records_per_second);
     let worker = BackfillWorker::new(
         storage.clone(),
         resolver,
@@ -90,9 +91,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let backfill_paused = std::env::var_os("APPVIEW_BACKFILL_PAUSED").is_some();
     if backfill_paused {
         info!("repository backfill paused by APPVIEW_BACKFILL_PAUSED");
+    } else if !config.backfill_enabled {
+        info!("repository backfill disabled; set APPVIEW_BACKFILL_ENABLED=true to enable it");
     }
+    let backfill_enabled = config.backfill_enabled;
     let backfill_task = tokio::spawn(async move {
-        if backfill_paused {
+        if backfill_paused || !backfill_enabled {
             return;
         }
         if let Err(error) = worker.run(backfill_shutdown).await {

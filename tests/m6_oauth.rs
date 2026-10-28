@@ -9,11 +9,13 @@ use atrium_common::store::Store;
 use atrium_oauth::store::{session::Session, state::InternalStateData};
 use axum::{Router, body::Body, http::Request, http::StatusCode};
 use http_body_util::BodyExt;
+use rusqlite::Connection;
 use serde_json::Value;
 use std::{
     future::Future,
     pin::Pin,
     sync::{Arc, Mutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tower::ServiceExt;
 
@@ -984,6 +986,147 @@ async fn oauth_callback_registers_account_and_logout_clears_its_session() {
     assert!(cleared_cookie.contains("HttpOnly"));
     assert!(cleared_cookie.contains("SameSite=Lax"));
     assert!(!storage.is_registered("did:plc:alice").unwrap());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn callback_database_writes_do_not_block_the_runtime_timer() {
+    let dir = std::env::temp_dir().join(format!(
+        "appview-callback-write-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("appview.db");
+    let storage = Arc::new(SqliteStorage::open(&path).unwrap());
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage.clone());
+    let login_cookie = prelogin_cookie(&app).await;
+
+    let blocker = Connection::open(&path).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let writer_storage = storage.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        writer_storage.put_record(&IndexedRecord {
+            did: "did:plc:writer".to_owned(),
+            collection: "app.bsky.feed.post".to_owned(),
+            rkey: "held-write".to_owned(),
+            uri: "at://did:plc:writer/app.bsky.feed.post/held-write".to_owned(),
+            cid: None,
+            time_us: 1,
+            record: serde_json::json!({"text":"writer"}),
+        })
+    });
+    started_rx.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(700));
+        blocker.execute_batch("COMMIT").unwrap();
+    });
+
+    let (timer_tx, timer_rx) = tokio::sync::oneshot::channel();
+    let timer_started = Instant::now();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = timer_tx.send(timer_started.elapsed());
+    });
+    let callback = app
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?code=valid-code&state=valid-state&scope=atproto")
+                .header("cookie", login_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let timer_delay = timer_rx.await.unwrap();
+    writer.join().unwrap().unwrap();
+    release.join().unwrap();
+    assert_eq!(callback.status(), StatusCode::SEE_OTHER);
+    assert!(
+        timer_delay < Duration::from_millis(200),
+        "runtime timer fired after {timer_delay:?} while sign-in wrote session state"
+    );
+    drop(storage);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn logout_database_writes_do_not_block_the_runtime_timer() {
+    let dir = std::env::temp_dir().join(format!(
+        "appview-logout-write-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("appview.db");
+    let storage = Arc::new(SqliteStorage::open(&path).unwrap());
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage.clone());
+    let session_cookie = finish_login(&app).await;
+
+    let blocker = Connection::open(&path).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let writer_storage = storage.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        writer_storage.put_record(&IndexedRecord {
+            did: "did:plc:writer".to_owned(),
+            collection: "app.bsky.feed.post".to_owned(),
+            rkey: "held-write".to_owned(),
+            uri: "at://did:plc:writer/app.bsky.feed.post/held-write".to_owned(),
+            cid: None,
+            time_us: 1,
+            record: serde_json::json!({"text":"writer"}),
+        })
+    });
+    started_rx.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(700));
+        blocker.execute_batch("COMMIT").unwrap();
+    });
+
+    let (timer_tx, timer_rx) = tokio::sync::oneshot::channel();
+    let timer_started = Instant::now();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = timer_tx.send(timer_started.elapsed());
+    });
+    let logout = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/logout")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", session_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let timer_delay = timer_rx.await.unwrap();
+    writer.join().unwrap().unwrap();
+    release.join().unwrap();
+    assert_eq!(logout.status(), StatusCode::SEE_OTHER);
+    assert!(
+        timer_delay < Duration::from_millis(200),
+        "runtime timer fired after {timer_delay:?} while logout wrote session state"
+    );
+    drop(storage);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]

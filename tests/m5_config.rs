@@ -8,6 +8,36 @@ fn appview_did_is_configurable_for_did_web_publication() {
 }
 
 #[test]
+fn backfill_record_rate_defaults_to_300_and_can_be_configured() {
+    let default = Config::from_toml_and_env("", std::iter::empty::<(&str, &str)>()).unwrap();
+    assert!(format!("{default:?}").contains("backfill_records_per_second: 300"));
+
+    let configured =
+        Config::from_toml_and_env("", [("APPVIEW_BACKFILL_RECORDS_PER_SECOND", "120")]).unwrap();
+    assert!(format!("{configured:?}").contains("backfill_records_per_second: 120"));
+}
+
+#[test]
+fn backfill_record_rate_rejects_zero_and_non_numbers() {
+    for value in ["0", "many"] {
+        assert!(
+            Config::from_toml_and_env("", [("APPVIEW_BACKFILL_RECORDS_PER_SECOND", value)])
+                .is_err(),
+            "invalid backfill rate {value:?} was accepted"
+        );
+    }
+}
+
+#[test]
+fn repository_backfill_is_disabled_by_default_and_requires_explicit_enablement() {
+    let default = Config::from_toml_and_env("", std::iter::empty::<(&str, &str)>()).unwrap();
+    assert!(format!("{default:?}").contains("backfill_enabled: false"));
+
+    let enabled = Config::from_toml_and_env("", [("APPVIEW_BACKFILL_ENABLED", "true")]).unwrap();
+    assert!(format!("{enabled:?}").contains("backfill_enabled: true"));
+}
+
+#[test]
 fn loopback_oauth_mode_can_be_selected_and_defaults_to_confidential() {
     let default = Config::from_toml_and_env("", std::iter::empty::<(&str, &str)>()).unwrap();
     assert!(format!("{default:?}").contains("oauth_mode: Confidential"));

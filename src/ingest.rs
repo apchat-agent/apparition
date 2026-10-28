@@ -274,6 +274,16 @@ pub trait Storage: Send + Sync {
         records: &[IndexedRecord],
         following: &[String],
     ) -> Result<(), StorageError>;
+    fn replace_repo_snapshot_throttled(
+        &self,
+        did: &str,
+        records: &[IndexedRecord],
+        following: &[String],
+        records_per_second: u64,
+    ) -> Result<(), StorageError> {
+        let _ = records_per_second;
+        self.replace_repo_snapshot(did, records, following)
+    }
     fn delete_record(&self, did: &str, collection: &str, rkey: &str) -> Result<(), StorageError>;
     fn get_record(
         &self,
@@ -1126,9 +1136,12 @@ impl Storage for MemoryStorage {
 
 /// Records per write transaction in a repository snapshot.
 const SNAPSHOT_BATCH: usize = 500;
+const SQLITE_READ_CONNECTIONS: usize = 4;
 
 pub struct SqliteStorage {
     connection: Mutex<Connection>,
+    read_connections: Vec<Mutex<Connection>>,
+    next_read_connection: AtomicU64,
     path: PathBuf,
     checkpointer_stop: Arc<AtomicBool>,
     checkpoint_backlog: Arc<AtomicU64>,
@@ -1282,8 +1295,18 @@ impl SqliteStorage {
         // SQLite's automatic checkpoint runs inside a commit, i.e. under our one
         // connection lock; on appview-host's disk a 1 GB WAL took minutes and froze every
         // request. A side connection checkpoints instead (PASSIVE never blocks writers).
-        connection.execute_batch("PRAGMA wal_autocheckpoint = 0; PRAGMA busy_timeout = 5000;
-             PRAGMA journal_size_limit = 67108864;")?;
+        connection.execute_batch(
+            "PRAGMA wal_autocheckpoint = 0; PRAGMA busy_timeout = 5000;
+             PRAGMA journal_size_limit = 67108864;",
+        )?;
+        let mut read_connections = Vec::new();
+        if path.as_os_str() != ":memory:" {
+            for _ in 0..SQLITE_READ_CONNECTIONS {
+                let reader = Connection::open(&path)?;
+                reader.execute_batch("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON;")?;
+                read_connections.push(Mutex::new(reader));
+            }
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let backlog = Arc::new(AtomicU64::new(0));
         if path.as_os_str() != ":memory:" {
@@ -1292,6 +1315,8 @@ impl SqliteStorage {
         }
         Ok(Self {
             connection: Mutex::new(connection),
+            read_connections,
+            next_read_connection: AtomicU64::new(0),
             path,
             checkpointer_stop: stop,
             checkpoint_backlog: backlog,
@@ -1308,36 +1333,27 @@ impl SqliteStorage {
     fn conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StorageError> {
         self.connection.lock().map_err(|_| StorageError::Poisoned)
     }
-}
 
-impl Storage for SqliteStorage {
-    fn write_backlog(&self) -> u64 {
-        self.checkpoint_backlog.load(Ordering::Relaxed)
+    fn read_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StorageError> {
+        if self.read_connections.is_empty() {
+            // Private in-memory databases cannot be opened by independent SQLite
+            // connections. File-backed production databases always use the reader pool.
+            return self.conn();
+        }
+        let index = self.next_read_connection.fetch_add(1, Ordering::Relaxed) as usize
+            % self.read_connections.len();
+        self.read_connections[index]
+            .lock()
+            .map_err(|_| StorageError::Poisoned)
     }
 
-    fn put_record(&self, record: &IndexedRecord) -> Result<(), StorageError> {
-        let record_json = serde_json::to_string(&record.record)?;
-        let connection = self.conn()?;
-        connection.execute(
-            "INSERT INTO records (did, collection, rkey, uri, cid, time_us, record_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(did, collection, rkey) DO UPDATE SET
-                 uri=excluded.uri, cid=excluded.cid, time_us=excluded.time_us, record_json=excluded.record_json",
-            params![record.did, record.collection, record.rkey, record.uri, record.cid, record.time_us, record_json],
-        )?;
-        write_notification_events(&connection, record)?;
-        Ok(())
-    }
-
-    fn replace_repo_snapshot(
+    fn replace_repo_snapshot_inner(
         &self,
         did: &str,
         records: &[IndexedRecord],
         following: &[String],
+        records_per_second: Option<u64>,
     ) -> Result<(), StorageError> {
-        // Serialise before taking the lock, and write records in short batches that
-        // each release it: one transaction for a big repo held the only connection
-        // for 70 s on appview-host and froze every page and sign-in behind it.
         let record_json = records
             .iter()
             .map(|record| serde_json::to_string(&record.record))
@@ -1388,9 +1404,13 @@ impl Storage for SqliteStorage {
         }
         transaction.commit()?;
         drop(connection);
-        for (batch, batch_json) in records
+
+        let write_started = Instant::now();
+        let total_batches = records.len().div_ceil(SNAPSHOT_BATCH);
+        for (batch_index, (batch, batch_json)) in records
             .chunks(SNAPSHOT_BATCH)
             .zip(record_json.chunks(SNAPSHOT_BATCH))
+            .enumerate()
         {
             let mut connection = self.conn()?;
             let transaction = connection.transaction()?;
@@ -1421,8 +1441,62 @@ impl Storage for SqliteStorage {
             drop(connection);
             // std's Mutex is not fair: without a yield this thread takes it straight back.
             std::thread::yield_now();
+
+            if let Some(rate) = records_per_second
+                && batch_index + 1 < total_batches
+            {
+                let written = ((batch_index + 1) * SNAPSHOT_BATCH).min(records.len()) as u128;
+                let target_nanos = written
+                    .saturating_mul(1_000_000_000)
+                    .checked_div(rate.max(1) as u128)
+                    .unwrap_or(u128::MAX)
+                    .min(u64::MAX as u128) as u64;
+                let target = Duration::from_nanos(target_nanos);
+                if let Some(remaining) = target.checked_sub(write_started.elapsed()) {
+                    std::thread::sleep(remaining);
+                }
+            }
         }
         Ok(())
+    }
+}
+
+impl Storage for SqliteStorage {
+    fn write_backlog(&self) -> u64 {
+        self.checkpoint_backlog.load(Ordering::Relaxed)
+    }
+
+    fn put_record(&self, record: &IndexedRecord) -> Result<(), StorageError> {
+        let record_json = serde_json::to_string(&record.record)?;
+        let connection = self.conn()?;
+        connection.execute(
+            "INSERT INTO records (did, collection, rkey, uri, cid, time_us, record_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(did, collection, rkey) DO UPDATE SET
+                 uri=excluded.uri, cid=excluded.cid, time_us=excluded.time_us, record_json=excluded.record_json",
+            params![record.did, record.collection, record.rkey, record.uri, record.cid, record.time_us, record_json],
+        )?;
+        write_notification_events(&connection, record)?;
+        Ok(())
+    }
+
+    fn replace_repo_snapshot(
+        &self,
+        did: &str,
+        records: &[IndexedRecord],
+        following: &[String],
+    ) -> Result<(), StorageError> {
+        self.replace_repo_snapshot_inner(did, records, following, None)
+    }
+
+    fn replace_repo_snapshot_throttled(
+        &self,
+        did: &str,
+        records: &[IndexedRecord],
+        following: &[String],
+        records_per_second: u64,
+    ) -> Result<(), StorageError> {
+        self.replace_repo_snapshot_inner(did, records, following, Some(records_per_second))
     }
 
     fn delete_record(&self, did: &str, collection: &str, rkey: &str) -> Result<(), StorageError> {
@@ -1444,7 +1518,7 @@ impl Storage for SqliteStorage {
         collection: &str,
         rkey: &str,
     ) -> Result<Option<IndexedRecord>, StorageError> {
-        self.conn()?
+        self.read_conn()?
             .query_row(
                 "SELECT did, collection, rkey, uri, cid, time_us, record_json
                  FROM records WHERE did=?1 AND collection=?2 AND rkey=?3",
@@ -1460,7 +1534,7 @@ impl Storage for SqliteStorage {
         collection: &str,
         uri: &str,
     ) -> Result<Option<IndexedRecord>, StorageError> {
-        self.conn()?
+        self.read_conn()?
             .query_row(
                 "SELECT did, collection, rkey, uri, cid, time_us, record_json FROM records WHERE collection=?1 AND uri=?2",
                 params![collection, uri],
@@ -1475,7 +1549,7 @@ impl Storage for SqliteStorage {
         parent_uri: &str,
         limit: usize,
     ) -> Result<Vec<IndexedRecord>, StorageError> {
-        let conn = self.conn()?;
+        let conn = self.read_conn()?;
         let mut statement = conn.prepare(
             "SELECT did, collection, rkey, uri, cid, time_us, record_json FROM records
              WHERE collection='app.bsky.feed.post' AND json_extract(record_json, '$.reply.parent.uri')=?1
@@ -1496,7 +1570,7 @@ impl Storage for SqliteStorage {
         subject_uri: &str,
         limit: usize,
     ) -> Result<Vec<IndexedRecord>, StorageError> {
-        let conn = self.conn()?;
+        let conn = self.read_conn()?;
         let mut statement = conn.prepare(
             "SELECT did, collection, rkey, uri, cid, time_us, record_json FROM records
              WHERE collection=?1 AND json_extract(record_json, '$.subject.uri')=?2
@@ -1516,7 +1590,7 @@ impl Storage for SqliteStorage {
         did: &str,
         limit: usize,
     ) -> Result<Vec<IndexedRecord>, StorageError> {
-        let conn = self.conn()?;
+        let conn = self.read_conn()?;
         let mut statement = conn.prepare(
             "SELECT did, collection, rkey, uri, cid, time_us, record_json FROM records
              WHERE collection='app.bsky.graph.follow' AND did=?1
@@ -1533,7 +1607,7 @@ impl Storage for SqliteStorage {
         did: &str,
         limit: usize,
     ) -> Result<Vec<IndexedRecord>, StorageError> {
-        let conn = self.conn()?;
+        let conn = self.read_conn()?;
         let mut statement = conn.prepare(
             "SELECT did, collection, rkey, uri, cid, time_us, record_json FROM records
              WHERE collection='app.bsky.graph.follow' AND json_extract(record_json, '$.subject')=?1
@@ -1546,7 +1620,7 @@ impl Storage for SqliteStorage {
     }
 
     fn profile_counts(&self, did: &str) -> Result<(usize, usize, usize), StorageError> {
-        let counts: (i64, i64, i64) = self.conn()?.query_row(
+        let counts: (i64, i64, i64) = self.read_conn()?.query_row(
             "SELECT
                 (SELECT COUNT(*) FROM records WHERE collection='app.bsky.graph.follow' AND did=?1),
                 (SELECT COUNT(*) FROM records WHERE collection='app.bsky.graph.follow' AND json_extract(record_json, '$.subject')=?1),
@@ -1563,7 +1637,7 @@ impl Storage for SqliteStorage {
         before: Option<&NotificationCursor>,
         limit: usize,
     ) -> Result<Vec<IndexedNotification>, StorageError> {
-        let conn = self.conn()?;
+        let conn = self.read_conn()?;
         let mut statement = conn.prepare(
             "SELECT r.did, r.collection, r.rkey, r.uri, r.cid, r.time_us, r.record_json,
                     n.reason, n.reason_subject
@@ -1598,7 +1672,7 @@ impl Storage for SqliteStorage {
     }
 
     fn notification_count(&self, did: &str) -> Result<usize, StorageError> {
-        Ok(self.conn()?.query_row(
+        Ok(self.read_conn()?.query_row(
             "SELECT COUNT(*) FROM notification_events WHERE subject_did=?1",
             [did],
             |row| row.get(0),
@@ -1612,7 +1686,7 @@ impl Storage for SqliteStorage {
         limit: usize,
         include_replies: bool,
     ) -> Result<Vec<IndexedRecord>, StorageError> {
-        let conn = self.conn()?;
+        let conn = self.read_conn()?;
         let reply_filter = if include_replies {
             ""
         } else {
@@ -1645,7 +1719,7 @@ impl Storage for SqliteStorage {
         cursor: Option<&RecordCursor>,
         limit: usize,
     ) -> Result<Vec<IndexedRecord>, StorageError> {
-        let conn = self.conn()?;
+        let conn = self.read_conn()?;
         let mut statement = conn.prepare(
             "SELECT did, collection, rkey, uri, cid, time_us, record_json FROM records
              WHERE collection='app.bsky.feed.post'
@@ -1675,7 +1749,7 @@ impl Storage for SqliteStorage {
         uri: &str,
         viewer_did: Option<&str>,
     ) -> Result<PostInteractionSummary, StorageError> {
-        let conn = self.conn()?;
+        let conn = self.read_conn()?;
         let count = |collection: &str, path: &str| -> Result<usize, rusqlite::Error> {
             conn.query_row(
                 &format!("SELECT COUNT(*) FROM records WHERE collection=?1 AND json_extract(record_json, '{path}')=?2"),
@@ -1705,7 +1779,7 @@ impl Storage for SqliteStorage {
     }
 
     fn records(&self) -> Result<Vec<IndexedRecord>, StorageError> {
-        let conn = self.conn()?;
+        let conn = self.read_conn()?;
         let mut statement = conn.prepare(
             "SELECT did, collection, rkey, uri, cid, time_us, record_json FROM records ORDER BY time_us DESC",
         )?;
@@ -1716,7 +1790,7 @@ impl Storage for SqliteStorage {
     }
 
     fn cursor(&self) -> Result<Option<u64>, StorageError> {
-        self.conn()?
+        self.read_conn()?
             .query_row(
                 "SELECT value FROM appview_state WHERE key='jetstream_cursor'",
                 [],
@@ -1782,7 +1856,7 @@ impl Storage for SqliteStorage {
     }
 
     fn is_registered(&self, did: &str) -> Result<bool, StorageError> {
-        Ok(self.conn()?.query_row(
+        Ok(self.read_conn()?.query_row(
             "SELECT EXISTS(SELECT 1 FROM registered_users WHERE did=?1)",
             [did],
             |row| row.get(0),
@@ -1810,7 +1884,7 @@ impl Storage for SqliteStorage {
     }
 
     fn is_followed_by_registered(&self, did: &str) -> Result<bool, StorageError> {
-        Ok(self.conn()?.query_row(
+        Ok(self.read_conn()?.query_row(
             "SELECT EXISTS(SELECT 1 FROM follows f JOIN registered_users r ON f.actor=r.did WHERE f.subject=?1)",
             [did],
             |row| row.get(0),
@@ -1870,7 +1944,7 @@ impl Storage for SqliteStorage {
     }
 
     fn pending_backfills(&self) -> Result<Vec<String>, StorageError> {
-        let conn = self.conn()?;
+        let conn = self.read_conn()?;
         let mut statement = conn.prepare(
             "SELECT q.did FROM backfill_queue q
              LEFT JOIN backfill_retry r ON r.did=q.did
@@ -1922,7 +1996,7 @@ impl Storage for SqliteStorage {
     }
 
     fn backfill_progress(&self, owner_did: &str) -> Result<(usize, usize), StorageError> {
-        let (total, done): (i64, i64) = self.conn()?.query_row(
+        let (total, done): (i64, i64) = self.read_conn()?.query_row(
             "SELECT COUNT(*), COALESCE(SUM(CASE WHEN s.done=1 THEN 1 ELSE 0 END),0)
              FROM backfill_scope b LEFT JOIN backfill_status s ON s.did=b.target_did
              WHERE b.owner_did=?1",
@@ -1933,7 +2007,7 @@ impl Storage for SqliteStorage {
     }
 
     fn backfill_failure_count(&self, owner_did: &str) -> Result<usize, StorageError> {
-        let count: i64 = self.conn()?.query_row(
+        let count: i64 = self.read_conn()?.query_row(
             "SELECT COUNT(*) FROM backfill_scope b
              JOIN backfill_retry r ON r.did=b.target_did
              LEFT JOIN backfill_status s ON s.did=b.target_did
@@ -1967,7 +2041,7 @@ impl Storage for SqliteStorage {
     }
 
     fn verified_handle(&self, did: &str) -> Result<Option<String>, StorageError> {
-        self.conn()?
+        self.read_conn()?
             .query_row(
                 "SELECT handle FROM verified_handles WHERE did=?1",
                 [did],
@@ -1978,7 +2052,7 @@ impl Storage for SqliteStorage {
     }
 
     fn handle_is_invalid(&self, did: &str) -> Result<bool, StorageError> {
-        Ok(self.conn()?.query_row(
+        Ok(self.read_conn()?.query_row(
             "SELECT EXISTS(SELECT 1 FROM invalid_handles WHERE did=?1)",
             [did],
             |row| row.get(0),
@@ -2013,7 +2087,7 @@ impl Storage for SqliteStorage {
         did: &str,
         session_id: &str,
     ) -> Result<Option<u64>, StorageError> {
-        self.conn()?
+        self.read_conn()?
             .query_row(
                 "SELECT generation FROM web_sessions WHERE did=?1 AND session_id=?2",
                 params![did, session_id],
@@ -2026,7 +2100,7 @@ impl Storage for SqliteStorage {
     }
 
     fn did_by_verified_handle(&self, handle: &str) -> Result<Option<String>, StorageError> {
-        self.conn()?
+        self.read_conn()?
             .query_row(
                 "SELECT did FROM verified_handles WHERE lower(handle)=lower(?1)",
                 [handle],
@@ -2037,7 +2111,7 @@ impl Storage for SqliteStorage {
     }
 
     fn is_tracked_did(&self, did: &str) -> Result<bool, StorageError> {
-        Ok(self.conn()?.query_row(
+        Ok(self.read_conn()?.query_row(
             "SELECT EXISTS(SELECT 1 FROM registered_users WHERE did=?1)
                 OR EXISTS(SELECT 1 FROM follows f JOIN registered_users r ON r.did=f.actor WHERE f.subject=?1)",
             [did],
@@ -2046,7 +2120,7 @@ impl Storage for SqliteStorage {
     }
 
     fn is_displayed_did(&self, did: &str) -> Result<bool, StorageError> {
-        Ok(self.conn()?.query_row(
+        Ok(self.read_conn()?.query_row(
             "SELECT EXISTS(SELECT 1 FROM records WHERE did=?1)",
             [did],
             |row| row.get(0),
@@ -2055,7 +2129,7 @@ impl Storage for SqliteStorage {
 
     fn stale_handle_dids(&self, ttl: Duration, limit: usize) -> Result<Vec<String>, StorageError> {
         let ttl_seconds = i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX);
-        let connection = self.conn()?;
+        let connection = self.read_conn()?;
         let mut statement = connection.prepare(
             "SELECT did FROM (
                  SELECT h.did AS did,h.updated_at AS checked_at FROM verified_handles h
@@ -2086,7 +2160,7 @@ impl Storage for SqliteStorage {
     }
 
     fn pending_handle_refreshes(&self, limit: usize) -> Result<Vec<String>, StorageError> {
-        let connection = self.conn()?;
+        let connection = self.read_conn()?;
         let mut statement = connection
             .prepare("SELECT did FROM handle_refresh_queue ORDER BY requested_at,did LIMIT ?1")?;
         let dids = statement
