@@ -1120,6 +1120,9 @@ impl Storage for MemoryStorage {
     }
 }
 
+/// Records per write transaction in a repository snapshot.
+const SNAPSHOT_BATCH: usize = 500;
+
 pub struct SqliteStorage {
     connection: Mutex<Connection>,
     path: PathBuf,
@@ -1265,6 +1268,13 @@ impl Storage for SqliteStorage {
         records: &[IndexedRecord],
         following: &[String],
     ) -> Result<(), StorageError> {
+        // Serialise before taking the lock, and write records in short batches that
+        // each release it: one transaction for a big repo held the only connection
+        // for 70 s on appview-host and froze every page and sign-in behind it.
+        let record_json = records
+            .iter()
+            .map(|record| serde_json::to_string(&record.record))
+            .collect::<Result<Vec<_>, _>>()?;
         let mut connection = self.conn()?;
         let transaction = connection.transaction()?;
         transaction.execute("DELETE FROM records WHERE did=?1", [did])?;
@@ -1279,24 +1289,6 @@ impl Storage for SqliteStorage {
             [did],
             |row| row.get(0),
         )?;
-        {
-            let mut insert = transaction.prepare(
-                "INSERT INTO records (did, collection, rkey, uri, cid, time_us, record_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            )?;
-            for record in records {
-                insert.execute(params![
-                    record.did,
-                    record.collection,
-                    record.rkey,
-                    record.uri,
-                    record.cid,
-                    record.time_us,
-                    serde_json::to_string(&record.record)?,
-                ])?;
-                write_notification_events(&transaction, record)?;
-            }
-        }
         {
             let mut insert_follow = transaction
                 .prepare("INSERT OR IGNORE INTO follows(actor,subject) VALUES(?1,?2)")?;
@@ -1328,6 +1320,41 @@ impl Storage for SqliteStorage {
             }
         }
         transaction.commit()?;
+        drop(connection);
+        for (batch, batch_json) in records
+            .chunks(SNAPSHOT_BATCH)
+            .zip(record_json.chunks(SNAPSHOT_BATCH))
+        {
+            let mut connection = self.conn()?;
+            let transaction = connection.transaction()?;
+            {
+                // A live event may have written one of these rows between batches;
+                // it is newer than the snapshot, so it wins.
+                let mut insert = transaction.prepare(
+                    "INSERT INTO records (did, collection, rkey, uri, cid, time_us, record_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(did, collection, rkey) DO NOTHING",
+                )?;
+                for (record, json) in batch.iter().zip(batch_json) {
+                    let inserted = insert.execute(params![
+                        record.did,
+                        record.collection,
+                        record.rkey,
+                        record.uri,
+                        record.cid,
+                        record.time_us,
+                        json,
+                    ])?;
+                    if inserted > 0 {
+                        write_notification_events(&transaction, record)?;
+                    }
+                }
+            }
+            transaction.commit()?;
+            drop(connection);
+            // std's Mutex is not fair: without a yield this thread takes it straight back.
+            std::thread::yield_now();
+        }
         Ok(())
     }
 
