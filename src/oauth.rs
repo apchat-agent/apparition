@@ -27,7 +27,8 @@ use atrium_oauth::{
         state::{InternalStateData, StateStore},
     },
 };
-use atrium_xrpc::{OutputDataOrBytes, XrpcClient, XrpcRequest};
+use atrium_xrpc::error::XrpcErrorKind;
+use atrium_xrpc::{Error as XrpcClientError, OutputDataOrBytes, XrpcClient, XrpcRequest};
 use axum::{
     Json, Router,
     extract::{Form, Query, State},
@@ -826,7 +827,10 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         let response: OutputDataOrBytes<Value> = session
             .send_xrpc::<Value, Value, Value, Value>(&request)
             .await
-            .map_err(|_| "PDS getPreferences request failed".to_owned())?;
+            .map_err(|error| {
+                log_pds_xrpc_failure("app.bsky.actor.getPreferences", &error);
+                "PDS getPreferences request failed".to_owned()
+            })?;
         let response = match response {
             OutputDataOrBytes::Data(value) => value,
             OutputDataOrBytes::Bytes(_) => {
@@ -874,7 +878,10 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         let response: OutputDataOrBytes<Value> = session
             .send_xrpc::<Value, Value, Value, Value>(&request)
             .await
-            .map_err(|_| "PDS getServiceAuth request failed".to_owned())?;
+            .map_err(|error| {
+                log_pds_xrpc_failure("com.atproto.server.getServiceAuth", &error);
+                "PDS getServiceAuth request failed".to_owned()
+            })?;
         match response {
             OutputDataOrBytes::Data(value) => value
                 .get("token")
@@ -3040,6 +3047,37 @@ fn render_web_quote<S: Storage>(storage: &S, embed: &Value) -> String {
 
 fn has_atproto_scope(scope: Option<&str>) -> bool {
     scope.is_some_and(|scope| scope.split_whitespace().any(|value| value == "atproto"))
+}
+
+fn log_pds_xrpc_failure(method: &'static str, error: &XrpcClientError<Value>) {
+    let (status, error_code, error_message) = match error {
+        XrpcClientError::XrpcResponse(response) => {
+            let (code, message) = response
+                .error
+                .as_ref()
+                .map(xrpc_error_details)
+                .unwrap_or((None, None));
+            (Some(response.status), code, message)
+        }
+        _ => (None, None, None),
+    };
+    tracing::warn!(
+        method,
+        status = ?status,
+        error_code = ?error_code,
+        error_message = ?error_message,
+        "PDS XRPC request failed"
+    );
+}
+
+fn xrpc_error_details(error: &XrpcErrorKind<Value>) -> (Option<&str>, Option<&str>) {
+    match error {
+        XrpcErrorKind::Custom(value) => (
+            value.get("error").and_then(Value::as_str),
+            value.get("message").and_then(Value::as_str),
+        ),
+        XrpcErrorKind::Undefined(value) => (value.error.as_deref(), value.message.as_deref()),
+    }
 }
 
 fn has_all_write_scopes(scope: Option<&str>) -> bool {
