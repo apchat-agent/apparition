@@ -468,6 +468,76 @@ async fn login_page_accepts_an_atproto_handle_or_did() {
 }
 
 #[tokio::test]
+async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code() {
+    let storage = Arc::new(MemoryStorage::default());
+    let thread_uri = "at://did:plc:alice/app.bsky.feed.post/root";
+    storage
+        .put_record(&IndexedRecord {
+            did: "did:plc:alice".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "root".into(),
+            uri: thread_uri.into(),
+            cid: Some("root-cid".into()),
+            time_us: 1,
+            record: serde_json::json!({"text":"A local post"}),
+        })
+        .unwrap();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage);
+    let cookie = finish_login(&app).await;
+    let paths = [
+        "/login",
+        "/app",
+        "/profile?did=did%3Aplc%3Aalice",
+        "/thread?uri=at%3A%2F%2Fdid%3Aplc%3Aalice%2Fapp.bsky.feed.post%2Froot",
+        "/notifications",
+    ];
+
+    for path in paths {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let html = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"), "{path}");
+        assert!(html.contains("href=\"/static/app.css?v=av13\""), "{path}");
+        assert!(!html.contains("style="), "{path}");
+        assert!(!html.contains("<script"), "{path}");
+    }
+
+    let stylesheet = app
+        .oneshot(
+            Request::builder()
+                .uri("/static/app.css?v=av13")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stylesheet.status(), StatusCode::OK);
+    assert!(stylesheet.headers()["content-type"].to_str().unwrap().starts_with("text/css"));
+    assert!(stylesheet.headers()["cache-control"].to_str().unwrap().contains("max-age="));
+}
+
+#[tokio::test]
 async fn authorize_rejects_cross_origin_and_cross_site_requests() {
     let app = OAuthPublic::new("https://appview.example")
         .unwrap()
