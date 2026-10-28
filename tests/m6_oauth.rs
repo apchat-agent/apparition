@@ -1981,6 +1981,54 @@ async fn web_embeds_render_images_cards_quotes_and_escape_user_content() {
 }
 
 #[tokio::test]
+async fn web_views_truncate_oversized_remote_post_text() {
+    let huge_text = "<script>hostile & text</script>".repeat(1200);
+    let storage = Arc::new(MemoryStorage::default());
+    storage.register_user("did:plc:alice").unwrap();
+    storage
+        .put_record(&IndexedRecord {
+            did: "did:plc:alice".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "huge".into(),
+            uri: "at://did:plc:alice/app.bsky.feed.post/huge".into(),
+            cid: None,
+            time_us: 1,
+            record: serde_json::json!({"text":huge_text}),
+        })
+        .unwrap();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage);
+    let cookie = finish_login(&app).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+
+    assert!(!html.contains(&huge_text));
+    assert!(
+        html.len() < 50_000,
+        "oversized remote text inflated the page"
+    );
+}
+
+#[tokio::test]
 async fn callback_keeps_partial_write_grants_read_only_and_blocks_actions() {
     let flow = FakeOAuthFlow::with_granted_scope(Some("atproto"));
     let actions = flow.actions.clone();
