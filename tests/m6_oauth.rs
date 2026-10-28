@@ -844,6 +844,20 @@ async fn oauth_authorization_state_and_tokens_survive_store_reopen() {
 }
 
 #[tokio::test]
+async fn root_redirects_to_the_app_instead_of_an_empty_404() {
+    // A bare 404 with no content type made a phone browser save "/" as a file.
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router();
+    let response = app
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers()["location"], "/app");
+}
+
+#[tokio::test]
 async fn web_views_and_write_actions_require_a_login_session() {
     let app = OAuthPublic::new("https://appview.example")
         .unwrap()

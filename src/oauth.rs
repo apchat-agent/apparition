@@ -291,6 +291,7 @@ impl OAuthPublic {
     {
         Router::new()
             .route(METADATA_PATH, get(metadata::<F, S>))
+            .route("/", get(root))
             .route("/login", get(login))
             .route("/oauth/authorize", post(authorize::<F, S>))
             .route("/oauth/callback", get(callback::<F, S>))
@@ -1064,6 +1065,11 @@ where
     S: Storage,
 {
     Json(state.public.metadata.clone())
+}
+
+/// The bare origin goes to the app, which sends a visitor without a session on to `/login`.
+async fn root() -> Redirect {
+    Redirect::to("/app")
 }
 
 async fn login() -> Html<&'static str> {
