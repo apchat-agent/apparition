@@ -1,6 +1,8 @@
-use crate::{identity::{DidDocument, IdentityResolver}, net::SafeHttpClient};
+use crate::{identity::{IdentityBackend, IdentityResolver}, net::SafeHttpClient};
+use http::HeaderMap;
 use serde_json::Value;
 use std::{collections::HashMap, sync::Arc, time::Duration};
+use url::Url;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedFeed {
@@ -12,13 +14,13 @@ pub struct ResolvedFeed {
     pub endpoint: String,
 }
 
-pub struct FeedClient<B: crate::identity::IdentityBackend> {
+pub struct FeedClient<B: IdentityBackend> {
     identity: Arc<IdentityResolver<B>>,
     http: SafeHttpClient,
     generator_cache: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, ResolvedFeed)>>,
 }
 
-impl<B: crate::identity::IdentityBackend> FeedClient<B> {
+impl<B: IdentityBackend> FeedClient<B> {
     pub fn new(identity: Arc<IdentityResolver<B>>, http: SafeHttpClient) -> Self {
         Self {
             identity,
@@ -27,9 +29,108 @@ impl<B: crate::identity::IdentityBackend> FeedClient<B> {
         }
     }
 
-    pub async fn resolve_feed(&self, _uri: &str) -> Result<ResolvedFeed, String> {
-        Err("feed generator resolution is not implemented".to_owned())
+    pub async fn resolve_feed(&self, uri: &str) -> Result<ResolvedFeed, String> {
+        if let Some((expires, feed)) = self.generator_cache.lock().await.get(uri).cloned()
+            && expires > tokio::time::Instant::now()
+        {
+            return Ok(feed);
+        }
+        let (creator_did, collection, rkey) = parse_feed_uri(uri)?;
+        let creator_doc = self
+            .identity
+            .resolve_did_document(&creator_did)
+            .await
+            .map_err(|error| format!("feed creator DID resolution failed: {error}"))?;
+        let pds = creator_doc
+            .pds_endpoint()
+            .ok_or_else(|| "feed creator DID document has no valid PDS endpoint".to_owned())?;
+        let mut record_url = Url::parse(&format!("{pds}/xrpc/com.atproto.repo.getRecord"))
+            .map_err(|_| "feed creator PDS URL is invalid".to_owned())?;
+        record_url
+            .query_pairs_mut()
+            .append_pair("repo", &creator_did)
+            .append_pair("collection", &collection)
+            .append_pair("rkey", &rkey);
+        let response = self
+            .http
+            .get(&record_url, HeaderMap::new(), 1024 * 1024)
+            .await?;
+        if !response.status().is_success() {
+            return Err("feed generator record could not be fetched".to_owned());
+        }
+        let record: Value = serde_json::from_slice(response.body())
+            .map_err(|_| "feed generator record was invalid JSON".to_owned())?;
+        let value = record
+            .get("value")
+            .ok_or_else(|| "feed generator record has no value".to_owned())?;
+        let service_did = value
+            .get("did")
+            .and_then(Value::as_str)
+            .filter(|did| !did.is_empty())
+            .ok_or_else(|| "feed generator record has no service DID".to_owned())?
+            .to_owned();
+        let service_doc = self
+            .identity
+            .resolve_did_document(&service_did)
+            .await
+            .map_err(|error| format!("feed generator service DID resolution failed: {error}"))?;
+        let endpoint = service_doc
+            .service
+            .iter()
+            .find(|service| {
+                (service.id == "#bsky_fg" || service.id == format!("{}#bsky_fg", service_doc.id))
+                    && service.type_name == "BskyFeedGenerator"
+            })
+            .map(|service| service.service_endpoint.clone())
+            .ok_or_else(|| "feed generator DID document is missing the #bsky_fg service".to_owned())?;
+        let endpoint_url = Url::parse(&endpoint)
+            .map_err(|_| "feed generator #bsky_fg endpoint URL is invalid".to_owned())?;
+        if endpoint_url.query().is_some()
+            || endpoint_url.fragment().is_some()
+            || !endpoint_url.username().is_empty()
+            || endpoint_url.password().is_some()
+        {
+            return Err("feed generator #bsky_fg endpoint URL has forbidden components".to_owned());
+        }
+        self.http.resolve_safe(&endpoint_url).await?;
+
+        let feed = ResolvedFeed {
+            uri: uri.to_owned(),
+            display_name: value
+                .get("displayName")
+                .and_then(Value::as_str)
+                .unwrap_or("Untitled feed")
+                .to_owned(),
+            description: value.get("description").and_then(Value::as_str).map(str::to_owned),
+            avatar: value.get("avatar").and_then(Value::as_str).map(str::to_owned),
+            service_did,
+            endpoint: endpoint.trim_end_matches('/').to_owned(),
+        };
+        self.generator_cache.lock().await.insert(
+            uri.to_owned(),
+            (tokio::time::Instant::now() + Duration::from_secs(60 * 60), feed.clone()),
+        );
+        Ok(feed)
     }
+}
+
+fn parse_feed_uri(uri: &str) -> Result<(String, String, String), String> {
+    let Some(path) = uri.strip_prefix("at://") else {
+        return Err("feed URI must use the at:// scheme".to_owned());
+    };
+    let mut parts = path.split('/');
+    let did = parts.next().unwrap_or_default();
+    let collection = parts.next().unwrap_or_default();
+    let rkey = parts.next().unwrap_or_default();
+    if did.is_empty()
+        || collection != "app.bsky.feed.generator"
+        || rkey.is_empty()
+        || parts.next().is_some()
+        || rkey.contains(['?', '#', '%'])
+    {
+        return Err("feed URI must identify one app.bsky.feed.generator record".to_owned());
+    }
+    Ok((did.to_owned(), collection.to_owned(), rkey.to_owned()))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -153,7 +254,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
-        (format!("http://creator.test:{}", address.port()), task)
+        (format!("http://localhost:{}", address.port()), task)
     }
 
     fn resolver(pds: String, endpoint: String) -> Arc<IdentityResolver<FakeIdentity>> {
@@ -166,14 +267,14 @@ mod tests {
     }
 
     fn client(identity: Arc<IdentityResolver<FakeIdentity>>) -> FeedClient<FakeIdentity> {
-        FeedClient::new(identity, SafeHttpClient::with_resolver(TestResolver).with_http_test_hosts(["creator.test".to_owned(), "generator.test".to_owned()]))
+        FeedClient::new(identity, SafeHttpClient::with_resolver(TestResolver).with_http_test_hosts(["localhost".to_owned()]))
     }
 
     #[tokio::test]
     async fn generator_records_resolve_did_web_and_did_plc_services() {
         let (pds, server) = fake_pds().await;
         let port = pds.rsplit(':').next().unwrap().to_owned();
-        let identity = resolver(pds, format!("http://generator.test:{port}/feed"));
+        let identity = resolver(pds, format!("http://localhost:{port}/feed"));
         let client = client(identity);
         for rkey in ["web", "plc"] {
             let uri = format!("at://{CREATOR}/app.bsky.feed.generator/{rkey}");
