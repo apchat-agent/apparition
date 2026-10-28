@@ -1,4 +1,4 @@
-use crate::{identity::{IdentityBackend, IdentityResolver}, net::SafeHttpClient};
+use crate::{identity::{IdentityBackend, IdentityResolver}, ingest::{IndexedRecord, Storage}, net::SafeHttpClient};
 use http::HeaderMap;
 use serde_json::Value;
 use std::{collections::{HashMap, HashSet}, sync::{Arc, Mutex, OnceLock}, time::Duration};
@@ -24,6 +24,19 @@ pub struct FeedSkeletonEntry {
 pub struct FeedSkeletonPage {
     pub feed: Vec<FeedSkeletonEntry>,
     pub cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HydratedFeedPost {
+    pub record: IndexedRecord,
+    pub reposted_by: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HydratedFeedPage {
+    pub feed: Vec<HydratedFeedPost>,
+    pub cursor: Option<String>,
+    pub dropped_count: usize,
 }
 
 pub struct FeedClient<B: IdentityBackend> {
@@ -182,6 +195,14 @@ impl<B: IdentityBackend> FeedClient<B> {
             cursor: body.get("cursor").and_then(Value::as_str).map(str::to_owned),
         })
     }
+
+    pub async fn hydrate_skeleton(
+        &self,
+        _skeleton: FeedSkeletonPage,
+        _storage: &dyn Storage,
+    ) -> Result<HydratedFeedPage, String> {
+        Err("feed hydration is not implemented".to_owned())
+    }
 }
 
 fn warn_anonymous_feed_once(feed_uri: &str) {
@@ -287,7 +308,7 @@ pub fn parse_saved_feed_preferences(response: &Value) -> Vec<SavedFeedPreference
 #[cfg(test)]
 mod tests {
     use super::{FeedClient, ResolvedFeed, parse_saved_feed_preferences};
-    use crate::{identity::{DidDocument, DidService, IdentityBackend, IdentityResolver, ResolutionError}, net::{HostResolver, SafeHttpClient}};
+    use crate::{identity::{DidDocument, DidService, IdentityBackend, IdentityResolver, ResolutionError}, ingest::IndexedRecord, net::{HostResolver, SafeHttpClient}};
     use axum::{Router, http::{HeaderMap, Uri}, response::IntoResponse, routing::{any, get}};
     use serde_json::json;
     use std::{collections::HashMap, future::Future, io::{self, Write}, net::{IpAddr, Ipv4Addr}, pin::Pin, sync::{Arc, Mutex}, time::Duration};
@@ -346,8 +367,14 @@ mod tests {
         let app = Router::new().fallback(any(|uri: Uri| async move {
             if uri.path() == "/xrpc/com.atproto.repo.getRecord" {
                 let query = uri.query().unwrap_or_default();
-                let service_did = if query.contains("rkey=web") { "did:web:generator.test" } else { "did:plc:generator" };
-                axum::Json(json!({ "uri": format!("at://{CREATOR}/app.bsky.feed.generator/{}", if query.contains("rkey=web") { "web" } else { "plc" }), "cid":"bafyreitest", "value":{"did":service_did,"displayName":"Example","description":"A feed","avatar":"https://img.test/avatar"} })).into_response()
+                if query.contains("collection=app.bsky.feed.generator") {
+                    let service_did = if query.contains("rkey=web") { "did:web:generator.test" } else { "did:plc:generator" };
+                    axum::Json(json!({ "uri": format!("at://{CREATOR}/app.bsky.feed.generator/{}", if query.contains("rkey=web") { "web" } else { "plc" }), "cid":"bafyreitest", "value":{"did":service_did,"displayName":"Example","description":"A feed","avatar":"https://img.test/avatar"} })).into_response()
+                } else if query.contains("rkey=live") {
+                    axum::Json(json!({ "uri":"at://did:plc:author/app.bsky.feed.post/live", "cid":"bafyreilive", "value":{"$type":"app.bsky.feed.post","text":"live hydration","createdAt":"2026-10-28T12:00:00Z"} })).into_response()
+                } else {
+                    axum::http::StatusCode::NOT_FOUND.into_response()
+                }
             } else { axum::http::StatusCode::NOT_FOUND.into_response() }
         }));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -399,6 +426,53 @@ mod tests {
         let error = client(no_service).resolve_feed(&format!("at://{CREATOR}/app.bsky.feed.generator/web")).await.unwrap_err();
         assert!(error.contains("bsky_fg"), "{error}");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn feed_hydration_keeps_skeleton_order_across_index_and_live_posts() {
+        use crate::ingest::{MemoryStorage, Storage};
+        let (pds, server) = fake_pds().await;
+        let mut docs = HashMap::new();
+        docs.insert(CREATOR.to_owned(), document(CREATOR, &pds, vec![]));
+        docs.insert("did:plc:author".to_owned(), document("did:plc:author", &pds, vec![]));
+        docs.insert("did:plc:reposter".to_owned(), document("did:plc:reposter", &pds, vec![]));
+        let identity = Arc::new(IdentityResolver::new(FakeIdentity(docs), Duration::from_secs(30)));
+        let client = client(identity);
+        let storage = MemoryStorage::default();
+        let indexed_first = indexed_post("did:plc:indexed", "first", "first indexed post");
+        let indexed_last = indexed_post("did:plc:indexed", "last", "last indexed post");
+        storage.put_record(&indexed_first).unwrap();
+        storage.put_record(&indexed_last).unwrap();
+        let missing = "at://did:plc:author/app.bsky.feed.post/missing";
+        let skeleton = super::FeedSkeletonPage {
+            feed: vec![
+                super::FeedSkeletonEntry { post_uri: indexed_first.uri.clone(), reason: None },
+                super::FeedSkeletonEntry {
+                    post_uri: "at://did:plc:author/app.bsky.feed.post/live".into(),
+                    reason: Some(json!({ "$type":"app.bsky.feed.defs#reasonRepost", "by":{"did":"did:plc:reposter"} })),
+                },
+                super::FeedSkeletonEntry { post_uri: missing.into(), reason: None },
+                super::FeedSkeletonEntry { post_uri: indexed_last.uri.clone(), reason: None },
+            ],
+            cursor: Some("next-cursor".into()),
+        };
+
+        let page = client.hydrate_skeleton(skeleton, &storage).await.unwrap();
+        let uris = page.feed.iter().map(|item| item.record.uri.as_str()).collect::<Vec<_>>();
+        assert_eq!(uris, [indexed_first.uri.as_str(), "at://did:plc:author/app.bsky.feed.post/live", indexed_last.uri.as_str()]);
+        assert_eq!(page.feed[1].record.record["text"], "live hydration");
+        assert_eq!(page.feed[1].reposted_by.as_deref(), Some("did:plc:reposter"));
+        assert_eq!(page.dropped_count, 1);
+        assert_eq!(page.cursor.as_deref(), Some("next-cursor"));
+        server.abort();
+    }
+
+    fn indexed_post(did: &str, rkey: &str, text: &str) -> IndexedRecord {
+        IndexedRecord {
+            did: did.into(), collection: "app.bsky.feed.post".into(), rkey: rkey.into(),
+            uri: format!("at://{did}/app.bsky.feed.post/{rkey}"), cid: None, time_us: 1,
+            record: json!({"$type":"app.bsky.feed.post","text":text,"createdAt":"2026-10-28T12:00:00Z"}),
+        }
     }
 
     #[tokio::test]
