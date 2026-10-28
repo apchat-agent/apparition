@@ -30,14 +30,14 @@ Command:
 cargo test --offline --release --test m3_ingest jetstream_sqlite_batch_throughput_benchmark -- --ignored --nocapture
 ```
 
-The local optimized-build benchmark processed 5,000 SQLite post events. The pre-batch path used one transaction per event; the batched path used production-sized groups of 200:
+The local optimized-build benchmark processed 5,000 SQLite post events. The pre-batch path did the old per-event record upsert, notification refresh, and cursor write; the batched path used production-sized groups of 200:
 
 | Path | Throughput | Elapsed |
 | --- | ---: | ---: |
-| One event per transaction | 7,916 events/s | 631.6 ms |
-| Groups of 200 | 52,161 events/s | 95.9 ms |
+| Per-event writes | 7,363 events/s | 679.1 ms |
+| Groups of 200 | 51,129 events/s | 97.8 ms |
 
-That is 6.59× faster in this local benchmark. It isolates SQLite ingest on this machine and does not model appview-host’s slower HDD RAID or websocket/network costs.
+That is 6.94× faster in this local benchmark. It isolates SQLite ingest on this machine and does not model appview-host’s slower HDD RAID or websocket/network costs.
 
 ## Verification
 

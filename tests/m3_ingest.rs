@@ -1,5 +1,5 @@
 use appview_rs::ingest::{
-    Ingestor, JetstreamConsumer, MemoryStorage, ScopeMode, SqliteStorage, Storage,
+    IndexedRecord, Ingestor, JetstreamConsumer, MemoryStorage, ScopeMode, SqliteStorage, Storage,
 };
 use futures_util::{SinkExt, StreamExt};
 use rusqlite::Connection;
@@ -552,13 +552,22 @@ fn jetstream_sqlite_batch_throughput_benchmark() {
         .collect::<Vec<_>>();
 
     let old_storage = Arc::new(SqliteStorage::open(&old_path).unwrap());
-    let old_ingestor = Ingestor::new(old_storage.clone(), ScopeMode::Full);
     let old_started = std::time::Instant::now();
-    for event in &events {
-        old_ingestor.process_json(event).unwrap();
+    for time_us in 1..=event_count {
+        let rkey = format!("r{time_us}");
+        let record = IndexedRecord {
+            did: "did:plc:benchmark".to_owned(),
+            collection: "app.bsky.feed.post".to_owned(),
+            rkey: rkey.clone(),
+            uri: format!("at://did:plc:benchmark/app.bsky.feed.post/{rkey}"),
+            cid: Some(format!("cid-{time_us}")),
+            time_us,
+            record: post("benchmark"),
+        };
+        old_storage.put_record(&record).unwrap();
+        old_storage.set_cursor(time_us).unwrap();
     }
     let old_elapsed = old_started.elapsed();
-    drop(old_ingestor);
     drop(old_storage);
 
     let batched_storage = Arc::new(SqliteStorage::open(&batched_path).unwrap());
