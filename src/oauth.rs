@@ -2472,19 +2472,29 @@ mod tests {
     #[tokio::test]
     async fn login_page_prefills_the_remembered_handle_safely() {
         let mut headers = HeaderMap::new();
-        headers.append(header::COOKIE, "appview_handle=owner.example.test".parse().unwrap());
+        headers.append(
+            header::COOKIE,
+            "appview_handle=owner.example.test".parse().unwrap(),
+        );
         let Html(body) = login(headers).await;
         assert!(body.contains("value=\"owner.example.test\""), "{body}");
 
         let mut headers = HeaderMap::new();
-        headers.append(header::COOKIE, "appview_handle=x\"onfocus=alert(1)".parse().unwrap());
+        headers.append(
+            header::COOKIE,
+            "appview_handle=x\"onfocus=alert(1)".parse().unwrap(),
+        );
         let Html(body) = login(headers).await;
         assert!(!body.contains("onfocus"), "{body}");
     }
 
     #[test]
     fn remembered_handle_cookie_only_for_handle_shaped_values() {
-        assert!(remember_handle_cookie("owner.example.test", true).unwrap().contains("Max-Age=31536000; Secure"));
+        assert!(
+            remember_handle_cookie("owner.example.test", true)
+                .unwrap()
+                .contains("Max-Age=31536000; Secure")
+        );
         assert!(remember_handle_cookie("did:plc:abc123", false).is_some());
         assert!(remember_handle_cookie("a;b", true).is_none());
     }
@@ -2493,7 +2503,10 @@ mod tests {
     fn cookie_lookup_reads_every_cookie_header() {
         let mut headers = HeaderMap::new();
         headers.append(header::COOKIE, "appview_session=abc".parse().unwrap());
-        headers.append(header::COOKIE, "other=1; appview_login=xyz".parse().unwrap());
+        headers.append(
+            header::COOKIE,
+            "other=1; appview_login=xyz".parse().unwrap(),
+        );
         assert_eq!(cookie_value_named(&headers, "appview_login"), Some("xyz"));
         assert_eq!(cookie_value_named(&headers, "appview_session"), Some("abc"));
     }
