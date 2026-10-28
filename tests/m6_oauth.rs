@@ -1975,6 +1975,7 @@ async fn web_embeds_render_images_cards_quotes_and_escape_user_content() {
     assert!(html.contains("alt=\"portrait &lt;script&gt;alert(1)&lt;/script&gt;\""));
     assert!(html.contains("Card &lt;Title&gt;"));
     assert!(html.contains("https://example.test/card?x=1&amp;y=2"));
+    assert!(html.contains("rel=\"nofollow noopener noreferrer ugc\""));
     assert!(html.contains("Quoted &lt;strong&gt;text&lt;/strong&gt;"));
     assert!(!html.contains("<script>alert(1)</script>"));
 }
