@@ -87,13 +87,21 @@ fn take_rate_slot(key: BucketKey, limit: usize) -> bool {
     let Ok(mut state) = state.lock() else {
         return false;
     };
+    take_rate_slot_with_state(&mut state, key, limit, Instant::now())
+}
+
+fn take_rate_slot_with_state(
+    state: &mut RateState,
+    key: BucketKey,
+    limit: usize,
+    now: Instant,
+) -> bool {
     if !state.buckets.contains_key(&key)
         && state.buckets.len() >= MAX_BUCKETS
         && let Some(oldest) = state.buckets.keys().next().cloned()
     {
         state.buckets.remove(&oldest);
     }
-    let now = Instant::now();
     let bucket = state.buckets.entry(key).or_default();
     while bucket
         .front()
@@ -130,7 +138,9 @@ fn with_headers(mut response: Response<Body>, public_https: bool) -> Response<Bo
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_REQUEST_BODY_BYTES, protect};
+    use super::{
+        MAX_BUCKETS, MAX_REQUEST_BODY_BYTES, RateState, protect, take_rate_slot_with_state,
+    };
     use axum::{
         body::{Body, Bytes},
         extract::ConnectInfo,
@@ -138,6 +148,7 @@ mod tests {
         routing::post,
     };
     use std::net::SocketAddr;
+    use std::time::Instant;
     use tower::ServiceExt;
 
     #[tokio::test]
@@ -199,5 +210,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 413);
+    }
+
+    #[test]
+    fn active_rate_buckets_are_preserved_when_the_bucket_map_is_full() {
+        let mut state = RateState::default();
+        let now = Instant::now();
+        for index in 0..MAX_BUCKETS {
+            assert!(take_rate_slot_with_state(
+                &mut state,
+                (format!("active-{index}"), "read"),
+                1,
+                now,
+            ));
+        }
+        let before = state
+            .buckets
+            .keys()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+
+        assert!(!take_rate_slot_with_state(
+            &mut state,
+            ("new-peer".to_owned(), "read"),
+            1,
+            now,
+        ));
+        assert_eq!(
+            state
+                .buckets
+                .keys()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>(),
+            before
+        );
     }
 }
