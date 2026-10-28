@@ -538,6 +538,104 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
 }
 
 #[tokio::test]
+async fn sign_in_error_page_uses_the_shared_mobile_document_shell() {
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(PanicCallbackFlow, Arc::new(MemoryStorage::default()));
+    let login_cookie = prelogin_cookie(&app).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?code=valid-code&state=valid-state&scope=atproto")
+                .header("cookie", login_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"));
+    assert!(html.contains("href=\"/static/app.css?v=av13\""));
+    assert!(!html.contains("style="));
+    assert!(!html.contains("<script"));
+}
+
+#[tokio::test]
+async fn web_posts_show_avatar_relative_time_and_accessible_actions() {
+    let storage = Arc::new(MemoryStorage::default());
+    storage
+        .put_record(&IndexedRecord {
+            did: "did:plc:alice".into(),
+            collection: "app.bsky.actor.profile".into(),
+            rkey: "self".into(),
+            uri: "at://did:plc:alice/app.bsky.actor.profile/self".into(),
+            cid: Some("profile-cid".into()),
+            time_us: 2,
+            record: serde_json::json!({
+                "displayName":"Alice",
+                "avatar":{"ref":{"$link":"bafk-alice-avatar"}}
+            }),
+        })
+        .unwrap();
+    storage
+        .put_record(&IndexedRecord {
+            did: "did:plc:alice".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "root".into(),
+            uri: "at://did:plc:alice/app.bsky.feed.post/root".into(),
+            cid: Some("root-cid".into()),
+            time_us: 1,
+            record: serde_json::json!({
+                "text":"A local post",
+                "createdAt":"2020-01-01T00:00:00Z"
+            }),
+        })
+        .unwrap();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage);
+    let cookie = finish_login(&app).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("https://cdn.bsky.app/img/avatar/plain/did:plc:alice/bafk-alice-avatar"));
+    assert!(html.contains("Alice"));
+    assert!(html.contains("@alice.test"));
+    assert!(html.contains("datetime=\"2020-01-01T00:00:00Z\""));
+    assert!(html.contains("ago</time>"));
+    assert!(html.contains("aria-label=\"Open replies\""));
+    assert!(html.contains("aria-label=\"Like post by @alice.test\""));
+    assert!(html.contains("aria-label=\"Repost by @alice.test\""));
+}
+
+#[tokio::test]
 async fn authorize_rejects_cross_origin_and_cross_site_requests() {
     let app = OAuthPublic::new("https://appview.example")
         .unwrap()
