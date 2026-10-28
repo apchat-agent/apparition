@@ -47,6 +47,7 @@ dependencies = [
  "futures-util",
  "hkdf",
  "hmac",
+ "http",
  "http-body-util",
  "ipld-core",
  "jose-jwk",

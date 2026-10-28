@@ -113,11 +113,20 @@ impl SafeHttpClient {
             .map(|address| SocketAddr::new(address, port))
             .collect())
     }
+
+    pub async fn send(
+        &self,
+        _request: http::Request<Vec<u8>>,
+        _max_bytes: usize,
+    ) -> Result<http::Response<Vec<u8>>, String> {
+        Err("outbound request failed".to_owned())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{HostResolver, SafeHttpClient, is_forbidden_ip};
+    use axum::{Router, response::Redirect, routing::get};
     use std::{
         collections::VecDeque,
         future::Future,
@@ -125,6 +134,7 @@ mod tests {
         pin::Pin,
         sync::{Arc, Mutex},
     };
+    use tokio::net::TcpListener;
     use url::Url;
 
     #[derive(Clone)]
@@ -238,5 +248,77 @@ mod tests {
             client.resolve_safe(&url).await.unwrap(),
             [SocketAddr::from(([93, 184, 216, 34], 443))]
         );
+    }
+
+    async fn test_server() -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route("/body", get(|| async { "body" }))
+            .route("/large", get(|| async { "this response is too large" }))
+            .route(
+                "/redirect",
+                get(|| async { Redirect::temporary("https://127.0.0.1/private") }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (address.to_string(), task)
+    }
+
+    fn local_test_client() -> SafeHttpClient {
+        SafeHttpClient::with_resolver(FakeResolver::new([vec!["127.0.0.1".parse().unwrap()]]))
+            .with_http_test_hosts(["safe.example".to_owned()])
+    }
+
+    #[tokio::test]
+    async fn guarded_http_request_pins_dns_and_caps_response_size() {
+        let (address, server) = test_server().await;
+        let client = local_test_client();
+        let response = client
+            .send(
+                http::Request::get(format!(
+                    "http://safe.example:{}/body",
+                    address.rsplit(':').next().unwrap()
+                ))
+                .body(Vec::new())
+                .unwrap(),
+                4,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.body(), b"body");
+
+        let too_large = client
+            .send(
+                http::Request::get(format!(
+                    "http://safe.example:{}/large",
+                    address.rsplit(':').next().unwrap()
+                ))
+                .body(Vec::new())
+                .unwrap(),
+                4,
+            )
+            .await;
+        assert!(too_large.is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn guarded_http_request_rechecks_redirect_destinations() {
+        let (address, server) = test_server().await;
+        let response = local_test_client()
+            .send(
+                http::Request::get(format!(
+                    "http://safe.example:{}/redirect",
+                    address.rsplit(':').next().unwrap()
+                ))
+                .body(Vec::new())
+                .unwrap(),
+                128,
+            )
+            .await;
+        assert!(response.is_err(), "redirect to loopback must be refused");
+        server.abort();
     }
 }
