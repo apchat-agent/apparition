@@ -1,11 +1,19 @@
-use std::collections::HashSet;
 use std::{
+    collections::HashSet,
     future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, OnceLock},
+    time::Duration,
 };
+use tokio::{net::lookup_host, sync::Semaphore, time::timeout};
 use url::Url;
+
+const MAX_REDIRECTS: usize = 5;
+const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+static OUTBOUND_REQUESTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 pub fn is_forbidden_ip(ip: IpAddr) -> bool {
     match ip {
@@ -64,12 +72,37 @@ pub trait HostResolver: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, String>> + Send + 'a>>;
 }
 
+#[derive(Default)]
+struct SystemResolver;
+
+impl HostResolver for SystemResolver {
+    fn resolve<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, String>> + Send + 'a>> {
+        Box::pin(async move {
+            lookup_host((host, port))
+                .await
+                .map(|addresses| addresses.map(|address| address.ip()).collect())
+                .map_err(|_| "DNS lookup failed".to_owned())
+        })
+    }
+}
+
 pub struct SafeHttpClient {
     resolver: Arc<dyn HostResolver>,
     http_test_hosts: HashSet<String>,
 }
 
 impl SafeHttpClient {
+    pub fn new() -> Self {
+        Self {
+            resolver: Arc::new(SystemResolver),
+            http_test_hosts: HashSet::new(),
+        }
+    }
+
     pub fn with_resolver(resolver: impl HostResolver + 'static) -> Self {
         Self {
             resolver: Arc::new(resolver),
@@ -88,11 +121,11 @@ impl SafeHttpClient {
     pub async fn resolve_safe(&self, url: &Url) -> Result<Vec<SocketAddr>, String> {
         let host = url.host_str().ok_or_else(|| "URL has no host".to_owned())?;
         let normalized_host = host.trim_end_matches('.').to_ascii_lowercase();
-        let test_host = self.http_test_hosts.contains(&normalized_host);
+        let test_http = url.scheme() == "http" && self.http_test_hosts.contains(&normalized_host);
         if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
             return Err("URL contains forbidden components".to_owned());
         }
-        if url.scheme() != "https" && !(url.scheme() == "http" && test_host) {
+        if url.scheme() != "https" && !test_http {
             return Err("outbound URL must use HTTPS".to_owned());
         }
         let port = url
@@ -105,7 +138,7 @@ impl SafeHttpClient {
         if addresses.is_empty() {
             return Err("host has no addresses".to_owned());
         }
-        if !test_host && addresses.iter().copied().any(is_forbidden_ip) {
+        if !test_http && addresses.iter().copied().any(is_forbidden_ip) {
             return Err("host resolved to a forbidden address".to_owned());
         }
         Ok(addresses
@@ -116,11 +149,148 @@ impl SafeHttpClient {
 
     pub async fn send(
         &self,
-        _request: http::Request<Vec<u8>>,
-        _max_bytes: usize,
+        request: http::Request<Vec<u8>>,
+        max_bytes: usize,
     ) -> Result<http::Response<Vec<u8>>, String> {
-        Err("outbound request failed".to_owned())
+        if request.body().len() > MAX_REQUEST_BYTES {
+            return Err("outbound request body is too large".to_owned());
+        }
+        let permit = OUTBOUND_REQUESTS
+            .get_or_init(|| Arc::new(Semaphore::new(32)))
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| "outbound request capacity is unavailable".to_owned())?;
+        let result = timeout(REQUEST_TIMEOUT, self.send_inner(request, max_bytes))
+            .await
+            .map_err(|_| "outbound request timed out".to_owned())?;
+        drop(permit);
+        result
     }
+
+    async fn send_inner(
+        &self,
+        mut request: http::Request<Vec<u8>>,
+        max_bytes: usize,
+    ) -> Result<http::Response<Vec<u8>>, String> {
+        let mut url = Url::parse(&request.uri().to_string())
+            .map_err(|_| "outbound request URL is invalid".to_owned())?;
+        for redirect_count in 0..=MAX_REDIRECTS {
+            let addresses = self.resolve_safe(&url).await?;
+            let host = url
+                .host_str()
+                .ok_or_else(|| "outbound URL has no host".to_owned())?;
+            let mut client = reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(REQUEST_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .no_proxy();
+            if host.parse::<IpAddr>().is_err() {
+                client = client.resolve_to_addrs(host, &addresses);
+            }
+            let client = client
+                .build()
+                .map_err(|_| "outbound HTTP client could not be initialized".to_owned())?;
+            let response = client
+                .request(request.method().clone(), url.clone())
+                .headers(request.headers().clone())
+                .body(request.body().clone())
+                .send()
+                .await
+                .map_err(|_| "outbound HTTP request failed".to_owned())?;
+
+            if is_redirect(response.status())
+                && let Some(location) = response.headers().get(http::header::LOCATION)
+            {
+                if redirect_count == MAX_REDIRECTS {
+                    return Err("outbound redirect limit exceeded".to_owned());
+                }
+                let location = location
+                    .to_str()
+                    .map_err(|_| "outbound redirect location is invalid".to_owned())?;
+                let next_url = url
+                    .join(location)
+                    .map_err(|_| "outbound redirect location is invalid".to_owned())?;
+                if next_url.origin() != url.origin() {
+                    if request.method() != http::Method::GET {
+                        return Err(
+                            "cross-origin redirect for a stateful request refused".to_owned()
+                        );
+                    }
+                    for name in [
+                        http::header::AUTHORIZATION,
+                        http::header::COOKIE,
+                        http::header::PROXY_AUTHORIZATION,
+                    ] {
+                        request.headers_mut().remove(name);
+                    }
+                    request.headers_mut().remove("dpop");
+                }
+                if response.status() == http::StatusCode::SEE_OTHER
+                    || (matches!(
+                        response.status(),
+                        http::StatusCode::MOVED_PERMANENTLY | http::StatusCode::FOUND
+                    ) && request.method() == http::Method::POST)
+                {
+                    *request.method_mut() = http::Method::GET;
+                    *request.body_mut() = Vec::new();
+                }
+                url = next_url;
+                continue;
+            }
+
+            if response
+                .content_length()
+                .is_some_and(|length| length > max_bytes as u64)
+            {
+                return Err("outbound response exceeds size limit".to_owned());
+            }
+            let status = response.status();
+            let version = response.version();
+            let headers = response.headers().clone();
+            let mut body = Vec::new();
+            let mut response = response;
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|_| "outbound response read failed".to_owned())?
+            {
+                if body
+                    .len()
+                    .checked_add(chunk.len())
+                    .is_none_or(|length| length > max_bytes)
+                {
+                    return Err("outbound response exceeds size limit".to_owned());
+                }
+                body.extend_from_slice(&chunk);
+            }
+            let mut builder = http::Response::builder().status(status).version(version);
+            for (name, value) in &headers {
+                builder = builder.header(name, value);
+            }
+            return builder
+                .body(body)
+                .map_err(|_| "outbound HTTP response is invalid".to_owned());
+        }
+        Err("outbound redirect limit exceeded".to_owned())
+    }
+}
+
+impl Default for SafeHttpClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn is_redirect(status: http::StatusCode) -> bool {
+    matches!(
+        status,
+        http::StatusCode::MOVED_PERMANENTLY
+            | http::StatusCode::FOUND
+            | http::StatusCode::SEE_OTHER
+            | http::StatusCode::TEMPORARY_REDIRECT
+            | http::StatusCode::PERMANENT_REDIRECT
+    )
 }
 
 #[cfg(test)]
