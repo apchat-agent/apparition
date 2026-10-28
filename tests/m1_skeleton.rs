@@ -42,6 +42,9 @@ async fn health_endpoint_returns_json_ok() {
             .unwrap();
         assert!(csp.contains("script-src 'none'"));
         assert!(csp.contains("frame-ancestors 'none'"));
+        // Sign-in is a form POST answered by a redirect to the user's authorization
+        // server; Safari and Chrome apply form-action to that redirect (2026-10-28).
+        assert!(csp.contains("form-action 'self' https:"), "{csp}");
         assert!(
             response.headers()["strict-transport-security"]
                 .to_str()
