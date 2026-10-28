@@ -1321,7 +1321,7 @@ where
 async fn logout<F, S>(State(state): State<Arc<OAuthWebState<F, S>>>, headers: HeaderMap) -> Response
 where
     F: OAuthFlow,
-    S: Storage,
+    S: Storage + 'static,
 {
     if !same_origin_request(&headers, &state.public.public_url) {
         return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
@@ -1334,12 +1334,41 @@ where
             state.public.secure_cookies(),
         );
     };
-    if let Err(error) = state.storage.rotate_web_session(&did, &session_id) {
-        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+    let storage = Arc::clone(&state.storage);
+    let storage_did = did.clone();
+    let storage_session_id = session_id.clone();
+    match tokio::task::spawn_blocking(move || {
+        storage.rotate_web_session(&storage_did, &storage_session_id)
+    })
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+        }
+        Err(error) => {
+            tracing::warn!(%error, "logout storage task failed while invalidating the session");
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage operation failed",
+            );
+        }
     }
     let remote_result = state.flow.logout(&did).await;
-    if let Err(error) = state.storage.unregister_user(&did) {
-        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+    let storage = Arc::clone(&state.storage);
+    let storage_did = did.clone();
+    match tokio::task::spawn_blocking(move || storage.unregister_user(&storage_did)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+        }
+        Err(error) => {
+            tracing::warn!(%error, "logout storage task failed while unregistering the user");
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage operation failed",
+            );
+        }
     }
     let response = clear_session_cookie(
         Redirect::to("/login").into_response(),
