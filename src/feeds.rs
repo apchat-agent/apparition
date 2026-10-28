@@ -1,7 +1,7 @@
 use crate::{identity::{IdentityBackend, IdentityResolver}, net::SafeHttpClient};
 use http::HeaderMap;
 use serde_json::Value;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::{HashMap, HashSet}, sync::{Arc, Mutex, OnceLock}, time::Duration};
 use url::Url;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -127,11 +127,69 @@ impl<B: IdentityBackend> FeedClient<B> {
 
     pub async fn get_skeleton(
         &self,
-        _feed: &ResolvedFeed,
-        _cursor: Option<&str>,
-        _service_jwt: Option<&str>,
+        feed: &ResolvedFeed,
+        cursor: Option<&str>,
+        service_jwt: Option<&str>,
     ) -> Result<FeedSkeletonPage, String> {
-        Err("feed skeleton requests are not implemented".to_owned())
+        if service_jwt.is_none() {
+            warn_anonymous_feed_once(&feed.uri);
+        }
+        let mut url = Url::parse(&feed.endpoint)
+            .map_err(|_| "feed generator endpoint URL is invalid".to_owned())?;
+        let path = format!(
+            "{}/xrpc/app.bsky.feed.getFeedSkeleton",
+            url.path().trim_end_matches('/')
+        );
+        url.set_path(&path);
+        url.query_pairs_mut()
+            .append_pair("feed", &feed.uri)
+            .append_pair("limit", "30");
+        if let Some(cursor) = cursor {
+            url.query_pairs_mut().append_pair("cursor", cursor);
+        }
+        let mut headers = HeaderMap::new();
+        if let Some(jwt) = service_jwt {
+            let value = http::HeaderValue::from_str(&format!("Bearer {jwt}"))
+                .map_err(|_| "feed service auth token is invalid".to_owned())?;
+            headers.insert(http::header::AUTHORIZATION, value);
+        }
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            self.http.get(&url, headers, 1024 * 1024),
+        )
+        .await
+        .map_err(|_| "feed skeleton request timed out".to_owned())??;
+        if !response.status().is_success() {
+            return Err("feed generator returned an error status".to_owned());
+        }
+        let body: Value = serde_json::from_slice(response.body())
+            .map_err(|_| "feed generator returned invalid JSON".to_owned())?;
+        let feed_items = body
+            .get("feed")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "feed generator response has no feed list".to_owned())?;
+        let items = feed_items
+            .iter()
+            .filter_map(|item| {
+                Some(FeedSkeletonEntry {
+                    post_uri: item.get("post")?.as_str()?.to_owned(),
+                    reason: item.get("reason").cloned(),
+                })
+            })
+            .collect();
+        Ok(FeedSkeletonPage {
+            feed: items,
+            cursor: body.get("cursor").and_then(Value::as_str).map(str::to_owned),
+        })
+    }
+}
+
+fn warn_anonymous_feed_once(feed_uri: &str) {
+    static WARNED_FEEDS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let warned = WARNED_FEEDS.get_or_init(|| Mutex::new(HashSet::new()));
+    let Ok(mut warned) = warned.lock() else { return };
+    if warned.insert(feed_uri.to_owned()) {
+        tracing::warn!(feed_uri, "feed service auth unavailable; requesting skeleton anonymously");
     }
 }
 
@@ -232,8 +290,10 @@ mod tests {
     use crate::{identity::{DidDocument, DidService, IdentityBackend, IdentityResolver, ResolutionError}, net::{HostResolver, SafeHttpClient}};
     use axum::{Router, http::{HeaderMap, Uri}, response::IntoResponse, routing::{any, get}};
     use serde_json::json;
-    use std::{collections::HashMap, future::Future, net::{IpAddr, Ipv4Addr}, pin::Pin, sync::{Arc, Mutex}, time::Duration};
+    use std::{collections::HashMap, future::Future, io::{self, Write}, net::{IpAddr, Ipv4Addr}, pin::Pin, sync::{Arc, Mutex}, time::Duration};
     use tokio::net::TcpListener;
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::fmt::MakeWriter;
 
     const CREATOR: &str = "did:web:creator.test";
 
@@ -249,6 +309,24 @@ mod tests {
     }
 
     struct TestResolver;
+
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    struct LogWriter(LogBuffer);
+
+    impl Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+
+    impl<'a> MakeWriter<'a> for LogBuffer {
+        type Writer = LogWriter;
+        fn make_writer(&'a self) -> Self::Writer { LogWriter(self.clone()) }
+    }
 
     impl HostResolver for TestResolver {
         fn resolve<'a>(&'a self, _: &'a str, _: u16) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, String>> + Send + 'a>> {
@@ -338,20 +416,26 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
         let feed = ResolvedFeed {
-            uri: "at://did:plc:creator/app.bsky.feed.generator/feed".into(),
+            uri: "at://did:plc:creator/app.bsky.feed.generator/jwt-log-test".into(),
             display_name: "Example".into(), description: None, avatar: None,
             service_did: "did:plc:service".into(), endpoint: format!("http://localhost:{}/fg", address.port()),
         };
         let client = client(resolver("".to_owned(), "".to_owned()));
-        let page = client.get_skeleton(&feed, Some("older + cursor"), Some("jwt-secret-test")).await.unwrap();
+        let logs = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false).with_writer(logs.clone()).finish();
+        let page = client.get_skeleton(&feed, Some("older + cursor"), Some("jwt-secret-test")).with_subscriber(subscriber).await.unwrap();
         assert_eq!(page.cursor.as_deref(), Some("next"));
         assert_eq!(page.feed.len(), 1);
-        let captured = captured.lock().unwrap().clone().unwrap();
-        assert_eq!(captured.0, "Bearer jwt-secret-test");
-        assert!(captured.1.starts_with("/fg/xrpc/app.bsky.feed.getFeedSkeleton?"));
-        assert!(captured.1.contains("feed=at%3A%2F%2Fdid%3Aplc%3Acreator"));
-        assert!(captured.1.contains("cursor=older+%2B+cursor"));
-        assert!(captured.1.contains("limit=30"));
+        let first_capture = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(first_capture.0, "Bearer jwt-secret-test");
+        assert!(first_capture.1.starts_with("/fg/xrpc/app.bsky.feed.getFeedSkeleton?"));
+        assert!(first_capture.1.contains("feed=at%3A%2F%2Fdid%3Aplc%3Acreator"));
+        assert!(first_capture.1.contains("cursor=older+%2B+cursor"));
+        assert!(first_capture.1.contains("limit=30"));
+        let fallback_subscriber = tracing_subscriber::fmt().without_time().with_ansi(false).with_writer(logs.clone()).finish();
+        client.get_skeleton(&feed, None, None).with_subscriber(fallback_subscriber).await.unwrap();
+        assert_eq!(captured.lock().unwrap().as_ref().unwrap().0, "");
+        assert!(!String::from_utf8(logs.0.lock().unwrap().clone()).unwrap().contains("jwt-secret-test"));
         server.abort();
     }
 
