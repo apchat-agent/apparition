@@ -23,6 +23,7 @@ const POST: &str = "app.bsky.feed.post";
 const LIKE: &str = "app.bsky.feed.like";
 const REPOST: &str = "app.bsky.feed.repost";
 const FOLLOW: &str = "app.bsky.graph.follow";
+const MAX_XRPC_PAGE_SIZE: usize = 100;
 
 struct ApiState<S: Storage, B: IdentityBackend> {
     storage: Arc<S>,
@@ -368,7 +369,7 @@ fn thread_view<S: Storage, B: IdentityBackend>(
     let replies = if depth > 0 && *budget > 0 {
         let candidates = state
             .storage
-            .replies_to(&record.uri, (*budget).min(100))
+            .replies_to(&record.uri, (*budget).min(MAX_XRPC_PAGE_SIZE))
             .map_err(|_| ApiError::internal())?;
         let mut replies = Vec::new();
         for reply in candidates {
@@ -449,7 +450,7 @@ pub fn timeline_records<'a>(
         .filter(|record| {
             record.collection == POST && (record.did == actor || followed.contains(&record.did))
         })
-        .take(limit.clamp(1, 100))
+        .take(limit.clamp(1, MAX_XRPC_PAGE_SIZE))
         .collect()
 }
 
@@ -646,7 +647,7 @@ fn query_limit(query: &HashMap<String, String>, default: usize) -> usize {
         .get("limit")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(default)
-        .clamp(1, 100)
+        .clamp(1, MAX_XRPC_PAGE_SIZE)
 }
 
 fn actor_to_did<S: Storage, B: IdentityBackend>(
