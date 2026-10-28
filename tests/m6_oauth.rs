@@ -24,6 +24,8 @@ struct FakeOAuthFlow {
     actions: Arc<Mutex<Vec<String>>>,
     granted_scope: Option<String>,
     browser_binding: Arc<Mutex<Option<String>>>,
+    callback_failure: Option<String>,
+    action_failure: Option<String>,
 }
 
 impl Default for FakeOAuthFlow {
@@ -32,6 +34,8 @@ impl Default for FakeOAuthFlow {
             actions: Arc::new(Mutex::new(Vec::new())),
             granted_scope: Some(EXPECTED_OAUTH_SCOPE.to_owned()),
             browser_binding: Arc::new(Mutex::new(None)),
+            callback_failure: None,
+            action_failure: None,
         }
     }
 }
@@ -62,6 +66,9 @@ impl OAuthFlow for FakeOAuthFlow {
         params: OAuthCallback,
     ) -> Pin<Box<dyn Future<Output = Result<OAuthAccount, String>> + Send + 'a>> {
         Box::pin(async move {
+            if let Some(error) = &self.callback_failure {
+                return Err(error.clone());
+            }
             let expected_binding = self.browser_binding.lock().unwrap().clone();
             if params.browser_binding != expected_binding {
                 return Err("invalid browser binding".to_owned());
@@ -90,6 +97,9 @@ impl OAuthFlow for FakeOAuthFlow {
         text: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
+            if let Some(error) = &self.action_failure {
+                return Err(error.clone());
+            }
             self.actions
                 .lock()
                 .unwrap()
@@ -604,6 +614,60 @@ async fn authorize_turns_an_upstream_panic_into_an_error_page() {
     );
     let body = response.into_body().collect().await.unwrap().to_bytes();
     assert!(String::from_utf8_lossy(&body).contains("Sign-in could not be completed"));
+}
+
+#[tokio::test]
+async fn oauth_and_write_errors_do_not_echo_tokens_or_internal_paths() {
+    let sentinel = "access_token=secret /srv/appview/oauth.sqlite";
+    let callback_app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(
+            FakeOAuthFlow {
+                callback_failure: Some(sentinel.to_owned()),
+                ..FakeOAuthFlow::default()
+            },
+            Arc::new(MemoryStorage::default()),
+        );
+    let login_cookie = prelogin_cookie(&callback_app).await;
+    let callback = callback_app
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?code=valid-code&state=valid-state")
+                .header("cookie", login_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let callback_body = callback.into_body().collect().await.unwrap().to_bytes();
+    assert!(!String::from_utf8_lossy(&callback_body).contains(sentinel));
+
+    let write_app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(
+            FakeOAuthFlow {
+                action_failure: Some(sentinel.to_owned()),
+                ..FakeOAuthFlow::default()
+            },
+            Arc::new(MemoryStorage::default()),
+        );
+    let session_cookie = finish_login(&write_app).await;
+    let write_response = write_app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/post")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", session_cookie)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("text=hello"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let write_body = write_response.into_body().collect().await.unwrap().to_bytes();
+    assert!(!String::from_utf8_lossy(&write_body).contains(sentinel));
 }
 
 #[cfg(unix)]
