@@ -1154,6 +1154,9 @@ fn spawn_checkpointer(
         .spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(CHECKPOINT_INTERVAL);
+                // Unknown counts as behind: a checkpoint of a big WAL runs for minutes,
+                // and the last small number would let the backfill pile on meanwhile.
+                backlog.store(u64::MAX, Ordering::Relaxed);
                 // Row: (busy, frames in the WAL, frames checkpointed).
                 match connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
                     Ok((row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
@@ -1284,6 +1287,7 @@ impl SqliteStorage {
         let stop = Arc::new(AtomicBool::new(false));
         let backlog = Arc::new(AtomicU64::new(0));
         if path.as_os_str() != ":memory:" {
+            backlog.store(u64::MAX, Ordering::Relaxed);
             spawn_checkpointer(path.clone(), Arc::clone(&stop), Arc::clone(&backlog))?;
         }
         Ok(Self {

@@ -108,3 +108,19 @@ async fn backfill_waits_for_the_checkpoint_backlog_to_drain() {
     .await
     .expect("shutdown must end the wait");
 }
+
+#[test]
+fn write_backlog_reads_as_behind_until_a_checkpoint_reports() {
+    let dir = std::env::temp_dir().join(format!("appview-backlog-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let storage = SqliteStorage::open(dir.join("appview.db")).unwrap();
+    assert_eq!(storage.write_backlog(), u64::MAX);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while storage.write_backlog() == u64::MAX {
+        assert!(Instant::now() < deadline, "checkpointer never reported");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(storage.write_backlog() < 100);
+    drop(storage);
+    let _ = std::fs::remove_dir_all(&dir);
+}
