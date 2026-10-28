@@ -21,7 +21,7 @@ use std::{
 };
 use tower::ServiceExt;
 
-const EXPECTED_OAUTH_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete";
+const EXPECTED_OAUTH_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=*";
 
 #[derive(Clone)]
 struct FakeOAuthFlow {
@@ -1325,6 +1325,36 @@ async fn pinned_feed_list_and_feed_timeline_routes_are_available_to_signed_in_us
             assert!(html.contains("href=\"/feeds\">Feeds</a>"));
         }
     }
+}
+
+#[tokio::test]
+async fn old_scope_session_gets_a_friendly_feed_reauthorization_page() {
+    let old_scope = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete";
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(
+            FakeOAuthFlow::with_granted_scope(Some(old_scope)),
+            Arc::new(MemoryStorage::default()),
+        );
+    let cookie = finish_login(&app).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/feeds")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = String::from_utf8(
+        response.into_body().collect().await.unwrap().to_bytes().to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("sign in again to allow feeds"));
+    assert!(html.contains("href=\"/login\""));
+    assert!(!html.contains("\"error\":\"OAuthError\""));
 }
 
 #[tokio::test]
