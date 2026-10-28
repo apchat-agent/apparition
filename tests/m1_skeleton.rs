@@ -27,31 +27,35 @@ fn config_loads_toml_and_environment_overrides() {
 
 #[tokio::test]
 async fn health_endpoint_returns_json_ok() {
-    let response = router()
-        .oneshot(
-            Request::builder()
-                .uri("/xrpc/_health")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
-    assert_eq!(response.headers()["x-content-type-options"], "nosniff");
-    assert_eq!(response.headers()["referrer-policy"], "no-referrer");
-    let csp = response.headers()["content-security-policy"]
-        .to_str()
-        .unwrap();
-    assert!(csp.contains("script-src 'none'"));
-    assert!(csp.contains("frame-ancestors 'none'"));
-    assert!(
-        response.headers()["strict-transport-security"]
+    let app = router();
+    for path in ["/xrpc/_health", "/healthz"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{path}");
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+        let csp = response.headers()["content-security-policy"]
             .to_str()
-            .unwrap()
-            .contains("max-age=")
-    );
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    assert_eq!(&body[..], br#"{"status":"ok"}"#);
+            .unwrap();
+        assert!(csp.contains("script-src 'none'"));
+        assert!(csp.contains("frame-ancestors 'none'"));
+        assert!(
+            response.headers()["strict-transport-security"]
+                .to_str()
+                .unwrap()
+                .contains("max-age=")
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], br#"{"status":"ok"}"#, "{path}");
+    }
 }
 
 #[tokio::test]
