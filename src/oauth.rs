@@ -1235,18 +1235,22 @@ where
         scope,
         browser_binding: Some(browser_binding),
     };
+    tracing::info!(issuer = ?params.issuer, "oauth callback received");
     let callback_result = std::panic::AssertUnwindSafe(state.flow.callback(params))
         .catch_unwind()
         .await;
     let account = match callback_result {
         Ok(Ok(account)) => account,
-        Ok(Err(_)) => {
+        Ok(Err(error)) => {
+            // The browser gets a generic message; the operator needs the real cause.
+            tracing::warn!(%error, "oauth callback could not be completed");
             return oauth_error(
                 StatusCode::BAD_REQUEST,
                 "Sign-in could not be completed. Please start again.",
             );
         }
         Err(_) => {
+            tracing::warn!("oauth callback panicked");
             return oauth_error_page(
                 StatusCode::BAD_GATEWAY,
                 "Sign-in could not be completed. Please start again.",
@@ -1254,12 +1258,14 @@ where
         }
     };
     if !has_atproto_scope(account.granted_scope.as_deref()) {
+        tracing::warn!(scope = ?account.granted_scope, "oauth callback without atproto scope");
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "OAuth token response must grant the atproto scope",
         );
     }
     if let Err(error) = state.storage.register_user(&account.did) {
+        tracing::warn!(%error, "oauth callback could not register the user");
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
     if let Some(handle) = account.verified_handle.as_deref()
