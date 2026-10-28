@@ -1,6 +1,7 @@
 use appview_rs::router;
 use appview_rs::{
     config::Config,
+    feeds::ResolvedFeed,
     ingest::{IndexedRecord, Ingestor, MemoryStorage, ScopeMode, SqliteStorage, Storage},
     oauth::{
         OAuthAccount, OAuthCallback, OAuthFlow, OAuthPublic, PdsCreatedRecord, PostStrongRef,
@@ -31,6 +32,7 @@ struct FakeOAuthFlow {
     browser_binding: Arc<Mutex<Option<String>>>,
     callback_failure: Option<String>,
     action_failure: Option<String>,
+    pinned_feeds: Vec<ResolvedFeed>,
 }
 
 impl Default for FakeOAuthFlow {
@@ -41,6 +43,7 @@ impl Default for FakeOAuthFlow {
             browser_binding: Arc::new(Mutex::new(None)),
             callback_failure: None,
             action_failure: None,
+            pinned_feeds: Vec::new(),
         }
     }
 }
@@ -162,6 +165,14 @@ impl OAuthFlow for FakeOAuthFlow {
                 }),
             ))
         })
+    }
+
+    fn pinned_feeds<'a>(
+        &'a self,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ResolvedFeed>, String>> + Send + 'a>> {
+        let feeds = self.pinned_feeds.clone();
+        Box::pin(async move { Ok(feeds) })
     }
 
     fn like<'a>(
@@ -626,6 +637,76 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
             .to_str()
             .unwrap()
             .contains("max-age=")
+    );
+}
+
+#[tokio::test]
+async fn bsky_style_shell_renders_navigation_pinned_feed_tabs_and_post_actions() {
+    let storage = Arc::new(MemoryStorage::default());
+    storage
+        .put_record(&IndexedRecord {
+            did: "did:plc:alice".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "post".into(),
+            uri: "at://did:plc:alice/app.bsky.feed.post/post".into(),
+            cid: Some("post-cid".into()),
+            time_us: 1,
+            record: serde_json::json!({"text":"A rendered post"}),
+        })
+        .unwrap();
+    let flow = FakeOAuthFlow {
+        pinned_feeds: vec![ResolvedFeed {
+            uri: "at://did:plc:creator/app.bsky.feed.generator/focus".into(),
+            display_name: "Focus <Feed>".into(),
+            description: None,
+            avatar: None,
+            service_did: "did:plc:service".into(),
+            endpoint: "https://feed.example".into(),
+        }],
+        ..FakeOAuthFlow::default()
+    };
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage);
+    let cookie = finish_login(&app).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("aria-label=\"Main navigation\""), "{html}");
+    assert!(html.contains("href=\"/app\">Home</a>"), "{html}");
+    assert!(html.contains("href=\"/feeds\">Feeds</a>"), "{html}");
+    assert!(
+        html.contains("href=\"/notifications\">Notifications</a>"),
+        "{html}"
+    );
+    assert!(html.contains("New post"), "{html}");
+    assert!(html.contains("aria-label=\"Feed tabs\""), "{html}");
+    assert!(html.contains(">Following</a>"), "{html}");
+    assert!(html.contains("Focus &lt;Feed&gt;"), "{html}");
+    assert!(html.contains("placeholder=\"Search\""), "{html}");
+    assert!(html.contains("aria-label=\"Mobile navigation\""), "{html}");
+    assert!(html.contains("action=\"/like\""), "{html}");
+    assert!(html.contains("action=\"/repost\""), "{html}");
+    assert!(
+        html.contains("href=\"/app/thread?uri=at%3A%2F%2Fdid%3Aplc%3Aalice"),
+        "{html}"
     );
 }
 
