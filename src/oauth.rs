@@ -526,14 +526,15 @@ type AppOAuthClient = OAuthClient<
     OAuthHandleResolver,
     SafeHttpClient,
 >;
+type SavedFeedCache =
+    Arc<tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, Vec<SavedFeedPreference>)>>>;
 
 pub struct AtriumOAuthFlow<B: crate::identity::IdentityBackend = HttpIdentityBackend> {
     client: Arc<AppOAuthClient>,
     identity_resolver: Arc<IdentityResolver<B>>,
     store: SqliteOAuthStore,
     feed_client: Arc<FeedClient<B>>,
-    saved_feed_cache:
-        Arc<tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, Vec<SavedFeedPreference>)>>>,
+    saved_feed_cache: SavedFeedCache,
 }
 
 impl<B: crate::identity::IdentityBackend> Clone for AtriumOAuthFlow<B> {
@@ -823,7 +824,14 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             }
         };
         let preferences = parse_saved_feed_preferences(&response);
-        self.saved_feed_cache.lock().await.insert(
+        let mut cache = self.saved_feed_cache.lock().await;
+        cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
+        if cache.len() >= 4096
+            && let Some(oldest) = cache.keys().next().cloned()
+        {
+            cache.remove(&oldest);
+        }
+        cache.insert(
             did.to_string(),
             (
                 tokio::time::Instant::now() + Duration::from_secs(5 * 60),

@@ -1319,6 +1319,11 @@ async fn pinned_feed_list_and_feed_timeline_routes_are_available_to_signed_in_us
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        if uri == "/feeds" {
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let html = String::from_utf8(body.to_vec()).unwrap();
+            assert!(html.contains("href=\"/feeds\">Feeds</a>"));
+        }
     }
 }
 

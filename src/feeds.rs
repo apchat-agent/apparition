@@ -155,7 +155,14 @@ impl<B: IdentityBackend> FeedClient<B> {
             service_did,
             endpoint: endpoint.trim_end_matches('/').to_owned(),
         };
-        self.generator_cache.lock().await.insert(
+        let mut cache = self.generator_cache.lock().await;
+        cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
+        if cache.len() >= 1024
+            && let Some(oldest) = cache.keys().next().cloned()
+        {
+            cache.remove(&oldest);
+        }
+        cache.insert(
             uri.to_owned(),
             (
                 tokio::time::Instant::now() + Duration::from_secs(60 * 60),
@@ -374,6 +381,9 @@ fn warn_anonymous_feed_once(feed_uri: &str) {
     let Ok(mut warned) = warned.lock() else {
         return;
     };
+    if warned.len() >= 512 && !warned.contains(feed_uri) {
+        return;
+    }
     if warned.insert(feed_uri.to_owned()) {
         tracing::warn!(
             feed_uri,
