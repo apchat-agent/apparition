@@ -3134,15 +3134,19 @@ fn render_web_post<S: Storage>(
         .pointer("/reply/parent/uri")
         .and_then(Value::as_str)
         .and_then(|parent_uri| {
-            storage
+            let parent = storage
                 .record_by_uri("app.bsky.feed.post", parent_uri)
                 .ok()
-                .flatten()
+                .flatten();
+            let parent_did = parent
+                .map(|parent| parent.did)
+                .or_else(|| post_uri_did(parent_uri).map(str::to_owned))?;
+            Some(parent_did)
         })
-        .map(|parent| {
-            let parent_profile = profile_view_from_storage(storage, &parent.did)
-                .unwrap_or_else(|_| json!({"did":parent.did,"handle":parent.did}));
-            let parent_handle = profile_handle(&parent_profile, &parent.did);
+        .map(|parent_did| {
+            let parent_profile = profile_view_from_storage(storage, &parent_did)
+                .unwrap_or_else(|_| json!({"did":parent_did,"handle":parent_did}));
+            let parent_handle = profile_handle(&parent_profile, &parent_did);
             let thread_uri = format!(
                 "/app/thread?uri={}",
                 url::form_urlencoded::byte_serialize(record.uri.as_bytes()).collect::<String>()
@@ -3243,6 +3247,18 @@ fn render_web_post<S: Storage>(
     format!(
         "<article class=\"post-card\"><header class=\"post-header\">{author}{time}</header>{reply_context}<p class=\"post-text\">{text}</p>{embed}<div class=\"post-actions\" aria-label=\"Post actions\">{actions}</div></article>"
     )
+}
+
+fn post_uri_did(uri: &str) -> Option<&str> {
+    let mut parts = uri.strip_prefix("at://")?.split('/');
+    let did = parts.next()?;
+    let collection = parts.next()?;
+    let rkey = parts.next()?;
+    if !(did.starts_with("did:plc:") || did.starts_with("did:web:")) {
+        return None;
+    }
+    (collection == "app.bsky.feed.post" && !rkey.is_empty() && parts.next().is_none())
+        .then_some(did)
 }
 
 fn render_web_embed<S: Storage>(storage: &S, author_did: &str, embed: &Value) -> String {
