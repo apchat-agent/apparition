@@ -39,25 +39,55 @@ async fn apply(
     request: Request<Body>,
     next: Next,
 ) -> Response<Body> {
+    let started = Instant::now();
+    let method = request.method().to_string();
+    let path = request.uri().path().to_owned();
     if request.uri().to_string().len() > MAX_URI_BYTES {
-        return with_headers(
+        let response = with_headers(
             (StatusCode::URI_TOO_LONG, "request target is too long").into_response(),
             public_https,
         );
+        log_request(&method, &path, started, response.status());
+        return response;
     }
     if let Some(ConnectInfo(peer)) = request.extensions().get::<ConnectInfo<SocketAddr>>()
         && !request_allowed(
-            request.uri().path(),
+            &path,
             request.headers().contains_key(header::AUTHORIZATION),
             peer.ip().to_string(),
         )
     {
-        return with_headers(
+        let response = with_headers(
             (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response(),
             public_https,
         );
+        log_request(&method, &path, started, response.status());
+        return response;
     }
-    with_headers(next.run(request).await, public_https)
+    let response = with_headers(next.run(request).await, public_https);
+    log_request(&method, &path, started, response.status());
+    response
+}
+
+fn log_request(method: &str, path: &str, started: Instant, status: StatusCode) {
+    let elapsed = started.elapsed();
+    let duration_ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
+    tracing::info!(
+        method,
+        path,
+        status = status.as_u16(),
+        duration_ms,
+        "HTTP request"
+    );
+    if elapsed > Duration::from_secs(2) {
+        tracing::warn!(
+            method,
+            path,
+            status = status.as_u16(),
+            duration_ms,
+            "HTTP request exceeded duration threshold"
+        );
+    }
 }
 
 fn request_allowed(path: &str, has_authorization: bool, ip: String) -> bool {
@@ -224,11 +254,24 @@ mod tests {
 
         let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
         assert!(logs.contains("HTTP request"), "{logs}");
-        assert!(logs.contains("method=GET"), "{logs}");
+        assert_eq!(
+            logs.lines().filter(|line| line.contains(" INFO ")).count(),
+            1,
+            "{logs}"
+        );
+        assert_eq!(
+            logs.lines().filter(|line| line.contains(" WARN ")).count(),
+            1,
+            "{logs}"
+        );
+        assert!(logs.contains("method=\"GET\""), "{logs}");
         assert!(logs.contains("path=\"/slow\""), "{logs}");
         assert!(logs.contains("status=200"), "{logs}");
         assert!(logs.contains("duration_ms="), "{logs}");
-        assert!(logs.contains("HTTP request exceeded duration threshold"), "{logs}");
+        assert!(
+            logs.contains("HTTP request exceeded duration threshold"),
+            "{logs}"
+        );
         assert!(!logs.contains("query-secret"), "{logs}");
         assert!(!logs.contains("cookie-secret"), "{logs}");
     }
