@@ -1,6 +1,7 @@
 pub mod api;
 pub mod backfill;
 pub mod config;
+pub mod http_security;
 pub mod identity;
 pub mod ingest;
 pub mod jwt;
@@ -18,9 +19,14 @@ pub fn router() -> Router {
 }
 
 pub fn router_with_oauth(oauth: oauth::OAuthPublic) -> Router {
-    Router::new()
-        .route("/xrpc/_health", get(health))
-        .merge(oauth.router())
+    let public_https = oauth.public_url().starts_with("https://");
+    http_security::protect(
+        Router::new()
+            .route("/xrpc/_health", get(health))
+            .route("/healthz", get(health))
+            .merge(oauth.router()),
+        public_https,
+    )
 }
 
 pub fn router_with_oauth_flow<F, S>(
@@ -32,9 +38,14 @@ where
     F: oauth::OAuthFlow,
     S: ingest::Storage + 'static,
 {
-    Router::new()
-        .route("/xrpc/_health", get(health))
-        .merge(oauth.router_with_flow(flow, storage))
+    let public_https = oauth.public_url().starts_with("https://");
+    http_security::protect(
+        Router::new()
+            .route("/xrpc/_health", get(health))
+            .route("/healthz", get(health))
+            .merge(oauth.router_with_flow(flow, storage)),
+        public_https,
+    )
 }
 
 #[derive(Serialize)]

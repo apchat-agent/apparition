@@ -45,6 +45,7 @@ atrium-identity = "0.1.9"
 atrium-common = "0.1.4"
 url = "2"
 http = "1"
+tower-http = { version = "0.6", features = ["limit"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -1,4 +1,5 @@
 use crate::{
+    http_security,
     identity::IdentityBackend,
     ingest::{IndexedRecord, NotificationCursor, RecordCursor, Storage, StorageError},
     jwt::{ServiceClaims, ServiceJwtVerifier},
@@ -97,12 +98,25 @@ where
     S: Storage + 'static,
     B: IdentityBackend + 'static,
 {
+    api_router_with_https(storage, jwt, appview_did, false)
+}
+
+pub fn api_router_with_https<S, B>(
+    storage: Arc<S>,
+    jwt: Arc<ServiceJwtVerifier<B>>,
+    appview_did: impl Into<String>,
+    public_https: bool,
+) -> Router
+where
+    S: Storage + 'static,
+    B: IdentityBackend + 'static,
+{
     let state = ApiState {
         storage,
         jwt,
         appview_did: appview_did.into(),
     };
-    Router::new()
+    let router = Router::new()
         .route("/.well-known/did.json", get(did_document::<S, B>))
         .route("/xrpc/app.bsky.actor.getProfile", get(get_profile::<S, B>))
         .route(
@@ -137,7 +151,8 @@ where
             "/xrpc/app.bsky.notification.getUnreadCount",
             get(get_unread_count::<S, B>),
         )
-        .with_state(state)
+        .with_state(state);
+    http_security::protect(router, public_https)
 }
 
 async fn did_document<S: Storage, B: IdentityBackend>(

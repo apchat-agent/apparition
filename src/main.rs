@@ -1,5 +1,5 @@
 use appview_rs::{
-    api::api_router,
+    api::api_router_with_https,
     backfill::{
         AtriumRepoVerifier, BackfillWorker, HostRateLimiter, HttpRepoSource, RepoBackfiller,
     },
@@ -51,11 +51,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         jwt_resolver,
         config.appview_did.clone(),
     ));
-    let app_router = router_with_oauth_flow(oauth, oauth_flow, storage.clone()).merge(api_router(
-        storage.clone(),
-        jwt,
-        config.appview_did.clone(),
-    ));
+    let app_router =
+        router_with_oauth_flow(oauth, oauth_flow, storage.clone()).merge(api_router_with_https(
+            storage.clone(),
+            jwt,
+            config.appview_did.clone(),
+            config.public_url.starts_with("https://"),
+        ));
     let backfiller = RepoBackfiller::new(
         storage.clone(),
         HttpRepoSource::default(),
@@ -109,9 +111,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         };
         info!(%login_url, "development login URL");
     }
-    axum::serve(listener, app_router)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app_router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     let _ = shutdown_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(3), async {
         let _ = ingestion_task.await;
