@@ -32,6 +32,19 @@ async fn health_endpoint_returns_json_ok() {
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+    let csp = response.headers()["content-security-policy"]
+        .to_str()
+        .unwrap();
+    assert!(csp.contains("script-src 'none'"));
+    assert!(csp.contains("frame-ancestors 'none'"));
+    assert!(
+        response.headers()["strict-transport-security"]
+            .to_str()
+            .unwrap()
+            .contains("max-age=")
+    );
     let body = response.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(&body[..], br#"{"status":"ok"}"#);
 }
