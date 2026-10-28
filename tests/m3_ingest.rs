@@ -620,6 +620,10 @@ async fn consumer_reconnects_after_a_silent_websocket_and_rotates_urls() {
 
     let live_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let live_address = live_listener.local_addr().unwrap();
+    let live_cursor = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64;
     let live_server = tokio::spawn(async move {
         let (stream, _) = live_listener.accept().await.unwrap();
         let mut websocket = accept_async(stream).await.unwrap();
@@ -627,7 +631,7 @@ async fn consumer_reconnects_after_a_silent_websocket_and_rotates_urls() {
             .send(Message::Text(
                 event(
                     "did:plc:root",
-                    1234,
+                    live_cursor,
                     "create",
                     "app.bsky.feed.post",
                     "recovered",
@@ -656,7 +660,7 @@ async fn consumer_reconnects_after_a_silent_websocket_and_rotates_urls() {
     });
 
     timeout(Duration::from_secs(2), async {
-        while storage.cursor().unwrap() != Some(1234) {
+        while storage.cursor().unwrap() != Some(live_cursor) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })

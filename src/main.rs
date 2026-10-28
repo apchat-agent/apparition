@@ -40,7 +40,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let ingestor = Ingestor::new(storage.clone(), config.scope_mode);
     let consumer = JetstreamConsumer::new(ingestor, Duration::from_secs(1))
         .with_idle_timeout(Duration::from_secs(config.jetstream_idle_timeout_secs))
-        .with_event_timeout(Duration::from_secs(config.jetstream_event_timeout_secs));
+        .with_event_timeout(Duration::from_secs(config.jetstream_event_timeout_secs))
+        .with_stale_cursor_threshold(Duration::from_secs(
+            config.jetstream_stale_cursor_threshold_secs,
+        ));
     let jetstream_urls = config.jetstream_urls.clone();
     let resolver = IdentityResolver::new(HttpIdentityBackend::default(), Duration::from_secs(1800));
     let jwt_resolver = Arc::new(IdentityResolver::new(

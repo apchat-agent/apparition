@@ -29,6 +29,8 @@ const BACKFILL_RETRY_BASE: Duration = Duration::from_secs(5);
 const BACKFILL_RETRY_MAX: Duration = Duration::from_secs(60 * 60);
 const MAX_BACKFILL_QUEUE: usize = 1_000;
 const BACKFILL_BATCH_SIZE: usize = 8;
+const JETSTREAM_BATCH_SIZE: usize = 200;
+const JETSTREAM_BATCH_DELAY: Duration = Duration::from_millis(250);
 
 fn backfill_retry_delay(failures: u32) -> Duration {
     let exponent = failures.saturating_sub(1).min(63);
@@ -74,6 +76,29 @@ pub struct IndexedRecord {
     pub cid: Option<String>,
     pub time_us: u64,
     pub record: Value,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct JetstreamStorageUpdate {
+    pub time_us: u64,
+    pub upsert: Option<IndexedRecord>,
+    pub delete: Option<(String, String, String)>,
+    pub follows: Vec<FollowUpdate>,
+    pub backfill_for: Vec<(String, String)>,
+    pub handle_refresh: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FollowUpdate {
+    pub actor: String,
+    pub subject: String,
+    pub following: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SkippedCursorWindow {
+    pub from: u64,
+    pub to: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -276,6 +301,10 @@ pub trait Storage: Send + Sync {
         0
     }
     fn put_record(&self, record: &IndexedRecord) -> Result<(), StorageError>;
+    fn apply_jetstream_batch(&self, updates: &[JetstreamStorageUpdate])
+    -> Result<(), StorageError>;
+    fn record_skipped_window(&self, from: u64, to: u64) -> Result<(), StorageError>;
+    fn skipped_windows(&self) -> Result<Vec<SkippedCursorWindow>, StorageError>;
     fn replace_repo_snapshot(
         &self,
         did: &str,
@@ -378,6 +407,7 @@ pub trait Storage: Send + Sync {
     fn handle_is_invalid(&self, did: &str) -> Result<bool, StorageError>;
     fn did_by_verified_handle(&self, handle: &str) -> Result<Option<String>, StorageError>;
     fn is_tracked_did(&self, did: &str) -> Result<bool, StorageError>;
+    fn registered_followers(&self, did: &str) -> Result<Vec<String>, StorageError>;
     fn is_displayed_did(&self, did: &str) -> Result<bool, StorageError>;
     fn stale_handle_dids(&self, ttl: Duration, limit: usize) -> Result<Vec<String>, StorageError>;
     fn queue_handle_refresh(&self, did: &str) -> Result<(), StorageError>;
@@ -426,6 +456,7 @@ pub struct MemoryStorage {
 struct MemoryState {
     records: HashMap<(String, String, String), IndexedRecord>,
     cursor: Option<u64>,
+    skipped_windows: Vec<SkippedCursorWindow>,
     registered: HashSet<String>,
     web_session_generations: HashMap<(String, String), u64>,
     follows: HashSet<(String, String)>,
@@ -456,6 +487,78 @@ impl Storage for MemoryStorage {
             .records
             .insert(key, record.clone());
         Ok(())
+    }
+
+    fn apply_jetstream_batch(
+        &self,
+        updates: &[JetstreamStorageUpdate],
+    ) -> Result<(), StorageError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        for update in updates {
+            if let Some(record) = &update.upsert {
+                let key = (
+                    record.did.clone(),
+                    record.collection.clone(),
+                    record.rkey.clone(),
+                );
+                inner.records.insert(key, record.clone());
+            }
+            if let Some((did, collection, rkey)) = &update.delete {
+                inner
+                    .records
+                    .remove(&(did.clone(), collection.clone(), rkey.clone()));
+            }
+            for follow in &update.follows {
+                let edge = (follow.actor.clone(), follow.subject.clone());
+                if follow.following {
+                    inner.follows.insert(edge);
+                } else {
+                    inner.follows.remove(&edge);
+                    inner
+                        .backfill_owners
+                        .remove(&(follow.actor.clone(), follow.subject.clone()));
+                }
+            }
+            for (owner_did, did) in &update.backfill_for {
+                if !inner.registered.contains(owner_did)
+                    || (did != owner_did
+                        && !inner.follows.contains(&(owner_did.clone(), did.clone())))
+                    || (!inner.backfill_queue.contains(did)
+                        && inner.backfill_queue.len() >= MAX_BACKFILL_QUEUE)
+                {
+                    continue;
+                }
+                inner
+                    .backfill_owners
+                    .insert((owner_did.clone(), did.clone()));
+                inner.backfill_queue.insert(did.clone());
+                inner.backfill_completed.remove(did);
+            }
+            if let Some(did) = &update.handle_refresh {
+                inner.handle_refresh_queue.insert(did.clone());
+            }
+            inner.cursor = Some(update.time_us);
+        }
+        Ok(())
+    }
+
+    fn record_skipped_window(&self, from: u64, to: u64) -> Result<(), StorageError> {
+        let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        inner.skipped_windows.push(SkippedCursorWindow { from, to });
+        inner.cursor = Some(to);
+        Ok(())
+    }
+
+    fn skipped_windows(&self) -> Result<Vec<SkippedCursorWindow>, StorageError> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .skipped_windows
+            .clone())
     }
 
     fn replace_repo_snapshot(
@@ -1073,6 +1176,16 @@ impl Storage for MemoryStorage {
                 .any(|(actor, subject)| subject == did && inner.registered.contains(actor)))
     }
 
+    fn registered_followers(&self, did: &str) -> Result<Vec<String>, StorageError> {
+        let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        Ok(inner
+            .follows
+            .iter()
+            .filter(|(actor, subject)| subject == did && inner.registered.contains(actor))
+            .map(|(actor, _)| actor.clone())
+            .collect())
+    }
+
     fn is_displayed_did(&self, did: &str) -> Result<bool, StorageError> {
         let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
         Ok(inner.records.values().any(|record| record.did == did))
@@ -1598,6 +1711,152 @@ impl Storage for SqliteStorage {
         )?;
         write_notification_events(&connection, record)?;
         Ok(())
+    }
+
+    fn apply_jetstream_batch(
+        &self,
+        updates: &[JetstreamStorageUpdate],
+    ) -> Result<(), StorageError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.conn()?;
+        let transaction = connection.transaction()?;
+        for update in updates {
+            if let Some(did) = &update.handle_refresh {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO handle_refresh_queue(did) VALUES(?1)",
+                    [did],
+                )?;
+            }
+            if let Some(record) = &update.upsert {
+                let record_json = serde_json::to_string(&record.record)?;
+                transaction.execute(
+                    "INSERT INTO records (did, collection, rkey, uri, cid, time_us, record_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(did, collection, rkey) DO UPDATE SET
+                         uri=excluded.uri, cid=excluded.cid, time_us=excluded.time_us,
+                         record_json=excluded.record_json",
+                    params![
+                        record.did,
+                        record.collection,
+                        record.rkey,
+                        record.uri,
+                        record.cid,
+                        record.time_us,
+                        record_json,
+                    ],
+                )?;
+                write_notification_events(&transaction, record)?;
+            }
+            if let Some((did, collection, rkey)) = &update.delete {
+                transaction.execute(
+                    "DELETE FROM records WHERE did=?1 AND collection=?2 AND rkey=?3",
+                    params![did, collection, rkey],
+                )?;
+                transaction.execute(
+                    "DELETE FROM notification_events WHERE source_did=?1 AND source_collection=?2 AND source_rkey=?3",
+                    params![did, collection, rkey],
+                )?;
+            }
+            for follow in &update.follows {
+                transaction.execute(
+                    "INSERT OR REPLACE INTO follows(actor,subject,following) VALUES(?1,?2,?3)",
+                    params![follow.actor, follow.subject, follow.following],
+                )?;
+                if !follow.following {
+                    transaction.execute(
+                        "DELETE FROM backfill_scope WHERE owner_did=?1 AND target_did=?2",
+                        params![follow.actor, follow.subject],
+                    )?;
+                }
+            }
+            for (owner_did, did) in &update.backfill_for {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO backfill_queue(did)
+                     SELECT ?2
+                     WHERE ((SELECT COUNT(*) FROM backfill_queue) < ?3
+                            OR EXISTS(SELECT 1 FROM backfill_queue WHERE did=?2))
+                       AND EXISTS(SELECT 1 FROM registered_users WHERE did=?1)
+                       AND (?1=?2 OR EXISTS(
+                           SELECT 1 FROM follows WHERE actor=?1 AND subject=?2 AND following=1
+                       ))",
+                    params![owner_did, did, MAX_BACKFILL_QUEUE],
+                )?;
+                transaction.execute(
+                    "INSERT OR REPLACE INTO backfill_scope(owner_did,target_did)
+                     SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM backfill_queue WHERE did=?2)
+                       AND EXISTS(SELECT 1 FROM registered_users WHERE did=?1)
+                       AND (?1=?2 OR EXISTS(
+                           SELECT 1 FROM follows WHERE actor=?1 AND subject=?2 AND following=1
+                       ))",
+                    params![owner_did, did],
+                )?;
+                transaction.execute(
+                    "INSERT INTO backfill_status(did,done) VALUES(?1,0)
+                     ON CONFLICT(did) DO UPDATE SET done=0
+                     WHERE EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
+                    [did],
+                )?;
+            }
+        }
+        transaction.execute(
+            "INSERT INTO appview_state(key,value) VALUES('jetstream_cursor',?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [updates.last().expect("nonempty batch").time_us.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn record_skipped_window(&self, from: u64, to: u64) -> Result<(), StorageError> {
+        let mut connection = self.conn()?;
+        let transaction = connection.transaction()?;
+        let stored: Option<String> = transaction
+            .query_row(
+                "SELECT value FROM appview_state WHERE key='jetstream_skipped_windows'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let mut windows = stored
+            .as_deref()
+            .map(serde_json::from_str::<Vec<SkippedCursorWindow>>)
+            .transpose()?
+            .unwrap_or_default();
+        windows.push(SkippedCursorWindow { from, to });
+        if windows.len() > 128 {
+            windows.drain(..windows.len() - 128);
+        }
+        transaction.execute(
+            "INSERT INTO appview_state(key,value) VALUES('jetstream_skipped_windows',?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [serde_json::to_string(&windows)?],
+        )?;
+        transaction.execute(
+            "INSERT INTO appview_state(key,value) VALUES('jetstream_cursor',?1)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [to.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn skipped_windows(&self) -> Result<Vec<SkippedCursorWindow>, StorageError> {
+        let stored: Option<String> = self
+            .read_conn()?
+            .query_row(
+                "SELECT value FROM appview_state WHERE key='jetstream_skipped_windows'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        stored
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map(Option::unwrap_or_default)
+            .map_err(Into::into)
     }
 
     fn replace_repo_snapshot(
@@ -2237,6 +2496,18 @@ impl Storage for SqliteStorage {
         )?)
     }
 
+    fn registered_followers(&self, did: &str) -> Result<Vec<String>, StorageError> {
+        let connection = self.read_conn()?;
+        let mut statement = connection.prepare(
+            "SELECT f.actor FROM follows f JOIN registered_users r ON r.did=f.actor
+             WHERE f.subject=?1 AND f.following=1",
+        )?;
+        statement
+            .query_map([did], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     fn is_displayed_did(&self, did: &str) -> Result<bool, StorageError> {
         Ok(self.read_conn()?.query_row(
             "SELECT EXISTS(SELECT 1 FROM records WHERE did=?1)",
@@ -2469,22 +2740,48 @@ impl<S: Storage> Ingestor<S> {
     }
 
     pub fn process_json(&self, json: &str) -> Result<(), IngestError> {
-        let event: JetstreamEvent = serde_json::from_str(json)?;
-        if matches!(event.kind.as_str(), "identity" | "account")
-            && (self.storage.is_tracked_did(&event.did)?
-                || self.storage.is_displayed_did(&event.did)?)
-        {
-            self.storage.queue_handle_refresh(&event.did)?;
+        self.process_json_batch(&[json.to_owned()])
+    }
+
+    pub fn process_json_batch(&self, json_events: &[String]) -> Result<(), IngestError> {
+        if json_events.is_empty() {
+            return Ok(());
         }
-        if event.kind == "commit"
-            && let Some(commit) = event.commit
-            && SUPPORTED_COLLECTIONS.contains(&commit.collection.as_str())
-        {
-            self.process_commit(event.did, event.time_us, commit)?;
+        let mut updates = Vec::with_capacity(json_events.len());
+        let mut staged_follows = HashMap::<(String, String), bool>::new();
+        let mut staged_records = HashMap::<(String, String, String), Option<IndexedRecord>>::new();
+        for json in json_events {
+            let event: JetstreamEvent = serde_json::from_str(json)?;
+            let mut update = JetstreamStorageUpdate {
+                time_us: event.time_us,
+                ..JetstreamStorageUpdate::default()
+            };
+            if matches!(event.kind.as_str(), "identity" | "account")
+                && (self.storage.is_tracked_did(&event.did)?
+                    || self.storage.is_displayed_did(&event.did)?)
+            {
+                update.handle_refresh = Some(event.did.clone());
+            }
+            if event.kind == "commit"
+                && let Some(commit) = event.commit
+                && SUPPORTED_COLLECTIONS.contains(&commit.collection.as_str())
+            {
+                self.process_commit(
+                    event.did,
+                    event.time_us,
+                    commit,
+                    &mut update,
+                    &mut staged_follows,
+                    &mut staged_records,
+                )?;
+            }
+            updates.push(update);
         }
-        self.storage.set_cursor(event.time_us)?;
-        self.cursor.store(event.time_us, Ordering::Relaxed);
-        self.processed.fetch_add(1, Ordering::Relaxed);
+        self.storage.apply_jetstream_batch(&updates)?;
+        let last_cursor = updates.last().expect("nonempty batch").time_us;
+        self.cursor.store(last_cursor, Ordering::Relaxed);
+        self.processed
+            .fetch_add(updates.len() as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -2493,6 +2790,9 @@ impl<S: Storage> Ingestor<S> {
         did: String,
         time_us: u64,
         commit: JetstreamCommit,
+        update: &mut JetstreamStorageUpdate,
+        staged_follows: &mut HashMap<(String, String), bool>,
+        staged_records: &mut HashMap<(String, String, String), Option<IndexedRecord>>,
     ) -> Result<(), IngestError> {
         // Parse and filter target DIDs before querying records or writing anything.
         let referenced_tracked = if self.scope == ScopeMode::Full {
@@ -2505,23 +2805,30 @@ impl<S: Storage> Ingestor<S> {
                     .and_then(|record| record.pointer("/subject/uri"))
                     .and_then(Value::as_str)
                     .and_then(uri_did)
-                    .map(|target_did| self.storage.is_tracked_did(target_did))
+                    .map(|target_did| self.is_tracked_in_batch(target_did, staged_follows))
                     .transpose()?
                     .unwrap_or(false),
-                "app.bsky.feed.post" => self.post_references_tracked(commit.record.as_ref())?,
+                "app.bsky.feed.post" => {
+                    self.post_references_tracked(commit.record.as_ref(), staged_follows)?
+                }
                 _ => false,
             }
         };
         let actor_tracked = match self.scope {
             ScopeMode::Full => true,
-            ScopeMode::Scoped => self.storage.is_tracked_did(&did)?,
+            ScopeMode::Scoped => self.is_tracked_in_batch(&did, staged_follows)?,
         };
         // Avoid a database record lookup for unrelated creates and updates. For a
         // delete, inspect the key so previously indexed interactions can be removed.
+        let record_key = (did.clone(), commit.collection.clone(), commit.rkey.clone());
         let previous =
             if commit.operation == "delete" || commit.collection == "app.bsky.graph.follow" {
-                self.storage
-                    .get_record(&did, &commit.collection, &commit.rkey)?
+                if let Some(previous) = staged_records.get(&record_key) {
+                    previous.clone()
+                } else {
+                    self.storage
+                        .get_record(&did, &commit.collection, &commit.rkey)?
+                }
             } else {
                 None
             };
@@ -2529,8 +2836,8 @@ impl<S: Storage> Ingestor<S> {
 
         if should_index {
             if commit.operation == "delete" {
-                self.storage
-                    .delete_record(&did, &commit.collection, &commit.rkey)?;
+                update.delete = Some((did.clone(), commit.collection.clone(), commit.rkey.clone()));
+                staged_records.insert(record_key.clone(), None);
             } else if let Some(record) = commit.record.as_ref() {
                 let uri = format!("at://{did}/{}/{}", commit.collection, commit.rkey);
                 let indexed = IndexedRecord {
@@ -2542,7 +2849,8 @@ impl<S: Storage> Ingestor<S> {
                     time_us,
                     record: record.clone(),
                 };
-                self.storage.put_record(&indexed)?;
+                update.upsert = Some(indexed.clone());
+                staged_records.insert(record_key.clone(), Some(indexed));
             }
         }
 
@@ -2550,7 +2858,12 @@ impl<S: Storage> Ingestor<S> {
             if let Some(old) = previous.as_ref()
                 && let Some(subject) = old.record.get("subject").and_then(Value::as_str)
             {
-                self.storage.set_follow(&did, subject, false)?;
+                update.follows.push(FollowUpdate {
+                    actor: did.clone(),
+                    subject: subject.to_owned(),
+                    following: false,
+                });
+                staged_follows.insert((did.clone(), subject.to_owned()), false);
             }
             if commit.operation != "delete"
                 && let Some(subject) = commit
@@ -2559,16 +2872,47 @@ impl<S: Storage> Ingestor<S> {
                     .and_then(|record| record.get("subject"))
                 && let Some(subject) = subject.as_str()
             {
-                self.storage.set_follow(&did, subject, true)?;
+                update.follows.push(FollowUpdate {
+                    actor: did.clone(),
+                    subject: subject.to_owned(),
+                    following: true,
+                });
+                staged_follows.insert((did.clone(), subject.to_owned()), true);
                 if self.scope == ScopeMode::Scoped {
-                    self.storage.enqueue_backfill_for(&did, subject)?;
+                    update.backfill_for.push((did, subject.to_owned()));
                 }
             }
         }
         Ok(())
     }
 
-    fn post_references_tracked(&self, record: Option<&Value>) -> Result<bool, IngestError> {
+    fn is_tracked_in_batch(
+        &self,
+        did: &str,
+        staged_follows: &HashMap<(String, String), bool>,
+    ) -> Result<bool, IngestError> {
+        if self.scope == ScopeMode::Full || self.storage.is_registered(did)? {
+            return Ok(true);
+        }
+        let followers = self.storage.registered_followers(did)?;
+        if followers.iter().any(|actor| {
+            staged_follows
+                .get(&(actor.clone(), did.to_owned()))
+                .copied()
+                .unwrap_or(true)
+        }) {
+            return Ok(true);
+        }
+        Ok(staged_follows
+            .iter()
+            .any(|((_, subject), following)| subject == did && *following))
+    }
+
+    fn post_references_tracked(
+        &self,
+        record: Option<&Value>,
+        staged_follows: &HashMap<(String, String), bool>,
+    ) -> Result<bool, IngestError> {
         let Some(record) = record else {
             return Ok(false);
         };
@@ -2585,7 +2929,7 @@ impl<S: Storage> Ingestor<S> {
             .filter_map(|path| record.pointer(path).and_then(Value::as_str))
         {
             if let Some(did) = uri_did(uri)
-                && self.storage.is_tracked_did(did)?
+                && self.is_tracked_in_batch(did, staged_follows)?
             {
                 return Ok(true);
             }
@@ -2603,7 +2947,7 @@ impl<S: Storage> Ingestor<S> {
             })
             .filter_map(|feature| feature.get("did").and_then(Value::as_str))
         {
-            if self.storage.is_tracked_did(did)? {
+            if self.is_tracked_in_batch(did, staged_follows)? {
                 return Ok(true);
             }
         }
@@ -2646,6 +2990,7 @@ pub struct JetstreamConsumer<S: Storage> {
     idle_timeout: Duration,
     event_timeout: Duration,
     metrics_interval: Duration,
+    stale_cursor_threshold: Duration,
 }
 
 struct JetstreamConnectionLog(String);
@@ -2670,6 +3015,50 @@ fn safe_jetstream_endpoint(value: &str) -> String {
     format!("{}://{host}{port}", url.scheme())
 }
 
+fn prepare_jetstream_url<S: Storage>(
+    ingestor: &Ingestor<S>,
+    stale_threshold: Duration,
+    base_url: &str,
+) -> Result<String, IngestError> {
+    let mut url =
+        reqwest::Url::parse(base_url).map_err(|error| IngestError::WebSocket(error.to_string()))?;
+    let saved_cursor = ingestor.storage.cursor()?;
+    let cursor = if let Some(saved_cursor) = saved_cursor {
+        let now_us = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros()
+            .min(u64::MAX as u128) as u64;
+        let threshold_us = stale_threshold.as_micros().min(u64::MAX as u128) as u64;
+        let recent_start = now_us.saturating_sub(30_000_000);
+        if now_us.saturating_sub(saved_cursor) > threshold_us && saved_cursor < recent_start {
+            ingestor
+                .storage
+                .record_skipped_window(saved_cursor, recent_start)?;
+            ingestor.cursor.store(recent_start, Ordering::Relaxed);
+            tracing::warn!(
+                from_cursor_us = saved_cursor,
+                to_cursor_us = recent_start,
+                "Jetstream skipped stale cursor window"
+            );
+            Some(recent_start)
+        } else {
+            Some(saved_cursor)
+        }
+    } else {
+        None
+    };
+    if let Some(cursor) = cursor {
+        url.query_pairs_mut()
+            .append_pair("cursor", &cursor.to_string());
+    }
+    for collection in SUPPORTED_COLLECTIONS {
+        url.query_pairs_mut()
+            .append_pair("wantedCollections", collection);
+    }
+    Ok(url.to_string())
+}
+
 impl<S: Storage + 'static> JetstreamConsumer<S> {
     pub fn new(ingestor: Ingestor<S>, reconnect_delay: Duration) -> Self {
         Self {
@@ -2678,6 +3067,7 @@ impl<S: Storage + 'static> JetstreamConsumer<S> {
             idle_timeout: Duration::from_secs(60),
             event_timeout: Duration::from_secs(60),
             metrics_interval: Duration::from_secs(10),
+            stale_cursor_threshold: Duration::from_secs(10 * 60),
         }
     }
 
@@ -2696,6 +3086,11 @@ impl<S: Storage + 'static> JetstreamConsumer<S> {
         self
     }
 
+    pub fn with_stale_cursor_threshold(mut self, threshold: Duration) -> Self {
+        self.stale_cursor_threshold = threshold;
+        self
+    }
+
     pub async fn consume_connection(&self, url: &str) -> Result<(), IngestError> {
         let endpoint = safe_jetstream_endpoint(url);
         let (mut websocket, _) = connect_async(url)
@@ -2705,32 +3100,88 @@ impl<S: Storage + 'static> JetstreamConsumer<S> {
         let _connection_log = JetstreamConnectionLog(endpoint);
         async {
             let mut idle_deadline = tokio::time::Instant::now() + self.idle_timeout;
+            let mut batch_deadline = None;
+            let mut pending_events = Vec::with_capacity(JETSTREAM_BATCH_SIZE);
             loop {
                 let remaining =
                     idle_deadline.saturating_duration_since(tokio::time::Instant::now());
-                let message = tokio::time::timeout(remaining, websocket.next())
-                    .await
-                    .map_err(|_| {
-                        IngestError::WebSocket(format!(
+                let incoming = tokio::select! {
+                    _ = async {
+                        if let Some(deadline) = batch_deadline {
+                            tokio::time::sleep_until(deadline).await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    }, if !pending_events.is_empty() => {
+                        self.process_event_batch(std::mem::take(&mut pending_events)).await?;
+                        batch_deadline = None;
+                        continue;
+                    }
+                    incoming = tokio::time::timeout(remaining, websocket.next()) => incoming,
+                };
+                let message = match incoming {
+                    Err(_) => {
+                        if !pending_events.is_empty() {
+                            self.process_event_batch(std::mem::take(&mut pending_events))
+                                .await?;
+                        }
+                        return Err(IngestError::WebSocket(format!(
                             "no Jetstream event received for {} seconds",
                             self.idle_timeout.as_secs_f64()
-                        ))
-                    })?;
-                let Some(message) = message else {
-                    break;
+                        )));
+                    }
+                    Ok(None) => {
+                        if !pending_events.is_empty() {
+                            self.process_event_batch(std::mem::take(&mut pending_events))
+                                .await?;
+                        }
+                        break;
+                    }
+                    Ok(Some(Err(error))) => {
+                        if !pending_events.is_empty() {
+                            self.process_event_batch(std::mem::take(&mut pending_events))
+                                .await?;
+                        }
+                        return Err(IngestError::WebSocket(error.to_string()));
+                    }
+                    Ok(Some(Ok(message))) => message,
                 };
-                match message.map_err(|error| IngestError::WebSocket(error.to_string()))? {
+                match message {
                     Message::Text(text) => {
-                        self.process_event_text(text.to_string()).await?;
+                        if pending_events.is_empty() {
+                            batch_deadline =
+                                Some(tokio::time::Instant::now() + JETSTREAM_BATCH_DELAY);
+                        }
+                        pending_events.push(text.to_string());
                         idle_deadline = tokio::time::Instant::now() + self.idle_timeout;
+                        if pending_events.len() >= JETSTREAM_BATCH_SIZE {
+                            self.process_event_batch(std::mem::take(&mut pending_events))
+                                .await?;
+                            batch_deadline = None;
+                        }
                     }
                     Message::Binary(bytes) => {
                         let text = std::str::from_utf8(&bytes)
                             .map_err(|error| IngestError::WebSocket(error.to_string()))?;
-                        self.process_event_text(text.to_owned()).await?;
+                        if pending_events.is_empty() {
+                            batch_deadline =
+                                Some(tokio::time::Instant::now() + JETSTREAM_BATCH_DELAY);
+                        }
+                        pending_events.push(text.to_owned());
                         idle_deadline = tokio::time::Instant::now() + self.idle_timeout;
+                        if pending_events.len() >= JETSTREAM_BATCH_SIZE {
+                            self.process_event_batch(std::mem::take(&mut pending_events))
+                                .await?;
+                            batch_deadline = None;
+                        }
                     }
-                    Message::Close(_) => break,
+                    Message::Close(_) => {
+                        if !pending_events.is_empty() {
+                            self.process_event_batch(std::mem::take(&mut pending_events))
+                                .await?;
+                        }
+                        break;
+                    }
                     Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
                 }
             }
@@ -2739,8 +3190,9 @@ impl<S: Storage + 'static> JetstreamConsumer<S> {
         .await
     }
 
-    async fn process_event_text(&self, text: String) -> Result<(), IngestError> {
-        let event: Value = serde_json::from_str(&text)?;
+    async fn process_event_batch(&self, events: Vec<String>) -> Result<(), IngestError> {
+        let event: Value =
+            serde_json::from_str(events.last().expect("event batch must not be empty"))?;
         let did = event
             .get("did")
             .and_then(Value::as_str)
@@ -2757,7 +3209,7 @@ impl<S: Storage + 'static> JetstreamConsumer<S> {
             .unwrap_or("unknown")
             .to_owned();
         let ingestor = self.ingestor.clone();
-        let task = tokio::task::spawn_blocking(move || ingestor.process_json(&text));
+        let task = tokio::task::spawn_blocking(move || ingestor.process_json_batch(&events));
         match tokio::time::timeout(self.event_timeout, task).await {
             Err(_) => {
                 tracing::warn!(
@@ -2802,7 +3254,16 @@ impl<S: Storage + 'static> JetstreamConsumer<S> {
             }
             let base_url = &urls[next_url % urls.len()];
             next_url += 1;
-            let url = self.url_with_cursor(base_url)?;
+            let ingestor = self.ingestor.clone();
+            let stale_threshold = self.stale_cursor_threshold;
+            let base_url = base_url.clone();
+            let url = tokio::task::spawn_blocking(move || {
+                prepare_jetstream_url(&ingestor, stale_threshold, &base_url)
+            })
+            .await
+            .map_err(|error| {
+                IngestError::WebSocket(format!("Jetstream URL worker failed: {error}"))
+            })??;
             let endpoint = safe_jetstream_endpoint(&url);
             let connection_result = {
                 let connection = self.consume_connection(&url);
@@ -2834,20 +3295,6 @@ impl<S: Storage + 'static> JetstreamConsumer<S> {
             }
             backoff = (backoff * 2).min(Duration::from_secs(30));
         }
-    }
-
-    fn url_with_cursor(&self, base_url: &str) -> Result<String, IngestError> {
-        let mut url = reqwest::Url::parse(base_url)
-            .map_err(|error| IngestError::WebSocket(error.to_string()))?;
-        if let Some(cursor) = self.ingestor.storage.cursor()? {
-            url.query_pairs_mut()
-                .append_pair("cursor", &cursor.to_string());
-        }
-        for collection in SUPPORTED_COLLECTIONS {
-            url.query_pairs_mut()
-                .append_pair("wantedCollections", collection);
-        }
-        Ok(url.to_string())
     }
 }
 
@@ -2937,9 +3384,12 @@ mod jetstream_catchup_tests {
             Duration::from_millis(1),
         );
 
-        let url = consumer
-            .url_with_cursor("wss://jetstream.example/subscribe")
-            .unwrap();
+        let url = prepare_jetstream_url(
+            &consumer.ingestor,
+            consumer.stale_cursor_threshold,
+            "wss://jetstream.example/subscribe",
+        )
+        .unwrap();
         let url = reqwest::Url::parse(&url).unwrap();
         let reconnect_cursor = url
             .query_pairs()
@@ -2951,18 +3401,20 @@ mod jetstream_catchup_tests {
         assert!(reconnect_cursor > stale_cursor, "{reconnect_cursor}");
         assert!(now_us.saturating_sub(reconnect_cursor) <= 31_000_000);
 
-        let skipped: String = storage
+        let skipped = storage.skipped_windows().unwrap();
+        assert_eq!(skipped.last().unwrap().from, stale_cursor);
+        assert_eq!(skipped.last().unwrap().to, reconnect_cursor);
+        let persisted: String = storage
             .conn()
             .unwrap()
             .query_row(
-                "SELECT value FROM appview_state WHERE key='jetstream_skipped_window'",
+                "SELECT value FROM appview_state WHERE key='jetstream_skipped_windows'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        let skipped: Value = serde_json::from_str(&skipped).unwrap();
-        assert_eq!(skipped["from"], stale_cursor);
-        assert_eq!(skipped["to"], reconnect_cursor);
+        assert!(persisted.contains(&stale_cursor.to_string()));
+        assert!(persisted.contains(&reconnect_cursor.to_string()));
         assert_eq!(storage.cursor().unwrap(), Some(reconnect_cursor));
     }
 }

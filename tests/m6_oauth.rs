@@ -1367,7 +1367,7 @@ async fn logged_in_write_forms_use_the_account_oauth_flow() {
 async fn successful_pds_writes_are_indexed_and_jetstream_replays_are_idempotent() {
     let public = OAuthPublic::new("https://appview.example").unwrap();
     let flow = FakeOAuthFlow::default();
-    let storage = Arc::new(MemoryStorage::default());
+    let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
     let app = public.router_with_flow(flow, storage.clone());
     let login_cookie = prelogin_cookie(&app).await;
     let callback = app

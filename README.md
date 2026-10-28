@@ -71,6 +71,7 @@ Open [http://127.0.0.1:3000/login](http://127.0.0.1:3000/login), enter an AT Pro
 | `jetstream_urls` | `APPVIEW_JETSTREAM_URLS` | east Jetstream URL | TOML string array, or comma-separated URLs in the environment |
 | `jetstream_idle_timeout_secs` | `APPVIEW_JETSTREAM_IDLE_TIMEOUT_SECS` | `60` | Reconnect when a Jetstream connection sends no websocket messages for this long |
 | `jetstream_event_timeout_secs` | `APPVIEW_JETSTREAM_EVENT_TIMEOUT_SECS` | `60` | Drop and reconnect if one event takes longer than this to process |
+| `jetstream_stale_cursor_threshold_secs` | `APPVIEW_JETSTREAM_STALE_CURSOR_THRESHOLD_SECS` | `600` | Skip and record an older cursor window when it is beyond this age |
 | `appview_did` | `APPVIEW_DID` | `did:web:localhost` | AppView service identity |
 | `public_url` | `APPVIEW_PUBLIC_URL` | `https://appview.example` | HTTPS origin and OAuth client ID origin in confidential mode; ignored in loopback mode |
 | `oauth_mode` | `APPVIEW_OAUTH_MODE` | `confidential` | `confidential` for the public HTTPS client, or `loopback` for local development OAuth |
@@ -78,6 +79,8 @@ Open [http://127.0.0.1:3000/login](http://127.0.0.1:3000/login), enter an AT Pro
 Use `scoped` for a small self-hosted instance. It indexes registered users, their follows, and interactions on their posts. `full` indexes every supported account and will use substantially more disk as the firehose continues. Neither mode currently has a retention or compaction policy.
 
 In scoped mode, incoming likes and reposts are indexed when their subject is a registered or followed DID's post. Replies, quotes, and facet mentions are also indexed when they point to a registered or followed DID. This makes counts and notifications accurate for events seen from the current Jetstream cursor onward; older likes, reposts, and replies are not backfilled.
+
+Jetstream writes commit in batches of up to 200 events or 250 ms. The saved cursor advances in the same transaction as the batch. On reconnect, a cursor older than the configured threshold is reset to 30 seconds ago; the skipped range is logged and saved in `appview_state` for future repair.
 
 A future count backfill could enqueue rate-limited, paginated `getLikes`, `getRepostedBy`, and thread snapshots for each tracked post, store those as count baselines, and reconcile the snapshots against Jetstream create/delete events using a captured cursor and record URI deduplication. That backfill is not implemented.
 

@@ -19,6 +19,8 @@ pub struct Config {
     pub jetstream_idle_timeout_secs: u64,
     #[serde(default = "default_jetstream_event_timeout_secs")]
     pub jetstream_event_timeout_secs: u64,
+    #[serde(default = "default_jetstream_stale_cursor_threshold_secs")]
+    pub jetstream_stale_cursor_threshold_secs: u64,
     #[serde(default = "default_backfill_records_per_second")]
     pub backfill_records_per_second: u64,
     #[serde(default)]
@@ -49,6 +51,7 @@ impl Default for Config {
             jetstream_urls: default_jetstream_urls(),
             jetstream_idle_timeout_secs: default_jetstream_idle_timeout_secs(),
             jetstream_event_timeout_secs: default_jetstream_event_timeout_secs(),
+            jetstream_stale_cursor_threshold_secs: default_jetstream_stale_cursor_threshold_secs(),
             backfill_records_per_second: default_backfill_records_per_second(),
             backfill_enabled: false,
             appview_did: default_appview_did(),
@@ -120,6 +123,10 @@ impl Config {
                 "APPVIEW_JETSTREAM_EVENT_TIMEOUT_SECS" => {
                     config.jetstream_event_timeout_secs =
                         parse_timeout("APPVIEW_JETSTREAM_EVENT_TIMEOUT_SECS", value)?;
+                }
+                "APPVIEW_JETSTREAM_STALE_CURSOR_THRESHOLD_SECS" => {
+                    config.jetstream_stale_cursor_threshold_secs =
+                        parse_timeout("APPVIEW_JETSTREAM_STALE_CURSOR_THRESHOLD_SECS", value)?;
                 }
                 "APPVIEW_BACKFILL_RECORDS_PER_SECOND" => {
                     config.backfill_records_per_second = parse_backfill_rate(value)?;
@@ -298,6 +305,10 @@ fn default_jetstream_idle_timeout_secs() -> u64 {
 
 fn default_jetstream_event_timeout_secs() -> u64 {
     60
+}
+
+fn default_jetstream_stale_cursor_threshold_secs() -> u64 {
+    10 * 60
 }
 
 fn default_backfill_records_per_second() -> u64 {
