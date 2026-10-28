@@ -383,8 +383,10 @@ impl OAuthPublic {
             .route("/notifications", get(notifications_page::<F, S>))
             .route("/profile", get(profile_page::<F, S>))
             .route("/thread", get(thread_page::<F, S>))
+            .route("/compose", get(quote_composer::<F, S>))
             .route("/post", post(write_post::<F, S>))
             .route("/reply", post(write_reply::<F, S>))
+            .route("/quote", post(write_quote::<F, S>))
             .route("/like", post(write_like::<F, S>))
             .route("/repost", post(write_repost::<F, S>))
             .with_state(Arc::new(OAuthWebState {
@@ -2453,6 +2455,94 @@ where
     .into_response()
 }
 
+async fn quote_composer<F, S>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response
+where
+    F: OAuthFlow,
+    S: Storage,
+{
+    let Some(viewer_did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref())
+    else {
+        return Redirect::to("/login").into_response();
+    };
+    let Some(quote_uri) = query.get("quote_uri") else {
+        return oauth_error(StatusCode::BAD_REQUEST, "quote_uri is required");
+    };
+    if post_uri_did(quote_uri).is_none() {
+        return oauth_error(StatusCode::BAD_REQUEST, "quote_uri is not a post URI");
+    }
+    let quoted = match load_post_record(&state.flow, state.storage.as_ref(), quote_uri).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return oauth_error(StatusCode::NOT_FOUND, "quoted post not found"),
+        Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
+    };
+    if quoted.cid.as_deref().is_none_or(str::is_empty) {
+        return oauth_error(StatusCode::BAD_REQUEST, "quoted post has no CID");
+    }
+    let write_forms_enabled =
+        verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
+    let composer = if write_forms_enabled {
+        format!(
+            "<form class=\"composer quote-composer\" action=\"/quote\" method=\"post\"><label for=\"quote-text\">Write a quote post</label><input type=\"hidden\" name=\"quote_uri\" value=\"{}\"><textarea id=\"quote-text\" name=\"text\" rows=\"4\" maxlength=\"300\" required></textarea>{}<button type=\"submit\">Post</button></form>",
+            html_escape(&quoted.uri),
+            render_quote_preview(state.storage.as_ref(), &quoted)
+        )
+    } else {
+        format!(
+            "<p role=\"status\">Read-only: write permissions were not granted.</p>{}",
+            render_quote_preview(state.storage.as_ref(), &quoted)
+        )
+    };
+    let pinned_feeds = pinned_feeds_for_layout(
+        &state.flow,
+        &viewer_did,
+        verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()),
+    )
+    .await;
+    Html(page_shell_with_feeds(
+        "Quote post",
+        &format!("<header class=\"page-heading\"><h1>Quote post</h1></header>{composer}"),
+        true,
+        &pinned_feeds,
+        None,
+        false,
+    ))
+    .into_response()
+}
+
+fn render_quote_preview<S: Storage>(storage: &S, quoted: &IndexedRecord) -> String {
+    let profile = profile_view_from_storage(storage, &quoted.did)
+        .unwrap_or_else(|_| json!({"did":quoted.did,"handle":quoted.did}));
+    let handle = profile_handle(&profile, &quoted.did);
+    let display_name = profile
+        .get("displayName")
+        .and_then(Value::as_str)
+        .unwrap_or(&handle);
+    let text = quoted
+        .record
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let embed = quoted
+        .record
+        .get("embed")
+        .map(|embed| render_web_embed(storage, &quoted.did, embed))
+        .unwrap_or_default();
+    format!(
+        "<article class=\"quoted-post-preview\" aria-label=\"Quoted post\"><header>{}{}</header><p class=\"post-text\">{}</p>{embed}</article>",
+        avatar_markup(&profile, "small-avatar"),
+        format!(
+            "<span class=\"quoted-author\"><strong>{}</strong> <span>@{}</span></span>",
+            html_escape(display_name),
+            html_escape(&handle)
+        ),
+        html_escape(text)
+    )
+}
+
 async fn thread_ancestors<F: OAuthFlow, S: Storage>(
     flow: &F,
     storage: &S,
@@ -2594,6 +2684,59 @@ where
             }
         }
         Err(error) => oauth_error(StatusCode::BAD_GATEWAY, &error),
+    }
+}
+
+async fn write_quote<F, S>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response
+where
+    F: OAuthFlow,
+    S: Storage + 'static,
+{
+    if !same_origin_request(&headers, &state.public.public_url) {
+        return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
+    }
+    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+        return Redirect::to("/login").into_response();
+    };
+    if !verified_cookie_write_access(&state.public, &headers, state.storage.as_ref()) {
+        return oauth_error(StatusCode::FORBIDDEN, "write permissions were not granted");
+    }
+    let text = form.get("text").map(String::as_str).unwrap_or("").trim();
+    if text.is_empty() || text.chars().count() > 300 {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "quote text must contain 1 to 300 characters",
+        );
+    }
+    let Some(quote_uri) = form
+        .get("quote_uri")
+        .filter(|uri| post_uri_did(uri).is_some())
+    else {
+        return oauth_error(StatusCode::BAD_REQUEST, "quote_uri is required");
+    };
+    let quoted = match load_post_record(&state.flow, state.storage.as_ref(), quote_uri).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return oauth_error(StatusCode::NOT_FOUND, "quoted post not found"),
+        Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
+    };
+    let Some(cid) = quoted.cid.as_deref().filter(|cid| !cid.is_empty()) else {
+        return oauth_error(StatusCode::BAD_REQUEST, "quoted post has no CID");
+    };
+    let quoted_ref = PostStrongRef {
+        uri: quoted.uri,
+        cid: cid.to_owned(),
+    };
+    let created = match state.flow.create_quote(&did, text, quoted_ref).await {
+        Ok(created) => created,
+        Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
+    };
+    match persist_created_record(state.storage.clone(), &did, "app.bsky.feed.post", created).await {
+        Ok(()) => Redirect::to("/app").into_response(),
+        Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
     }
 }
 
@@ -3255,8 +3398,9 @@ fn render_web_post<S: Storage>(
         } else {
             format!("Like post by @{}", html_escape(&handle))
         };
+        let quote_href = format!("/compose?quote_uri={}", form_encoded(&record.uri));
         format!(
-            "{reply_action}<form class=\"post-action-form\" action=\"/like\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\">{like_intent}<button class=\"post-action\" type=\"submit\" aria-label=\"{like_aria}\" aria-pressed=\"{}\">{}{like_label}<span class=\"action-count\">{}</span></button></form><form class=\"post-action-form\" action=\"/repost\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\"><button class=\"post-action\" type=\"submit\" aria-label=\"Repost by @{}\">{}{repost_label}<span class=\"action-count\">{}</span></button></form>",
+            "{reply_action}<form class=\"post-action-form\" action=\"/like\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\">{like_intent}<button class=\"post-action\" type=\"submit\" aria-label=\"{like_aria}\" aria-pressed=\"{}\">{}{like_label}<span class=\"action-count\">{}</span></button></form><details class=\"repost-menu\"><summary class=\"post-action\" aria-label=\"Repost menu\">{}{repost_label}<span class=\"action-count\">{}</span></summary><div class=\"repost-menu-options\"><form class=\"post-action-form\" action=\"/repost\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\"><button class=\"post-action\" type=\"submit\" aria-label=\"Repost by @{}\">Repost</button></form><a href=\"{}\">Quote post</a></div></details>",
             if interactions.viewer_like.is_some() {
                 "true"
             } else {
@@ -3264,9 +3408,10 @@ fn render_web_post<S: Storage>(
             },
             icon_svg("like"),
             interactions.like_count,
-            html_escape(&handle),
             icon_svg("repost"),
-            interactions.repost_count
+            interactions.repost_count,
+            html_escape(&handle),
+            html_escape(&quote_href)
         )
     } else {
         reply_action

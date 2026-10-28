@@ -386,6 +386,35 @@ textarea:focus-visible {
   font-weight: 700;
 }
 
+.quote-composer .quoted-post-preview {
+  margin: 0.25rem 0 0.35rem;
+}
+
+.quoted-post-preview {
+  padding: 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 0.9rem;
+  background: var(--surface);
+}
+
+.quoted-post-preview > header {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.small-avatar {
+  width: 2rem;
+  height: 2rem;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+.quoted-author span {
+  color: var(--muted);
+}
+
 input,
 textarea,
 button {
@@ -560,6 +589,54 @@ button:hover,
   margin-top: 0.35rem;
   padding-top: 0;
   border-top: 0;
+}
+
+.repost-menu {
+  position: relative;
+}
+
+.repost-menu > summary {
+  list-style: none;
+}
+
+.repost-menu > summary::-webkit-details-marker {
+  display: none;
+}
+
+.repost-menu-options {
+  position: absolute;
+  z-index: 3;
+  top: calc(100% - 0.2rem);
+  right: 0;
+  display: grid;
+  min-width: 9rem;
+  padding: 0.35rem;
+  border: 1px solid var(--line);
+  border-radius: 0.8rem;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.repost-menu-options .post-action,
+.repost-menu-options a {
+  display: flex;
+  min-height: 40px;
+  align-items: center;
+  justify-content: flex-start;
+  padding: 0.5rem 0.65rem;
+  border: 0;
+  border-radius: 0.55rem;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.9rem;
+  text-decoration: none;
+}
+
+.repost-menu-options .post-action:hover,
+.repost-menu-options a:hover {
+  background: var(--surface-raised);
+  color: var(--accent);
 }
 
 .post-action {

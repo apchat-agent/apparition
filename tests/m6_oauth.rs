@@ -167,6 +167,32 @@ impl OAuthFlow for FakeOAuthFlow {
         })
     }
 
+    fn create_quote<'a>(
+        &'a self,
+        did: &'a str,
+        text: &'a str,
+        quoted: PostStrongRef,
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.actions
+                .lock()
+                .unwrap()
+                .push(format!("quote:{did}:{text}:{}:{}", quoted.uri, quoted.cid));
+            Ok(fake_pds_create_record(
+                did,
+                "app.bsky.feed.post",
+                "pds-quote-r1",
+                "pds-quote-cid",
+                serde_json::json!({
+                    "$type":"app.bsky.feed.post",
+                    "text":text,
+                    "createdAt":"2026-10-28T00:00:00Z",
+                    "embed":{"$type":"app.bsky.embed.record","record":quoted}
+                }),
+            ))
+        })
+    }
+
     fn pinned_feeds<'a>(
         &'a self,
         _: &'a str,
