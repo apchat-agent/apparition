@@ -1134,10 +1134,14 @@ where
             StatusCode::BAD_GATEWAY,
             "invalid authorization endpoint URL",
         ),
-        Ok(Err(_)) => oauth_error(
-            StatusCode::BAD_REQUEST,
-            "Sign-in could not be started. Please try again.",
-        ),
+        Ok(Err(error)) => {
+            // The browser gets a generic message; the operator needs the real cause.
+            tracing::warn!(%error, "oauth sign-in could not be started");
+            oauth_error(
+                StatusCode::BAD_REQUEST,
+                "Sign-in could not be started. Please try again.",
+            )
+        }
         Err(_) => oauth_error_page(
             StatusCode::BAD_GATEWAY,
             "Sign-in could not be completed. Please start again.",
