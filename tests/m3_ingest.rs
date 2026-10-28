@@ -45,6 +45,43 @@ fn sqlite_memory_storage_does_not_create_a_disk_file() {
     drop(storage);
 }
 
+#[test]
+fn sqlite_ingest_follow_scope_queries_do_not_scan_follows() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let path = root.join(format!(
+        "target/av15b-query-plan-{}.sqlite3",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    drop(SqliteStorage::open(&path).unwrap());
+    let connection = Connection::open(&path).unwrap();
+    let queries = [
+        "SELECT f.actor FROM follows f JOIN registered_users r ON r.did=f.actor
+         WHERE f.subject=?1 AND f.following=1",
+        "SELECT EXISTS(SELECT 1 FROM follows f JOIN registered_users r ON r.did=f.actor
+                       WHERE f.subject=?1 AND f.following=1)",
+    ];
+
+    for query in queries {
+        let mut statement = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+            .unwrap();
+        let plan = statement
+            .query_map(["did:plc:benchmark"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            !plan.iter().any(|line| line.contains("SCAN f")),
+            "follow scope query must not scan the follows table; query={query}; plan={plan:?}"
+        );
+        assert!(
+            plan.iter().any(|line| line.contains("SEARCH f")),
+            "follow scope query should search an index; query={query}; plan={plan:?}"
+        );
+    }
+}
+
 fn post(text: &str) -> serde_json::Value {
     json!({"$type":"app.bsky.feed.post", "text":text, "createdAt":"2026-10-27T00:00:00Z"})
 }
