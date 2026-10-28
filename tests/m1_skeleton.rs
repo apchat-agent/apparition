@@ -31,12 +31,7 @@ async fn health_endpoint_returns_json_ok() {
     for path in ["/xrpc/_health", "/healthz"] {
         let response = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(path)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), 200, "{path}");

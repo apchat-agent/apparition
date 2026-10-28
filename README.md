@@ -28,6 +28,26 @@ curl http://127.0.0.1:3000/.well-known/oauth-client-metadata.json
 
 Set `APPVIEW_PUBLIC_URL` to the externally reachable HTTPS origin and `APPVIEW_DID` to its `did:web` identifier. The DID hostname, public URL hostname, and reverse proxy host must agree. For example, `did:web:appview.example.com` should be served at `https://appview.example.com/.well-known/did.json`. Terminate TLS at the proxy and forward requests to the configured local listen address.
 
+## Running in a container
+
+The multi-stage image compiles the locked Rust dependencies in a build stage and runs the binary as UID 10001 in a Debian slim image. The runtime listens on `0.0.0.0:3000`, stores SQLite and the OAuth client key under `/data`, and checks `/healthz`. The process only needs write access to the mounted data volume; run the container with a read-only root filesystem:
+
+```sh
+docker build -t appview-rs:local .
+docker volume create appview-data
+docker run --detach --name appview-rs \
+  --publish 127.0.0.1:3000:3000 \
+  --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+  --mount source=appview-data,target=/data \
+  --env APPVIEW_PUBLIC_URL=https://appview.example.com \
+  --env APPVIEW_DID=did:web:appview.example.com \
+  appview-rs:local
+curl http://127.0.0.1:3000/healthz
+curl http://127.0.0.1:3000/login
+```
+
+Replace the example URL and DID with the public HTTPS origin and its matching `did:web`. Put a TLS reverse proxy in front of the container and expose its port only to that proxy. Bind another host port with `--publish 3000:3000` only when direct access is intended. TOML configuration can be supplied by mounting a read-only file and setting `APPVIEW_CONFIG`; environment variables can override individual options. The OAuth signing key is created in `/data/oauth-client-key.json`, so keep the data volume private and persistent and back it up with the database. Do not put OAuth keys in the image, build arguments, or source tree.
+
 ## Try it locally
 
 On the same Mac that runs the browser, start the app in loopback OAuth mode. It uses the default public east Jetstream and indexes registered accounts and their network in `scoped` mode:

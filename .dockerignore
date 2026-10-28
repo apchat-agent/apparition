@@ -1,0 +1,8 @@
+.git
+target
+data
+appview.toml
+*.db
+*.db-shm
+*.db-wal
+oauth-client-key.json
