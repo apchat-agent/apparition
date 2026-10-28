@@ -12,6 +12,9 @@ use std::{
 use tokio::{net::TcpListener, time::timeout};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
+#[path = "support/synthetic_db.rs"]
+mod synthetic_db;
+
 fn event(
     did: &str,
     time_us: u64,
@@ -44,6 +47,67 @@ fn sqlite_memory_storage_does_not_create_a_disk_file() {
 
 fn post(text: &str) -> serde_json::Value {
     json!({"$type":"app.bsky.feed.post", "text":text, "createdAt":"2026-10-27T00:00:00Z"})
+}
+
+#[test]
+#[ignore = "large SQLite ingest benchmark; creates a multi-million-row database under target/"]
+fn jetstream_large_database_batch_ingest_benchmark() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let path = root.join("target/av15b-synthetic.sqlite3");
+    let generated = synthetic_db::ensure_database(&path).unwrap();
+    let (records, follows, notifications) = synthetic_db::row_counts(&path).unwrap();
+    println!(
+        "synthetic database: generated={generated}, records={records}, follows={follows}, notifications={notifications}"
+    );
+
+    let startup_started = std::time::Instant::now();
+    let storage = Arc::new(SqliteStorage::open(&path).unwrap());
+    println!(
+        "SqliteStorage::open_ms={:.3}",
+        startup_started.elapsed().as_secs_f64() * 1000.0
+    );
+    let ingestor = Ingestor::new(storage, ScopeMode::Scoped);
+    let events = (0..600)
+        .map(|index| {
+            if index % 100 == 99 {
+                event(
+                    "did:plc:bench-untracked-author",
+                    index + 1,
+                    "create",
+                    "app.bsky.feed.like",
+                    &format!("bench-like-{index}"),
+                    Some(json!({"subject":{"uri":"at://did:plc:synthetic-tracked-000/app.bsky.feed.post/target-0","cid":"cid-target"}})),
+                )
+            } else {
+                event(
+                    "did:plc:bench-untracked-author",
+                    index + 1,
+                    "create",
+                    "app.bsky.feed.post",
+                    &format!("bench-post-{index}"),
+                    Some(post("large database benchmark")),
+                )
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let benchmark_started = std::time::Instant::now();
+    for batch in events.chunks(200) {
+        let batch_started = std::time::Instant::now();
+        ingestor.process_json_batch(batch).unwrap();
+        println!(
+            "batch_events={}, batch_ms={:.3}",
+            batch.len(),
+            batch_started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    let elapsed = benchmark_started.elapsed();
+    println!(
+        "large_database_ingest: events={}, elapsed_ms={:.3}, events_per_second={:.1}",
+        events.len(),
+        elapsed.as_secs_f64() * 1000.0,
+        events.len() as f64 / elapsed.as_secs_f64()
+    );
 }
 
 #[test]
