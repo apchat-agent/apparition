@@ -3,6 +3,7 @@ use appview_rs::{
         DidDocument as AppDidDocument, DidService, IdentityBackend, IdentityResolver,
         ResolutionError,
     },
+    ingest::MemoryStorage,
     net::SafeHttpClient,
     oauth::{OAuthCallback, OAuthFlow, OAuthPublic, PostStrongRef, SqliteOAuthStore},
 };
@@ -20,7 +21,12 @@ use atrium_oauth::{
     AtprotoClientMetadata, AuthMethod, AuthorizeOptions, CallbackParams, GrantType, KnownScope,
     OAuthClient, OAuthClientConfig, OAuthResolverConfig, Scope,
 };
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -32,6 +38,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
+use tower::ServiceExt;
 use tracing_subscriber::fmt::MakeWriter;
 
 const DID: &str = "did:plc:abcdefghijklmnopqrstuvwx";
@@ -397,6 +404,92 @@ async fn pds_4xx_logs_safe_error_details_without_credentials() {
         "{logs}"
     );
     assert!(!logs.contains("browser-binding-log-test"), "{logs}");
+    server.abort();
+}
+
+#[tokio::test]
+async fn old_granted_scope_in_production_session_shows_feed_reauthorization_page() {
+    let old_scope = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete";
+    let public = OAuthPublic::new("https://appview.example").unwrap();
+    let (flow, _, shared, server) =
+        production_flow_with_public(public.clone(), None, Some(old_scope)).await;
+    let app = public.router_with_flow(flow, Arc::new(MemoryStorage::default()));
+    let authorize = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/authorize")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("handle=did%3Aplc%3Aabcdefghijklmnopqrstuvwx"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authorize.status(), StatusCode::SEE_OTHER);
+    let login_cookie = authorize.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let state = latest_state(&shared);
+    let issuer = server_origin(&shared);
+    let callback = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/oauth/callback?code=valid-code&state={state}&iss={}",
+                    url::form_urlencoded::byte_serialize(issuer.as_bytes()).collect::<String>()
+                ))
+                .header("cookie", login_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(callback.status(), StatusCode::SEE_OTHER);
+    let session_cookie = callback
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .find_map(|header| {
+            let value = header.to_str().ok()?;
+            value
+                .starts_with("appview_session=")
+                .then(|| value.split(';').next().unwrap().to_owned())
+        })
+        .unwrap();
+    let feeds = app
+        .oneshot(
+            Request::builder()
+                .uri("/feeds")
+                .header("cookie", session_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(feeds.status(), StatusCode::OK);
+    let html = String::from_utf8(
+        feeds
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        html.to_ascii_lowercase()
+            .contains("sign in again to allow feeds")
+    );
+    assert!(html.contains("href=\"/login\""));
     server.abort();
 }
 
