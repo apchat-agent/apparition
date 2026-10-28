@@ -589,7 +589,7 @@ async fn post_thread_returns_parent_chain_and_time_ordered_nested_replies() {
 
 #[tokio::test]
 async fn extreme_thread_depth_and_reply_fanout_stay_within_a_node_budget() {
-    let storage = Arc::new(MemoryStorage::default());
+    let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
     let root = "at://did:plc:alice/app.bsky.feed.post/root";
     for index in 0..150 {
         let (rkey, record) = if index == 0 {

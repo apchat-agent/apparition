@@ -3,6 +3,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    cmp::Reverse,
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
@@ -279,7 +280,28 @@ pub trait Storage: Send + Sync {
         collection: &str,
         uri: &str,
     ) -> Result<Option<IndexedRecord>, StorageError>;
-    fn replies_to(&self, parent_uri: &str) -> Result<Vec<IndexedRecord>, StorageError>;
+    fn replies_to(
+        &self,
+        parent_uri: &str,
+        limit: usize,
+    ) -> Result<Vec<IndexedRecord>, StorageError>;
+    fn records_for_subject(
+        &self,
+        collection: &str,
+        subject_uri: &str,
+        limit: usize,
+    ) -> Result<Vec<IndexedRecord>, StorageError>;
+    fn follows_for_actor(
+        &self,
+        did: &str,
+        limit: usize,
+    ) -> Result<Vec<IndexedRecord>, StorageError>;
+    fn followers_for_did(
+        &self,
+        did: &str,
+        limit: usize,
+    ) -> Result<Vec<IndexedRecord>, StorageError>;
+    fn profile_counts(&self, did: &str) -> Result<(usize, usize, usize), StorageError>;
     fn notifications_for(
         &self,
         did: &str,
@@ -486,7 +508,11 @@ impl Storage for MemoryStorage {
             .cloned())
     }
 
-    fn replies_to(&self, parent_uri: &str) -> Result<Vec<IndexedRecord>, StorageError> {
+    fn replies_to(
+        &self,
+        parent_uri: &str,
+        limit: usize,
+    ) -> Result<Vec<IndexedRecord>, StorageError> {
         let mut replies = self
             .inner
             .lock()
@@ -508,7 +534,96 @@ impl Storage for MemoryStorage {
                 .cmp(&right.time_us)
                 .then_with(|| left.uri.cmp(&right.uri))
         });
+        replies.truncate(limit.clamp(1, 100));
         Ok(replies)
+    }
+
+    fn records_for_subject(
+        &self,
+        collection: &str,
+        subject_uri: &str,
+        limit: usize,
+    ) -> Result<Vec<IndexedRecord>, StorageError> {
+        let mut records = self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .records
+            .values()
+            .filter(|record| {
+                record.collection == collection
+                    && record
+                        .record
+                        .pointer("/subject/uri")
+                        .and_then(Value::as_str)
+                        == Some(subject_uri)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        records.sort_by_key(|record| Reverse(record.time_us));
+        records.truncate(limit.clamp(1, 101));
+        Ok(records)
+    }
+
+    fn follows_for_actor(
+        &self,
+        did: &str,
+        limit: usize,
+    ) -> Result<Vec<IndexedRecord>, StorageError> {
+        let mut records = self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .records
+            .values()
+            .filter(|record| record.collection == "app.bsky.graph.follow" && record.did == did)
+            .cloned()
+            .collect::<Vec<_>>();
+        records.sort_by_key(|record| Reverse(record.time_us));
+        records.truncate(limit.clamp(1, 101));
+        Ok(records)
+    }
+
+    fn followers_for_did(
+        &self,
+        did: &str,
+        limit: usize,
+    ) -> Result<Vec<IndexedRecord>, StorageError> {
+        let mut records = self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .records
+            .values()
+            .filter(|record| {
+                record.collection == "app.bsky.graph.follow"
+                    && record.record.get("subject").and_then(Value::as_str) == Some(did)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        records.sort_by_key(|record| Reverse(record.time_us));
+        records.truncate(limit.clamp(1, 101));
+        Ok(records)
+    }
+
+    fn profile_counts(&self, did: &str) -> Result<(usize, usize, usize), StorageError> {
+        let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut follows = 0;
+        let mut followers = 0;
+        let mut posts = 0;
+        for record in inner.records.values() {
+            match record.collection.as_str() {
+                "app.bsky.graph.follow" => {
+                    follows += usize::from(record.did == did);
+                    followers += usize::from(
+                        record.record.get("subject").and_then(Value::as_str) == Some(did),
+                    );
+                }
+                "app.bsky.feed.post" => posts += usize::from(record.did == did),
+                _ => {}
+            }
+        }
+        Ok((follows, followers, posts))
     }
 
     fn notifications_for(
@@ -1015,6 +1130,8 @@ impl SqliteStorage {
                  ON records(collection, did, json_type(record_json, '$.reply'), time_us DESC, uri DESC);
              CREATE INDEX IF NOT EXISTS records_follow_actor_subject
                  ON records(collection, did, json_extract(record_json, '$.subject'));
+             CREATE INDEX IF NOT EXISTS records_follow_subject_actor
+                 ON records(collection, json_extract(record_json, '$.subject'), did, time_us DESC);
              CREATE INDEX IF NOT EXISTS records_collection_subject_uri
                  ON records(collection, json_extract(record_json, '$.subject.uri'), time_us DESC);
              CREATE INDEX IF NOT EXISTS records_collection_parent_uri
@@ -1220,17 +1337,91 @@ impl Storage for SqliteStorage {
             .map_err(Into::into)
     }
 
-    fn replies_to(&self, parent_uri: &str) -> Result<Vec<IndexedRecord>, StorageError> {
+    fn replies_to(
+        &self,
+        parent_uri: &str,
+        limit: usize,
+    ) -> Result<Vec<IndexedRecord>, StorageError> {
         let conn = self.conn()?;
         let mut statement = conn.prepare(
             "SELECT did, collection, rkey, uri, cid, time_us, record_json FROM records
              WHERE collection='app.bsky.feed.post' AND json_extract(record_json, '$.reply.parent.uri')=?1
-             ORDER BY time_us ASC, uri ASC",
+             ORDER BY time_us ASC, uri ASC LIMIT ?2",
         )?;
         statement
-            .query_map([parent_uri], row_to_record)?
+            .query_map(
+                params![parent_uri, limit.clamp(1, 100) as i64],
+                row_to_record,
+            )?
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    fn records_for_subject(
+        &self,
+        collection: &str,
+        subject_uri: &str,
+        limit: usize,
+    ) -> Result<Vec<IndexedRecord>, StorageError> {
+        let conn = self.conn()?;
+        let mut statement = conn.prepare(
+            "SELECT did, collection, rkey, uri, cid, time_us, record_json FROM records
+             WHERE collection=?1 AND json_extract(record_json, '$.subject.uri')=?2
+             ORDER BY time_us DESC, uri DESC LIMIT ?3",
+        )?;
+        statement
+            .query_map(
+                params![collection, subject_uri, limit.clamp(1, 101) as i64],
+                row_to_record,
+            )?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    fn follows_for_actor(
+        &self,
+        did: &str,
+        limit: usize,
+    ) -> Result<Vec<IndexedRecord>, StorageError> {
+        let conn = self.conn()?;
+        let mut statement = conn.prepare(
+            "SELECT did, collection, rkey, uri, cid, time_us, record_json FROM records
+             WHERE collection='app.bsky.graph.follow' AND did=?1
+             ORDER BY time_us DESC, uri DESC LIMIT ?2",
+        )?;
+        statement
+            .query_map(params![did, limit.clamp(1, 101) as i64], row_to_record)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    fn followers_for_did(
+        &self,
+        did: &str,
+        limit: usize,
+    ) -> Result<Vec<IndexedRecord>, StorageError> {
+        let conn = self.conn()?;
+        let mut statement = conn.prepare(
+            "SELECT did, collection, rkey, uri, cid, time_us, record_json FROM records
+             WHERE collection='app.bsky.graph.follow' AND json_extract(record_json, '$.subject')=?1
+             ORDER BY time_us DESC, uri DESC LIMIT ?2",
+        )?;
+        statement
+            .query_map(params![did, limit.clamp(1, 101) as i64], row_to_record)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    fn profile_counts(&self, did: &str) -> Result<(usize, usize, usize), StorageError> {
+        let counts: (i64, i64, i64) = self.conn()?.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM records WHERE collection='app.bsky.graph.follow' AND did=?1),
+                (SELECT COUNT(*) FROM records WHERE collection='app.bsky.graph.follow' AND json_extract(record_json, '$.subject')=?1),
+                (SELECT COUNT(*) FROM records WHERE collection='app.bsky.feed.post' AND did=?1)",
+            [did],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        Ok((counts.0 as usize, counts.1 as usize, counts.2 as usize))
     }
 
     fn notifications_for(

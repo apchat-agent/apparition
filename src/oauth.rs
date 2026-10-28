@@ -1602,12 +1602,12 @@ where
         .get("parentHeight")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(80)
-        .min(100);
+        .min(20);
     let depth = query
         .get("depth")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(3)
-        .min(20);
+        .min(6);
     let ancestors = match thread_ancestors(state.storage.as_ref(), &record, parent_height) {
         Ok(ancestors) => ancestors,
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
@@ -1627,12 +1627,14 @@ where
             )
         })
         .collect::<String>();
+    let mut reply_budget = 100;
     let replies_html = match render_thread_replies(
         state.storage.as_ref(),
         &record,
         &viewer_did,
         write_forms_enabled,
         depth,
+        &mut reply_budget,
     ) {
         Ok(replies) => replies,
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
@@ -1692,18 +1694,29 @@ fn render_thread_replies<S: Storage>(
     viewer_did: &str,
     write_forms_enabled: bool,
     depth: usize,
+    budget: &mut usize,
 ) -> Result<String, StorageError> {
-    if depth == 0 {
+    if depth == 0 || *budget == 0 {
         return Ok(String::new());
     }
-    let replies = storage.replies_to(&record.uri)?;
+    let replies = storage.replies_to(&record.uri, (*budget).min(100))?;
     if replies.is_empty() {
         return Ok(String::new());
     }
     let mut html = String::from("<ol>");
     for reply in replies {
-        let nested =
-            render_thread_replies(storage, &reply, viewer_did, write_forms_enabled, depth - 1)?;
+        if *budget == 0 {
+            break;
+        }
+        *budget -= 1;
+        let nested = render_thread_replies(
+            storage,
+            &reply,
+            viewer_did,
+            write_forms_enabled,
+            depth - 1,
+            budget,
+        )?;
         html.push_str(&format!(
             "<li>{}{nested}</li>",
             render_web_post(storage, &reply, viewer_did, write_forms_enabled, false)
@@ -2182,9 +2195,9 @@ fn render_web_quote<S: Storage>(storage: &S, embed: &Value) -> String {
         None
     } else {
         storage
-            .records()
+            .record_by_uri("app.bsky.feed.post", uri)
             .ok()
-            .and_then(|records| records.into_iter().find(|record| record.uri == uri))
+            .flatten()
     };
     if let Some(quoted) = quoted {
         let profile = profile_view_from_storage(storage, &quoted.did)

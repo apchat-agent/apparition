@@ -241,15 +241,18 @@ async fn get_posts<S: Storage, B: IdentityBackend>(
     if uris.is_empty() {
         return Err(ApiError::bad_request("missing query parameter uris"));
     }
-    let records = state.storage.records().map_err(|_| ApiError::internal())?;
-    let posts = uris
+    let mut records = Vec::new();
+    for uri in uris.iter().take(25) {
+        if let Some(record) = state
+            .storage
+            .record_by_uri(POST, uri)
+            .map_err(|_| ApiError::internal())?
+        {
+            records.push(record);
+        }
+    }
+    let posts = records
         .iter()
-        .take(25)
-        .filter_map(|uri| {
-            records
-                .iter()
-                .find(|record| record.collection == POST && record.uri == uri.as_str())
-        })
         .map(|record| {
             post_view(
                 &state,
@@ -277,13 +280,14 @@ async fn get_post_thread<S: Storage, B: IdentityBackend>(
         .get("depth")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(6)
-        .min(100);
+        .min(6);
     let parent_height = query
         .get("parentHeight")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(80)
-        .min(100);
+        .min(20);
     let viewer_did = claims.as_ref().map(|claims| claims.iss.as_str());
+    let mut budget = 100;
     let thread = thread_view(
         &state,
         &post,
@@ -291,6 +295,7 @@ async fn get_post_thread<S: Storage, B: IdentityBackend>(
         parent_height,
         viewer_did,
         &mut HashSet::new(),
+        &mut budget,
     )?;
     Ok(Json(json!({"thread":thread})))
 }
@@ -302,7 +307,12 @@ fn thread_view<S: Storage, B: IdentityBackend>(
     parent_height: usize,
     viewer_did: Option<&str>,
     visited: &mut HashSet<String>,
+    budget: &mut usize,
 ) -> Result<Value, ApiError> {
+    if *budget == 0 {
+        return Ok(Value::Null);
+    }
+    *budget -= 1;
     if !visited.insert(record.uri.clone()) {
         return Ok(json!({
             "$type":"app.bsky.feed.defs#threadViewPost",
@@ -328,6 +338,7 @@ fn thread_view<S: Storage, B: IdentityBackend>(
                     parent_height - 1,
                     viewer_did,
                     visited,
+                    budget,
                 )?)
             } else {
                 None
@@ -339,14 +350,27 @@ fn thread_view<S: Storage, B: IdentityBackend>(
         None
     }
     .unwrap_or(Value::Null);
-    let replies = if depth > 0 {
-        state
+    let replies = if depth > 0 && *budget > 0 {
+        let candidates = state
             .storage
-            .replies_to(&record.uri)
-            .map_err(|_| ApiError::internal())?
-            .into_iter()
-            .map(|reply| thread_view(state, &reply, depth - 1, 0, viewer_did, visited))
-            .collect::<Result<Vec<_>, _>>()?
+            .replies_to(&record.uri, (*budget).min(100))
+            .map_err(|_| ApiError::internal())?;
+        let mut replies = Vec::new();
+        for reply in candidates {
+            if *budget == 0 {
+                break;
+            }
+            replies.push(thread_view(
+                state,
+                &reply,
+                depth - 1,
+                0,
+                viewer_did,
+                visited,
+                budget,
+            )?);
+        }
+        replies
     } else {
         Vec::new()
     };
@@ -421,9 +445,8 @@ async fn get_likes<S: Storage, B: IdentityBackend>(
 ) -> Result<Json<Value>, ApiError> {
     let _ = authorize(&state, &headers, "app.bsky.feed.getLikes", false).await?;
     let uri = required(&query, "uri")?;
-    let records = state.storage.records().map_err(|_| ApiError::internal())?;
-    let likes = records.iter().filter(|record| record.collection == LIKE && subject_uri(record) == Some(uri))
-        .take(query_limit(&query, 50)).map(|record| json!({
+    let likes = state.storage.records_for_subject(LIKE, uri, query_limit(&query, 50))
+        .map_err(|_| ApiError::internal())?.iter().map(|record| json!({
             "actor":profile_view(&state, &record.did).unwrap_or_else(|_| json!({"did":record.did,"handle":"handle.invalid"})),
             "createdAt":record.record.get("createdAt").cloned().unwrap_or(Value::Null),
             "indexedAt":record.record.get("createdAt").cloned().unwrap_or(Value::Null)
@@ -438,11 +461,12 @@ async fn get_reposted_by<S: Storage, B: IdentityBackend>(
 ) -> Result<Json<Value>, ApiError> {
     let _ = authorize(&state, &headers, "app.bsky.feed.getRepostedBy", false).await?;
     let uri = required(&query, "uri")?;
-    let records = state.storage.records().map_err(|_| ApiError::internal())?;
-    let reposted_by = records
+    let reposts = state
+        .storage
+        .records_for_subject(REPOST, uri, query_limit(&query, 50))
+        .map_err(|_| ApiError::internal())?;
+    let reposted_by = reposts
         .iter()
-        .filter(|record| record.collection == REPOST && subject_uri(record) == Some(uri))
-        .take(query_limit(&query, 50))
         .map(|record| profile_view(&state, &record.did))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(
@@ -457,10 +481,12 @@ async fn get_follows<S: Storage, B: IdentityBackend>(
 ) -> Result<Json<Value>, ApiError> {
     let _ = authorize(&state, &headers, "app.bsky.graph.getFollows", false).await?;
     let actor = actor_to_did(&state, required(&query, "actor")?)?;
-    let records = state.storage.records().map_err(|_| ApiError::internal())?;
+    let records = state
+        .storage
+        .follows_for_actor(&actor, query_limit(&query, 50))
+        .map_err(|_| ApiError::internal())?;
     let follows = records
         .iter()
-        .filter(|record| record.collection == FOLLOW && record.did == actor)
         .filter_map(|record| record.record.get("subject").and_then(Value::as_str))
         .take(query_limit(&query, 50))
         .map(|did| profile_view(&state, did))
@@ -477,14 +503,12 @@ async fn get_followers<S: Storage, B: IdentityBackend>(
 ) -> Result<Json<Value>, ApiError> {
     let _ = authorize(&state, &headers, "app.bsky.graph.getFollowers", false).await?;
     let actor = actor_to_did(&state, required(&query, "actor")?)?;
-    let records = state.storage.records().map_err(|_| ApiError::internal())?;
+    let records = state
+        .storage
+        .followers_for_did(&actor, query_limit(&query, 50))
+        .map_err(|_| ApiError::internal())?;
     let followers = records
         .iter()
-        .filter(|record| {
-            record.collection == FOLLOW
-                && record.record.get("subject").and_then(Value::as_str) == Some(actor.as_str())
-        })
-        .take(query_limit(&query, 50))
         .map(|record| profile_view(&state, &record.did))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(
@@ -637,22 +661,7 @@ pub(crate) fn profile_view_from_storage<S: Storage>(
 ) -> Result<Value, StorageError> {
     let profile = storage.get_record(did, ACTOR_PROFILE, "self")?;
     let record = profile.as_ref().map(|profile| &profile.record);
-    let all_records = storage.records()?;
-    let follows = all_records
-        .iter()
-        .filter(|entry| entry.collection == FOLLOW && entry.did == did)
-        .count();
-    let followers = all_records
-        .iter()
-        .filter(|entry| {
-            entry.collection == FOLLOW
-                && entry.record.get("subject").and_then(Value::as_str) == Some(did)
-        })
-        .count();
-    let posts = all_records
-        .iter()
-        .filter(|entry| entry.collection == POST && entry.did == did)
-        .count();
+    let (follows, followers, posts) = storage.profile_counts(did)?;
     let handle = if let Some(handle) = storage.verified_handle(did)? {
         handle
     } else if storage.handle_is_invalid(did)? {
@@ -737,13 +746,6 @@ fn post_view<S: Storage, B: IdentityBackend>(
         post["embed"] = embed.clone();
     }
     Ok(post)
-}
-
-fn subject_uri(record: &IndexedRecord) -> Option<&str> {
-    record
-        .record
-        .pointer("/subject/uri")
-        .and_then(Value::as_str)
 }
 
 fn follow_subjects(records: &[IndexedRecord], actor: &str) -> HashSet<String> {
