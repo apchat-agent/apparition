@@ -280,6 +280,17 @@ pub enum HandleRefreshError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Resolution(#[from] ResolutionError),
+    #[error("database worker task failed: {0}")]
+    StorageTask(#[from] tokio::task::JoinError),
+}
+
+async fn storage_call<S, T, F>(storage: Arc<S>, operation: F) -> Result<T, HandleRefreshError>
+where
+    S: Storage + 'static,
+    T: Send + 'static,
+    F: FnOnce(&S) -> Result<T, StorageError> + Send + 'static,
+{
+    Ok(tokio::task::spawn_blocking(move || operation(&storage)).await??)
 }
 
 /// Periodically re-verifies stored handles for DIDs with indexed or registered data.
@@ -292,7 +303,7 @@ pub struct HandleRefreshWorker<S: Storage, B: IdentityBackend> {
     last_refresh: Mutex<Option<Instant>>,
 }
 
-impl<S: Storage, B: IdentityBackend> HandleRefreshWorker<S, B> {
+impl<S: Storage + 'static, B: IdentityBackend> HandleRefreshWorker<S, B> {
     pub fn new(
         storage: Arc<S>,
         resolver: IdentityResolver<B>,
@@ -314,7 +325,11 @@ impl<S: Storage, B: IdentityBackend> HandleRefreshWorker<S, B> {
             .storage
             .stale_handle_dids(self.handle_ttl, HANDLE_REFRESH_BATCH)?
         {
-            self.storage.queue_handle_refresh(&did)?;
+            let queued_did = did.clone();
+            storage_call(Arc::clone(&self.storage), move |storage| {
+                storage.queue_handle_refresh(&queued_did)
+            })
+            .await?;
         }
 
         let pending = self
@@ -379,21 +394,29 @@ impl<S: Storage, B: IdentityBackend> HandleRefreshWorker<S, B> {
                 | ResolutionError::UnsupportedDid(_)),
             ) => {
                 tracing::debug!(%did, %error, "DID verification failed; clearing its cached handle");
-                self.storage.clear_verified_handle(did)?;
-                self.storage.complete_handle_refresh(did)?;
+                let storage_did = did.to_owned();
+                storage_call(Arc::clone(&self.storage), move |storage| {
+                    storage.clear_verified_handle(&storage_did)?;
+                    storage.complete_handle_refresh(&storage_did)
+                })
+                .await?;
                 return Ok(());
             }
             Err(error) => return Err(error.into()),
         };
-        match self
+        let verified_handle = self
             .resolver
             .verified_handle_for_document(&document)
-            .await?
-        {
-            Some(handle) => self.storage.set_verified_handle(did, &handle)?,
-            None => self.storage.clear_verified_handle(did)?,
-        }
-        self.storage.complete_handle_refresh(did)?;
+            .await?;
+        let storage_did = did.to_owned();
+        storage_call(Arc::clone(&self.storage), move |storage| {
+            match verified_handle {
+                Some(handle) => storage.set_verified_handle(&storage_did, &handle)?,
+                None => storage.clear_verified_handle(&storage_did)?,
+            }
+            storage.complete_handle_refresh(&storage_did)
+        })
+        .await?;
         Ok(())
     }
 }

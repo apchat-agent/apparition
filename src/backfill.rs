@@ -46,6 +46,15 @@ pub enum BackfillError {
     StorageTask(#[from] tokio::task::JoinError),
 }
 
+async fn storage_call<S, T, F>(storage: Arc<S>, operation: F) -> Result<T, BackfillError>
+where
+    S: Storage + 'static,
+    T: Send + 'static,
+    F: FnOnce(&S) -> Result<T, StorageError> + Send + 'static,
+{
+    Ok(tokio::task::spawn_blocking(move || operation(&storage)).await??)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RepoRecord {
     pub collection: String,
@@ -535,7 +544,12 @@ where
                 }
                 let result = self.backfill_one(&did).await;
                 if let Err(error) = result {
-                    match self.storage.record_backfill_failure(&did) {
+                    let storage_did = did.clone();
+                    match storage_call(Arc::clone(&self.storage), move |storage| {
+                        storage.record_backfill_failure(&storage_did)
+                    })
+                    .await
+                    {
                         Ok(retry_after) => tracing::warn!(
                             %did,
                             %error,
@@ -568,15 +582,20 @@ where
             .resolve_did_document(did)
             .await
             .map_err(|error| BackfillError::Verify(error.to_string()))?;
-        match self
+        let verified_handle = self
             .resolver
             .verified_handle_for_document(&document)
             .await
-            .map_err(|error| BackfillError::Verify(error.to_string()))?
-        {
-            Some(handle) => self.storage.set_verified_handle(did, &handle)?,
-            None => self.storage.clear_verified_handle(did)?,
-        }
+            .map_err(|error| BackfillError::Verify(error.to_string()))?;
+        let storage_did = did.to_owned();
+        storage_call(
+            Arc::clone(&self.storage),
+            move |storage| match verified_handle {
+                Some(handle) => storage.set_verified_handle(&storage_did, &handle),
+                None => storage.clear_verified_handle(&storage_did),
+            },
+        )
+        .await?;
         let pds = document.pds_endpoint().ok_or_else(|| {
             BackfillError::InvalidPds(format!("no valid PDS endpoint in {did} DID document"))
         })?;
@@ -586,7 +605,11 @@ where
             ))
         })?;
         self.backfiller.backfill(did, &pds, &signing_key).await?;
-        self.storage.complete_backfill(did)?;
+        let storage_did = did.to_owned();
+        storage_call(Arc::clone(&self.storage), move |storage| {
+            storage.complete_backfill(&storage_did)
+        })
+        .await?;
         Ok(())
     }
 }

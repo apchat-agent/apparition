@@ -8,7 +8,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, TryLockError,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -46,6 +46,14 @@ fn epoch_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
+fn epoch_micros() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
         .min(i64::MAX as u128) as i64
 }
 
@@ -1142,6 +1150,7 @@ pub struct SqliteStorage {
     connection: Mutex<Connection>,
     read_connections: Vec<Mutex<Connection>>,
     next_read_connection: AtomicU64,
+    deferred_handle_refreshes: Mutex<HashSet<String>>,
     path: PathBuf,
     checkpointer_stop: Arc<AtomicBool>,
     checkpoint_backlog: Arc<AtomicU64>,
@@ -1250,6 +1259,7 @@ impl SqliteStorage {
              CREATE TABLE IF NOT EXISTS follows (
                  actor TEXT NOT NULL,
                  subject TEXT NOT NULL,
+                 following INTEGER NOT NULL DEFAULT 1,
                  PRIMARY KEY (actor, subject)
              );
              CREATE TABLE IF NOT EXISTS backfill_queue (
@@ -1284,6 +1294,7 @@ impl SqliteStorage {
                  requested_at INTEGER NOT NULL DEFAULT (unixepoch())
              );",
         )?;
+        migrate_follow_state(&connection)?;
         connection.execute(
             "DELETE FROM backfill_queue
              WHERE did NOT IN (
@@ -1317,6 +1328,7 @@ impl SqliteStorage {
             connection: Mutex::new(connection),
             read_connections,
             next_read_connection: AtomicU64::new(0),
+            deferred_handle_refreshes: Mutex::new(HashSet::new()),
             path,
             checkpointer_stop: stop,
             checkpoint_backlog: backlog,
@@ -1347,6 +1359,51 @@ impl SqliteStorage {
             .map_err(|_| StorageError::Poisoned)
     }
 
+    fn pace_snapshot_writes(
+        records_per_second: Option<u64>,
+        write_started: Instant,
+        records_written: u64,
+    ) {
+        let Some(rate) = records_per_second else {
+            return;
+        };
+        let target_nanos = u128::from(records_written)
+            .saturating_mul(1_000_000_000)
+            .checked_div(u128::from(rate.max(1)))
+            .unwrap_or(u128::MAX)
+            .min(u128::from(u64::MAX)) as u64;
+        if let Some(remaining) =
+            Duration::from_nanos(target_nanos).checked_sub(write_started.elapsed())
+        {
+            std::thread::sleep(remaining);
+        }
+    }
+
+    fn delete_snapshot_rows(
+        &self,
+        did: &str,
+        cutoff_us: i64,
+        sql: &str,
+        records_per_second: Option<u64>,
+        write_started: Instant,
+        records_written: &mut u64,
+    ) -> Result<(), StorageError> {
+        loop {
+            let mut connection = self.conn()?;
+            let transaction = connection.transaction()?;
+            let deleted =
+                transaction.execute(sql, params![did, cutoff_us, SNAPSHOT_BATCH as i64])?;
+            transaction.commit()?;
+            drop(connection);
+            if deleted == 0 {
+                return Ok(());
+            }
+            *records_written = records_written.saturating_add(deleted as u64);
+            Self::pace_snapshot_writes(records_per_second, write_started, *records_written);
+            std::thread::yield_now();
+        }
+    }
+
     fn replace_repo_snapshot_inner(
         &self,
         did: &str,
@@ -1358,54 +1415,125 @@ impl SqliteStorage {
             .iter()
             .map(|record| serde_json::to_string(&record.record))
             .collect::<Result<Vec<_>, _>>()?;
+        let write_started = Instant::now();
+        let cutoff_us = epoch_micros();
+        let follow_rowid_cutoff: i64 = self.conn()?.query_row(
+            "SELECT COALESCE(MAX(rowid),0) FROM follows WHERE actor=?1",
+            [did],
+            |row| row.get(0),
+        )?;
+        let scope_rowid_cutoff: i64 = self.conn()?.query_row(
+            "SELECT COALESCE(MAX(rowid),0) FROM backfill_scope
+             WHERE owner_did=?1 AND target_did!=?1",
+            [did],
+            |row| row.get(0),
+        )?;
+        let mut records_written = 0_u64;
+        self.delete_snapshot_rows(
+            did,
+            cutoff_us,
+            "DELETE FROM records WHERE rowid IN (
+                 SELECT rowid FROM records WHERE did=?1 AND time_us<=?2 ORDER BY rowid LIMIT ?3
+             )",
+            records_per_second,
+            write_started,
+            &mut records_written,
+        )?;
+        self.delete_snapshot_rows(
+            did,
+            cutoff_us,
+            "DELETE FROM notification_events WHERE rowid IN (
+                 SELECT rowid FROM notification_events WHERE source_did=?1 AND time_us<=?2 ORDER BY rowid LIMIT ?3
+             )",
+            records_per_second,
+            write_started,
+            &mut records_written,
+        )?;
+        self.delete_snapshot_rows(
+            did,
+            follow_rowid_cutoff,
+            "DELETE FROM follows WHERE rowid IN (
+                 SELECT rowid FROM follows WHERE actor=?1 AND rowid<=?2 ORDER BY rowid LIMIT ?3
+             )",
+            records_per_second,
+            write_started,
+            &mut records_written,
+        )?;
+        self.delete_snapshot_rows(
+            did,
+            scope_rowid_cutoff,
+            "DELETE FROM backfill_scope WHERE rowid IN (
+                 SELECT rowid FROM backfill_scope
+                 WHERE owner_did=?1 AND target_did!=?1 AND rowid<=?2
+                 ORDER BY rowid LIMIT ?3
+             )",
+            records_per_second,
+            write_started,
+            &mut records_written,
+        )?;
         let mut connection = self.conn()?;
         let transaction = connection.transaction()?;
-        transaction.execute("DELETE FROM records WHERE did=?1", [did])?;
-        transaction.execute("DELETE FROM notification_events WHERE source_did=?1", [did])?;
-        transaction.execute("DELETE FROM follows WHERE actor=?1", [did])?;
-        transaction.execute(
-            "DELETE FROM backfill_scope WHERE owner_did=?1 AND target_did!=?1",
-            [did],
-        )?;
         let is_registered: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM registered_users WHERE did=?1)",
             [did],
             |row| row.get(0),
         )?;
-        {
-            let mut insert_follow = transaction
-                .prepare("INSERT OR IGNORE INTO follows(actor,subject) VALUES(?1,?2)")?;
-            let mut insert_scope = transaction.prepare(
-                "INSERT OR IGNORE INTO backfill_scope(owner_did,target_did) VALUES(?1,?2)",
-            )?;
-            let mut enqueue = transaction.prepare(
-                "INSERT OR IGNORE INTO backfill_queue(did)
-                 SELECT ?1 WHERE (SELECT COUNT(*) FROM backfill_queue) < ?2
-                    OR EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
-            )?;
-            let mut set_pending = transaction.prepare(
-                "INSERT INTO backfill_status(did,done) VALUES(?1,0)
-                 ON CONFLICT(did) DO UPDATE SET done=0",
-            )?;
-            for subject in following {
-                insert_follow.execute(params![did, subject])?;
-                if is_registered {
-                    enqueue.execute(params![subject, MAX_BACKFILL_QUEUE])?;
-                    if transaction.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
-                        [subject],
-                        |row| row.get::<_, bool>(0),
-                    )? {
-                        insert_scope.execute(params![did, subject])?;
-                        set_pending.execute([subject])?;
-                    }
-                }
-            }
-        }
         transaction.commit()?;
         drop(connection);
 
-        let write_started = Instant::now();
+        let follow_batches = following.chunks(SNAPSHOT_BATCH).collect::<Vec<_>>();
+        for (batch_index, batch) in follow_batches.iter().enumerate() {
+            let mut connection = self.conn()?;
+            let transaction = connection.transaction()?;
+            let mut inserted_follow_rows = 0_u64;
+            {
+                // Preserve follow changes that arrived after cleanup began.
+                // Tombstones let a live unfollow win over the fetched snapshot.
+                let mut insert_follow = transaction.prepare(
+                    "INSERT OR IGNORE INTO follows(actor,subject,following) VALUES(?1,?2,1)",
+                )?;
+                let mut insert_scope = transaction.prepare(
+                    "INSERT OR IGNORE INTO backfill_scope(owner_did,target_did) VALUES(?1,?2)",
+                )?;
+                let mut enqueue = transaction.prepare(
+                    "INSERT OR IGNORE INTO backfill_queue(did)
+                     SELECT ?1 WHERE (SELECT COUNT(*) FROM backfill_queue) < ?2
+                        OR EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
+                )?;
+                let mut set_pending = transaction.prepare(
+                    "INSERT INTO backfill_status(did,done) VALUES(?1,0)
+                     ON CONFLICT(did) DO UPDATE SET done=0",
+                )?;
+                for subject in *batch {
+                    inserted_follow_rows = inserted_follow_rows
+                        .saturating_add(insert_follow.execute(params![did, subject])? as u64);
+                    let is_following: bool = transaction.query_row(
+                        "SELECT following FROM follows WHERE actor=?1 AND subject=?2",
+                        params![did, subject],
+                        |row| row.get(0),
+                    )?;
+                    if is_registered && is_following {
+                        enqueue.execute(params![subject, MAX_BACKFILL_QUEUE])?;
+                        if transaction.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
+                            [subject],
+                            |row| row.get::<_, bool>(0),
+                        )? {
+                            insert_scope.execute(params![did, subject])?;
+                            set_pending.execute([subject])?;
+                        }
+                    }
+                }
+            }
+            transaction.commit()?;
+            drop(connection);
+            std::thread::yield_now();
+            records_written = records_written.saturating_add(inserted_follow_rows);
+            if records_per_second.is_some() && batch_index + 1 < follow_batches.len() {
+                Self::pace_snapshot_writes(records_per_second, write_started, records_written);
+            }
+        }
+
         let total_batches = records.len().div_ceil(SNAPSHOT_BATCH);
         for (batch_index, (batch, batch_json)) in records
             .chunks(SNAPSHOT_BATCH)
@@ -1414,6 +1542,7 @@ impl SqliteStorage {
         {
             let mut connection = self.conn()?;
             let transaction = connection.transaction()?;
+            let mut inserted_records = 0_u64;
             {
                 // A live event may have written one of these rows between batches;
                 // it is newer than the snapshot, so it wins.
@@ -1433,6 +1562,7 @@ impl SqliteStorage {
                         json,
                     ])?;
                     if inserted > 0 {
+                        inserted_records += inserted as u64;
                         write_notification_events(&transaction, record)?;
                     }
                 }
@@ -1441,20 +1571,10 @@ impl SqliteStorage {
             drop(connection);
             // std's Mutex is not fair: without a yield this thread takes it straight back.
             std::thread::yield_now();
+            records_written = records_written.saturating_add(inserted_records);
 
-            if let Some(rate) = records_per_second
-                && batch_index + 1 < total_batches
-            {
-                let written = ((batch_index + 1) * SNAPSHOT_BATCH).min(records.len()) as u128;
-                let target_nanos = written
-                    .saturating_mul(1_000_000_000)
-                    .checked_div(rate.max(1) as u128)
-                    .unwrap_or(u128::MAX)
-                    .min(u64::MAX as u128) as u64;
-                let target = Duration::from_nanos(target_nanos);
-                if let Some(remaining) = target.checked_sub(write_started.elapsed()) {
-                    std::thread::sleep(remaining);
-                }
+            if records_per_second.is_some() && batch_index + 1 < total_batches {
+                Self::pace_snapshot_writes(records_per_second, write_started, records_written);
             }
         }
         Ok(())
@@ -1847,7 +1967,8 @@ impl Storage for SqliteStorage {
         transaction.execute("DELETE FROM backfill_scope WHERE owner_did=?1", [did])?;
         transaction.execute(
             "DELETE FROM backfill_queue WHERE did=?1 AND NOT EXISTS (
-                 SELECT 1 FROM follows f JOIN registered_users r ON f.actor=r.did WHERE f.subject=?1
+                 SELECT 1 FROM follows f JOIN registered_users r ON f.actor=r.did
+                 WHERE f.subject=?1 AND f.following=1
              )",
             [did],
         )?;
@@ -1865,16 +1986,11 @@ impl Storage for SqliteStorage {
 
     fn set_follow(&self, actor: &str, subject: &str, following: bool) -> Result<(), StorageError> {
         let connection = self.conn()?;
-        if following {
-            connection.execute(
-                "INSERT OR IGNORE INTO follows(actor,subject) VALUES(?1,?2)",
-                params![actor, subject],
-            )?;
-        } else {
-            connection.execute(
-                "DELETE FROM follows WHERE actor=?1 AND subject=?2",
-                params![actor, subject],
-            )?;
+        connection.execute(
+            "INSERT OR REPLACE INTO follows(actor,subject,following) VALUES(?1,?2,?3)",
+            params![actor, subject, following],
+        )?;
+        if !following {
             connection.execute(
                 "DELETE FROM backfill_scope WHERE owner_did=?1 AND target_did=?2",
                 params![actor, subject],
@@ -1885,7 +2001,8 @@ impl Storage for SqliteStorage {
 
     fn is_followed_by_registered(&self, did: &str) -> Result<bool, StorageError> {
         Ok(self.read_conn()?.query_row(
-            "SELECT EXISTS(SELECT 1 FROM follows f JOIN registered_users r ON f.actor=r.did WHERE f.subject=?1)",
+            "SELECT EXISTS(SELECT 1 FROM follows f JOIN registered_users r ON f.actor=r.did
+             WHERE f.subject=?1 AND f.following=1)",
             [did],
             |row| row.get(0),
         )?)
@@ -1901,7 +2018,7 @@ impl Storage for SqliteStorage {
                     OR EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1))
                AND (EXISTS(SELECT 1 FROM registered_users WHERE did=?1)
                     OR EXISTS(SELECT 1 FROM follows f JOIN registered_users r ON r.did=f.actor
-                              WHERE f.subject=?1))",
+                              WHERE f.subject=?1 AND f.following=1))",
             params![did, MAX_BACKFILL_QUEUE],
         )?;
         transaction.execute(
@@ -1923,14 +2040,14 @@ impl Storage for SqliteStorage {
              WHERE ((SELECT COUNT(*) FROM backfill_queue) < ?3
                     OR EXISTS(SELECT 1 FROM backfill_queue WHERE did=?2))
                AND EXISTS(SELECT 1 FROM registered_users WHERE did=?1)
-               AND (?1=?2 OR EXISTS(SELECT 1 FROM follows WHERE actor=?1 AND subject=?2))",
+               AND (?1=?2 OR EXISTS(SELECT 1 FROM follows WHERE actor=?1 AND subject=?2 AND following=1))",
             params![owner_did, did, MAX_BACKFILL_QUEUE],
         )?;
         transaction.execute(
-            "INSERT OR IGNORE INTO backfill_scope(owner_did,target_did)
+            "INSERT OR REPLACE INTO backfill_scope(owner_did,target_did)
              SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM backfill_queue WHERE did=?2)
                AND EXISTS(SELECT 1 FROM registered_users WHERE did=?1)
-               AND (?1=?2 OR EXISTS(SELECT 1 FROM follows WHERE actor=?1 AND subject=?2))",
+               AND (?1=?2 OR EXISTS(SELECT 1 FROM follows WHERE actor=?1 AND subject=?2 AND following=1))",
             params![owner_did, did],
         )?;
         transaction.execute(
@@ -2113,7 +2230,8 @@ impl Storage for SqliteStorage {
     fn is_tracked_did(&self, did: &str) -> Result<bool, StorageError> {
         Ok(self.read_conn()?.query_row(
             "SELECT EXISTS(SELECT 1 FROM registered_users WHERE did=?1)
-                OR EXISTS(SELECT 1 FROM follows f JOIN registered_users r ON r.did=f.actor WHERE f.subject=?1)",
+                OR EXISTS(SELECT 1 FROM follows f JOIN registered_users r ON r.did=f.actor
+                          WHERE f.subject=?1 AND f.following=1)",
             [did],
             |row| row.get(0),
         )?)
@@ -2139,7 +2257,8 @@ impl Storage for SqliteStorage {
              WHERE h.checked_at<=unixepoch()-?1
                AND (EXISTS(SELECT 1 FROM registered_users r WHERE r.did=h.did)
                     OR EXISTS(SELECT 1 FROM records x WHERE x.did=h.did)
-                    OR EXISTS(SELECT 1 FROM follows f JOIN registered_users r ON r.did=f.actor WHERE f.subject=h.did))
+                    OR EXISTS(SELECT 1 FROM follows f JOIN registered_users r ON r.did=f.actor
+                              WHERE f.subject=h.did AND f.following=1))
              GROUP BY h.did ORDER BY MIN(h.checked_at),h.did LIMIT ?2",
         )?;
         let dids = statement
@@ -2152,26 +2271,60 @@ impl Storage for SqliteStorage {
     }
 
     fn queue_handle_refresh(&self, did: &str) -> Result<(), StorageError> {
-        self.conn()?.execute(
-            "INSERT OR IGNORE INTO handle_refresh_queue(did) VALUES(?1)",
-            [did],
-        )?;
+        match self.connection.try_lock() {
+            Ok(connection) => {
+                connection.execute(
+                    "INSERT OR IGNORE INTO handle_refresh_queue(did) VALUES(?1)",
+                    [did],
+                )?;
+            }
+            Err(TryLockError::WouldBlock) => {
+                self.deferred_handle_refreshes
+                    .lock()
+                    .map_err(|_| StorageError::Poisoned)?
+                    .insert(did.to_owned());
+            }
+            Err(TryLockError::Poisoned(_)) => return Err(StorageError::Poisoned),
+        }
         Ok(())
     }
 
     fn pending_handle_refreshes(&self, limit: usize) -> Result<Vec<String>, StorageError> {
+        let limit = limit.max(1);
+        let mut dids = self
+            .deferred_handle_refreshes
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        dids.sort();
+        dids.truncate(limit);
         let connection = self.read_conn()?;
-        let mut statement = connection
-            .prepare("SELECT did FROM handle_refresh_queue ORDER BY requested_at,did LIMIT ?1")?;
-        let dids = statement
-            .query_map([i64::try_from(limit.max(1)).unwrap_or(i64::MAX)], |row| {
-                row.get(0)
-            })?
-            .collect::<Result<Vec<String>, _>>()?;
+        let remaining = limit.saturating_sub(dids.len());
+        if remaining > 0 {
+            let mut statement = connection.prepare(
+                "SELECT did FROM handle_refresh_queue ORDER BY requested_at,did LIMIT ?1",
+            )?;
+            dids.extend(
+                statement
+                    .query_map([i64::try_from(remaining).unwrap_or(i64::MAX)], |row| {
+                        row.get(0)
+                    })?
+                    .collect::<Result<Vec<String>, _>>()?,
+            );
+        }
+        dids.sort();
+        dids.dedup();
+        dids.truncate(limit);
         Ok(dids)
     }
 
     fn complete_handle_refresh(&self, did: &str) -> Result<(), StorageError> {
+        self.deferred_handle_refreshes
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .remove(did);
         self.conn()?
             .execute("DELETE FROM handle_refresh_queue WHERE did=?1", [did])?;
         Ok(())
@@ -2253,6 +2406,20 @@ fn migrate_notification_events(connection: &Connection) -> Result<(), StorageErr
         "INSERT INTO appview_state(key,value) VALUES('notification_events_v1','1')",
         [],
     )?;
+    Ok(())
+}
+
+fn migrate_follow_state(connection: &Connection) -> Result<(), StorageError> {
+    let columns = connection
+        .prepare("PRAGMA table_info(follows)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|column| column == "following") {
+        connection.execute(
+            "ALTER TABLE follows ADD COLUMN following INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
     Ok(())
 }
 

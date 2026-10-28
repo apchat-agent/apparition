@@ -157,6 +157,114 @@ async fn large_repo_backfill_is_spread_across_batches_by_a_record_rate_budget() 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn session_writes_can_run_between_batches_while_a_snapshot_removes_old_records() {
+    let dir = std::env::temp_dir().join(format!(
+        "appview-snapshot-cleanup-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let storage = SqliteStorage::open(dir.join("appview.db")).unwrap();
+    let did = "did:plc:cleanup";
+    let existing: Vec<IndexedRecord> = (0..60_000)
+        .map(|index| IndexedRecord {
+            did: did.to_owned(),
+            collection: "app.bsky.feed.post".to_owned(),
+            rkey: format!("p{index}"),
+            uri: format!("at://{did}/app.bsky.feed.post/p{index}"),
+            cid: None,
+            time_us: index,
+            record: serde_json::json!({"text":"x".repeat(200)}),
+        })
+        .collect();
+    storage.replace_repo_snapshot(did, &existing, &[]).unwrap();
+
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            started_tx.send(()).unwrap();
+            storage.replace_repo_snapshot(did, &[], &[]).unwrap();
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let started = Instant::now();
+        storage
+            .rotate_web_session("did:plc:login", "session")
+            .unwrap();
+        let elapsed = started.elapsed();
+        writer.join().unwrap();
+        elapsed
+    });
+
+    assert!(
+        writer < Duration::from_millis(200),
+        "session write waited {writer:?} behind snapshot cleanup"
+    );
+    assert!(storage.records().unwrap().is_empty());
+    drop(storage);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn session_writes_can_run_between_batches_while_a_snapshot_rebuilds_many_follows() {
+    let dir = std::env::temp_dir().join(format!(
+        "appview-follow-cleanup-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let storage = SqliteStorage::open(dir.join("appview.db")).unwrap();
+    let did = "did:plc:many-follows";
+    storage.register_user(did).unwrap();
+    let following: Vec<String> = (0..100_000)
+        .map(|index| format!("did:plc:subject-{index}"))
+        .collect();
+
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let elapsed = std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            started_tx.send(()).unwrap();
+            storage.replace_repo_snapshot(did, &[], &following).unwrap();
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let started = Instant::now();
+        storage
+            .rotate_web_session("did:plc:login", "session")
+            .unwrap();
+        storage
+            .set_follow(did, "did:plc:subject-99999", false)
+            .unwrap();
+        let elapsed = started.elapsed();
+        writer.join().unwrap();
+        elapsed
+    });
+
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "session write waited {elapsed:?} behind follow snapshot work"
+    );
+    assert!(
+        !storage
+            .is_followed_by_registered("did:plc:subject-99999")
+            .unwrap()
+    );
+    assert!(
+        storage
+            .is_followed_by_registered("did:plc:subject-99998")
+            .unwrap()
+    );
+    drop(storage);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // A big repository snapshot used to hold the one connection lock for its whole
 // write (70 s for an 82k-record repo on appview-host), freezing every page and sign-in.
 #[test]

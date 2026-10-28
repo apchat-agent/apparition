@@ -458,6 +458,7 @@ async fn an_api_storage_read_does_not_block_the_runtime_timer() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("appview.db");
     let storage = Arc::new(SqliteStorage::open(&path).unwrap());
+    storage.register_user(ALICE).unwrap();
     let (router, _) = api_for_storage(storage.clone());
 
     let blocker = Connection::open(&path).unwrap();
@@ -502,6 +503,7 @@ async fn an_api_storage_read_does_not_block_the_runtime_timer() {
     let timer_delay = timer_rx.await.unwrap();
     writer.join().unwrap().unwrap();
     release.join().unwrap();
+    assert_eq!(storage.pending_handle_refreshes(10).unwrap(), [ALICE]);
     assert!(
         timer_delay < Duration::from_millis(200),
         "runtime timer fired after {timer_delay:?} while an API read ran"
