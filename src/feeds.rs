@@ -1,5 +1,6 @@
 use crate::{identity::{IdentityBackend, IdentityResolver}, ingest::{IndexedRecord, Storage}, net::SafeHttpClient};
 use http::HeaderMap;
+use futures_util::{StreamExt, stream};
 use serde_json::Value;
 use std::{collections::{HashMap, HashSet}, sync::{Arc, Mutex, OnceLock}, time::Duration};
 use url::Url;
@@ -43,6 +44,7 @@ pub struct FeedClient<B: IdentityBackend> {
     identity: Arc<IdentityResolver<B>>,
     http: SafeHttpClient,
     generator_cache: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, ResolvedFeed)>>,
+    live_post_cache: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, IndexedRecord)>>,
 }
 
 impl<B: IdentityBackend> FeedClient<B> {
@@ -51,6 +53,7 @@ impl<B: IdentityBackend> FeedClient<B> {
             identity,
             http,
             generator_cache: tokio::sync::Mutex::new(HashMap::new()),
+            live_post_cache: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -198,10 +201,133 @@ impl<B: IdentityBackend> FeedClient<B> {
 
     pub async fn hydrate_skeleton(
         &self,
-        _skeleton: FeedSkeletonPage,
-        _storage: &dyn Storage,
+        skeleton: FeedSkeletonPage,
+        storage: &dyn Storage,
     ) -> Result<HydratedFeedPage, String> {
-        Err("feed hydration is not implemented".to_owned())
+        const LIVE_FETCH_CONCURRENCY: usize = 8;
+        const PAGE_BUDGET: Duration = Duration::from_secs(8);
+        let count = skeleton.feed.len();
+        let cursor = skeleton.cursor;
+        let deadline = tokio::time::Instant::now() + PAGE_BUDGET;
+        let mut pending = stream::iter(skeleton.feed.into_iter().enumerate())
+            .map(|(index, item)| async move {
+                self.hydrate_one(index, item, storage).await
+            })
+            .buffer_unordered(LIVE_FETCH_CONCURRENCY);
+        let mut hydrated = Vec::with_capacity(count);
+        loop {
+            match tokio::time::timeout_at(deadline, pending.next()).await {
+                Ok(Some(Some(item))) => hydrated.push(item),
+                Ok(Some(None)) => {},
+                Ok(None) | Err(_) => break,
+            }
+        }
+        hydrated.sort_by_key(|(index, _)| *index);
+        let feed = hydrated.into_iter().map(|(_, post)| post).collect::<Vec<_>>();
+        Ok(HydratedFeedPage {
+            dropped_count: count.saturating_sub(feed.len()),
+            feed,
+            cursor,
+        })
+    }
+
+    async fn hydrate_one(
+        &self,
+        index: usize,
+        item: FeedSkeletonEntry,
+        storage: &dyn Storage,
+    ) -> Option<(usize, HydratedFeedPost)> {
+        let record = storage
+            .record_by_uri("app.bsky.feed.post", &item.post_uri)
+            .ok()
+            .flatten();
+        let record = match record {
+            Some(record) => record,
+            None => self.fetch_live_post(&item.post_uri).await.ok()?,
+        };
+        let reposted_by = match item
+            .reason
+            .as_ref()
+            .filter(|reason| {
+                reason.get("$type").and_then(Value::as_str)
+                    == Some("app.bsky.feed.defs#reasonRepost")
+            })
+            .and_then(|reason| reason.get("by"))
+            .and_then(|by| by.get("did"))
+            .and_then(Value::as_str)
+        {
+            Some(did) => self
+                .identity
+                .resolve_did(did)
+                .await
+                .ok()
+                .map(|identity| identity.handle.unwrap_or(identity.did)),
+            None => None,
+        };
+        Some((index, HydratedFeedPost { record, reposted_by }))
+    }
+
+    async fn fetch_live_post(&self, uri: &str) -> Result<IndexedRecord, String> {
+        if let Some((expires, record)) = self.live_post_cache.lock().await.get(uri).cloned()
+            && expires > tokio::time::Instant::now()
+        {
+            return Ok(record);
+        }
+        let (did, collection, rkey) = parse_post_uri(uri)?;
+        let document = self
+            .identity
+            .resolve_did_document(&did)
+            .await
+            .map_err(|error| format!("post author DID resolution failed: {error}"))?;
+        let pds = document
+            .pds_endpoint()
+            .ok_or_else(|| "post author DID document has no valid PDS endpoint".to_owned())?;
+        let mut url = Url::parse(&format!("{pds}/xrpc/com.atproto.repo.getRecord"))
+            .map_err(|_| "post author PDS URL is invalid".to_owned())?;
+        url.query_pairs_mut()
+            .append_pair("repo", &did)
+            .append_pair("collection", &collection)
+            .append_pair("rkey", &rkey);
+        let response = self.http.get(&url, HeaderMap::new(), 1024 * 1024).await?;
+        if !response.status().is_success() {
+            return Err("post could not be fetched from its author PDS".to_owned());
+        }
+        let body: Value = serde_json::from_slice(response.body())
+            .map_err(|_| "post PDS response was invalid JSON".to_owned())?;
+        if body.get("uri").and_then(Value::as_str) != Some(uri) {
+            return Err("post PDS returned a different record URI".to_owned());
+        }
+        let value = body
+            .get("value")
+            .filter(|value| value.is_object())
+            .cloned()
+            .ok_or_else(|| "post PDS response has no record value".to_owned())?;
+        let time_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros()
+            .min(u64::MAX as u128) as u64;
+        let record = IndexedRecord {
+            did,
+            collection,
+            rkey,
+            uri: uri.to_owned(),
+            cid: body.get("cid").and_then(Value::as_str).map(str::to_owned),
+            time_us,
+            record: value,
+        };
+        let mut cache = self.live_post_cache.lock().await;
+        cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
+        if cache.len() >= 256
+            && let Some(oldest) = cache.keys().next().cloned()
+        {
+            cache.remove(&oldest);
+        }
+        cache.insert(
+            uri.to_owned(),
+            (tokio::time::Instant::now() + Duration::from_secs(10 * 60), record.clone()),
+        );
+        Ok(record)
     }
 }
 
@@ -229,6 +355,25 @@ fn parse_feed_uri(uri: &str) -> Result<(String, String, String), String> {
         || rkey.contains(['?', '#', '%'])
     {
         return Err("feed URI must identify one app.bsky.feed.generator record".to_owned());
+    }
+    Ok((did.to_owned(), collection.to_owned(), rkey.to_owned()))
+}
+
+fn parse_post_uri(uri: &str) -> Result<(String, String, String), String> {
+    let Some(path) = uri.strip_prefix("at://") else {
+        return Err("post URI must use the at:// scheme".to_owned());
+    };
+    let mut parts = path.split('/');
+    let did = parts.next().unwrap_or_default();
+    let collection = parts.next().unwrap_or_default();
+    let rkey = parts.next().unwrap_or_default();
+    if did.is_empty()
+        || collection != "app.bsky.feed.post"
+        || rkey.is_empty()
+        || parts.next().is_some()
+        || rkey.contains(['?', '#', '%'])
+    {
+        return Err("skeleton item must identify one app.bsky.feed.post record".to_owned());
     }
     Ok((did.to_owned(), collection.to_owned(), rkey.to_owned()))
 }
