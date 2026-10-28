@@ -743,7 +743,7 @@ fn post_view<S: Storage, B: IdentityBackend>(
     let mut post = json!({
         "uri":record.uri,"cid":record.cid,"author":profile_view(state, &record.did).unwrap_or_else(|_| json!({"did":record.did,"handle":"handle.invalid"})),
         "record":record.record,
-        "replyCount":interactions.reply_count,"repostCount":interactions.repost_count,"likeCount":interactions.like_count,"quoteCount":0,"bookmarkCount":0,"labels":[]
+        "replyCount":interactions.reply_count,"repostCount":interactions.repost_count,"likeCount":interactions.like_count,"quoteCount":interactions.quote_count,"bookmarkCount":0,"labels":[]
     });
     if viewer_did.is_some() {
         let mut viewer = json!({});

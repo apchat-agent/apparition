@@ -106,6 +106,7 @@ pub struct PostInteractionSummary {
     pub like_count: usize,
     pub repost_count: usize,
     pub reply_count: usize,
+    pub quote_count: usize,
     pub viewer_like: Option<String>,
     pub viewer_repost: Option<String>,
 }
@@ -966,6 +967,15 @@ impl Storage for MemoryStorage {
             {
                 summary.reply_count += 1;
             }
+            if record.collection == "app.bsky.feed.post"
+                && record
+                    .record
+                    .pointer("/embed/record/uri")
+                    .and_then(Value::as_str)
+                    == Some(uri)
+            {
+                summary.quote_count += 1;
+            }
         }
         Ok(summary)
     }
@@ -1461,6 +1471,8 @@ impl SqliteStorage {
                  ON records(collection, json_extract(record_json, '$.subject.uri'), time_us DESC);
              CREATE INDEX IF NOT EXISTS records_collection_parent_uri
                  ON records(collection, json_extract(record_json, '$.reply.parent.uri'), time_us DESC);
+             CREATE INDEX IF NOT EXISTS records_collection_embed_record_uri
+                 ON records(collection, json_extract(record_json, '$.embed.record.uri'), time_us DESC);
              CREATE INDEX IF NOT EXISTS records_replies_order
                  ON records(collection, json_extract(record_json, '$.reply.parent.uri'), time_us, uri);
              CREATE INDEX IF NOT EXISTS records_author_subject_uri
@@ -2388,6 +2400,7 @@ impl Storage for SqliteStorage {
             like_count: count("app.bsky.feed.like", "$.subject.uri")?,
             repost_count: count("app.bsky.feed.repost", "$.subject.uri")?,
             reply_count: count("app.bsky.feed.post", "$.reply.parent.uri")?,
+            quote_count: count("app.bsky.feed.post", "$.embed.record.uri")?,
             ..PostInteractionSummary::default()
         };
         if let Some(viewer_did) = viewer_did {
