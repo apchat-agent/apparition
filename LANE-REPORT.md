@@ -284,3 +284,12 @@ The required anonymous-attacker inventory was committed first as `ba73fb3` (`tmp
 - The bounded queue drops new scheduling work while its 1,000-item capacity is full; queueing resumes when space is available and new follow events are processed. This keeps memory and storage bounded but can delay initial account backfills during a sustained full queue.
 - Before cloud deployment, the owner must choose a provider, provide the public HTTPS domain/URL and matching `did:web`, and decide how the persistent `/data` volume (including `/data/oauth-client-key.json`) will be backed up or supplied through a secret-management process. No provider, domain, or key secret was available in this lane.
 - No public-load, concurrency, or disk-growth benchmark was run. Search and blob-proxy routes do not exist in this version.
+
+## av16 custom feeds (2026-10-28)
+
+Implemented saved custom feed preferences, guarded generator resolution, service-authenticated skeleton requests with anonymous fallback, ordered hydration, and the `/feeds` and `/app/feed` pages. Full red/green commit evidence and remaining work are in [LANE-REPORT-av16.md](LANE-REPORT-av16.md).
+
+- `RUST_TEST_THREADS=1 cargo test --offline`: passed, 160 tests, 1 ignored benchmark. Default-parallel runs hit the previously documented timing-sensitive av14 snapshot lock assertion; serial full suite passed.
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy --offline -- -D warnings`: passed.
+- No live server was accessed and nothing was pushed.
