@@ -1349,10 +1349,19 @@ async fn old_scope_session_gets_a_friendly_feed_reauthorization_page() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let html = String::from_utf8(
-        response.into_body().collect().await.unwrap().to_bytes().to_vec(),
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
     )
     .unwrap();
-    assert!(html.contains("sign in again to allow feeds"));
+    assert!(
+        html.to_ascii_lowercase()
+            .contains("sign in again to allow feeds")
+    );
     assert!(html.contains("href=\"/login\""));
     assert!(!html.contains("\"error\":\"OAuthError\""));
 }

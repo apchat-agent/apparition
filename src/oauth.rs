@@ -68,11 +68,15 @@ const SESSION_TTL_SECONDS: u64 = 30 * 24 * 60 * 60;
 const LOGIN_COOKIE_TTL_SECONDS: u64 = 10 * 60;
 const MAX_RENDERED_REMOTE_CHARS: usize = 4096;
 const WEB_STYLESHEET_URL: &str = "/static/app.css?v=av16";
-const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete";
+const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=*";
 const WRITE_SCOPES: [&str; 3] = [
     "repo:app.bsky.feed.post?action=create",
     "repo:app.bsky.feed.like?action=create&action=delete",
     "repo:app.bsky.feed.repost?action=create&action=delete",
+];
+const FEED_SCOPES: [&str; 2] = [
+    "rpc:app.bsky.actor.getPreferences?aud=*",
+    "rpc:app.bsky.feed.getFeedSkeleton?aud=*",
 ];
 type HmacSha256 = Hmac<Sha256>;
 
@@ -428,9 +432,11 @@ impl OAuthPublic {
         session_id: &str,
         generation: u64,
         write_access: bool,
+        feed_access: bool,
     ) -> String {
         let expires = unix_time().saturating_add(SESSION_TTL_SECONDS);
-        let payload = format!("{did}\n{expires}\n{session_id}\n{generation}\n{write_access}");
+        let payload =
+            format!("{did}\n{expires}\n{session_id}\n{generation}\n{write_access}\n{feed_access}");
         let encoded = URL_SAFE_NO_PAD.encode(payload.as_bytes());
         let mut mac = HmacSha256::new_from_slice(&self.cookie_key())
             .expect("HMAC accepts keys of any length");
@@ -471,7 +477,7 @@ impl OAuthPublic {
         Some(binding.to_owned())
     }
 
-    fn verify_session_cookie(&self, token: &str) -> Option<(String, String, u64, bool)> {
+    fn verify_session_cookie(&self, token: &str) -> Option<(String, String, u64, bool, bool)> {
         let (payload, signature) = token.split_once('.')?;
         let signature = URL_SAFE_NO_PAD.decode(signature).ok()?;
         let mut mac = HmacSha256::new_from_slice(&self.cookie_key()).ok()?;
@@ -483,7 +489,10 @@ impl OAuthPublic {
         let (did, session) = value.split_once('\n')?;
         let (expires, session) = session.split_once('\n')?;
         let (session_id, generation) = session.split_once('\n')?;
-        let (generation, write_access) = generation.split_once('\n')?;
+        let (generation, permissions) = generation.split_once('\n')?;
+        let (write_access, feed_access) = permissions
+            .split_once('\n')
+            .unwrap_or((permissions, "false"));
         if expires.parse::<u64>().ok()? <= unix_time()
             || session_id.is_empty()
             || !(did.starts_with("did:plc:") || did.starts_with("did:web:"))
@@ -495,6 +504,7 @@ impl OAuthPublic {
             session_id.to_owned(),
             generation.parse().ok()?,
             write_access.parse().ok()?,
+            feed_access.parse().ok()?,
         ))
     }
 
@@ -1531,11 +1541,16 @@ where
     };
     let mut response = Redirect::to("/app").into_response();
     let write_access = has_all_write_scopes(account.granted_scope.as_deref());
+    let feed_access = has_all_feed_scopes(account.granted_scope.as_deref());
     let cookie = format!(
         "{SESSION_COOKIE}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL_SECONDS}{}",
-        state
-            .public
-            .issue_session_cookie(&account.did, &session_id, generation, write_access),
+        state.public.issue_session_cookie(
+            &account.did,
+            &session_id,
+            generation,
+            write_access,
+            feed_access,
+        ),
         if state.public.secure_cookies() {
             "; Secure"
         } else {
@@ -1562,7 +1577,7 @@ where
     if !same_origin_request(&headers, &state.public.public_url) {
         return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
     }
-    let Some((did, session_id, _, _)) =
+    let Some((did, session_id, _, _, _)) =
         verified_cookie_session(&state.public, &headers, state.storage.as_ref())
     else {
         return clear_session_cookie(
@@ -1744,6 +1759,9 @@ where
     let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return Redirect::to("/login").into_response();
     };
+    if !verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()) {
+        return feed_reauthorization_page();
+    }
     let feeds = match state.flow.pinned_feeds(&did).await {
         Ok(feeds) => feeds,
         Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
@@ -1776,6 +1794,9 @@ where
     let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return Redirect::to("/login").into_response();
     };
+    if !verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()) {
+        return feed_reauthorization_page();
+    }
     let Some(uri) = query.get("uri").filter(|uri| !uri.is_empty()) else {
         return oauth_error(StatusCode::BAD_REQUEST, "feed uri is required");
     };
@@ -2426,7 +2447,7 @@ fn verified_cookie_did<S: Storage>(
     headers: &HeaderMap,
     storage: &S,
 ) -> Option<String> {
-    verified_cookie_session(public, headers, storage).map(|(did, _, _, _)| did)
+    verified_cookie_session(public, headers, storage).map(|(did, _, _, _, _)| did)
 }
 
 fn verified_cookie_write_access<S: Storage>(
@@ -2435,22 +2456,31 @@ fn verified_cookie_write_access<S: Storage>(
     storage: &S,
 ) -> bool {
     verified_cookie_session(public, headers, storage)
-        .is_some_and(|(_, _, _, write_access)| write_access)
+        .is_some_and(|(_, _, _, write_access, _)| write_access)
+}
+
+fn verified_cookie_feed_access<S: Storage>(
+    public: &OAuthPublic,
+    headers: &HeaderMap,
+    storage: &S,
+) -> bool {
+    verified_cookie_session(public, headers, storage)
+        .is_some_and(|(_, _, _, _, feed_access)| feed_access)
 }
 
 fn verified_cookie_session<S: Storage>(
     public: &OAuthPublic,
     headers: &HeaderMap,
     storage: &S,
-) -> Option<(String, String, u64, bool)> {
-    let (did, session_id, generation, write_access) =
+) -> Option<(String, String, u64, bool, bool)> {
+    let (did, session_id, generation, write_access, feed_access) =
         cookie_value(headers).and_then(|value| public.verify_session_cookie(value))?;
     (storage
         .web_session_generation(&did, &session_id)
         .ok()
         .flatten()
         == Some(generation))
-    .then_some((did, session_id, generation, write_access))
+    .then_some((did, session_id, generation, write_access, feed_access))
 }
 
 fn same_origin_request(headers: &HeaderMap, public_url: &str) -> bool {
@@ -2541,6 +2571,15 @@ fn oauth_error_page(status: StatusCode, message: &str) -> Response {
         )),
     )
         .into_response()
+}
+
+fn feed_reauthorization_page() -> Response {
+    Html(page_shell(
+        "Allow feeds",
+        "<section class=\"error-card\"><p class=\"eyebrow\">Permission update</p><h1>Sign in again to allow feeds</h1><p>Your existing sign-in does not include permission to load saved feeds. Sign in again and approve the updated access.</p><a class=\"primary-link\" href=\"/login\">Sign in again</a></section>",
+        false,
+    ))
+    .into_response()
 }
 
 fn valid_redirect_url(value: &str) -> bool {
@@ -3013,10 +3052,25 @@ fn has_all_write_scopes(scope: Option<&str>) -> bool {
         .all(|required| granted.contains(required))
 }
 
+fn has_all_feed_scopes(scope: Option<&str>) -> bool {
+    let Some(scope) = scope else {
+        return false;
+    };
+    let granted = scope.split_whitespace().collect::<HashSet<_>>();
+    FEED_SCOPES
+        .iter()
+        .all(|required| granted.contains(required))
+}
+
 fn requested_scopes() -> Vec<Scope> {
     std::iter::once(Scope::Known(KnownScope::Atproto))
         .chain(
             WRITE_SCOPES
+                .iter()
+                .map(|scope| Scope::Unknown((*scope).to_owned())),
+        )
+        .chain(
+            FEED_SCOPES
                 .iter()
                 .map(|scope| Scope::Unknown((*scope).to_owned())),
         )
