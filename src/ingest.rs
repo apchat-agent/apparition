@@ -2538,4 +2538,41 @@ mod backfill_resource_tests {
             "SQLite queue has {sqlite_count} items"
         );
     }
+
+    #[test]
+    fn opening_a_database_trims_an_oversized_legacy_backfill_queue() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!(
+                "backfill-migration-{}-{}.sqlite",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        let storage = SqliteStorage::open(&path).unwrap();
+        {
+            let connection = storage.conn().unwrap();
+            for index in 0..=1_000 {
+                connection
+                    .execute(
+                        "INSERT INTO backfill_queue(did) VALUES(?1)",
+                        [format!("did:plc:legacy-{index:04}")],
+                    )
+                    .unwrap();
+            }
+        }
+        drop(storage);
+
+        let reopened = SqliteStorage::open(&path).unwrap();
+        let queue_count: usize = reopened
+            .conn()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM backfill_queue", [], |row| row.get(0))
+            .unwrap();
+        drop(reopened);
+        std::fs::remove_file(&path).unwrap();
+        assert!(queue_count <= 1_000, "SQLite queue has {queue_count} items");
+    }
 }
