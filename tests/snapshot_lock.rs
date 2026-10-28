@@ -1,4 +1,10 @@
-use appview_rs::ingest::{IndexedRecord, SqliteStorage, Storage};
+use appview_rs::{
+    backfill::{
+        BackfillError, HostRateLimiter, RepoBackfiller, RepoFetcher, RepoRecord, RepoVerifier,
+        VerifiedRepo,
+    },
+    ingest::{IndexedRecord, SqliteStorage, Storage},
+};
 use rusqlite::Connection;
 use std::time::{Duration, Instant};
 
@@ -88,6 +94,64 @@ fn page_reads_do_not_wait_for_a_writer_holding_the_database() {
     assert!(
         elapsed < Duration::from_millis(200),
         "page reads waited {elapsed:?} for a database writer"
+    );
+    drop(storage);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn large_repo_backfill_is_spread_across_batches_by_a_record_rate_budget() {
+    struct EmptyFetcher;
+    impl RepoFetcher for EmptyFetcher {
+        async fn fetch_repo(&self, _: &str, _: &str) -> Result<Vec<u8>, BackfillError> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct LargeVerifier;
+    impl RepoVerifier for LargeVerifier {
+        async fn verify(&self, _: &[u8], _: &str, _: &str) -> Result<VerifiedRepo, BackfillError> {
+            Ok(VerifiedRepo {
+                records: (0..1_000)
+                    .map(|index| RepoRecord {
+                        collection: "app.bsky.feed.post".to_owned(),
+                        rkey: format!("p{index}"),
+                        cid: format!("cid{index}"),
+                        record: serde_json::json!({"text":"backfill"}),
+                    })
+                    .collect(),
+            })
+        }
+    }
+
+    let dir = std::env::temp_dir().join(format!(
+        "appview-rate-budget-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let storage = std::sync::Arc::new(SqliteStorage::open(dir.join("appview.db")).unwrap());
+    let backfiller = RepoBackfiller::new(
+        storage.clone(),
+        EmptyFetcher,
+        LargeVerifier,
+        HostRateLimiter::new(Duration::ZERO),
+    );
+
+    let started = Instant::now();
+    let indexed = backfiller
+        .backfill("did:plc:large", "https://pds.example", "did:key:fake")
+        .await
+        .unwrap();
+
+    assert_eq!(indexed, 1_000);
+    assert!(
+        started.elapsed() >= Duration::from_millis(1_500),
+        "1,000 records were written in {:?}; the 300 records/s budget was not applied between batches",
+        started.elapsed()
     );
     drop(storage);
     let _ = std::fs::remove_dir_all(&dir);
