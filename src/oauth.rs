@@ -1201,7 +1201,7 @@ async fn callback<F, S>(
 ) -> Response
 where
     F: OAuthFlow,
-    S: Storage,
+    S: Storage + 'static,
 {
     if query.get("code").is_none_or(|code| code.trim().is_empty())
         || query
@@ -1264,21 +1264,34 @@ where
             "OAuth token response must grant the atproto scope",
         );
     }
-    if let Err(error) = state.storage.register_user(&account.did) {
-        tracing::warn!(%error, "oauth callback could not register the user");
-        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
-    }
-    if let Some(handle) = account.verified_handle.as_deref()
-        && let Err(error) = state.storage.set_verified_handle(&account.did, handle)
-    {
-        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
-    }
     let mut session_id_bytes = [0u8; 32];
     thread_rng().fill_bytes(&mut session_id_bytes);
     let session_id = URL_SAFE_NO_PAD.encode(session_id_bytes);
-    let generation = match state.storage.rotate_web_session(&account.did, &session_id) {
-        Ok(generation) => generation,
-        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    let storage = Arc::clone(&state.storage);
+    let storage_did = account.did.clone();
+    let storage_handle = account.verified_handle.clone();
+    let storage_session_id = session_id.clone();
+    let generation = match tokio::task::spawn_blocking(move || {
+        storage.register_user(&storage_did)?;
+        if let Some(handle) = storage_handle.as_deref() {
+            storage.set_verified_handle(&storage_did, handle)?;
+        }
+        storage.rotate_web_session(&storage_did, &storage_session_id)
+    })
+    .await
+    {
+        Ok(Ok(generation)) => generation,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "oauth callback could not persist the user session");
+            return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+        }
+        Err(error) => {
+            tracing::warn!(%error, "oauth callback storage task failed");
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage operation failed",
+            );
+        }
     };
     let mut response = Redirect::to("/app").into_response();
     let write_access = has_all_write_scopes(account.granted_scope.as_deref());
