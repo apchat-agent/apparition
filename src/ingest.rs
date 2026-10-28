@@ -2443,3 +2443,28 @@ impl<S: Storage + 'static> JetstreamConsumer<S> {
         Ok(url.to_string())
     }
 }
+
+#[cfg(test)]
+mod backfill_resource_tests {
+    use super::*;
+
+    #[test]
+    fn backfill_queue_has_a_global_storage_cap() {
+        let memory = MemoryStorage::default();
+        let sqlite = SqliteStorage::open(":memory:").unwrap();
+        for index in 0..=1_000 {
+            let did = format!("did:plc:account-{index:04}");
+            memory.register_user(&did).unwrap();
+            sqlite.register_user(&did).unwrap();
+        }
+
+        let memory_count = memory.inner.lock().unwrap().backfill_queue.len();
+        let sqlite_count: usize = sqlite
+            .conn()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM backfill_queue", [], |row| row.get(0))
+            .unwrap();
+        assert!(memory_count <= 1_000, "memory queue has {memory_count} items");
+        assert!(sqlite_count <= 1_000, "SQLite queue has {sqlite_count} items");
+    }
+}
