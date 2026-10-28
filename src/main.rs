@@ -22,9 +22,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let listen_address: SocketAddr = config.listen.parse()?;
     let listener = TcpListener::bind(listen_address).await?;
     let address = listener.local_addr()?;
-    let database_path = PathBuf::from(&config.data_dir).join("appview.db");
+    let (database_path, oauth_database_path) = appview_rs::config::database_paths(&config.data_dir);
     let storage = Arc::new(SqliteStorage::open(&database_path)?);
-    let oauth_store = SqliteOAuthStore::open(&database_path)?;
+    let oauth_store = SqliteOAuthStore::open(&oauth_database_path)?;
     let oauth_key_path = PathBuf::from(&config.data_dir).join("oauth-client-key.json");
     let oauth = match config.oauth_mode {
         OAuthMode::Confidential => OAuthPublic::load_or_create(&config.public_url, oauth_key_path)?,

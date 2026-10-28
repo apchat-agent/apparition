@@ -16,7 +16,7 @@ cp appview.example.toml appview.toml
 APPVIEW_CONFIG=./appview.toml ./target/release/appview-rs
 ```
 
-The sample config uses the public east Jetstream and indexes in `scoped` mode. The server binds to `127.0.0.1:3000`; put it behind a TLS reverse proxy for a public deployment. Keep the SQLite database and OAuth key in a persistent, private data directory. Back up `appview.db` and `oauth-client-key.json` together. The key is created with owner-only permissions on Unix and must remain stable across restarts. Confidential mode uses it for client assertions; loopback mode uses it only to sign local browser cookies.
+The sample config uses the public east Jetstream and indexes in `scoped` mode. The server binds to `127.0.0.1:3000`; put it behind a TLS reverse proxy for a public deployment. Keep the SQLite database and OAuth key in a persistent, private data directory. Back up `appview.db`, `oauth.db` (sign-in sessions, kept separate so backfill writes cannot lock sign-in out) and `oauth-client-key.json` together. The key is created with owner-only permissions on Unix and must remain stable across restarts. Confidential mode uses it for client assertions; loopback mode uses it only to sign local browser cookies.
 
 Check the server and public service documents:
 

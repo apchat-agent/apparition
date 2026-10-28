@@ -272,3 +272,13 @@ fn default_appview_did() -> String {
 fn default_public_url() -> String {
     "https://appview.example".to_owned()
 }
+
+/// Paths of the record database and the OAuth session database inside `data_dir`.
+///
+/// Sign-in state lives in its own file: repository backfill holds long write transactions on
+/// the record database, and a shared file made sign-in fail with "database is locked"
+/// (2026-10-28, while a follow backfill was running).
+pub fn database_paths(data_dir: &str) -> (PathBuf, PathBuf) {
+    let dir = PathBuf::from(data_dir);
+    (dir.join("appview.db"), dir.join("oauth.db"))
+}
