@@ -4,7 +4,7 @@ use appview_rs::{
         ResolutionError,
     },
     net::SafeHttpClient,
-    oauth::{OAuthCallback, OAuthFlow, OAuthPublic, SqliteOAuthStore},
+    oauth::{OAuthCallback, OAuthFlow, OAuthPublic, PostStrongRef, SqliteOAuthStore},
 };
 use atrium_api::{
     agent::Agent,
@@ -82,6 +82,7 @@ struct FakeServerState {
     token_count: usize,
     token_sub: Option<String>,
     token_scope: Option<String>,
+    create_count: usize,
 }
 
 #[derive(Clone)]
@@ -395,6 +396,63 @@ async fn pds_4xx_logs_safe_error_details_without_credentials() {
         "{logs}"
     );
     assert!(!logs.contains("browser-binding-log-test"), "{logs}");
+    server.abort();
+}
+
+#[tokio::test]
+async fn fake_pds_receives_correct_reply_root_and_parent_strong_refs() {
+    let (flow, _, shared, server) = production_flow(None, Some(EXPECTED_OAUTH_SCOPE)).await;
+    flow.authorize(DID, "reply-test-binding").await.unwrap();
+    let state = latest_state(&shared);
+    flow.callback(OAuthCallback {
+        code: "valid-code".to_owned(),
+        state,
+        issuer: Some(server_origin(&shared)),
+        scope: None,
+        browser_binding: Some("reply-test-binding".to_owned()),
+    })
+    .await
+    .unwrap();
+
+    let root = PostStrongRef {
+        uri: format!("at://{DID}/app.bsky.feed.post/root"),
+        cid: "root-cid".to_owned(),
+    };
+    let parent = PostStrongRef {
+        uri: root.uri.clone(),
+        cid: root.cid.clone(),
+    };
+    flow.create_reply(DID, "Top level reply", root.clone(), parent)
+        .await
+        .unwrap();
+    let reply_parent = PostStrongRef {
+        uri: format!("at://{DID}/app.bsky.feed.post/reply-one"),
+        cid: "reply-one-cid".to_owned(),
+    };
+    flow.create_reply(DID, "Nested reply", root.clone(), reply_parent.clone())
+        .await
+        .unwrap();
+
+    let requests = shared.lock().unwrap().requests.clone();
+    let creates = requests
+        .iter()
+        .filter(|request| {
+            request
+                .path
+                .starts_with("/xrpc/com.atproto.repo.createRecord")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(creates.len(), 2);
+    let top: Value = serde_json::from_str(&creates[0].body).unwrap();
+    let nested: Value = serde_json::from_str(&creates[1].body).unwrap();
+    let root_json = json!({"uri":root.uri,"cid":root.cid});
+    assert_eq!(top["record"]["reply"]["root"], root_json);
+    assert_eq!(top["record"]["reply"]["parent"], root_json);
+    assert_eq!(nested["record"]["reply"]["root"], root_json);
+    assert_eq!(
+        nested["record"]["reply"]["parent"],
+        json!({"uri":reply_parent.uri,"cid":reply_parent.cid})
+    );
     server.abort();
 }
 
@@ -731,6 +789,20 @@ async fn serve_one(mut stream: TcpStream, origin: &str, state: Arc<Mutex<FakeSer
                 })
                 .to_string(),
             ),
+            path if path.starts_with("/xrpc/com.atproto.repo.createRecord") => {
+                state.create_count += 1;
+                let number = state.create_count;
+                (
+                    200,
+                    vec![],
+                    json!({
+                        "uri":format!("at://{DID}/app.bsky.feed.post/reply-{number}"),
+                        "cid":format!("reply-cid-{number}"),
+                        "commit":{"cid":format!("reply-cid-{number}"),"rev":format!("reply-rev-{number}")}
+                    })
+                    .to_string(),
+                )
+            }
             _ => (404, vec![], json!({"error":"not_found"}).to_string()),
         }
     };

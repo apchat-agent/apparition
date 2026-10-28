@@ -133,6 +133,12 @@ pub struct PdsCreatedRecord {
     pub time_us: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostStrongRef {
+    pub uri: String,
+    pub cid: String,
+}
+
 pub trait OAuthFlow: Clone + Send + Sync + 'static {
     fn authorize<'a>(
         &'a self,
@@ -153,6 +159,15 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
         _text: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
         Box::pin(async { Err("post action is not available".to_owned()) })
+    }
+    fn create_reply<'a>(
+        &'a self,
+        _did: &'a str,
+        _text: &'a str,
+        _root: PostStrongRef,
+        _parent: PostStrongRef,
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+        Box::pin(async { Err("reply action is not available".to_owned()) })
     }
     fn like<'a>(
         &'a self,

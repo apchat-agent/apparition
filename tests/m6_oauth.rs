@@ -3,7 +3,8 @@ use appview_rs::{
     config::Config,
     ingest::{IndexedRecord, Ingestor, MemoryStorage, ScopeMode, SqliteStorage, Storage},
     oauth::{
-        OAuthAccount, OAuthCallback, OAuthFlow, OAuthPublic, PdsCreatedRecord, SqliteOAuthStore,
+        OAuthAccount, OAuthCallback, OAuthFlow, OAuthPublic, PdsCreatedRecord, PostStrongRef,
+        SqliteOAuthStore,
     },
 };
 use atrium_api::types::string::Did;
@@ -132,6 +133,33 @@ impl OAuthFlow for FakeOAuthFlow {
                 "pds-post-r1",
                 "pds-post-cid",
                 serde_json::json!({"$type":"app.bsky.feed.post","text":text,"createdAt":"2026-10-28T00:00:00Z"}),
+            ))
+        })
+    }
+
+    fn create_reply<'a>(
+        &'a self,
+        did: &'a str,
+        text: &'a str,
+        root: PostStrongRef,
+        parent: PostStrongRef,
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.actions.lock().unwrap().push(format!(
+                "reply:{did}:{text}:{}:{}:{}:{}",
+                root.uri, root.cid, parent.uri, parent.cid
+            ));
+            Ok(fake_pds_create_record(
+                did,
+                "app.bsky.feed.post",
+                "pds-reply-r1",
+                "pds-reply-cid",
+                serde_json::json!({
+                    "$type":"app.bsky.feed.post",
+                    "text":text,
+                    "createdAt":"2026-10-28T00:00:00Z",
+                    "reply":{"root":root,"parent":parent}
+                }),
             ))
         })
     }
@@ -2185,6 +2213,82 @@ async fn web_thread_renders_the_parent_chain_and_nested_replies_in_time_order() 
         root < parent && parent < focus && focus < early && early < nested && nested < late,
         "{html}"
     );
+    assert!(html.contains("action=\"/reply\""), "{html}");
+    assert!(html.contains("name=\"parent_uri\""), "{html}");
+    assert!(html.contains("maxlength=\"300\""), "{html}");
+}
+
+#[tokio::test]
+async fn reply_form_checks_origin_and_writes_through_to_the_index() {
+    let storage = Arc::new(MemoryStorage::default());
+    let parent_uri = "at://did:plc:friend/app.bsky.feed.post/parent";
+    storage
+        .put_record(&IndexedRecord {
+            did: "did:plc:friend".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "parent".into(),
+            uri: parent_uri.into(),
+            cid: Some("parent-cid".into()),
+            time_us: 1,
+            record: serde_json::json!({"text":"Parent post"}),
+        })
+        .unwrap();
+    let flow = FakeOAuthFlow::default();
+    let actions = flow.actions.clone();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage.clone());
+    let cookie = finish_login(&app).await;
+    let body =
+        "parent_uri=at%3A%2F%2Fdid%3Aplc%3Afriend%2Fapp.bsky.feed.post%2Fparent&text=Reply+text";
+
+    let rejected = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/reply")
+                .header("origin", "https://attacker.example")
+                .header("sec-fetch-site", "cross-site")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("cookie", &cookie)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/reply")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("cookie", cookie)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        actions.lock().unwrap().as_slice(),
+        [
+            "reply:did:plc:alice:Reply text:at://did:plc:friend/app.bsky.feed.post/parent:parent-cid:at://did:plc:friend/app.bsky.feed.post/parent:parent-cid"
+        ]
+    );
+    let indexed = storage
+        .record_by_uri(
+            "app.bsky.feed.post",
+            "at://did:plc:alice/app.bsky.feed.post/pds-reply-r1",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(indexed.record["reply"]["root"]["uri"], parent_uri);
+    assert_eq!(indexed.record["reply"]["parent"]["cid"], "parent-cid");
 }
 
 #[tokio::test]
