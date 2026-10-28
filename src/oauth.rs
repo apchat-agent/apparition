@@ -1084,10 +1084,34 @@ fn normalize_login(typed: &str) -> String {
     }
 }
 
-async fn login() -> Html<&'static str> {
-    Html(
-        "<!doctype html><html><head><title>Sign in</title></head><body><main><h1>Sign in to your AppView</h1><form action=\"/oauth/authorize\" method=\"post\"><label>AT Protocol handle or DID <input name=\"handle\" autocomplete=\"username\" required></label><button type=\"submit\">Continue</button></form></main></body></html>",
-    )
+const HANDLE_COOKIE: &str = "appview_handle";
+
+fn handle_shaped(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '_'))
+}
+
+/// Remembers the last handle typed so the sign-in form comes back filled in.
+fn remember_handle_cookie(handle: &str, secure: bool) -> Option<String> {
+    handle_shaped(handle).then(|| {
+        format!(
+            "{HANDLE_COOKIE}={handle}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000{}",
+            if secure { "; Secure" } else { "" }
+        )
+    })
+}
+
+async fn login(headers: HeaderMap) -> Html<String> {
+    let value = cookie_value_named(&headers, HANDLE_COOKIE)
+        .filter(|handle| handle_shaped(handle))
+        .map(|handle| format!(" value=\"{}\"", html_escape(handle)))
+        .unwrap_or_default();
+    Html(format!(
+        "<!doctype html><html><head><title>Sign in</title></head><body><main><h1>Sign in to your AppView</h1><form action=\"/oauth/authorize\" method=\"post\"><label>AT Protocol handle or DID <input name=\"handle\" autocomplete=\"username\" autocapitalize=\"none\"{value} required></label><button type=\"submit\">Continue</button></form></main></body></html>",
+    ))
 }
 
 async fn authorize<F, S>(
@@ -1140,6 +1164,15 @@ where
                 header::SET_COOKIE,
                 HeaderValue::from_str(&cookie).expect("login cookie token is header safe"),
             );
+            if let Some(remember) = remember_handle_cookie(
+                &normalize_login(form.get("handle").expect("validated above")),
+                state.public.secure_cookies(),
+            ) {
+                response.headers_mut().append(
+                    header::SET_COOKIE,
+                    HeaderValue::from_str(&remember).expect("handle-shaped values are header safe"),
+                );
+            }
             response
         }
         Ok(Ok(_)) => oauth_error(
@@ -1184,6 +1217,11 @@ where
     let browser_binding = cookie_value_named(&headers, LOGIN_COOKIE)
         .and_then(|value| state.public.verify_login_cookie(value));
     let Some(browser_binding) = browser_binding else {
+        tracing::warn!(
+            cookie_headers = headers.get_all(header::COOKIE).iter().count(),
+            login_cookie_present = cookie_value_named(&headers, LOGIN_COOKIE).is_some(),
+            "oauth callback without a valid browser binding cookie"
+        );
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "OAuth callback is missing its browser binding cookie",
@@ -1935,10 +1973,10 @@ fn cookie_value(headers: &HeaderMap) -> Option<&str> {
 
 fn cookie_value_named<'a>(headers: &'a HeaderMap, expected_name: &str) -> Option<&'a str> {
     headers
-        .get(header::COOKIE)?
-        .to_str()
-        .ok()?
-        .split(';')
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(';'))
         .filter_map(|part| part.trim().split_once('='))
         .find_map(|(name, value)| (name == expected_name).then_some(value))
 }
@@ -2422,6 +2460,37 @@ fn create_key_file(path: &Path) -> Result<fs::File, std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // HTTP/2 browsers may send each cookie as its own `cookie` header; the
+    // sign-in cookie was missed when another cookie came first (2026-10-28).
+    #[tokio::test]
+    async fn login_page_prefills_the_remembered_handle_safely() {
+        let mut headers = HeaderMap::new();
+        headers.append(header::COOKIE, "appview_handle=owner.example.test".parse().unwrap());
+        let Html(body) = login(headers).await;
+        assert!(body.contains("value=\"owner.example.test\""), "{body}");
+
+        let mut headers = HeaderMap::new();
+        headers.append(header::COOKIE, "appview_handle=x\"onfocus=alert(1)".parse().unwrap());
+        let Html(body) = login(headers).await;
+        assert!(!body.contains("onfocus"), "{body}");
+    }
+
+    #[test]
+    fn remembered_handle_cookie_only_for_handle_shaped_values() {
+        assert!(remember_handle_cookie("owner.example.test", true).unwrap().contains("Max-Age=31536000; Secure"));
+        assert!(remember_handle_cookie("did:plc:abc123", false).is_some());
+        assert!(remember_handle_cookie("a;b", true).is_none());
+    }
+
+    #[test]
+    fn cookie_lookup_reads_every_cookie_header() {
+        let mut headers = HeaderMap::new();
+        headers.append(header::COOKIE, "appview_session=abc".parse().unwrap());
+        headers.append(header::COOKIE, "other=1; appview_login=xyz".parse().unwrap());
+        assert_eq!(cookie_value_named(&headers, "appview_login"), Some("xyz"));
+        assert_eq!(cookie_value_named(&headers, "appview_session"), Some("abc"));
+    }
 
     fn signed_cookie(public: &OAuthPublic, domain: &str, value: &str) -> String {
         let payload = URL_SAFE_NO_PAD.encode(value.as_bytes());
