@@ -695,6 +695,10 @@ async fn oauth_callback_registers_account_and_logout_clears_its_session() {
         .await
         .unwrap();
     assert_eq!(logout.status(), StatusCode::SEE_OTHER);
+    let cleared_cookie = logout.headers()["set-cookie"].to_str().unwrap();
+    assert!(cleared_cookie.contains("Secure"));
+    assert!(cleared_cookie.contains("HttpOnly"));
+    assert!(cleared_cookie.contains("SameSite=Lax"));
     assert!(!storage.is_registered("did:plc:alice").unwrap());
 }
 
