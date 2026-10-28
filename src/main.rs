@@ -63,7 +63,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         HttpRepoSource::default(),
         AtriumRepoVerifier,
         HostRateLimiter::new(Duration::from_millis(500)),
-    );
+    )
+    .with_records_per_second(config.backfill_records_per_second);
     let worker = BackfillWorker::new(
         storage.clone(),
         resolver,

@@ -22,6 +22,7 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 
 const MAX_REPO_CAR_BYTES: usize = 64 * 1024 * 1024;
+pub const DEFAULT_BACKFILL_RECORDS_PER_SECOND: u64 = 300;
 const INDEXED_COLLECTIONS: &[&str] = &[
     "app.bsky.feed.post",
     "app.bsky.feed.like",
@@ -41,6 +42,8 @@ pub enum BackfillError {
     Verify(String),
     #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error("database worker task failed: {0}")]
+    StorageTask(#[from] tokio::task::JoinError),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -346,6 +349,7 @@ where
     fetcher: F,
     verifier: V,
     limiter: Arc<HostRateLimiter>,
+    records_per_second: u64,
 }
 
 impl<S, F, V> RepoBackfiller<S, F, V>
@@ -360,7 +364,13 @@ where
             fetcher,
             verifier,
             limiter: Arc::new(limiter),
+            records_per_second: DEFAULT_BACKFILL_RECORDS_PER_SECOND,
         }
+    }
+
+    pub fn with_records_per_second(mut self, records_per_second: u64) -> Self {
+        self.records_per_second = records_per_second.max(1);
+        self
     }
 
     pub async fn backfill(
@@ -368,7 +378,10 @@ where
         did: &str,
         pds: &str,
         signing_did_key: &str,
-    ) -> Result<usize, BackfillError> {
+    ) -> Result<usize, BackfillError>
+    where
+        S: 'static,
+    {
         let endpoint = UrlParts::parse_pds(pds)?;
         let host = reqwest::Url::parse(&endpoint.origin)
             .map_err(|error| BackfillError::InvalidPds(error.to_string()))?
@@ -403,8 +416,18 @@ where
             });
         }
         let count = records.len();
-        self.storage
-            .replace_repo_snapshot(did, &records, &following)?;
+        let storage = Arc::clone(&self.storage);
+        let snapshot_did = did.to_owned();
+        let records_per_second = self.records_per_second;
+        tokio::task::spawn_blocking(move || {
+            storage.replace_repo_snapshot_throttled(
+                &snapshot_did,
+                &records,
+                &following,
+                records_per_second,
+            )
+        })
+        .await??;
         tracing::info!(
             did,
             indexed_records = count,

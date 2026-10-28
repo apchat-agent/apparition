@@ -19,6 +19,8 @@ pub struct Config {
     pub jetstream_idle_timeout_secs: u64,
     #[serde(default = "default_jetstream_event_timeout_secs")]
     pub jetstream_event_timeout_secs: u64,
+    #[serde(default = "default_backfill_records_per_second")]
+    pub backfill_records_per_second: u64,
     #[serde(default = "default_appview_did")]
     pub appview_did: String,
     #[serde(default = "default_public_url")]
@@ -45,6 +47,7 @@ impl Default for Config {
             jetstream_urls: default_jetstream_urls(),
             jetstream_idle_timeout_secs: default_jetstream_idle_timeout_secs(),
             jetstream_event_timeout_secs: default_jetstream_event_timeout_secs(),
+            backfill_records_per_second: default_backfill_records_per_second(),
             appview_did: default_appview_did(),
             public_url: default_public_url(),
             oauth_mode: OAuthMode::default(),
@@ -70,6 +73,8 @@ pub enum ConfigError {
         variable: &'static str,
         value: String,
     },
+    #[error("APPVIEW_BACKFILL_RECORDS_PER_SECOND must be a positive integer, got {0}")]
+    InvalidBackfillRate(String),
     #[error("loopback OAuth requires APPVIEW_LISTEN to be a loopback socket address, got {0}")]
     UnsafeLoopbackListen(String),
 }
@@ -110,6 +115,9 @@ impl Config {
                 "APPVIEW_JETSTREAM_EVENT_TIMEOUT_SECS" => {
                     config.jetstream_event_timeout_secs =
                         parse_timeout("APPVIEW_JETSTREAM_EVENT_TIMEOUT_SECS", value)?;
+                }
+                "APPVIEW_BACKFILL_RECORDS_PER_SECOND" => {
+                    config.backfill_records_per_second = parse_backfill_rate(value)?;
                 }
                 "APPVIEW_DID" => config.appview_did = value.to_owned(),
                 "APPVIEW_PUBLIC_URL" => config.public_url = value.to_owned(),
@@ -172,6 +180,10 @@ impl Config {
                 "APPVIEW_JETSTREAM_EVENT_TIMEOUT_SECS",
                 env::var("APPVIEW_JETSTREAM_EVENT_TIMEOUT_SECS").unwrap_or_default(),
             ),
+            (
+                "APPVIEW_BACKFILL_RECORDS_PER_SECOND",
+                env::var("APPVIEW_BACKFILL_RECORDS_PER_SECOND").unwrap_or_default(),
+            ),
             ("APPVIEW_DID", env::var("APPVIEW_DID").unwrap_or_default()),
             (
                 "APPVIEW_PUBLIC_URL",
@@ -213,6 +225,9 @@ impl Config {
                     "APPVIEW_JETSTREAM_EVENT_TIMEOUT_SECS" => {
                         config.jetstream_event_timeout_secs = parse_timeout(key, &value)?;
                     }
+                    "APPVIEW_BACKFILL_RECORDS_PER_SECOND" => {
+                        config.backfill_records_per_second = parse_backfill_rate(&value)?;
+                    }
                     "APPVIEW_DID" => config.appview_did = value,
                     "APPVIEW_PUBLIC_URL" => config.public_url = value,
                     "APPVIEW_OAUTH_MODE" => config.oauth_mode = parse_oauth_mode(&value)?,
@@ -232,6 +247,14 @@ fn parse_oauth_mode(value: &str) -> Result<OAuthMode, ConfigError> {
         "loopback" => Ok(OAuthMode::Loopback),
         _ => Err(ConfigError::InvalidOAuthMode(value.to_owned())),
     }
+}
+
+fn parse_backfill_rate(value: &str) -> Result<u64, ConfigError> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|rate| *rate > 0)
+        .ok_or_else(|| ConfigError::InvalidBackfillRate(value.to_owned()))
 }
 
 fn default_listen() -> String {
@@ -256,6 +279,10 @@ fn default_jetstream_idle_timeout_secs() -> u64 {
 
 fn default_jetstream_event_timeout_secs() -> u64 {
     60
+}
+
+fn default_backfill_records_per_second() -> u64 {
+    300
 }
 
 fn parse_timeout(variable: &'static str, value: &str) -> Result<u64, ConfigError> {

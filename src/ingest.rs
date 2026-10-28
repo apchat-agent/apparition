@@ -274,6 +274,16 @@ pub trait Storage: Send + Sync {
         records: &[IndexedRecord],
         following: &[String],
     ) -> Result<(), StorageError>;
+    fn replace_repo_snapshot_throttled(
+        &self,
+        did: &str,
+        records: &[IndexedRecord],
+        following: &[String],
+        records_per_second: u64,
+    ) -> Result<(), StorageError> {
+        let _ = records_per_second;
+        self.replace_repo_snapshot(did, records, following)
+    }
     fn delete_record(&self, did: &str, collection: &str, rkey: &str) -> Result<(), StorageError>;
     fn get_record(
         &self,
@@ -1336,36 +1346,14 @@ impl SqliteStorage {
             .lock()
             .map_err(|_| StorageError::Poisoned)
     }
-}
 
-impl Storage for SqliteStorage {
-    fn write_backlog(&self) -> u64 {
-        self.checkpoint_backlog.load(Ordering::Relaxed)
-    }
-
-    fn put_record(&self, record: &IndexedRecord) -> Result<(), StorageError> {
-        let record_json = serde_json::to_string(&record.record)?;
-        let connection = self.conn()?;
-        connection.execute(
-            "INSERT INTO records (did, collection, rkey, uri, cid, time_us, record_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(did, collection, rkey) DO UPDATE SET
-                 uri=excluded.uri, cid=excluded.cid, time_us=excluded.time_us, record_json=excluded.record_json",
-            params![record.did, record.collection, record.rkey, record.uri, record.cid, record.time_us, record_json],
-        )?;
-        write_notification_events(&connection, record)?;
-        Ok(())
-    }
-
-    fn replace_repo_snapshot(
+    fn replace_repo_snapshot_inner(
         &self,
         did: &str,
         records: &[IndexedRecord],
         following: &[String],
+        records_per_second: Option<u64>,
     ) -> Result<(), StorageError> {
-        // Serialise before taking the lock, and write records in short batches that
-        // each release it: one transaction for a big repo held the only connection
-        // for 70 s on appview-host and froze every page and sign-in behind it.
         let record_json = records
             .iter()
             .map(|record| serde_json::to_string(&record.record))
@@ -1416,9 +1404,13 @@ impl Storage for SqliteStorage {
         }
         transaction.commit()?;
         drop(connection);
-        for (batch, batch_json) in records
+
+        let write_started = Instant::now();
+        let total_batches = records.len().div_ceil(SNAPSHOT_BATCH);
+        for (batch_index, (batch, batch_json)) in records
             .chunks(SNAPSHOT_BATCH)
             .zip(record_json.chunks(SNAPSHOT_BATCH))
+            .enumerate()
         {
             let mut connection = self.conn()?;
             let transaction = connection.transaction()?;
@@ -1449,8 +1441,62 @@ impl Storage for SqliteStorage {
             drop(connection);
             // std's Mutex is not fair: without a yield this thread takes it straight back.
             std::thread::yield_now();
+
+            if let Some(rate) = records_per_second
+                && batch_index + 1 < total_batches
+            {
+                let written = ((batch_index + 1) * SNAPSHOT_BATCH).min(records.len()) as u128;
+                let target_nanos = written
+                    .saturating_mul(1_000_000_000)
+                    .checked_div(rate.max(1) as u128)
+                    .unwrap_or(u128::MAX)
+                    .min(u64::MAX as u128) as u64;
+                let target = Duration::from_nanos(target_nanos);
+                if let Some(remaining) = target.checked_sub(write_started.elapsed()) {
+                    std::thread::sleep(remaining);
+                }
+            }
         }
         Ok(())
+    }
+}
+
+impl Storage for SqliteStorage {
+    fn write_backlog(&self) -> u64 {
+        self.checkpoint_backlog.load(Ordering::Relaxed)
+    }
+
+    fn put_record(&self, record: &IndexedRecord) -> Result<(), StorageError> {
+        let record_json = serde_json::to_string(&record.record)?;
+        let connection = self.conn()?;
+        connection.execute(
+            "INSERT INTO records (did, collection, rkey, uri, cid, time_us, record_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(did, collection, rkey) DO UPDATE SET
+                 uri=excluded.uri, cid=excluded.cid, time_us=excluded.time_us, record_json=excluded.record_json",
+            params![record.did, record.collection, record.rkey, record.uri, record.cid, record.time_us, record_json],
+        )?;
+        write_notification_events(&connection, record)?;
+        Ok(())
+    }
+
+    fn replace_repo_snapshot(
+        &self,
+        did: &str,
+        records: &[IndexedRecord],
+        following: &[String],
+    ) -> Result<(), StorageError> {
+        self.replace_repo_snapshot_inner(did, records, following, None)
+    }
+
+    fn replace_repo_snapshot_throttled(
+        &self,
+        did: &str,
+        records: &[IndexedRecord],
+        following: &[String],
+        records_per_second: u64,
+    ) -> Result<(), StorageError> {
+        self.replace_repo_snapshot_inner(did, records, following, Some(records_per_second))
     }
 
     fn delete_record(&self, did: &str, collection: &str, rkey: &str) -> Result<(), StorageError> {
