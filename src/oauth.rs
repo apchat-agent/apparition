@@ -54,6 +54,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 use thiserror::Error;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const METADATA_PATH: &str = "/.well-known/oauth-client-metadata.json";
 const CALLBACK_PATH: &str = "/oauth/callback";
@@ -62,6 +63,7 @@ const LOGIN_COOKIE: &str = "appview_login";
 const SESSION_TTL_SECONDS: u64 = 30 * 24 * 60 * 60;
 const LOGIN_COOKIE_TTL_SECONDS: u64 = 10 * 60;
 const MAX_RENDERED_REMOTE_CHARS: usize = 4096;
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=av13";
 const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete";
 const WRITE_SCOPES: [&str; 3] = [
     "repo:app.bsky.feed.post?action=create",
@@ -291,6 +293,7 @@ impl OAuthPublic {
     {
         Router::new()
             .route(METADATA_PATH, get(metadata::<F, S>))
+            .route("/static/app.css", get(app_stylesheet))
             .route("/", get(root))
             .route("/login", get(login))
             .route("/oauth/authorize", post(authorize::<F, S>))
@@ -1067,6 +1070,32 @@ where
     Json(state.public.metadata.clone())
 }
 
+async fn app_stylesheet() -> Response {
+    let mut response = include_str!("../static/app.css").into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/css; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    response
+}
+
+fn page_shell(title: &str, content: &str, authenticated: bool) -> String {
+    let navigation = if authenticated {
+        "<nav class=\"site-nav\" aria-label=\"Main navigation\"><a href=\"/app\">Timeline</a><a href=\"/notifications\">Notifications</a><a href=\"/profile\">Profile</a><form action=\"/logout\" method=\"post\"><button type=\"submit\">Sign out</button></form></nav>"
+    } else {
+        "<nav class=\"site-nav\" aria-label=\"Main navigation\"><a href=\"/login\">Sign in</a></nav>"
+    };
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>{}</title><link rel=\"stylesheet\" href=\"{}\"></head><body><a class=\"skip-link\" href=\"#main-content\">Skip to content</a><div class=\"site-shell\"><header class=\"site-header\"><a class=\"brand\" href=\"/app\">AppView</a>{navigation}</header><main id=\"main-content\" class=\"page-content\">{content}</main></div></body></html>",
+        html_escape(title),
+        WEB_STYLESHEET_URL
+    )
+}
+
 /// The bare origin goes to the app, which sends a visitor without a session on to `/login`.
 async fn root() -> Redirect {
     Redirect::to("/app")
@@ -1109,8 +1138,12 @@ async fn login(headers: HeaderMap) -> Html<String> {
         .filter(|handle| handle_shaped(handle))
         .map(|handle| format!(" value=\"{}\"", html_escape(handle)))
         .unwrap_or_default();
-    Html(format!(
-        "<!doctype html><html><head><title>Sign in</title></head><body><main><h1>Sign in to your AppView</h1><form action=\"/oauth/authorize\" method=\"post\"><label>AT Protocol handle or DID <input name=\"handle\" autocomplete=\"username\" autocapitalize=\"none\"{value} required></label><button type=\"submit\">Continue</button></form></main></body></html>",
+    Html(page_shell(
+        "Sign in",
+        &format!(
+            "<section class=\"login-card\"><p class=\"eyebrow\">Your network, your view</p><h1>Sign in to AppView</h1><p class=\"intro\">Use your AT Protocol handle or DID to continue securely with your account provider.</p><form action=\"/oauth/authorize\" method=\"post\" class=\"login-form\"><label for=\"handle\">AT Protocol handle or DID</label><input id=\"handle\" name=\"handle\" autocomplete=\"username\" autocapitalize=\"none\" placeholder=\"you.bsky.social\"{value} required><button type=\"submit\">Continue</button></form></section>"
+        ),
+        false,
     ))
 }
 
@@ -1373,7 +1406,7 @@ where
         .iter()
         .map(|record| {
             format!(
-                "<li>{}</li>",
+                "<li class=\"post-item\">{}</li>",
                 render_web_post(
                     state.storage.as_ref(),
                     record,
@@ -1385,7 +1418,7 @@ where
         })
         .collect::<String>();
     let posts = if posts.is_empty() {
-        "<li>No indexed posts yet.</li>".to_owned()
+        "<li class=\"empty-state\">No indexed posts yet.</li>".to_owned()
     } else {
         posts
     };
@@ -1422,7 +1455,7 @@ where
         "<p role=\"status\">Read-only: write permissions were not granted, so posting, liking, and reposting are disabled.</p>".to_owned()
     };
     let post_form = if write_forms_enabled {
-        "<form action=\"/post\" method=\"post\"><textarea name=\"text\" required></textarea><button>Post</button></form>"
+        "<form class=\"composer\" action=\"/post\" method=\"post\"><label for=\"new-post\">Write a post</label><textarea id=\"new-post\" name=\"text\" rows=\"3\" maxlength=\"300\" required></textarea><button type=\"submit\">Post</button></form>"
     } else {
         ""
     };
@@ -1438,16 +1471,19 @@ where
                 let encoded =
                     url::form_urlencoded::byte_serialize(cursor.as_bytes()).collect::<String>();
                 format!(
-                    "<a rel=\"next\" href=\"/app?limit={limit}&amp;cursor={encoded}\">Older</a>"
+                    "<a class=\"pagination-link\" rel=\"next\" href=\"/app?limit={limit}&amp;cursor={encoded}\">Older</a>"
                 )
             })
             .unwrap_or_default()
     } else {
         String::new()
     };
-    Html(format!(
-        "<!doctype html><html><head><title>AppView</title></head><body><main><h1>Timeline for {}</h1><nav><a href=\"/profile?did={}\">Profile</a> <a href=\"/notifications\">Notifications</a> <form action=\"/logout\" method=\"post\"><button>Log out</button></form></nav>{read_only_message}{indexing_status}<ol>{posts}</ol>{older}{post_form}</main></body></html>",
-        html_escape(&did), html_escape(&did)
+    Html(page_shell(
+        "Timeline",
+        &format!(
+            "<header class=\"page-heading\"><p class=\"eyebrow\">Your feed</p><h1>Timeline</h1><p class=\"page-subtitle\">Posts from accounts in your local view.</p></header>{read_only_message}{indexing_status}{post_form}<ol class=\"post-list\">{posts}</ol>{older}",
+        ),
+        true,
     ))
     .into_response()
 }
@@ -1486,7 +1522,7 @@ where
         .map(|notification| render_web_notification(state.storage.as_ref(), notification))
         .collect::<String>();
     let items = if items.is_empty() {
-        "<li>No notifications yet.</li>".to_owned()
+        "<li class=\"empty-state\">No notifications yet.</li>".to_owned()
     } else {
         items
     };
@@ -1502,7 +1538,7 @@ where
                 let cursor =
                     url::form_urlencoded::byte_serialize(cursor.as_bytes()).collect::<String>();
                 format!(
-                    "<a rel=\"next\" href=\"/notifications?cursor={}\">Older</a>",
+                    "<a class=\"pagination-link\" rel=\"next\" href=\"/notifications?cursor={}\">Older</a>",
                     html_escape(&cursor)
                 )
             })
@@ -1510,10 +1546,14 @@ where
     } else {
         String::new()
     };
-    Html(format!(
-        "<!doctype html><html><head><title>Notifications</title></head><body><main><h1>Notifications</h1><nav><a href=\"/app\">Timeline</a> <a href=\"/profile?did={}\">Profile</a></nav><ol>{items}</ol>{older}</main></body></html>",
-        html_escape(&did)
-    )).into_response()
+    Html(page_shell(
+        "Notifications",
+        &format!(
+            "<header class=\"page-heading\"><p class=\"eyebrow\">What’s happening</p><h1>Notifications</h1><p class=\"page-subtitle\">Recent activity around your posts and profile.</p></header><ol class=\"notification-list\">{items}</ol>{older}"
+        ),
+        true,
+    ))
+    .into_response()
 }
 
 fn render_web_notification<S: Storage>(storage: &S, notification: &IndexedNotification) -> String {
@@ -1559,7 +1599,8 @@ fn render_web_notification<S: Storage>(storage: &S, notification: &IndexedNotifi
         String::new()
     };
     format!(
-        "<li><article><header><a href=\"{}\">@{}</a> {reason}</header>{text}{thread_link}</article></li>",
+        "<li class=\"notification-item\"><article class=\"notification-card\"><header class=\"notification-heading\">{}<div><a class=\"author-name\" href=\"{}\">@{}</a><span class=\"notification-reason\">{reason}</span></div></header>{text}{thread_link}</article></li>",
+        avatar_markup(&author, "avatar"),
         html_escape(&author_uri),
         html_escape(&handle)
     )
@@ -1610,7 +1651,7 @@ where
         .iter()
         .map(|record| {
             format!(
-                "<li>{}</li>",
+                "<li class=\"post-item\">{}</li>",
                 render_web_post(
                     state.storage.as_ref(),
                     record,
@@ -1622,7 +1663,7 @@ where
         })
         .collect::<String>();
     let posts = if posts.is_empty() {
-        "<li>No indexed posts yet.</li>".to_owned()
+        "<li class=\"empty-state\">No indexed posts yet.</li>".to_owned()
     } else {
         posts
     };
@@ -1640,16 +1681,22 @@ where
                 let encoded_cursor =
                     url::form_urlencoded::byte_serialize(cursor.as_bytes()).collect::<String>();
                 format!(
-                    "<a rel=\"next\" href=\"/profile?did={encoded_did}&amp;limit={limit}&amp;cursor={encoded_cursor}\">Older</a>"
+                    "<a class=\"pagination-link\" rel=\"next\" href=\"/profile?did={encoded_did}&amp;limit={limit}&amp;cursor={encoded_cursor}\">Older</a>"
                 )
             })
             .unwrap_or_default()
     } else {
         String::new()
     };
-    Html(format!(
-        "<!doctype html><html><head><title>Profile</title></head><body><main><h1>{}</h1><p>@{}</p><a href=\"/app\">Timeline</a><ol>{posts}</ol>{older}</main></body></html>",
-        html_escape(display_name), html_escape(&handle)
+    Html(page_shell(
+        display_name,
+        &format!(
+            "<section class=\"profile-card\">{}<div><h1>{}</h1><p class=\"profile-handle\">@{}</p></div></section><header class=\"section-heading\"><h2>Posts</h2></header><ol class=\"post-list\">{posts}</ol>{older}",
+            avatar_markup(&profile, "profile-avatar"),
+            html_escape(display_name),
+            html_escape(&handle)
+        ),
+        true,
     ))
     .into_response()
 }
@@ -1697,7 +1744,7 @@ where
         .iter()
         .map(|ancestor| {
             format!(
-                "<li>{}</li>",
+                "<li class=\"post-item\">{}</li>",
                 render_web_post(
                     state.storage.as_ref(),
                     ancestor,
@@ -1725,15 +1772,19 @@ where
     } else {
         "<p role=\"status\">Read-only: write permissions were not granted.</p>".to_owned()
     };
-    Html(format!(
-        "<!doctype html><html><head><title>Post</title></head><body><main>{read_only_message}<section class=\"thread-ancestors\"><ol>{ancestors_html}</ol></section>{}<section class=\"thread-replies\"><h2>Replies</h2>{replies_html}</section><a href=\"/app\">Timeline</a></main></body></html>",
-        render_web_post(
-            state.storage.as_ref(),
-            &record,
-            &viewer_did,
-            write_forms_enabled,
-            false
-        )
+    Html(page_shell(
+        "Thread",
+        &format!(
+            "<header class=\"page-heading\"><p class=\"eyebrow\">Conversation</p><h1>Thread</h1></header>{read_only_message}<section class=\"thread-ancestors\" aria-label=\"Earlier posts in this thread\"><ol class=\"post-list\">{ancestors_html}</ol></section><section class=\"thread-focus\" aria-label=\"Selected post\">{}</section><section class=\"thread-replies\"><h2>Replies</h2>{replies_html}</section>",
+            render_web_post(
+                state.storage.as_ref(),
+                &record,
+                &viewer_did,
+                write_forms_enabled,
+                false
+            )
+        ),
+        true,
     ))
     .into_response()
 }
@@ -1799,7 +1850,7 @@ fn render_thread_replies<S: Storage>(
             budget,
         )?;
         html.push_str(&format!(
-            "<li>{}{nested}</li>",
+            "<li class=\"post-item\">{}{nested}</li>",
             render_web_post(storage, &reply, viewer_did, write_forms_enabled, false)
         ));
     }
@@ -2026,9 +2077,13 @@ fn oauth_error(status: StatusCode, message: &str) -> Response {
 fn oauth_error_page(status: StatusCode, message: &str) -> Response {
     (
         status,
-        Html(format!(
-            "<!doctype html><html><head><title>Sign-in error</title></head><body><main><h1>Sign-in error</h1><p>{}</p><a href=\"/login\">Try again</a></main></body></html>",
-            html_escape(message)
+        Html(page_shell(
+            "Sign-in error",
+            &format!(
+                "<section class=\"error-card\"><p class=\"eyebrow\">Something went wrong</p><h1>Sign-in error</h1><p>{}</p><a class=\"primary-link\" href=\"/login\">Try again</a></section>",
+                html_escape(message)
+            ),
+            false,
         )),
     )
         .into_response()
@@ -2072,6 +2127,59 @@ fn profile_handle(profile: &Value, did: &str) -> String {
         .to_owned()
 }
 
+fn safe_avatar_url(profile: &Value) -> Option<&str> {
+    let avatar = profile.get("avatar").and_then(Value::as_str)?;
+    let url = url::Url::parse(avatar).ok()?;
+    (url.scheme() == "https"
+        && url.host_str() == Some("cdn.bsky.app")
+        && url.username().is_empty()
+        && url.password().is_none())
+    .then_some(avatar)
+}
+
+fn avatar_markup(profile: &Value, class_name: &str) -> String {
+    if let Some(avatar) = safe_avatar_url(profile) {
+        format!(
+            "<img class=\"{class_name}\" src=\"{}\" alt=\"\" loading=\"lazy\">",
+            html_escape(avatar)
+        )
+    } else {
+        format!("<span class=\"{class_name} avatar-placeholder\" aria-hidden=\"true\"></span>")
+    }
+}
+
+fn relative_time(created_at: &str) -> String {
+    let Ok(created_at) = OffsetDateTime::parse(created_at, &Rfc3339) else {
+        return "time unavailable".to_owned();
+    };
+    let seconds = OffsetDateTime::now_utc().unix_timestamp() - created_at.unix_timestamp();
+    if seconds.unsigned_abs() < 60 {
+        return if seconds < 0 {
+            "soon".to_owned()
+        } else {
+            "now".to_owned()
+        };
+    }
+    let (amount, unit) = match seconds.unsigned_abs() {
+        value if value < 60 * 60 => (value / 60, "minute"),
+        value if value < 24 * 60 * 60 => (value / (60 * 60), "hour"),
+        value if value < 7 * 24 * 60 * 60 => (value / (24 * 60 * 60), "day"),
+        value if value < 30 * 24 * 60 * 60 => (value / (7 * 24 * 60 * 60), "week"),
+        value if value < 365 * 24 * 60 * 60 => (value / (30 * 24 * 60 * 60), "month"),
+        value => (value / (365 * 24 * 60 * 60), "year"),
+    };
+    let unit = if amount == 1 {
+        unit.to_owned()
+    } else {
+        format!("{unit}s")
+    };
+    if seconds < 0 {
+        format!("in {amount} {unit}")
+    } else {
+        format!("{amount} {unit} ago")
+    }
+}
+
 fn render_web_post<S: Storage>(
     storage: &S,
     record: &IndexedRecord,
@@ -2091,10 +2199,12 @@ fn render_web_post<S: Storage>(
         url::form_urlencoded::byte_serialize(record.did.as_bytes()).collect::<String>()
     );
     let author = format!(
-        "<a href=\"{}\">{} @{}</a>",
+        "{}<div class=\"post-author\"><a class=\"author-name\" href=\"{}\">{}</a><a class=\"author-handle\" href=\"{}\">@{}</a></div>",
+        avatar_markup(&profile, "avatar"),
         html_escape(&profile_uri),
         html_escape(display_name),
-        html_escape(&handle)
+        html_escape(&profile_uri),
+        html_escape(&handle),
     );
     let reply_context = record
         .record
@@ -2127,9 +2237,10 @@ fn render_web_post<S: Storage>(
         .and_then(Value::as_str)
         .map(|created_at| {
             format!(
-                "<time datetime=\"{}\">{}</time>",
+                "<span class=\"sr-only\" aria-hidden=\"true\"><time datetime=\"{}\">{}</time></span><span class=\"relative-time\">{}</span>",
                 html_escape(created_at),
-                html_escape(created_at)
+                html_escape(created_at),
+                relative_time(created_at)
             )
         })
         .unwrap_or_default();
@@ -2144,7 +2255,7 @@ fn render_web_post<S: Storage>(
             url::form_urlencoded::byte_serialize(record.uri.as_bytes()).collect::<String>()
         );
         format!(
-            "<a href=\"{}\">{}</a>",
+            "<a class=\"post-text-link\" href=\"{}\">{}</a>",
             html_escape(&thread_uri),
             html_escape(text)
         )
@@ -2155,7 +2266,7 @@ fn render_web_post<S: Storage>(
         .post_interaction_summary(&record.uri, Some(viewer_did))
         .unwrap_or_default();
     let counts = format!(
-        "{} {} · {} {} · {} {}",
+        "<ul class=\"post-counts\" aria-label=\"Post engagement\"><li>{} {}</li><li>{} {}</li><li>{} {}</li></ul>",
         interactions.like_count,
         if interactions.like_count == 1 {
             "like"
@@ -2175,6 +2286,15 @@ fn render_web_post<S: Storage>(
             "replies"
         },
     );
+    let thread_uri = format!(
+        "/thread?uri={}",
+        url::form_urlencoded::byte_serialize(record.uri.as_bytes()).collect::<String>()
+    );
+    let reply_action = format!(
+        "<a class=\"post-action\" href=\"{}\" aria-label=\"Open replies\"><span>Reply</span><span class=\"action-count\">{}</span></a>",
+        html_escape(&thread_uri),
+        interactions.reply_count
+    );
     let actions = if write_forms_enabled {
         let uri = html_escape(&record.uri);
         let cid = html_escape(record.cid.as_deref().unwrap_or(""));
@@ -2191,11 +2311,22 @@ fn render_web_post<S: Storage>(
         } else {
             "Repost"
         };
+        let like_aria = if interactions.viewer_like.is_some() {
+            format!("Unlike post by @{}", html_escape(&handle))
+        } else {
+            format!("Like post by @{}", html_escape(&handle))
+        };
         format!(
-            "<form action=\"/like\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\">{like_intent}<button>{like_label}</button></form><form action=\"/repost\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\"><button>{repost_label}</button></form>"
+            "{reply_action}<form class=\"post-action-form\" action=\"/like\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\">{like_intent}<button class=\"post-action\" type=\"submit\" aria-label=\"{like_aria}\" aria-pressed=\"{}\">{like_label}</button></form><form class=\"post-action-form\" action=\"/repost\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\"><button class=\"post-action\" type=\"submit\" aria-label=\"Repost by @{}\">{repost_label}</button></form>",
+            if interactions.viewer_like.is_some() {
+                "true"
+            } else {
+                "false"
+            },
+            html_escape(&handle)
         )
     } else {
-        String::new()
+        reply_action
     };
     let embed = record
         .record
@@ -2203,7 +2334,7 @@ fn render_web_post<S: Storage>(
         .map(|embed| render_web_embed(storage, &record.did, embed))
         .unwrap_or_default();
     format!(
-        "<article><header>{author}</header>{reply_context}{time}<p>{text}</p><p class=\"counts\">{counts}</p>{embed}{actions}</article>"
+        "<article class=\"post-card\"><header class=\"post-header\">{author}{time}</header>{reply_context}<p class=\"post-text\">{text}</p>{embed}{counts}<div class=\"post-actions\" aria-label=\"Post actions\">{actions}</div></article>"
     )
 }
 
@@ -2472,19 +2603,29 @@ mod tests {
     #[tokio::test]
     async fn login_page_prefills_the_remembered_handle_safely() {
         let mut headers = HeaderMap::new();
-        headers.append(header::COOKIE, "appview_handle=owner.example.test".parse().unwrap());
+        headers.append(
+            header::COOKIE,
+            "appview_handle=owner.example.test".parse().unwrap(),
+        );
         let Html(body) = login(headers).await;
         assert!(body.contains("value=\"owner.example.test\""), "{body}");
 
         let mut headers = HeaderMap::new();
-        headers.append(header::COOKIE, "appview_handle=x\"onfocus=alert(1)".parse().unwrap());
+        headers.append(
+            header::COOKIE,
+            "appview_handle=x\"onfocus=alert(1)".parse().unwrap(),
+        );
         let Html(body) = login(headers).await;
         assert!(!body.contains("onfocus"), "{body}");
     }
 
     #[test]
     fn remembered_handle_cookie_only_for_handle_shaped_values() {
-        assert!(remember_handle_cookie("owner.example.test", true).unwrap().contains("Max-Age=31536000; Secure"));
+        assert!(
+            remember_handle_cookie("owner.example.test", true)
+                .unwrap()
+                .contains("Max-Age=31536000; Secure")
+        );
         assert!(remember_handle_cookie("did:plc:abc123", false).is_some());
         assert!(remember_handle_cookie("a;b", true).is_none());
     }
@@ -2493,7 +2634,10 @@ mod tests {
     fn cookie_lookup_reads_every_cookie_header() {
         let mut headers = HeaderMap::new();
         headers.append(header::COOKIE, "appview_session=abc".parse().unwrap());
-        headers.append(header::COOKIE, "other=1; appview_login=xyz".parse().unwrap());
+        headers.append(
+            header::COOKIE,
+            "other=1; appview_login=xyz".parse().unwrap(),
+        );
         assert_eq!(cookie_value_named(&headers, "appview_login"), Some("xyz"));
         assert_eq!(cookie_value_named(&headers, "appview_session"), Some("abc"));
     }

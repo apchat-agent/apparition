@@ -517,7 +517,12 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
                 .to_vec(),
         )
         .unwrap();
-        assert!(html.contains("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"), "{path}");
+        assert!(
+            html.contains(
+                "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+            ),
+            "{path}"
+        );
         assert!(html.contains("href=\"/static/app.css?v=av13\""), "{path}");
         assert!(!html.contains("style="), "{path}");
         assert!(!html.contains("<script"), "{path}");
@@ -533,8 +538,18 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
         .await
         .unwrap();
     assert_eq!(stylesheet.status(), StatusCode::OK);
-    assert!(stylesheet.headers()["content-type"].to_str().unwrap().starts_with("text/css"));
-    assert!(stylesheet.headers()["cache-control"].to_str().unwrap().contains("max-age="));
+    assert!(
+        stylesheet.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/css")
+    );
+    assert!(
+        stylesheet.headers()["cache-control"]
+            .to_str()
+            .unwrap()
+            .contains("max-age=")
+    );
 }
 
 #[tokio::test]
@@ -564,7 +579,9 @@ async fn sign_in_error_page_uses_the_shared_mobile_document_shell() {
             .to_vec(),
     )
     .unwrap();
-    assert!(html.contains("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"));
+    assert!(
+        html.contains("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">")
+    );
     assert!(html.contains("href=\"/static/app.css?v=av13\""));
     assert!(!html.contains("style="));
     assert!(!html.contains("<script"));
@@ -629,7 +646,7 @@ async fn web_posts_show_avatar_relative_time_and_accessible_actions() {
     assert!(html.contains("Alice"));
     assert!(html.contains("@alice.test"));
     assert!(html.contains("datetime=\"2020-01-01T00:00:00Z\""));
-    assert!(html.contains("ago</time>"));
+    assert!(html.contains("ago</span>"));
     assert!(html.contains("aria-label=\"Open replies\""));
     assert!(html.contains("aria-label=\"Like post by @alice.test\""));
     assert!(html.contains("aria-label=\"Repost by @alice.test\""));
