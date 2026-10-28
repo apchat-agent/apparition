@@ -588,6 +588,56 @@ async fn post_thread_returns_parent_chain_and_time_ordered_nested_replies() {
 }
 
 #[tokio::test]
+async fn extreme_thread_depth_and_reply_fanout_stay_within_a_node_budget() {
+    let storage = Arc::new(MemoryStorage::default());
+    let root = "at://did:plc:alice/app.bsky.feed.post/root";
+    for index in 0..150 {
+        let (rkey, record) = if index == 0 {
+            ("root".to_owned(), json!({"text":"root"}))
+        } else {
+            (
+                format!("reply{index}"),
+                json!({"text":"reply","reply":{"parent":{"uri":root}}}),
+            )
+        };
+        storage
+            .put_record(&IndexedRecord {
+                did: ALICE.into(),
+                collection: "app.bsky.feed.post".into(),
+                rkey: rkey.clone(),
+                uri: format!("at://{ALICE}/app.bsky.feed.post/{rkey}"),
+                cid: None,
+                time_us: index,
+                record,
+            })
+            .unwrap();
+    }
+    let (router, _) = api_for_storage(storage);
+
+    let (status, body) = request(
+        router,
+        "/xrpc/app.bsky.feed.getPostThread?uri=at%3A%2F%2Fdid%3Aplc%3Aalice%2Fapp.bsky.feed.post%2Froot&depth=100000&parentHeight=100000",
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    fn count_posts(value: &Value) -> usize {
+        usize::from(
+            value.get("$type").and_then(Value::as_str) == Some("app.bsky.feed.defs#threadViewPost"),
+        ) + value
+            .as_object()
+            .map(|object| object.values().map(count_posts).sum())
+            .unwrap_or(0)
+            + value
+                .as_array()
+                .map(|array| array.iter().map(count_posts).sum())
+                .unwrap_or(0)
+    }
+    assert!(count_posts(&body) <= 100, "thread exceeded node budget");
+}
+
+#[tokio::test]
 async fn notifications_include_likes_reposts_replies_mentions_quotes_and_follows() {
     let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
     let post_uri = format!("at://{ALICE}/app.bsky.feed.post/own");
