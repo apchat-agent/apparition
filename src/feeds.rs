@@ -8,8 +8,68 @@ pub struct SavedFeedPreference {
     pub pinned: bool,
 }
 
-pub fn parse_saved_feed_preferences(_response: &Value) -> Vec<SavedFeedPreference> {
-    Vec::new()
+pub fn parse_saved_feed_preferences(response: &Value) -> Vec<SavedFeedPreference> {
+    let Some(preferences) = response.get("preferences").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    if let Some(v2) = preferences.iter().find(|preference| {
+        preference.get("$type").and_then(Value::as_str)
+            == Some("app.bsky.actor.defs#savedFeedsPrefV2")
+    }) {
+        return v2
+            .get("items")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| {
+                Some(SavedFeedPreference {
+                    id: item.get("id")?.as_str()?.to_owned(),
+                    feed_type: item.get("type")?.as_str()?.to_owned(),
+                    value: item.get("value")?.as_str()?.to_owned(),
+                    pinned: item.get("pinned")?.as_bool()?,
+                })
+            })
+            .collect();
+    }
+
+    let Some(legacy) = preferences.iter().find(|preference| {
+        preference.get("$type").and_then(Value::as_str)
+            == Some("app.bsky.actor.defs#savedFeedsPref")
+    }) else {
+        return Vec::new();
+    };
+    let pinned = legacy
+        .get("pinned")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    let saved = legacy
+        .get("saved")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    let mut result = Vec::new();
+    for (value, is_pinned) in pinned
+        .iter()
+        .map(|value| (*value, true))
+        .chain(saved.iter().map(|value| (*value, false)))
+    {
+        if result.iter().any(|item: &SavedFeedPreference| item.value == value) {
+            continue;
+        }
+        result.push(SavedFeedPreference {
+            id: value.to_owned(),
+            feed_type: "feed".to_owned(),
+            value: value.to_owned(),
+            pinned: is_pinned,
+        });
+    }
+    result
 }
 
 #[cfg(test)]
