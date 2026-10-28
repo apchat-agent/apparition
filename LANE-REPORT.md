@@ -244,3 +244,43 @@ The app-side root cause of the observed stall was that `JetstreamConsumer::consu
 - `cargo clippy --locked --offline --all-targets -- -D warnings`: passed.
 - `cargo deny check licenses`: passed (`licenses ok`).
 - Refresh and interaction regressions use local fake backends and local events. The throughput sample used a generated local event stream and SQLite under this repository's `target/`; no live server or live data was touched. Nothing was pushed.
+
+## av12 public exposure hardening and container preparation (2026-10-28)
+
+The required anonymous-attacker inventory was committed first as `ba73fb3` (`tmp/HARDENING.md`), before the implementation changes. The route-by-route and outbound-fetch inventory remains there.
+
+| Threat surface | Fixed | Evidence |
+| --- | --- | --- |
+| Outbound HTTP and SSRF | All outbound HTTP is routed through `SafeHttpClient`: HTTPS by default, safe DNS resolution and IP checks, checked-IP pinning, redirect revalidation and hop limits, time and response limits, and a global concurrency bound. This covers identity and handle lookup, OAuth metadata and token calls, Atrium PDS reads/writes, and repository backfill. | `rejects_non_public_ipv4_and_ipv6_ranges`, `resolver_policy_rejects_mixed_and_rebound_dns_answers`, `resolver_policy_allows_a_public_dns_answer`, `guarded_http_request_rechecks_redirect_destinations`, `guarded_http_request_pins_dns_and_caps_response_size`. Source grep for reqwest/hyper client construction finds `reqwest::Client::builder` only in `src/net.rs`; no other direct client/fetch construction was found under `src/`. |
+| Public request work | SQLite read routes use bounded indexed storage queries instead of materializing the records table. XRPC pages cap at 100, thread traversal has depth and node budgets, request targets cap at 8 KiB, and bodies cap at 32 KiB. Per-IP and global rate buckets cover login, reads, writes, and outbound-triggering routes; a full bucket map preserves active buckets and denies new peers until expired entries can be pruned. Backfill accepts only registered users' own repositories and recorded follows, holds at most 1,000 DIDs (including queue trimming when an older database opens), and returns eight pending DIDs per worker batch. | `author_feed_caps_a_million_item_page_at_one_hundred`, `extreme_thread_depth_and_reply_fanout_stay_within_a_node_budget`, `eleventh_login_attempt_from_one_ip_returns_429`, `oversized_login_form_body_returns_413`, `active_rate_buckets_are_preserved_when_the_bucket_map_is_full`, `backfill_queue_has_a_global_storage_cap`, `opening_a_database_trims_an_oversized_legacy_backfill_queue`, `pending_backfill_batches_are_bounded`, `backfill_enqueue_requires_a_registered_owner_and_existing_follow`, `registered_owner_cannot_queue_repository_outside_follow_scope`. |
+| Sessions, OAuth, and CSRF | Same-origin and fetch-metadata checks cover state-changing POSTs. Cookies are HttpOnly and SameSite=Lax, and Secure on HTTPS. Login state, PKCE, DPoP nonce handling, random session IDs, 0600 SQLite/key files, per-session invalidation, and logout token revocation remain covered. Confidential mode remains available for public URLs; its signing key is stored outside the repo. | Existing regressions include cross-origin authorization/write/logout rejection, cookie Secure policy, state/browser binding, DPoP nonce retry, session rotation, token revocation, and owner-only file permissions. |
+| HTML and browser policy | Remote text is HTML-escaped and capped at 4,096 characters. External links allow only HTTP(S) and carry `nofollow noopener noreferrer ugc`. CSP disallows scripts and frames; nosniff, no-referrer, frame denial, and HTTPS-only HSTS are set. | `web_embeds_render_images_cards_quotes_and_escape_user_content`, `web_views_truncate_oversized_remote_post_text`, `health_endpoint_returns_json_ok` (checks both health paths and response headers). |
+| Errors and logs | OAuth/upstream/storage errors and JWT verification failures return generic messages. Jetstream lifecycle logs include only endpoint origins, not URL paths or query strings; connection failures are generic. | `oauth_and_write_errors_do_not_echo_tokens_or_internal_paths`, `proxy_jwt_rejects_a_valid_claim_set_signed_by_another_key`, `websocket_connection_lifecycle_is_logged_at_info` (uses a secret query parameter and asserts it is absent from logs). |
+| Container | Added a two-stage Debian slim Dockerfile, UID/GID 10001, `/data` volume, configurable listener via `APPVIEW_LISTEN`, environment or mounted TOML configuration, and a `/healthz` Docker healthcheck. README documents the read-only-root run command, TLS proxy placement, data persistence, and key handling. | `health_endpoint_returns_json_ok` covers `/healthz`. No Docker, Podman, Colima, or Buildah executable is installed in this environment, so image build/run and host curls could not be performed. The Dockerfile was reviewed and `git diff --check` passed. |
+
+### Red/green evidence
+
+- `f3d9de8` reproduced a queue size of 1,001; `08bb84c` reproduced unbounded batches and anonymous enqueue; `e3b674a` reproduced a registered owner queueing a DID outside its follows. Green fix: `41b23a1`.
+- `83548ef` made the callback echo `access_token=secret` and `/srv/appview/oauth.sqlite`; green fix: `9c29a05`. `ce68cd6` showed the JWT signature diagnostic in an XRPC response; green fix: `5ab90eb`.
+- `30b69c3` added the million-item page regression. Temporarily removing the existing clamp made the route return 101 items instead of the required 100; the hard cap was restored and made explicit in `862f1ee`.
+- `1e26cd4` added the container probe route check. Temporarily removing `/healthz` made the regression return 404. The route is present in the server wrapper and is checked alongside `/xrpc/_health`.
+- `8d9648f` showed the rate limiter accepted a new bucket and evicted an active bucket at capacity; `2b9c1a6` prunes expired buckets and denies new peers while the map remains full. `f319791` captured a Jetstream access token in connection logs; `7101645` logs only the endpoint origin.
+- `b275ea5` showed a previously persisted queue with 1,001 items stayed oversized after startup; `3753117` trims old queues to the 1,000 oldest entries.
+- Earlier av12 red commits cover SSRF ranges/redirects/rebinding, hostile and oversized rendered content, security headers, login rate limiting, and oversized request bodies. Each fix was kept in a subsequent green commit; no test was removed or weakened.
+
+### Verification
+
+- `cargo test --locked --offline`: passed, 120 tests (unit: 17, av11 identity refresh: 5, M1: 4, M2: 5, M3: 13, M4: 11, M5 config: 5, M5 read API: 20, M6 web OAuth: 36, M6 protocol: 4).
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy --locked --offline --all-targets -- -D warnings`: passed.
+- `cargo deny check licenses`: passed (`licenses ok`).
+- `cargo build --release --locked --offline`: passed; the release binary compiled under the repo's `target/` but does not substitute for the unavailable image build.
+- No live AppView, account, or live data was accessed. No cloud resource or image was created, and nothing was pushed.
+
+### Remaining limits and cloud deployment inputs
+
+- No container engine was available, so image construction, `docker run`, `/healthz`, and host-side `/login` checks remain unverified here. The Dockerfile requires the build host to fetch the Rust and Debian base images and Cargo dependencies.
+- The per-IP limiter uses the TCP peer address and does not trust forwarded-IP headers. Behind a TLS reverse proxy or load balancer, requests share that peer's bucket; enforce client-IP rate limits at the trusted edge and prevent direct public access to the app port.
+- The bounded queue drops new scheduling work while its 1,000-item capacity is full; queueing resumes when space is available and new follow events are processed. This keeps memory and storage bounded but can delay initial account backfills during a sustained full queue.
+- Before cloud deployment, the owner must choose a provider, provide the public HTTPS domain/URL and matching `did:web`, and decide how the persistent `/data` volume (including `/data/oauth-client-key.json`) will be backed up or supplied through a secret-management process. No provider, domain, or key secret was available in this lane.
+- No public-load, concurrency, or disk-growth benchmark was run. Search and blob-proxy routes do not exist in this version.
