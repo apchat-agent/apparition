@@ -421,6 +421,10 @@ fn parse_post_uri(uri: &str) -> Result<(String, String, String), String> {
     Ok((did.to_owned(), collection.to_owned(), rkey.to_owned()))
 }
 
+pub fn feed_avatar_url(_avatar: &Value, _creator_did: &str) -> Option<String> {
+    None
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SavedFeedPreference {
     pub id: String,
@@ -920,5 +924,18 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert!(parsed[0].pinned);
         assert!(!parsed[1].pinned);
+    }
+
+    #[test]
+    fn feed_generator_blob_avatar_uses_the_feed_thumbnail_url() {
+        let avatar = json!({
+            "ref": {"$link":"bafkreib7t6y5x4w3v2u1"},
+            "mimeType":"image/jpeg",
+            "size":1234
+        });
+        assert_eq!(
+            super::feed_avatar_url(&avatar, "did:plc:creator"),
+            Some("https://cdn.bsky.app/img/feed_thumbnail/plain/did:plc:creator/bafkreib7t6y5x4w3v2u1@jpeg".into())
+        );
     }
 }
