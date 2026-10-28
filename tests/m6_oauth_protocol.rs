@@ -797,8 +797,8 @@ async fn serve_one(mut stream: TcpStream, origin: &str, state: Arc<Mutex<FakeSer
                     vec![],
                     json!({
                         "uri":format!("at://{DID}/app.bsky.feed.post/reply-{number}"),
-                        "cid":format!("reply-cid-{number}"),
-                        "commit":{"cid":format!("reply-cid-{number}"),"rev":format!("reply-rev-{number}")}
+                        "cid":"bafyreiedv4rjxnzxvlvlgqbi4vpqi3s4iuz4buywtkgfjpfjn2gix5cocu",
+                        "commit":{"cid":"bafyreiedv4rjxnzxvlvlgqbi4vpqi3s4iuz4buywtkgfjpfjn2gix5cocu","rev":"3lq6p4xgrb22a"}
                     })
                     .to_string(),
                 )

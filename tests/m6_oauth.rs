@@ -567,6 +567,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
         "/app",
         "/profile?did=did%3Aplc%3Aalice",
         "/thread?uri=at%3A%2F%2Fdid%3Aplc%3Aalice%2Fapp.bsky.feed.post%2Froot",
+        "/app/thread?uri=at%3A%2F%2Fdid%3Aplc%3Aalice%2Fapp.bsky.feed.post%2Froot",
         "/notifications",
     ];
 
@@ -1306,7 +1307,7 @@ async fn web_views_and_write_actions_require_a_login_session() {
         assert_eq!(response.status(), StatusCode::SEE_OTHER, "{path}");
         assert_eq!(response.headers()["location"], "/login");
     }
-    for path in ["/post", "/like", "/repost"] {
+    for path in ["/post", "/reply", "/like", "/repost"] {
         let response = app
             .clone()
             .oneshot(
@@ -2122,7 +2123,7 @@ async fn timeline_replies_name_the_parent_author_and_link_to_the_thread() {
     assert!(html.contains("replying to @friend.test"), "{html}");
     assert!(
         html.contains(
-            "href=\"/thread?uri=at%3A%2F%2Fdid%3Aplc%3Aalice%2Fapp.bsky.feed.post%2Freply\""
+            "href=\"/app/thread?uri=at%3A%2F%2Fdid%3Aplc%3Aalice%2Fapp.bsky.feed.post%2Freply\""
         ),
         "{html}"
     );

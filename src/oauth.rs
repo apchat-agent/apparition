@@ -169,6 +169,12 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
         Box::pin(async { Err("reply action is not available".to_owned()) })
     }
+    fn fetch_post<'a>(
+        &'a self,
+        _uri: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<IndexedRecord, String>> + Send + 'a>> {
+        Box::pin(async { Err("post fetch is not available".to_owned()) })
+    }
     fn like<'a>(
         &'a self,
         _did: &'a str,
@@ -365,10 +371,12 @@ impl OAuthPublic {
             .route("/app", get(app_home::<F, S>))
             .route("/feeds", get(feeds_page::<F, S>))
             .route("/app/feed", get(feed_timeline_page::<F, S>))
+            .route("/app/thread", get(thread_page::<F, S>))
             .route("/notifications", get(notifications_page::<F, S>))
             .route("/profile", get(profile_page::<F, S>))
             .route("/thread", get(thread_page::<F, S>))
             .route("/post", post(write_post::<F, S>))
+            .route("/reply", post(write_reply::<F, S>))
             .route("/like", post(write_like::<F, S>))
             .route("/repost", post(write_repost::<F, S>))
             .with_state(Arc::new(OAuthWebState {
@@ -1123,6 +1131,35 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
             )
             .await
         })
+    }
+
+    fn create_reply<'a>(
+        &'a self,
+        did: &'a str,
+        text: &'a str,
+        root: PostStrongRef,
+        parent: PostStrongRef,
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.create_record(
+                did,
+                "app.bsky.feed.post",
+                json!({
+                    "$type":"app.bsky.feed.post",
+                    "text":text,
+                    "createdAt":Datetime::now(),
+                    "reply":{"root":root,"parent":parent}
+                }),
+            )
+            .await
+        })
+    }
+
+    fn fetch_post<'a>(
+        &'a self,
+        uri: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<IndexedRecord, String>> + Send + 'a>> {
+        Box::pin(async move { self.feed_client.fetch_post(uri).await })
     }
 
     fn like<'a>(
@@ -2005,7 +2042,7 @@ fn render_web_notification<S: Storage>(storage: &S, notification: &IndexedNotifi
         let encoded =
             url::form_urlencoded::byte_serialize(target_uri.as_bytes()).collect::<String>();
         format!(
-            "<a href=\"/thread?uri={}\">View thread</a>",
+            "<a href=\"/app/thread?uri={}\">View thread</a>",
             html_escape(&encoded)
         )
     } else {
@@ -2130,12 +2167,10 @@ where
     let Some(uri) = query.get("uri") else {
         return oauth_error(StatusCode::BAD_REQUEST, "uri is required");
     };
-    let record = match state.storage.record_by_uri("app.bsky.feed.post", uri) {
-        Ok(record) => record,
-        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
-    };
-    let Some(record) = record else {
-        return oauth_error(StatusCode::NOT_FOUND, "post not found");
+    let record = match load_post_record(&state.flow, state.storage.as_ref(), uri).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return oauth_error(StatusCode::NOT_FOUND, "post not found"),
+        Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
     };
     let write_forms_enabled =
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
@@ -2149,10 +2184,11 @@ where
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(3)
         .min(6);
-    let ancestors = match thread_ancestors(state.storage.as_ref(), &record, parent_height) {
-        Ok(ancestors) => ancestors,
-        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
-    };
+    let ancestors =
+        match thread_ancestors(&state.flow, state.storage.as_ref(), &record, parent_height).await {
+            Ok(ancestors) => ancestors,
+            Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+        };
     let ancestors_html = ancestors
         .iter()
         .map(|ancestor| {
@@ -2185,10 +2221,15 @@ where
     } else {
         "<p role=\"status\">Read-only: write permissions were not granted.</p>".to_owned()
     };
+    let reply_composer = if write_forms_enabled {
+        render_reply_composer(state.storage.as_ref(), &record)
+    } else {
+        String::new()
+    };
     Html(page_shell(
         "Thread",
         &format!(
-            "<header class=\"page-heading\"><p class=\"eyebrow\">Conversation</p><h1>Thread</h1></header>{read_only_message}<section class=\"thread-ancestors\" aria-label=\"Earlier posts in this thread\"><ol class=\"post-list\">{ancestors_html}</ol></section><section class=\"thread-focus\" aria-label=\"Selected post\">{}</section><section class=\"thread-replies\"><h2>Replies</h2>{replies_html}</section>",
+            "<header class=\"page-heading\"><p class=\"eyebrow\">Conversation</p><h1>Thread</h1></header>{read_only_message}<section class=\"thread-ancestors\" aria-label=\"Earlier posts in this thread\"><ol class=\"post-list\">{ancestors_html}</ol></section><section class=\"thread-focus\" aria-label=\"Selected post\">{}</section><section class=\"thread-replies\"><h2>Replies</h2>{replies_html}</section>{reply_composer}",
             render_web_post(
                 state.storage.as_ref(),
                 &record,
@@ -2202,11 +2243,12 @@ where
     .into_response()
 }
 
-fn thread_ancestors<S: Storage>(
+async fn thread_ancestors<F: OAuthFlow, S: Storage>(
+    flow: &F,
     storage: &S,
     record: &IndexedRecord,
     parent_height: usize,
-) -> Result<Vec<IndexedRecord>, StorageError> {
+) -> Result<Vec<IndexedRecord>, String> {
     let mut ancestors = Vec::new();
     let mut visited = HashSet::from([record.uri.clone()]);
     let mut parent_uri = record
@@ -2219,8 +2261,15 @@ fn thread_ancestors<S: Storage>(
         if !visited.insert(uri.clone()) {
             break;
         }
-        let Some(parent) = storage.record_by_uri("app.bsky.feed.post", &uri)? else {
-            break;
+        let local_parent = storage
+            .record_by_uri("app.bsky.feed.post", &uri)
+            .map_err(|error| error.to_string())?;
+        let parent = match local_parent {
+            Some(parent) => parent,
+            None => match flow.fetch_post(&uri).await {
+                Ok(parent) if parent.uri == uri => parent,
+                Ok(_) | Err(_) => break,
+            },
         };
         parent_uri = parent
             .record
@@ -2231,6 +2280,35 @@ fn thread_ancestors<S: Storage>(
     }
     ancestors.reverse();
     Ok(ancestors)
+}
+
+async fn load_post_record<F: OAuthFlow, S: Storage>(
+    flow: &F,
+    storage: &S,
+    uri: &str,
+) -> Result<Option<IndexedRecord>, String> {
+    if let Some(record) = storage
+        .record_by_uri("app.bsky.feed.post", uri)
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(Some(record));
+    }
+    let record = flow.fetch_post(uri).await?;
+    if record.uri != uri || record.collection != "app.bsky.feed.post" {
+        return Err("post fetch returned a different record".to_owned());
+    }
+    Ok(Some(record))
+}
+
+fn render_reply_composer<S: Storage>(storage: &S, parent: &IndexedRecord) -> String {
+    let profile = profile_view_from_storage(storage, &parent.did)
+        .unwrap_or_else(|_| json!({"did":parent.did,"handle":parent.did}));
+    let handle = profile_handle(&profile, &parent.did);
+    format!(
+        "<form class=\"composer reply-composer\" action=\"/reply\" method=\"post\"><p class=\"reply-context\">Replying to @{}</p><input type=\"hidden\" name=\"parent_uri\" value=\"{}\"><label for=\"reply-text\">Write a reply</label><textarea id=\"reply-text\" name=\"text\" rows=\"3\" maxlength=\"300\" required></textarea><button type=\"submit\">Reply</button></form>",
+        html_escape(&handle),
+        html_escape(&parent.uri)
+    )
 }
 
 fn render_thread_replies<S: Storage>(
@@ -2306,6 +2384,88 @@ where
             }
         }
         Err(error) => oauth_error(StatusCode::BAD_GATEWAY, &error),
+    }
+}
+
+async fn write_reply<F, S>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response
+where
+    F: OAuthFlow,
+    S: Storage + 'static,
+{
+    if !same_origin_request(&headers, &state.public.public_url) {
+        return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
+    }
+    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+        return Redirect::to("/login").into_response();
+    };
+    if !verified_cookie_write_access(&state.public, &headers, state.storage.as_ref()) {
+        return oauth_error(StatusCode::FORBIDDEN, "write permissions were not granted");
+    }
+    let text = form.get("text").map(String::as_str).unwrap_or("").trim();
+    if text.is_empty() || text.chars().count() > 300 {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "reply text must contain 1 to 300 characters",
+        );
+    }
+    let Some(parent_uri) = form.get("parent_uri").filter(|uri| !uri.trim().is_empty()) else {
+        return oauth_error(StatusCode::BAD_REQUEST, "parent_uri is required");
+    };
+    let parent = match load_post_record(&state.flow, state.storage.as_ref(), parent_uri).await {
+        Ok(Some(parent)) => parent,
+        Ok(None) => return oauth_error(StatusCode::NOT_FOUND, "parent post not found"),
+        Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
+    };
+    let Some(parent_cid) = parent.cid.as_deref().filter(|cid| !cid.is_empty()) else {
+        return oauth_error(StatusCode::BAD_REQUEST, "parent post has no CID");
+    };
+    let parent_ref = PostStrongRef {
+        uri: parent.uri.clone(),
+        cid: parent_cid.to_owned(),
+    };
+    let root_ref = if let Some(root) = parent
+        .record
+        .get("reply")
+        .and_then(|reply| reply.get("root"))
+    {
+        let (Some(uri), Some(cid)) = (
+            root.get("uri").and_then(Value::as_str),
+            root.get("cid").and_then(Value::as_str),
+        ) else {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "parent reply has no root reference",
+            );
+        };
+        if uri.is_empty() || cid.is_empty() {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "parent reply has no root reference",
+            );
+        }
+        PostStrongRef {
+            uri: uri.to_owned(),
+            cid: cid.to_owned(),
+        }
+    } else {
+        parent_ref.clone()
+    };
+    let created = match state
+        .flow
+        .create_reply(&did, text, root_ref, parent_ref)
+        .await
+    {
+        Ok(created) => created,
+        Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
+    };
+    let redirect = format!("/app/thread?uri={}", form_encoded(&created.uri));
+    match persist_created_record(state.storage.clone(), &did, "app.bsky.feed.post", created).await {
+        Ok(()) => Redirect::to(&redirect).into_response(),
+        Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
     }
 }
 
@@ -2806,7 +2966,7 @@ fn render_web_post<S: Storage>(
                 .unwrap_or_else(|_| json!({"did":parent.did,"handle":parent.did}));
             let parent_handle = profile_handle(&parent_profile, &parent.did);
             let thread_uri = format!(
-                "/thread?uri={}",
+                "/app/thread?uri={}",
                 url::form_urlencoded::byte_serialize(record.uri.as_bytes()).collect::<String>()
             );
             format!(
@@ -2836,7 +2996,7 @@ fn render_web_post<S: Storage>(
         .unwrap_or("");
     let text = if link_text_to_thread {
         let thread_uri = format!(
-            "/thread?uri={}",
+            "/app/thread?uri={}",
             url::form_urlencoded::byte_serialize(record.uri.as_bytes()).collect::<String>()
         );
         format!(
@@ -2872,7 +3032,7 @@ fn render_web_post<S: Storage>(
         },
     );
     let thread_uri = format!(
-        "/thread?uri={}",
+        "/app/thread?uri={}",
         url::form_urlencoded::byte_serialize(record.uri.as_bytes()).collect::<String>()
     );
     let reply_action = format!(

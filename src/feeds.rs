@@ -373,6 +373,10 @@ impl<B: IdentityBackend> FeedClient<B> {
         );
         Ok(record)
     }
+
+    pub async fn fetch_post(&self, uri: &str) -> Result<IndexedRecord, String> {
+        self.fetch_live_post(uri).await
+    }
 }
 
 fn warn_anonymous_feed_once(feed_uri: &str) {
