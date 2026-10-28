@@ -1225,6 +1225,13 @@ impl SqliteStorage {
                  requested_at INTEGER NOT NULL DEFAULT (unixepoch())
              );",
         )?;
+        connection.execute(
+            "DELETE FROM backfill_queue
+             WHERE did NOT IN (
+                 SELECT did FROM backfill_queue ORDER BY enqueued_at,did LIMIT ?1
+             )",
+            [MAX_BACKFILL_QUEUE],
+        )?;
         migrate_notification_events(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
