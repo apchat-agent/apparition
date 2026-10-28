@@ -21,6 +21,8 @@ pub struct Config {
     pub jetstream_event_timeout_secs: u64,
     #[serde(default = "default_backfill_records_per_second")]
     pub backfill_records_per_second: u64,
+    #[serde(default)]
+    pub backfill_enabled: bool,
     #[serde(default = "default_appview_did")]
     pub appview_did: String,
     #[serde(default = "default_public_url")]
@@ -48,6 +50,7 @@ impl Default for Config {
             jetstream_idle_timeout_secs: default_jetstream_idle_timeout_secs(),
             jetstream_event_timeout_secs: default_jetstream_event_timeout_secs(),
             backfill_records_per_second: default_backfill_records_per_second(),
+            backfill_enabled: false,
             appview_did: default_appview_did(),
             public_url: default_public_url(),
             oauth_mode: OAuthMode::default(),
@@ -75,6 +78,8 @@ pub enum ConfigError {
     },
     #[error("APPVIEW_BACKFILL_RECORDS_PER_SECOND must be a positive integer, got {0}")]
     InvalidBackfillRate(String),
+    #[error("APPVIEW_BACKFILL_ENABLED must be 'true' or 'false', got {0}")]
+    InvalidBackfillEnabled(String),
     #[error("loopback OAuth requires APPVIEW_LISTEN to be a loopback socket address, got {0}")]
     UnsafeLoopbackListen(String),
 }
@@ -119,6 +124,7 @@ impl Config {
                 "APPVIEW_BACKFILL_RECORDS_PER_SECOND" => {
                     config.backfill_records_per_second = parse_backfill_rate(value)?;
                 }
+                "APPVIEW_BACKFILL_ENABLED" => config.backfill_enabled = parse_bool(value)?,
                 "APPVIEW_DID" => config.appview_did = value.to_owned(),
                 "APPVIEW_PUBLIC_URL" => config.public_url = value.to_owned(),
                 "APPVIEW_OAUTH_MODE" => {
@@ -184,6 +190,10 @@ impl Config {
                 "APPVIEW_BACKFILL_RECORDS_PER_SECOND",
                 env::var("APPVIEW_BACKFILL_RECORDS_PER_SECOND").unwrap_or_default(),
             ),
+            (
+                "APPVIEW_BACKFILL_ENABLED",
+                env::var("APPVIEW_BACKFILL_ENABLED").unwrap_or_default(),
+            ),
             ("APPVIEW_DID", env::var("APPVIEW_DID").unwrap_or_default()),
             (
                 "APPVIEW_PUBLIC_URL",
@@ -228,6 +238,7 @@ impl Config {
                     "APPVIEW_BACKFILL_RECORDS_PER_SECOND" => {
                         config.backfill_records_per_second = parse_backfill_rate(&value)?;
                     }
+                    "APPVIEW_BACKFILL_ENABLED" => config.backfill_enabled = parse_bool(&value)?,
                     "APPVIEW_DID" => config.appview_did = value,
                     "APPVIEW_PUBLIC_URL" => config.public_url = value,
                     "APPVIEW_OAUTH_MODE" => config.oauth_mode = parse_oauth_mode(&value)?,
@@ -255,6 +266,14 @@ fn parse_backfill_rate(value: &str) -> Result<u64, ConfigError> {
         .ok()
         .filter(|rate| *rate > 0)
         .ok_or_else(|| ConfigError::InvalidBackfillRate(value.to_owned()))
+}
+
+fn parse_bool(value: &str) -> Result<bool, ConfigError> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(ConfigError::InvalidBackfillEnabled(value.to_owned())),
+    }
 }
 
 fn default_listen() -> String {
