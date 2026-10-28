@@ -620,7 +620,7 @@ async fn authorize<S: Storage, B: IdentityBackend>(
         .verify(token, lexicon)
         .await
         .map(Some)
-        .map_err(|error| ApiError::unauthorized(error.to_string()))
+        .map_err(|_| ApiError::unauthorized("invalid service JWT"))
 }
 
 fn required<'a>(query: &'a HashMap<String, String>, key: &str) -> Result<&'a str, ApiError> {

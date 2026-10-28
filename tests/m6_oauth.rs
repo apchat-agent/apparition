@@ -666,7 +666,12 @@ async fn oauth_and_write_errors_do_not_echo_tokens_or_internal_paths() {
         )
         .await
         .unwrap();
-    let write_body = write_response.into_body().collect().await.unwrap().to_bytes();
+    let write_body = write_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
     assert!(!String::from_utf8_lossy(&write_body).contains(sentinel));
 }
 
