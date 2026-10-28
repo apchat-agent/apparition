@@ -1,0 +1,966 @@
+use crate::{
+    identity::{IdentityBackend, IdentityResolver},
+    ingest::{IndexedRecord, Storage},
+    net::SafeHttpClient,
+};
+use futures_util::{StreamExt, stream};
+use http::HeaderMap;
+use serde_json::Value;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex, OnceLock},
+    time::Duration,
+};
+use url::Url;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedFeed {
+    pub uri: String,
+    pub display_name: String,
+    pub description: Option<String>,
+    pub avatar: Option<String>,
+    pub service_did: String,
+    pub endpoint: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FeedSkeletonEntry {
+    pub post_uri: String,
+    pub reason: Option<Value>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FeedSkeletonPage {
+    pub feed: Vec<FeedSkeletonEntry>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HydratedFeedPost {
+    pub record: IndexedRecord,
+    pub reposted_by: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HydratedFeedPage {
+    pub feed: Vec<HydratedFeedPost>,
+    pub cursor: Option<String>,
+    pub dropped_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FeedTimeline {
+    pub generator: ResolvedFeed,
+    pub timeline: HydratedFeedPage,
+}
+
+pub struct FeedClient<B: IdentityBackend> {
+    identity: Arc<IdentityResolver<B>>,
+    http: SafeHttpClient,
+    generator_cache: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, ResolvedFeed)>>,
+    live_post_cache: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, IndexedRecord)>>,
+}
+
+impl<B: IdentityBackend> FeedClient<B> {
+    pub fn new(identity: Arc<IdentityResolver<B>>, http: SafeHttpClient) -> Self {
+        Self {
+            identity,
+            http,
+            generator_cache: tokio::sync::Mutex::new(HashMap::new()),
+            live_post_cache: tokio::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub async fn resolve_feed(&self, uri: &str) -> Result<ResolvedFeed, String> {
+        if let Some((expires, feed)) = self.generator_cache.lock().await.get(uri).cloned()
+            && expires > tokio::time::Instant::now()
+        {
+            return Ok(feed);
+        }
+        let (creator_did, collection, rkey) = parse_feed_uri(uri)?;
+        let creator_doc = self
+            .identity
+            .resolve_did_document(&creator_did)
+            .await
+            .map_err(|error| format!("feed creator DID resolution failed: {error}"))?;
+        let pds = creator_doc
+            .pds_endpoint()
+            .ok_or_else(|| "feed creator DID document has no valid PDS endpoint".to_owned())?;
+        let mut record_url = Url::parse(&format!("{pds}/xrpc/com.atproto.repo.getRecord"))
+            .map_err(|_| "feed creator PDS URL is invalid".to_owned())?;
+        record_url
+            .query_pairs_mut()
+            .append_pair("repo", &creator_did)
+            .append_pair("collection", &collection)
+            .append_pair("rkey", &rkey);
+        let response = self
+            .http
+            .get(&record_url, HeaderMap::new(), 1024 * 1024)
+            .await?;
+        if !response.status().is_success() {
+            return Err("feed generator record could not be fetched".to_owned());
+        }
+        let record: Value = serde_json::from_slice(response.body())
+            .map_err(|_| "feed generator record was invalid JSON".to_owned())?;
+        let value = record
+            .get("value")
+            .ok_or_else(|| "feed generator record has no value".to_owned())?;
+        let service_did = value
+            .get("did")
+            .and_then(Value::as_str)
+            .filter(|did| !did.is_empty())
+            .ok_or_else(|| "feed generator record has no service DID".to_owned())?
+            .to_owned();
+        let service_doc = self
+            .identity
+            .resolve_did_document(&service_did)
+            .await
+            .map_err(|error| format!("feed generator service DID resolution failed: {error}"))?;
+        let endpoint = service_doc
+            .service
+            .iter()
+            .find(|service| {
+                (service.id == "#bsky_fg" || service.id == format!("{}#bsky_fg", service_doc.id))
+                    && service.type_name == "BskyFeedGenerator"
+            })
+            .map(|service| service.service_endpoint.clone())
+            .ok_or_else(|| {
+                "feed generator DID document is missing the #bsky_fg service".to_owned()
+            })?;
+        let endpoint_url = Url::parse(&endpoint)
+            .map_err(|_| "feed generator #bsky_fg endpoint URL is invalid".to_owned())?;
+        if endpoint_url.query().is_some()
+            || endpoint_url.fragment().is_some()
+            || !endpoint_url.username().is_empty()
+            || endpoint_url.password().is_some()
+        {
+            return Err("feed generator #bsky_fg endpoint URL has forbidden components".to_owned());
+        }
+        self.http.resolve_safe(&endpoint_url).await?;
+
+        let feed = ResolvedFeed {
+            uri: uri.to_owned(),
+            display_name: value
+                .get("displayName")
+                .and_then(Value::as_str)
+                .unwrap_or("Untitled feed")
+                .to_owned(),
+            description: value
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            avatar: value
+                .get("avatar")
+                .and_then(|avatar| feed_avatar_url(avatar, &creator_did)),
+            service_did,
+            endpoint: endpoint.trim_end_matches('/').to_owned(),
+        };
+        let mut cache = self.generator_cache.lock().await;
+        cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
+        if cache.len() >= 1024
+            && let Some(oldest) = cache.keys().next().cloned()
+        {
+            cache.remove(&oldest);
+        }
+        cache.insert(
+            uri.to_owned(),
+            (
+                tokio::time::Instant::now() + Duration::from_secs(60 * 60),
+                feed.clone(),
+            ),
+        );
+        Ok(feed)
+    }
+
+    pub async fn get_skeleton(
+        &self,
+        feed: &ResolvedFeed,
+        cursor: Option<&str>,
+        service_jwt: Option<&str>,
+    ) -> Result<FeedSkeletonPage, String> {
+        if service_jwt.is_none() {
+            warn_anonymous_feed_once(&feed.uri);
+        }
+        let mut url = Url::parse(&feed.endpoint)
+            .map_err(|_| "feed generator endpoint URL is invalid".to_owned())?;
+        let path = format!(
+            "{}/xrpc/app.bsky.feed.getFeedSkeleton",
+            url.path().trim_end_matches('/')
+        );
+        url.set_path(&path);
+        url.query_pairs_mut()
+            .append_pair("feed", &feed.uri)
+            .append_pair("limit", "30");
+        if let Some(cursor) = cursor {
+            url.query_pairs_mut().append_pair("cursor", cursor);
+        }
+        let mut headers = HeaderMap::new();
+        if let Some(jwt) = service_jwt {
+            let value = http::HeaderValue::from_str(&format!("Bearer {jwt}"))
+                .map_err(|_| "feed service auth token is invalid".to_owned())?;
+            headers.insert(http::header::AUTHORIZATION, value);
+        }
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            self.http.get(&url, headers, 1024 * 1024),
+        )
+        .await
+        .map_err(|_| "feed skeleton request timed out".to_owned())??;
+        if !response.status().is_success() {
+            return Err("feed generator returned an error status".to_owned());
+        }
+        let body: Value = serde_json::from_slice(response.body())
+            .map_err(|_| "feed generator returned invalid JSON".to_owned())?;
+        let feed_items = body
+            .get("feed")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "feed generator response has no feed list".to_owned())?;
+        let items = feed_items
+            .iter()
+            .filter_map(|item| {
+                Some(FeedSkeletonEntry {
+                    post_uri: item.get("post")?.as_str()?.to_owned(),
+                    reason: item.get("reason").cloned(),
+                })
+            })
+            .collect();
+        Ok(FeedSkeletonPage {
+            feed: items,
+            cursor: body
+                .get("cursor")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        })
+    }
+
+    pub async fn hydrate_skeleton(
+        &self,
+        skeleton: FeedSkeletonPage,
+        storage: &dyn Storage,
+    ) -> Result<HydratedFeedPage, String> {
+        const LIVE_FETCH_CONCURRENCY: usize = 8;
+        const PAGE_BUDGET: Duration = Duration::from_secs(8);
+        let count = skeleton.feed.len();
+        let cursor = skeleton.cursor;
+        let deadline = tokio::time::Instant::now() + PAGE_BUDGET;
+        let mut pending = stream::iter(skeleton.feed.into_iter().enumerate())
+            .map(|(index, item)| async move { self.hydrate_one(index, item, storage).await })
+            .buffer_unordered(LIVE_FETCH_CONCURRENCY);
+        let mut hydrated = Vec::with_capacity(count);
+        loop {
+            match tokio::time::timeout_at(deadline, pending.next()).await {
+                Ok(Some(Some(item))) => hydrated.push(item),
+                Ok(Some(None)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+        hydrated.sort_by_key(|(index, _)| *index);
+        let feed = hydrated
+            .into_iter()
+            .map(|(_, post)| post)
+            .collect::<Vec<_>>();
+        Ok(HydratedFeedPage {
+            dropped_count: count.saturating_sub(feed.len()),
+            feed,
+            cursor,
+        })
+    }
+
+    async fn hydrate_one(
+        &self,
+        index: usize,
+        item: FeedSkeletonEntry,
+        storage: &dyn Storage,
+    ) -> Option<(usize, HydratedFeedPost)> {
+        let record = storage
+            .record_by_uri("app.bsky.feed.post", &item.post_uri)
+            .ok()
+            .flatten();
+        let record = match record {
+            Some(record) => record,
+            None => self.fetch_live_post(&item.post_uri).await.ok()?,
+        };
+        let reposted_by = match item
+            .reason
+            .as_ref()
+            .filter(|reason| {
+                reason.get("$type").and_then(Value::as_str)
+                    == Some("app.bsky.feed.defs#reasonRepost")
+            })
+            .and_then(|reason| reason.get("by"))
+            .and_then(|by| by.get("did"))
+            .and_then(Value::as_str)
+        {
+            Some(did) => self
+                .identity
+                .resolve_did(did)
+                .await
+                .ok()
+                .map(|identity| identity.handle.unwrap_or(identity.did)),
+            None => None,
+        };
+        Some((
+            index,
+            HydratedFeedPost {
+                record,
+                reposted_by,
+            },
+        ))
+    }
+
+    async fn fetch_live_post(&self, uri: &str) -> Result<IndexedRecord, String> {
+        if let Some((expires, record)) = self.live_post_cache.lock().await.get(uri).cloned()
+            && expires > tokio::time::Instant::now()
+        {
+            return Ok(record);
+        }
+        let (did, collection, rkey) = parse_post_uri(uri)?;
+        let document = self
+            .identity
+            .resolve_did_document(&did)
+            .await
+            .map_err(|error| format!("post author DID resolution failed: {error}"))?;
+        let pds = document
+            .pds_endpoint()
+            .ok_or_else(|| "post author DID document has no valid PDS endpoint".to_owned())?;
+        let mut url = Url::parse(&format!("{pds}/xrpc/com.atproto.repo.getRecord"))
+            .map_err(|_| "post author PDS URL is invalid".to_owned())?;
+        url.query_pairs_mut()
+            .append_pair("repo", &did)
+            .append_pair("collection", &collection)
+            .append_pair("rkey", &rkey);
+        let response = self.http.get(&url, HeaderMap::new(), 1024 * 1024).await?;
+        if !response.status().is_success() {
+            return Err("post could not be fetched from its author PDS".to_owned());
+        }
+        let body: Value = serde_json::from_slice(response.body())
+            .map_err(|_| "post PDS response was invalid JSON".to_owned())?;
+        if body.get("uri").and_then(Value::as_str) != Some(uri) {
+            return Err("post PDS returned a different record URI".to_owned());
+        }
+        let value = body
+            .get("value")
+            .filter(|value| value.is_object())
+            .cloned()
+            .ok_or_else(|| "post PDS response has no record value".to_owned())?;
+        let time_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros()
+            .min(u64::MAX as u128) as u64;
+        let record = IndexedRecord {
+            did,
+            collection,
+            rkey,
+            uri: uri.to_owned(),
+            cid: body.get("cid").and_then(Value::as_str).map(str::to_owned),
+            time_us,
+            record: value,
+        };
+        let mut cache = self.live_post_cache.lock().await;
+        cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
+        if cache.len() >= 256
+            && let Some(oldest) = cache.keys().next().cloned()
+        {
+            cache.remove(&oldest);
+        }
+        cache.insert(
+            uri.to_owned(),
+            (
+                tokio::time::Instant::now() + Duration::from_secs(10 * 60),
+                record.clone(),
+            ),
+        );
+        Ok(record)
+    }
+}
+
+fn warn_anonymous_feed_once(feed_uri: &str) {
+    static WARNED_FEEDS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let warned = WARNED_FEEDS.get_or_init(|| Mutex::new(HashSet::new()));
+    let Ok(mut warned) = warned.lock() else {
+        return;
+    };
+    if warned.len() >= 512 && !warned.contains(feed_uri) {
+        return;
+    }
+    if warned.insert(feed_uri.to_owned()) {
+        tracing::warn!(
+            feed_uri,
+            "feed service auth unavailable; requesting skeleton anonymously"
+        );
+    }
+}
+
+fn parse_feed_uri(uri: &str) -> Result<(String, String, String), String> {
+    let Some(path) = uri.strip_prefix("at://") else {
+        return Err("feed URI must use the at:// scheme".to_owned());
+    };
+    let mut parts = path.split('/');
+    let did = parts.next().unwrap_or_default();
+    let collection = parts.next().unwrap_or_default();
+    let rkey = parts.next().unwrap_or_default();
+    if did.is_empty()
+        || collection != "app.bsky.feed.generator"
+        || rkey.is_empty()
+        || parts.next().is_some()
+        || rkey.contains(['?', '#', '%'])
+    {
+        return Err("feed URI must identify one app.bsky.feed.generator record".to_owned());
+    }
+    Ok((did.to_owned(), collection.to_owned(), rkey.to_owned()))
+}
+
+fn parse_post_uri(uri: &str) -> Result<(String, String, String), String> {
+    let Some(path) = uri.strip_prefix("at://") else {
+        return Err("post URI must use the at:// scheme".to_owned());
+    };
+    let mut parts = path.split('/');
+    let did = parts.next().unwrap_or_default();
+    let collection = parts.next().unwrap_or_default();
+    let rkey = parts.next().unwrap_or_default();
+    if did.is_empty()
+        || collection != "app.bsky.feed.post"
+        || rkey.is_empty()
+        || parts.next().is_some()
+        || rkey.contains(['?', '#', '%'])
+    {
+        return Err("skeleton item must identify one app.bsky.feed.post record".to_owned());
+    }
+    Ok((did.to_owned(), collection.to_owned(), rkey.to_owned()))
+}
+
+pub fn feed_avatar_url(avatar: &Value, creator_did: &str) -> Option<String> {
+    if let Some(url) = avatar.as_str() {
+        return Some(url.to_owned());
+    }
+    let cid = avatar
+        .pointer("/ref/$link")
+        .and_then(Value::as_str)
+        .or_else(|| avatar.get("ref").and_then(Value::as_str))?;
+    if cid.is_empty()
+        || !cid
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return None;
+    }
+    Some(format!(
+        "https://cdn.bsky.app/img/feed_thumbnail/plain/{creator_did}/{cid}@jpeg"
+    ))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedFeedPreference {
+    pub id: String,
+    pub feed_type: String,
+    pub value: String,
+    pub pinned: bool,
+}
+
+pub fn parse_saved_feed_preferences(response: &Value) -> Vec<SavedFeedPreference> {
+    let Some(preferences) = response.get("preferences").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    if let Some(v2) = preferences.iter().find(|preference| {
+        preference.get("$type").and_then(Value::as_str)
+            == Some("app.bsky.actor.defs#savedFeedsPrefV2")
+    }) {
+        return v2
+            .get("items")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| {
+                Some(SavedFeedPreference {
+                    id: item.get("id")?.as_str()?.to_owned(),
+                    feed_type: item.get("type")?.as_str()?.to_owned(),
+                    value: item.get("value")?.as_str()?.to_owned(),
+                    pinned: item.get("pinned")?.as_bool()?,
+                })
+            })
+            .collect();
+    }
+
+    let Some(legacy) = preferences.iter().find(|preference| {
+        preference.get("$type").and_then(Value::as_str)
+            == Some("app.bsky.actor.defs#savedFeedsPref")
+    }) else {
+        return Vec::new();
+    };
+    let pinned = legacy
+        .get("pinned")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    let saved = legacy
+        .get("saved")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    let mut result = Vec::new();
+    for (value, is_pinned) in pinned
+        .iter()
+        .map(|value| (*value, true))
+        .chain(saved.iter().map(|value| (*value, false)))
+    {
+        if result
+            .iter()
+            .any(|item: &SavedFeedPreference| item.value == value)
+        {
+            continue;
+        }
+        result.push(SavedFeedPreference {
+            id: value.to_owned(),
+            feed_type: "feed".to_owned(),
+            value: value.to_owned(),
+            pinned: is_pinned,
+        });
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FeedClient, ResolvedFeed, parse_saved_feed_preferences};
+    use crate::{
+        identity::{DidDocument, DidService, IdentityBackend, IdentityResolver, ResolutionError},
+        ingest::IndexedRecord,
+        net::{HostResolver, SafeHttpClient},
+    };
+    use axum::{
+        Router,
+        http::{HeaderMap, Uri},
+        response::IntoResponse,
+        routing::{any, get},
+    };
+    use serde_json::json;
+    use std::{
+        collections::HashMap,
+        future::Future,
+        io::{self, Write},
+        net::{IpAddr, Ipv4Addr},
+        pin::Pin,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+    use tokio::net::TcpListener;
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    const CREATOR: &str = "did:web:creator.test";
+
+    #[derive(Clone)]
+    struct FakeIdentity(HashMap<String, DidDocument>);
+
+    impl IdentityBackend for FakeIdentity {
+        async fn did_document(&self, did: &str) -> Result<Option<DidDocument>, ResolutionError> {
+            Ok(self.0.get(did).cloned())
+        }
+        async fn dns_txt_did(&self, _: &str) -> Result<Option<String>, ResolutionError> {
+            Ok(None)
+        }
+        async fn well_known_did(&self, _: &str) -> Result<Option<String>, ResolutionError> {
+            Ok(None)
+        }
+    }
+
+    struct TestResolver;
+
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    struct LogWriter(LogBuffer);
+
+    impl Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for LogBuffer {
+        type Writer = LogWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            LogWriter(self.clone())
+        }
+    }
+
+    impl HostResolver for TestResolver {
+        fn resolve<'a>(
+            &'a self,
+            _: &'a str,
+            _: u16,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, String>> + Send + 'a>> {
+            Box::pin(async { Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]) })
+        }
+    }
+
+    fn document(did: &str, pds: &str, services: Vec<DidService>) -> DidDocument {
+        let mut service = services;
+        if !pds.is_empty() {
+            service.insert(
+                0,
+                DidService {
+                    id: "#atproto_pds".into(),
+                    type_name: "AtprotoPersonalDataServer".into(),
+                    service_endpoint: pds.into(),
+                },
+            );
+        }
+        DidDocument {
+            id: did.to_owned(),
+            also_known_as: vec![],
+            verification_method: vec![],
+            service,
+        }
+    }
+
+    async fn fake_pds() -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new().fallback(any(|uri: Uri| async move {
+            if uri.path() == "/xrpc/com.atproto.repo.getRecord" {
+                let query = uri.query().unwrap_or_default();
+                if query.contains("collection=app.bsky.feed.generator") {
+                    let service_did = if query.contains("rkey=web") { "did:web:generator.test" } else { "did:plc:generator" };
+                    axum::Json(json!({ "uri": format!("at://{CREATOR}/app.bsky.feed.generator/{}", if query.contains("rkey=web") { "web" } else { "plc" }), "cid":"bafyreitest", "value":{"did":service_did,"displayName":"Example","description":"A feed","avatar":"https://img.test/avatar"} })).into_response()
+                } else if query.contains("rkey=live") {
+                    axum::Json(json!({ "uri":"at://did:plc:author/app.bsky.feed.post/live", "cid":"bafyreilive", "value":{"$type":"app.bsky.feed.post","text":"live hydration","createdAt":"2026-10-28T12:00:00Z"} })).into_response()
+                } else {
+                    axum::http::StatusCode::NOT_FOUND.into_response()
+                }
+            } else { axum::http::StatusCode::NOT_FOUND.into_response() }
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://localhost:{}", address.port()), task)
+    }
+
+    fn resolver(pds: String, endpoint: String) -> Arc<IdentityResolver<FakeIdentity>> {
+        let docs = HashMap::from([
+            (CREATOR.to_owned(), document(CREATOR, &pds, vec![])),
+            (
+                "did:web:generator.test".to_owned(),
+                document(
+                    "did:web:generator.test",
+                    "",
+                    if endpoint.is_empty() {
+                        vec![]
+                    } else {
+                        vec![DidService {
+                            id: "#bsky_fg".into(),
+                            type_name: "BskyFeedGenerator".into(),
+                            service_endpoint: endpoint.clone(),
+                        }]
+                    },
+                ),
+            ),
+            (
+                "did:plc:generator".to_owned(),
+                document(
+                    "did:plc:generator",
+                    "",
+                    if endpoint.is_empty() {
+                        vec![]
+                    } else {
+                        vec![DidService {
+                            id: "#bsky_fg".into(),
+                            type_name: "BskyFeedGenerator".into(),
+                            service_endpoint: endpoint,
+                        }]
+                    },
+                ),
+            ),
+        ]);
+        Arc::new(IdentityResolver::new(
+            FakeIdentity(docs),
+            Duration::from_secs(30),
+        ))
+    }
+
+    fn client(identity: Arc<IdentityResolver<FakeIdentity>>) -> FeedClient<FakeIdentity> {
+        FeedClient::new(
+            identity,
+            SafeHttpClient::with_resolver(TestResolver)
+                .with_http_test_hosts(["localhost".to_owned()]),
+        )
+    }
+
+    #[tokio::test]
+    async fn generator_records_resolve_did_web_and_did_plc_services() {
+        let (pds, server) = fake_pds().await;
+        let port = pds.rsplit(':').next().unwrap().to_owned();
+        let identity = resolver(pds, format!("http://localhost:{port}/feed"));
+        let client = client(identity);
+        for rkey in ["web", "plc"] {
+            let uri = format!("at://{CREATOR}/app.bsky.feed.generator/{rkey}");
+            let feed = client.resolve_feed(&uri).await.unwrap();
+            assert_eq!(feed.display_name, "Example");
+            assert!(feed.endpoint.ends_with("/feed"));
+            assert_eq!(
+                feed.service_did,
+                if rkey == "web" {
+                    "did:web:generator.test"
+                } else {
+                    "did:plc:generator"
+                }
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn generator_resolution_refuses_missing_service_and_ssrf_endpoint() {
+        let (pds, server) = fake_pds().await;
+        let endpoint = "https://blocked.test/feed";
+        let identity = resolver(pds.clone(), endpoint.to_owned());
+        let blocked = client(identity);
+        let error = blocked
+            .resolve_feed(&format!("at://{CREATOR}/app.bsky.feed.generator/web"))
+            .await
+            .unwrap_err();
+        assert!(error.contains("forbidden address"), "{error}");
+
+        let no_service = resolver(pds, "".to_owned());
+        // An empty service endpoint is invalid and must produce a clear resolution error.
+        let error = client(no_service)
+            .resolve_feed(&format!("at://{CREATOR}/app.bsky.feed.generator/web"))
+            .await
+            .unwrap_err();
+        assert!(error.contains("bsky_fg"), "{error}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn feed_hydration_keeps_skeleton_order_across_index_and_live_posts() {
+        use crate::ingest::{MemoryStorage, Storage};
+        let (pds, server) = fake_pds().await;
+        let mut docs = HashMap::new();
+        docs.insert(CREATOR.to_owned(), document(CREATOR, &pds, vec![]));
+        docs.insert(
+            "did:plc:author".to_owned(),
+            document("did:plc:author", &pds, vec![]),
+        );
+        docs.insert(
+            "did:plc:reposter".to_owned(),
+            document("did:plc:reposter", &pds, vec![]),
+        );
+        let identity = Arc::new(IdentityResolver::new(
+            FakeIdentity(docs),
+            Duration::from_secs(30),
+        ));
+        let client = client(identity);
+        let storage = MemoryStorage::default();
+        let indexed_first = indexed_post("did:plc:indexed", "first", "first indexed post");
+        let indexed_last = indexed_post("did:plc:indexed", "last", "last indexed post");
+        storage.put_record(&indexed_first).unwrap();
+        storage.put_record(&indexed_last).unwrap();
+        let missing = "at://did:plc:author/app.bsky.feed.post/missing";
+        let skeleton = super::FeedSkeletonPage {
+            feed: vec![
+                super::FeedSkeletonEntry {
+                    post_uri: indexed_first.uri.clone(),
+                    reason: None,
+                },
+                super::FeedSkeletonEntry {
+                    post_uri: "at://did:plc:author/app.bsky.feed.post/live".into(),
+                    reason: Some(
+                        json!({ "$type":"app.bsky.feed.defs#reasonRepost", "by":{"did":"did:plc:reposter"} }),
+                    ),
+                },
+                super::FeedSkeletonEntry {
+                    post_uri: missing.into(),
+                    reason: None,
+                },
+                super::FeedSkeletonEntry {
+                    post_uri: indexed_last.uri.clone(),
+                    reason: None,
+                },
+            ],
+            cursor: Some("next-cursor".into()),
+        };
+
+        let page = client.hydrate_skeleton(skeleton, &storage).await.unwrap();
+        let uris = page
+            .feed
+            .iter()
+            .map(|item| item.record.uri.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            uris,
+            [
+                indexed_first.uri.as_str(),
+                "at://did:plc:author/app.bsky.feed.post/live",
+                indexed_last.uri.as_str()
+            ]
+        );
+        assert_eq!(page.feed[1].record.record["text"], "live hydration");
+        assert_eq!(
+            page.feed[1].reposted_by.as_deref(),
+            Some("did:plc:reposter")
+        );
+        assert_eq!(page.dropped_count, 1);
+        assert_eq!(page.cursor.as_deref(), Some("next-cursor"));
+        server.abort();
+    }
+
+    fn indexed_post(did: &str, rkey: &str, text: &str) -> IndexedRecord {
+        IndexedRecord {
+            did: did.into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: rkey.into(),
+            uri: format!("at://{did}/app.bsky.feed.post/{rkey}"),
+            cid: None,
+            time_us: 1,
+            record: json!({"$type":"app.bsky.feed.post","text":text,"createdAt":"2026-10-28T12:00:00Z"}),
+        }
+    }
+
+    #[tokio::test]
+    async fn skeleton_request_uses_service_jwt_cursor_and_expected_xrpc_path() {
+        let captured = Arc::new(Mutex::new(None::<(String, String)>));
+        let capture = captured.clone();
+        let app = Router::new().route("/fg/xrpc/app.bsky.feed.getFeedSkeleton", get(move |uri: Uri, headers: HeaderMap| {
+            let capture = capture.clone();
+            async move {
+                *capture.lock().unwrap() = Some((headers.get("authorization").and_then(|value| value.to_str().ok()).unwrap_or("").to_owned(), uri.to_string()));
+                axum::Json(json!({"feed":[{"post":"at://did:plc:author/app.bsky.feed.post/a"}],"cursor":"next"}))
+            }
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let feed = ResolvedFeed {
+            uri: "at://did:plc:creator/app.bsky.feed.generator/jwt-log-test".into(),
+            display_name: "Example".into(),
+            description: None,
+            avatar: None,
+            service_did: "did:plc:service".into(),
+            endpoint: format!("http://localhost:{}/fg", address.port()),
+        };
+        let client = client(resolver("".to_owned(), "".to_owned()));
+        let logs = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(logs.clone())
+            .finish();
+        let page = client
+            .get_skeleton(&feed, Some("older + cursor"), Some("jwt-secret-test"))
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+        assert_eq!(page.cursor.as_deref(), Some("next"));
+        assert_eq!(page.feed.len(), 1);
+        let first_capture = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(first_capture.0, "Bearer jwt-secret-test");
+        assert!(
+            first_capture
+                .1
+                .starts_with("/fg/xrpc/app.bsky.feed.getFeedSkeleton?")
+        );
+        assert!(
+            first_capture
+                .1
+                .contains("feed=at%3A%2F%2Fdid%3Aplc%3Acreator")
+        );
+        assert!(first_capture.1.contains("cursor=older+%2B+cursor"));
+        assert!(first_capture.1.contains("limit=30"));
+        let fallback_subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(logs.clone())
+            .finish();
+        client
+            .get_skeleton(&feed, None, None)
+            .with_subscriber(fallback_subscriber)
+            .await
+            .unwrap();
+        assert_eq!(captured.lock().unwrap().as_ref().unwrap().0, "");
+        assert!(
+            !String::from_utf8(logs.0.lock().unwrap().clone())
+                .unwrap()
+                .contains("jwt-secret-test")
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn saved_feed_preferences_keep_v2_items_and_prefer_v2_over_legacy() {
+        let response = json!({
+            "preferences": [
+                {
+                    "$type": "app.bsky.actor.defs#savedFeedsPref",
+                    "pinned": ["at://did:plc:legacy/app.bsky.feed.generator/old"],
+                    "saved": ["at://did:plc:legacy/app.bsky.feed.generator/old"]
+                },
+                {
+                    "$type": "app.bsky.actor.defs#savedFeedsPrefV2",
+                    "items": [
+                        {"id":"1", "type":"feed", "value":"at://did:plc:one/app.bsky.feed.generator/a", "pinned":false},
+                        {"id":"2", "type":"timeline", "value":"following", "pinned":true},
+                        {"id":"3", "type":"feed", "value":"at://did:plc:two/app.bsky.feed.generator/b", "pinned":true},
+                        {"id":"4", "type":"list", "value":"at://did:plc:list/app.bsky.graph.list/x", "pinned":true},
+                        {"id":"5", "type":"futureType", "value":"opaque", "pinned":false}
+                    ]
+                }
+            ]
+        });
+
+        let parsed = parse_saved_feed_preferences(&response);
+        assert_eq!(parsed.len(), 5);
+        assert_eq!(parsed[1].feed_type, "timeline");
+        assert_eq!(parsed[4].feed_type, "futureType");
+        let pinned_feeds = parsed
+            .iter()
+            .filter(|item| item.feed_type == "feed" && item.pinned)
+            .map(|item| item.value.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(pinned_feeds, ["at://did:plc:two/app.bsky.feed.generator/b"]);
+        assert!(!parsed.iter().any(|item| item.value.ends_with("/old")));
+    }
+
+    #[test]
+    fn legacy_saved_feed_preferences_are_used_when_v2_is_absent() {
+        let response = json!({
+            "preferences": [{
+                "$type": "app.bsky.actor.defs#savedFeedsPref",
+                "pinned": ["at://did:plc:one/app.bsky.feed.generator/pinned"],
+                "saved": [
+                    "at://did:plc:one/app.bsky.feed.generator/pinned",
+                    "at://did:plc:two/app.bsky.feed.generator/other"
+                ]
+            }]
+        });
+
+        let parsed = parse_saved_feed_preferences(&response);
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed[0].pinned);
+        assert!(!parsed[1].pinned);
+    }
+
+    #[test]
+    fn feed_generator_blob_avatar_uses_the_feed_thumbnail_url() {
+        let avatar = json!({
+            "ref": {"$link":"bafkreib7t6y5x4w3v2u1"},
+            "mimeType":"image/jpeg",
+            "size":1234
+        });
+        assert_eq!(
+            super::feed_avatar_url(&avatar, "did:plc:creator"),
+            Some("https://cdn.bsky.app/img/feed_thumbnail/plain/did:plc:creator/bafkreib7t6y5x4w3v2u1@jpeg".into())
+        );
+    }
+}

@@ -571,7 +571,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
             ),
             "{path}"
         );
-        assert!(html.contains("href=\"/static/app.css?v=av13\""), "{path}");
+        assert!(html.contains("href=\"/static/app.css?v=av16\""), "{path}");
         assert!(!html.contains("style="), "{path}");
         assert!(!html.contains("<script"), "{path}");
     }
@@ -579,7 +579,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
     let stylesheet = app
         .oneshot(
             Request::builder()
-                .uri("/static/app.css?v=av13")
+                .uri("/static/app.css?v=av16")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -630,7 +630,7 @@ async fn sign_in_error_page_uses_the_shared_mobile_document_shell() {
     assert!(
         html.contains("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">")
     );
-    assert!(html.contains("href=\"/static/app.css?v=av13\""));
+    assert!(html.contains("href=\"/static/app.css?v=av16\""));
     assert!(!html.contains("style="));
     assert!(!html.contains("<script"));
 }
@@ -1295,6 +1295,35 @@ async fn web_views_and_write_actions_require_a_login_session() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::SEE_OTHER, "{path}");
         assert_eq!(response.headers()["location"], "/login");
+    }
+}
+
+#[tokio::test]
+async fn pinned_feed_list_and_feed_timeline_routes_are_available_to_signed_in_users() {
+    let public = OAuthPublic::new("https://appview.example").unwrap();
+    let app = public.router_with_flow(FakeOAuthFlow::default(), Arc::new(MemoryStorage::default()));
+    let cookie = finish_login(&app).await;
+    for uri in [
+        "/feeds",
+        "/app/feed?uri=at%3A%2F%2Fdid%3Aplc%3Acreator%2Fapp.bsky.feed.generator%2Ffeed",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        if uri == "/feeds" {
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let html = String::from_utf8(body.to_vec()).unwrap();
+            assert!(html.contains("href=\"/feeds\">Feeds</a>"));
+        }
     }
 }
 
