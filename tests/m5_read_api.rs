@@ -973,6 +973,22 @@ async fn profile_shows_the_did_while_initial_handle_verification_is_pending() {
 }
 
 #[tokio::test]
+async fn anonymous_profile_lookup_cannot_queue_arbitrary_did_fetches() {
+    let storage = Arc::new(MemoryStorage::default());
+    let (router, _) = api_for_storage(storage.clone());
+
+    let (status, _) = request(
+        router,
+        "/xrpc/app.bsky.actor.getProfile?actor=did%3Aplc%3Aattacker-controlled",
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(storage.pending_handle_refreshes(10).unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn remaining_read_responses_preserve_recorded_public_api_keys() {
     let (router, _) = api();
     let route_fixtures = [
