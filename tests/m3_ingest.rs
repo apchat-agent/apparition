@@ -82,6 +82,42 @@ fn sqlite_ingest_follow_scope_queries_do_not_scan_follows() {
     }
 }
 
+#[test]
+fn ingest_batches_log_parse_scope_record_apply_and_commit_phases_at_debug() {
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(CapturedMakeWriter(output.clone()))
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let _guard = tracing::dispatcher::set_default(&dispatch);
+    let ingestor = Ingestor::new(Arc::new(MemoryStorage::default()), ScopeMode::Full);
+    ingestor
+        .process_json_batch(&[event(
+            "did:plc:phase-test",
+            1,
+            "create",
+            "app.bsky.feed.post",
+            "one",
+            Some(post("phase timing")),
+        )])
+        .unwrap();
+
+    let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("Jetstream batch phase timing"), "{logs}");
+    for phase in [
+        "parse_ms",
+        "scope_lookup_ms",
+        "record_lookup_ms",
+        "apply_jetstream_batch_ms",
+        "commit_ms",
+        "total_ms",
+    ] {
+        assert!(logs.contains(phase), "missing {phase} in {logs}");
+    }
+}
+
 fn post(text: &str) -> serde_json::Value {
     json!({"$type":"app.bsky.feed.post", "text":text, "createdAt":"2026-10-27T00:00:00Z"})
 }
@@ -904,6 +940,14 @@ async fn metrics_are_emitted_during_idle_periods_with_zero_events_and_cursor_lag
     let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
     assert!(logs.contains("Jetstream ingestion metrics"), "{logs}");
     assert!(logs.contains("events=0"), "{logs}");
+    for field in [
+        "batches=0",
+        "avg_batch_ms=",
+        "max_batch_ms=",
+        "slowest_phase=",
+    ] {
+        assert!(logs.contains(field), "missing {field} in {logs}");
+    }
     assert!(logs.contains("cursor_lag_seconds="), "{logs}");
     assert!(logs.contains("Jetstream disconnected"), "{logs}");
 }
