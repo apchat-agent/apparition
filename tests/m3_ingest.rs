@@ -630,8 +630,9 @@ async fn websocket_connection_lifecycle_is_logged_at_info() {
         Ingestor::new(Arc::new(MemoryStorage::default()), ScopeMode::Full),
         Duration::from_millis(1),
     );
+    let secret_endpoint = format!("ws://{address}/subscribe?access_token=do-not-log");
     consumer
-        .consume_connection(&format!("ws://{address}/subscribe"))
+        .consume_connection(&secret_endpoint)
         .await
         .unwrap();
     server.await.unwrap();
@@ -639,6 +640,7 @@ async fn websocket_connection_lifecycle_is_logged_at_info() {
     let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
     assert!(logs.contains("Jetstream connected"), "{logs}");
     assert!(logs.contains("Jetstream disconnected"), "{logs}");
+    assert!(!logs.contains("do-not-log"), "{logs}");
 }
 
 struct CapturedMakeWriter(Arc<Mutex<Vec<u8>>>);
