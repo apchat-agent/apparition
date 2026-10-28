@@ -79,3 +79,27 @@ async fn eleventh_login_attempt_from_one_ip_returns_429() {
         );
     }
 }
+
+#[tokio::test]
+async fn oversized_login_form_body_returns_413() {
+    let app = router_with_oauth_flow(
+        OAuthPublic::new("https://appview.example").unwrap(),
+        DisabledOAuthFlow,
+        std::sync::Arc::new(MemoryStorage::default()),
+    );
+    let body = format!("handle={}", "a".repeat(40_000));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/authorize")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 413);
+}
