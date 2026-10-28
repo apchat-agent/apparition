@@ -472,19 +472,47 @@ fn entering_scope_queues_registered_and_newly_followed_repositories() {
 }
 
 #[test]
-fn pending_backfill_batches_are_bounded_and_require_a_registered_owner() {
+fn pending_backfill_batches_are_bounded() {
     fn check(storage: &impl Storage) {
-        storage
-            .enqueue_backfill_for("did:plc:anonymous", "did:plc:arbitrary")
-            .unwrap();
-        assert!(storage.pending_backfills().unwrap().is_empty());
-
         for index in 0..12 {
             storage
                 .register_user(&format!("did:plc:user-{index:02}"))
                 .unwrap();
         }
         assert!(storage.pending_backfills().unwrap().len() <= 8);
+    }
+
+    check(&MemoryStorage::default());
+    check(&appview_rs::ingest::SqliteStorage::open(":memory:").unwrap());
+}
+
+#[test]
+fn backfill_enqueue_requires_a_registered_owner_and_existing_follow() {
+    fn check(storage: &impl Storage) {
+        storage
+            .enqueue_backfill_for("did:plc:anonymous", "did:plc:arbitrary")
+            .unwrap();
+        assert!(storage.pending_backfills().unwrap().is_empty());
+
+        storage.register_user("did:plc:owner").unwrap();
+        storage
+            .enqueue_backfill_for("did:plc:owner", "did:plc:not-followed")
+            .unwrap();
+        assert_eq!(storage.pending_backfills().unwrap(), ["did:plc:owner"]);
+    }
+
+    check(&MemoryStorage::default());
+    check(&appview_rs::ingest::SqliteStorage::open(":memory:").unwrap());
+}
+
+#[test]
+fn registered_owner_cannot_queue_repository_outside_follow_scope() {
+    fn check(storage: &impl Storage) {
+        storage.register_user("did:plc:owner").unwrap();
+        storage
+            .enqueue_backfill_for("did:plc:owner", "did:plc:not-followed")
+            .unwrap();
+        assert_eq!(storage.pending_backfills().unwrap(), ["did:plc:owner"]);
     }
 
     check(&MemoryStorage::default());
