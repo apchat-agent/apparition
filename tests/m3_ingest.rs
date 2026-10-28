@@ -124,6 +124,41 @@ fn scoped_ingest_indexes_registered_and_followed_posts_and_registered_post_inter
 }
 
 #[test]
+fn scoped_batch_applies_new_follow_scope_to_later_events_in_the_same_batch() {
+    let storage = Arc::new(MemoryStorage::default());
+    storage.register_user("did:plc:root").unwrap();
+    let ingestor = Ingestor::new(storage.clone(), ScopeMode::Scoped);
+    let events = vec![
+        event(
+            "did:plc:root",
+            10,
+            "create",
+            "app.bsky.graph.follow",
+            "follow-friend",
+            Some(json!({"$type":"app.bsky.graph.follow","subject":"did:plc:friend"})),
+        ),
+        event(
+            "did:plc:friend",
+            11,
+            "create",
+            "app.bsky.feed.post",
+            "friend-post",
+            Some(post("posted after follow")),
+        ),
+    ];
+
+    ingestor.process_json_batch(&events).unwrap();
+
+    assert!(
+        storage
+            .get_record("did:plc:friend", "app.bsky.feed.post", "friend-post")
+            .unwrap()
+            .is_some(),
+        "events later in the committed batch must see earlier scope changes"
+    );
+}
+
+#[test]
 fn scoped_ingest_indexes_interactions_and_post_references_on_followed_accounts() {
     let storage = Arc::new(MemoryStorage::default());
     storage.register_user("did:plc:root").unwrap();
@@ -487,6 +522,73 @@ async fn websocket_event_batch_rolls_back_records_and_cursor_on_failed_commit() 
     drop(storage);
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
+    }
+}
+
+#[test]
+#[ignore = "manual local SQLite throughput benchmark"]
+fn jetstream_sqlite_batch_throughput_benchmark() {
+    let event_count = 5_000_u64;
+    let old_path = std::env::temp_dir().join(format!(
+        "appview-rs-av15-before-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let batched_path = old_path.with_extension("batched.db");
+    let events = (1..=event_count)
+        .map(|time_us| {
+            event(
+                "did:plc:benchmark",
+                time_us,
+                "create",
+                "app.bsky.feed.post",
+                &format!("r{time_us}"),
+                Some(post("benchmark")),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let old_storage = Arc::new(SqliteStorage::open(&old_path).unwrap());
+    let old_ingestor = Ingestor::new(old_storage.clone(), ScopeMode::Full);
+    let old_started = std::time::Instant::now();
+    for event in &events {
+        old_ingestor.process_json(event).unwrap();
+    }
+    let old_elapsed = old_started.elapsed();
+    drop(old_ingestor);
+    drop(old_storage);
+
+    let batched_storage = Arc::new(SqliteStorage::open(&batched_path).unwrap());
+    let batched_ingestor = Ingestor::new(batched_storage.clone(), ScopeMode::Full);
+    let batched_started = std::time::Instant::now();
+    for batch in events.chunks(200) {
+        batched_ingestor.process_json_batch(batch).unwrap();
+    }
+    let batched_elapsed = batched_started.elapsed();
+    assert_eq!(
+        batched_storage.records().unwrap().len(),
+        event_count as usize
+    );
+    assert_eq!(batched_storage.cursor().unwrap(), Some(event_count));
+
+    let old_rate = event_count as f64 / old_elapsed.as_secs_f64();
+    let batched_rate = event_count as f64 / batched_elapsed.as_secs_f64();
+    println!(
+        "SQLite Jetstream throughput: before={old_rate:.0} events/s ({:?}); batches_of_200={batched_rate:.0} events/s ({:?}); speedup={:.2}x",
+        old_elapsed,
+        batched_elapsed,
+        batched_rate / old_rate,
+    );
+
+    drop(batched_ingestor);
+    drop(batched_storage);
+    for path in [old_path, batched_path] {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 }
 
