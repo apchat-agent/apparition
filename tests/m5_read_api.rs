@@ -416,6 +416,35 @@ async fn author_feed_cursor_advances_between_pages() {
 }
 
 #[tokio::test]
+async fn author_feed_caps_a_million_item_page_at_one_hundred() {
+    let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
+    for index in 0..150 {
+        let rkey = format!("p{index:03}");
+        storage
+            .put_record(&IndexedRecord {
+                did: ALICE.to_owned(),
+                collection: "app.bsky.feed.post".to_owned(),
+                rkey: rkey.clone(),
+                uri: format!("at://{ALICE}/app.bsky.feed.post/{rkey}"),
+                cid: None,
+                time_us: 10_000 - index,
+                record: json!({"text":"post"}),
+            })
+            .unwrap();
+    }
+    let (router, _) = api_for_storage(storage);
+    let (status, body) = request(
+        router,
+        "/xrpc/app.bsky.feed.getAuthorFeed?actor=did%3Aplc%3Aalice&limit=1000000",
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["feed"].as_array().unwrap().len(), 100);
+}
+
+#[tokio::test]
 async fn post_views_count_indexed_interactions_and_include_the_viewers_own_records() {
     let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
     let post_uri = format!("at://{ALICE}/app.bsky.feed.post/p1");
