@@ -1299,6 +1299,30 @@ async fn web_views_and_write_actions_require_a_login_session() {
 }
 
 #[tokio::test]
+async fn pinned_feed_list_and_feed_timeline_routes_are_available_to_signed_in_users() {
+    let public = OAuthPublic::new("https://appview.example").unwrap();
+    let app = public.router_with_flow(FakeOAuthFlow::default(), Arc::new(MemoryStorage::default()));
+    let cookie = finish_login(&app).await;
+    for uri in [
+        "/feeds",
+        "/app/feed?uri=at%3A%2F%2Fdid%3Aplc%3Acreator%2Fapp.bsky.feed.generator%2Ffeed",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+    }
+}
+
+#[tokio::test]
 async fn logged_in_write_forms_use_the_account_oauth_flow() {
     let public = OAuthPublic::new("https://appview.example").unwrap();
     let flow = FakeOAuthFlow::default();
