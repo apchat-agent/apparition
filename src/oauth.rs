@@ -61,6 +61,7 @@ const SESSION_COOKIE: &str = "appview_session";
 const LOGIN_COOKIE: &str = "appview_login";
 const SESSION_TTL_SECONDS: u64 = 30 * 24 * 60 * 60;
 const LOGIN_COOKIE_TTL_SECONDS: u64 = 10 * 60;
+const MAX_RENDERED_REMOTE_CHARS: usize = 4096;
 const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete";
 const WRITE_SCOPES: [&str; 3] = [
     "repo:app.bsky.feed.post?action=create",
@@ -1965,12 +1966,22 @@ fn valid_redirect_url(value: &str) -> bool {
 }
 
 fn html_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
+    let mut escaped = String::with_capacity(value.len().min(MAX_RENDERED_REMOTE_CHARS * 2));
+    for (index, character) in value.chars().enumerate() {
+        if index == MAX_RENDERED_REMOTE_CHARS {
+            escaped.push('…');
+            break;
+        }
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            character => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 fn profile_handle(profile: &Value, did: &str) -> String {
