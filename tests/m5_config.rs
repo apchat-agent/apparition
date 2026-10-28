@@ -18,6 +18,26 @@ fn backfill_record_rate_defaults_to_300_and_can_be_configured() {
 }
 
 #[test]
+fn stale_jetstream_cursor_threshold_defaults_to_ten_minutes_and_is_configurable() {
+    let default = Config::from_toml_and_env("", std::iter::empty::<(&str, &str)>()).unwrap();
+    assert!(format!("{default:?}").contains("jetstream_stale_cursor_threshold_secs: 600"));
+
+    let configured = Config::from_toml_and_env(
+        "jetstream_stale_cursor_threshold_secs = 120",
+        [("APPVIEW_JETSTREAM_STALE_CURSOR_THRESHOLD_SECS", "300")],
+    )
+    .unwrap();
+    assert!(format!("{configured:?}").contains("jetstream_stale_cursor_threshold_secs: 300"));
+
+    let from_toml = Config::from_toml_and_env(
+        "jetstream_stale_cursor_threshold_secs = 120",
+        std::iter::empty::<(&str, &str)>(),
+    )
+    .unwrap();
+    assert!(format!("{from_toml:?}").contains("jetstream_stale_cursor_threshold_secs: 120"));
+}
+
+#[test]
 fn backfill_record_rate_rejects_zero_and_non_numbers() {
     for value in ["0", "many"] {
         assert!(
