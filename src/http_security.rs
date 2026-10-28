@@ -96,11 +96,15 @@ fn take_rate_slot_with_state(
     limit: usize,
     now: Instant,
 ) -> bool {
-    if !state.buckets.contains_key(&key)
-        && state.buckets.len() >= MAX_BUCKETS
-        && let Some(oldest) = state.buckets.keys().next().cloned()
-    {
-        state.buckets.remove(&oldest);
+    if !state.buckets.contains_key(&key) && state.buckets.len() >= MAX_BUCKETS {
+        state.buckets.retain(|_, bucket| {
+            bucket
+                .back()
+                .is_some_and(|last| now.saturating_duration_since(*last) < WINDOW)
+        });
+        if state.buckets.len() >= MAX_BUCKETS {
+            return false;
+        }
     }
     let bucket = state.buckets.entry(key).or_default();
     while bucket
