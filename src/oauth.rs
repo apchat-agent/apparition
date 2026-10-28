@@ -1163,6 +1163,30 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
         })
     }
 
+    fn create_quote<'a>(
+        &'a self,
+        did: &'a str,
+        text: &'a str,
+        quoted: PostStrongRef,
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.create_record(
+                did,
+                "app.bsky.feed.post",
+                json!({
+                    "$type":"app.bsky.feed.post",
+                    "text":text,
+                    "createdAt":Datetime::now(),
+                    "embed":{
+                        "$type":"app.bsky.embed.record",
+                        "record":quoted
+                    }
+                }),
+            )
+            .await
+        })
+    }
+
     fn fetch_post<'a>(
         &'a self,
         uri: &'a str,
