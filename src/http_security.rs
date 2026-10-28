@@ -123,7 +123,10 @@ fn take_rate_slot_with_state(
 fn with_headers(mut response: Response<Body>, public_https: bool) -> Response<Body> {
     let headers = response.headers_mut();
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
-    headers.insert(header::REFERRER_POLICY, "no-referrer".parse().unwrap());
+    // Not "no-referrer": under it browsers send `Origin: null` on our own form POSTs, and the
+    // same-origin check on /oauth/authorize then refuses every real login. "same-origin" still
+    // sends nothing to other sites.
+    headers.insert(header::REFERRER_POLICY, "same-origin".parse().unwrap());
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
         "default-src 'none'; base-uri 'none'; form-action 'self'; img-src 'self' https://cdn.bsky.app; style-src 'self'; script-src 'none'; connect-src 'self'; object-src 'none'; frame-ancestors 'none'"

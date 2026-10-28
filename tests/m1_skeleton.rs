@@ -36,7 +36,7 @@ async fn health_endpoint_returns_json_ok() {
             .unwrap();
         assert_eq!(response.status(), 200, "{path}");
         assert_eq!(response.headers()["x-content-type-options"], "nosniff");
-        assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+        assert_eq!(response.headers()["referrer-policy"], "same-origin");
         let csp = response.headers()["content-security-policy"]
             .to_str()
             .unwrap();
