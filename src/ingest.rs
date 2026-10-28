@@ -8,7 +8,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, TryLockError,
+        Arc, Mutex, RwLock, TryLockError,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -183,6 +183,32 @@ pub enum StorageError {
     Poisoned,
     #[error("storage I/O error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct TrackedSet {
+    registered: HashSet<String>,
+    follow_counts: HashMap<String, u32>,
+}
+
+impl TrackedSet {
+    fn is_tracked(&self, did: &str) -> bool {
+        self.registered.contains(did) || self.follow_counts.get(did).is_some_and(|count| *count > 0)
+    }
+
+    fn follow_count(&self, did: &str) -> u32 {
+        self.follow_counts.get(did).copied().unwrap_or_default()
+    }
+
+    fn apply_follow_delta(&mut self, subject: &str, delta: i64) {
+        let current = i64::from(self.follow_count(subject));
+        let next = current.saturating_add(delta).clamp(0, i64::from(u32::MAX)) as u32;
+        if next == 0 {
+            self.follow_counts.remove(subject);
+        } else {
+            self.follow_counts.insert(subject.to_owned(), next);
+        }
+    }
 }
 
 fn notification_edges(
@@ -395,6 +421,8 @@ pub trait Storage: Send + Sync {
         session_id: &str,
     ) -> Result<Option<u64>, StorageError>;
     fn set_follow(&self, actor: &str, subject: &str, following: bool) -> Result<(), StorageError>;
+    fn is_following(&self, actor: &str, subject: &str) -> Result<bool, StorageError>;
+    fn tracked_follow_count(&self, did: &str) -> Result<u32, StorageError>;
     fn is_followed_by_registered(&self, did: &str) -> Result<bool, StorageError>;
     fn enqueue_backfill(&self, did: &str) -> Result<(), StorageError>;
     fn enqueue_backfill_for(&self, owner_did: &str, did: &str) -> Result<(), StorageError>;
@@ -465,7 +493,7 @@ struct MemoryState {
     records: HashMap<(String, String, String), IndexedRecord>,
     cursor: Option<u64>,
     skipped_windows: Vec<SkippedCursorWindow>,
-    registered: HashSet<String>,
+    tracked: TrackedSet,
     web_session_generations: HashMap<(String, String), u64>,
     follows: HashSet<(String, String)>,
     backfill_queue: HashSet<String>,
@@ -522,6 +550,7 @@ impl Storage for MemoryStorage {
             }
             for follow in &update.follows {
                 let edge = (follow.actor.clone(), follow.subject.clone());
+                let was_following = inner.follows.contains(&edge);
                 if follow.following {
                     inner.follows.insert(edge);
                 } else {
@@ -530,9 +559,16 @@ impl Storage for MemoryStorage {
                         .backfill_owners
                         .remove(&(follow.actor.clone(), follow.subject.clone()));
                 }
+                if was_following != follow.following
+                    && inner.tracked.registered.contains(&follow.actor)
+                {
+                    inner
+                        .tracked
+                        .apply_follow_delta(&follow.subject, if follow.following { 1 } else { -1 });
+                }
             }
             for (owner_did, did) in &update.backfill_for {
-                if !inner.registered.contains(owner_did)
+                if !inner.tracked.registered.contains(owner_did)
                     || (did != owner_did
                         && !inner.follows.contains(&(owner_did.clone(), did.clone())))
                     || (!inner.backfill_queue.contains(did)
@@ -583,6 +619,17 @@ impl Storage for MemoryStorage {
         inner
             .records
             .retain(|(record_did, _, _), _| record_did != did);
+        let old_follows = inner
+            .follows
+            .iter()
+            .filter(|(actor, _)| actor == did)
+            .map(|(_, subject)| subject.clone())
+            .collect::<Vec<_>>();
+        if inner.tracked.registered.contains(did) {
+            for subject in &old_follows {
+                inner.tracked.apply_follow_delta(subject, -1);
+            }
+        }
         inner.follows.retain(|(actor, _)| actor != did);
         inner
             .backfill_owners
@@ -596,8 +643,11 @@ impl Storage for MemoryStorage {
             inner.records.insert(key, record.clone());
         }
         for subject in following {
-            inner.follows.insert((did.to_owned(), subject.clone()));
-            if inner.registered.contains(did)
+            let inserted = inner.follows.insert((did.to_owned(), subject.clone()));
+            if inserted && inner.tracked.registered.contains(did) {
+                inner.tracked.apply_follow_delta(subject, 1);
+            }
+            if inner.tracked.registered.contains(did)
                 && (inner.backfill_queue.contains(subject)
                     || inner.backfill_queue.len() < MAX_BACKFILL_QUEUE)
             {
@@ -949,7 +999,17 @@ impl Storage for MemoryStorage {
 
     fn register_user(&self, did: &str) -> Result<(), StorageError> {
         let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
-        inner.registered.insert(did.to_owned());
+        if inner.tracked.registered.insert(did.to_owned()) {
+            let subjects = inner
+                .follows
+                .iter()
+                .filter(|(actor, _)| actor == did)
+                .map(|(_, subject)| subject.clone())
+                .collect::<Vec<_>>();
+            for subject in subjects {
+                inner.tracked.apply_follow_delta(&subject, 1);
+            }
+        }
         if inner.backfill_queue.contains(did) || inner.backfill_queue.len() < MAX_BACKFILL_QUEUE {
             inner.backfill_queue.insert(did.to_owned());
             inner
@@ -965,6 +1025,7 @@ impl Storage for MemoryStorage {
             .inner
             .lock()
             .map_err(|_| StorageError::Poisoned)?
+            .tracked
             .registered
             .contains(did))
     }
@@ -995,13 +1056,24 @@ impl Storage for MemoryStorage {
 
     fn unregister_user(&self, did: &str) -> Result<(), StorageError> {
         let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
-        inner.registered.remove(did);
+        if inner.tracked.registered.contains(did) {
+            let subjects = inner
+                .follows
+                .iter()
+                .filter(|(actor, _)| actor == did)
+                .map(|(_, subject)| subject.clone())
+                .collect::<Vec<_>>();
+            for subject in subjects {
+                inner.tracked.apply_follow_delta(&subject, -1);
+            }
+            inner.tracked.registered.remove(did);
+        }
         inner.follows.retain(|(actor, _)| actor != did);
         inner.backfill_owners.retain(|(owner, _)| owner != did);
         if !inner
             .follows
             .iter()
-            .any(|(actor, subject)| subject == did && inner.registered.contains(actor))
+            .any(|(actor, subject)| subject == did && inner.tracked.registered.contains(actor))
         {
             inner.backfill_queue.remove(did);
         }
@@ -1011,6 +1083,7 @@ impl Storage for MemoryStorage {
     fn set_follow(&self, actor: &str, subject: &str, following: bool) -> Result<(), StorageError> {
         let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
         let edge = (actor.to_owned(), subject.to_owned());
+        let was_following = inner.follows.contains(&edge);
         if following {
             inner.follows.insert(edge);
         } else {
@@ -1019,24 +1092,39 @@ impl Storage for MemoryStorage {
                 .backfill_owners
                 .remove(&(actor.to_owned(), subject.to_owned()));
         }
+        if was_following != following && inner.tracked.registered.contains(actor) {
+            inner
+                .tracked
+                .apply_follow_delta(subject, if following { 1 } else { -1 });
+        }
         Ok(())
     }
 
-    fn is_followed_by_registered(&self, did: &str) -> Result<bool, StorageError> {
-        let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
-        Ok(inner
+    fn is_following(&self, actor: &str, subject: &str) -> Result<bool, StorageError> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
             .follows
-            .iter()
-            .any(|(actor, subject)| subject == did && inner.registered.contains(actor)))
+            .contains(&(actor.to_owned(), subject.to_owned())))
+    }
+
+    fn tracked_follow_count(&self, did: &str) -> Result<u32, StorageError> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .tracked
+            .follow_count(did))
+    }
+
+    fn is_followed_by_registered(&self, did: &str) -> Result<bool, StorageError> {
+        Ok(self.tracked_follow_count(did)? > 0)
     }
 
     fn enqueue_backfill(&self, did: &str) -> Result<(), StorageError> {
         let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
-        let tracked = inner.registered.contains(did)
-            || inner
-                .follows
-                .iter()
-                .any(|(actor, subject)| subject == did && inner.registered.contains(actor));
+        let tracked = inner.tracked.is_tracked(did);
         if tracked
             && (inner.backfill_queue.contains(did)
                 || inner.backfill_queue.len() < MAX_BACKFILL_QUEUE)
@@ -1049,7 +1137,7 @@ impl Storage for MemoryStorage {
 
     fn enqueue_backfill_for(&self, owner_did: &str, did: &str) -> Result<(), StorageError> {
         let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
-        if !inner.registered.contains(owner_did)
+        if !inner.tracked.registered.contains(owner_did)
             || (did != owner_did
                 && !inner
                     .follows
@@ -1181,11 +1269,7 @@ impl Storage for MemoryStorage {
 
     fn is_tracked_did(&self, did: &str) -> Result<bool, StorageError> {
         let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
-        Ok(inner.registered.contains(did)
-            || inner
-                .follows
-                .iter()
-                .any(|(actor, subject)| subject == did && inner.registered.contains(actor)))
+        Ok(inner.tracked.is_tracked(did))
     }
 
     fn registered_followers(&self, did: &str) -> Result<Vec<String>, StorageError> {
@@ -1193,7 +1277,7 @@ impl Storage for MemoryStorage {
         Ok(inner
             .follows
             .iter()
-            .filter(|(actor, subject)| subject == did && inner.registered.contains(actor))
+            .filter(|(actor, subject)| subject == did && inner.tracked.registered.contains(actor))
             .map(|(actor, _)| actor.clone())
             .collect())
     }
@@ -1206,12 +1290,9 @@ impl Storage for MemoryStorage {
     fn stale_handle_dids(&self, ttl: Duration, limit: usize) -> Result<Vec<String>, StorageError> {
         let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
         let is_tracked = |did: &str| {
-            inner.registered.contains(did)
+            inner.tracked.registered.contains(did)
                 || inner.records.values().any(|record| record.did == did)
-                || inner
-                    .follows
-                    .iter()
-                    .any(|(actor, subject)| subject == did && inner.registered.contains(actor))
+                || inner.tracked.follow_count(did) > 0
         };
         let mut dids = inner
             .verified_handles
@@ -1279,12 +1360,40 @@ pub struct SqliteStorage {
     path: PathBuf,
     checkpointer_stop: Arc<AtomicBool>,
     checkpoint_backlog: Arc<AtomicU64>,
+    tracked: Arc<RwLock<TrackedSet>>,
 }
 
 impl Drop for SqliteStorage {
     fn drop(&mut self) {
         self.checkpointer_stop.store(true, Ordering::Relaxed);
     }
+}
+
+fn build_tracked_set(connection: &Connection) -> Result<(TrackedSet, u64), StorageError> {
+    let mut tracked = TrackedSet::default();
+    let mut registered = connection.prepare("SELECT did FROM registered_users")?;
+    for did in registered.query_map([], |row| row.get::<_, String>(0))? {
+        tracked.registered.insert(did?);
+    }
+    drop(registered);
+
+    let mut active_follow_edges = 0_u64;
+    let mut follows = connection.prepare(
+        "SELECT f.subject, COUNT(*) FROM follows f
+         JOIN registered_users r ON r.did=f.actor
+         WHERE f.following=1 GROUP BY f.subject",
+    )?;
+    for row in follows.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })? {
+        let (subject, count) = row?;
+        let count = u32::try_from(count).unwrap_or(u32::MAX);
+        active_follow_edges = active_follow_edges.saturating_add(u64::from(count));
+        if count > 0 {
+            tracked.follow_counts.insert(subject, count);
+        }
+    }
+    Ok((tracked, active_follow_edges))
 }
 
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
@@ -1439,6 +1548,16 @@ impl SqliteStorage {
             "PRAGMA wal_autocheckpoint = 0; PRAGMA busy_timeout = 5000;
              PRAGMA journal_size_limit = 67108864;",
         )?;
+        let tracked_build_started = Instant::now();
+        let (tracked_set, tracked_follow_edges) = build_tracked_set(&connection)?;
+        let tracked_set_build_ms = tracked_build_started.elapsed().as_secs_f64() * 1000.0;
+        tracing::info!(
+            registered_users = tracked_set.registered.len(),
+            followed_dids = tracked_set.follow_counts.len(),
+            active_registered_follow_edges = tracked_follow_edges,
+            tracked_set_build_ms,
+            "Built in-memory tracked DID set"
+        );
         let mut read_connections = Vec::new();
         if path.as_os_str() != ":memory:" {
             for _ in 0..SQLITE_READ_CONNECTIONS {
@@ -1461,6 +1580,7 @@ impl SqliteStorage {
             path,
             checkpointer_stop: stop,
             checkpoint_backlog: backlog,
+            tracked: Arc::new(RwLock::new(tracked_set)),
         })
     }
 
@@ -1469,6 +1589,27 @@ impl SqliteStorage {
         Ok(self
             .conn()?
             .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))?)
+    }
+
+    /// Rebuild the startup scope table from SQLite and compare it with the live table.
+    pub fn tracked_set_matches_sqlite(&self) -> Result<bool, StorageError> {
+        let connection = self.read_conn()?;
+        let (rebuilt, _) = build_tracked_set(&connection)?;
+        Ok(*self.tracked.read().map_err(|_| StorageError::Poisoned)? == rebuilt)
+    }
+
+    fn apply_tracked_follow_deltas(
+        &self,
+        deltas: &HashMap<String, i64>,
+    ) -> Result<(), StorageError> {
+        if deltas.is_empty() {
+            return Ok(());
+        }
+        let mut tracked = self.tracked.write().map_err(|_| StorageError::Poisoned)?;
+        for (subject, delta) in deltas {
+            tracked.apply_follow_delta(subject, *delta);
+        }
+        Ok(())
     }
 
     fn conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StorageError> {
@@ -1533,6 +1674,59 @@ impl SqliteStorage {
         }
     }
 
+    fn delete_snapshot_follows(
+        &self,
+        did: &str,
+        rowid_cutoff: i64,
+        records_per_second: Option<u64>,
+        write_started: Instant,
+        records_written: &mut u64,
+    ) -> Result<(), StorageError> {
+        loop {
+            let mut connection = self.conn()?;
+            let transaction = connection.transaction()?;
+            let actor_is_registered: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM registered_users WHERE did=?1)",
+                [did],
+                |row| row.get(0),
+            )?;
+            let subjects = {
+                let mut statement = transaction.prepare(
+                    "SELECT subject FROM follows WHERE following=1 AND rowid IN (
+                         SELECT rowid FROM follows WHERE actor=?1 AND rowid<=?2
+                         ORDER BY rowid LIMIT ?3
+                     )",
+                )?;
+                statement
+                    .query_map(params![did, rowid_cutoff, SNAPSHOT_BATCH as i64], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            let deleted = transaction.execute(
+                "DELETE FROM follows WHERE rowid IN (
+                     SELECT rowid FROM follows WHERE actor=?1 AND rowid<=?2
+                     ORDER BY rowid LIMIT ?3
+                 )",
+                params![did, rowid_cutoff, SNAPSHOT_BATCH as i64],
+            )?;
+            transaction.commit()?;
+            if actor_is_registered {
+                let mut tracked = self.tracked.write().map_err(|_| StorageError::Poisoned)?;
+                for subject in &subjects {
+                    tracked.apply_follow_delta(subject, -1);
+                }
+            }
+            drop(connection);
+            if deleted == 0 {
+                return Ok(());
+            }
+            *records_written = records_written.saturating_add(deleted as u64);
+            Self::pace_snapshot_writes(records_per_second, write_started, *records_written);
+            std::thread::yield_now();
+        }
+    }
+
     fn replace_repo_snapshot_inner(
         &self,
         did: &str,
@@ -1578,12 +1772,9 @@ impl SqliteStorage {
             write_started,
             &mut records_written,
         )?;
-        self.delete_snapshot_rows(
+        self.delete_snapshot_follows(
             did,
             follow_rowid_cutoff,
-            "DELETE FROM follows WHERE rowid IN (
-                 SELECT rowid FROM follows WHERE actor=?1 AND rowid<=?2 ORDER BY rowid LIMIT ?3
-             )",
             records_per_second,
             write_started,
             &mut records_written,
@@ -1614,7 +1805,13 @@ impl SqliteStorage {
         for (batch_index, batch) in follow_batches.iter().enumerate() {
             let mut connection = self.conn()?;
             let transaction = connection.transaction()?;
+            let registered_for_tracker: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM registered_users WHERE did=?1)",
+                [did],
+                |row| row.get(0),
+            )?;
             let mut inserted_follow_rows = 0_u64;
+            let mut inserted_subjects = Vec::new();
             {
                 // Preserve follow changes that arrived after cleanup began.
                 // Tombstones let a live unfollow win over the fetched snapshot.
@@ -1634,8 +1831,11 @@ impl SqliteStorage {
                      ON CONFLICT(did) DO UPDATE SET done=0",
                 )?;
                 for subject in *batch {
-                    inserted_follow_rows = inserted_follow_rows
-                        .saturating_add(insert_follow.execute(params![did, subject])? as u64);
+                    let inserted = insert_follow.execute(params![did, subject])?;
+                    inserted_follow_rows = inserted_follow_rows.saturating_add(inserted as u64);
+                    if inserted > 0 {
+                        inserted_subjects.push(subject.clone());
+                    }
                     let is_following: bool = transaction.query_row(
                         "SELECT following FROM follows WHERE actor=?1 AND subject=?2",
                         params![did, subject],
@@ -1655,6 +1855,12 @@ impl SqliteStorage {
                 }
             }
             transaction.commit()?;
+            if registered_for_tracker {
+                let mut tracked = self.tracked.write().map_err(|_| StorageError::Poisoned)?;
+                for subject in inserted_subjects {
+                    tracked.apply_follow_delta(&subject, 1);
+                }
+            }
             drop(connection);
             std::thread::yield_now();
             records_written = records_written.saturating_add(inserted_follow_rows);
@@ -1739,6 +1945,7 @@ impl Storage for SqliteStorage {
         let apply_started = Instant::now();
         let mut connection = self.conn()?;
         let transaction = connection.transaction()?;
+        let mut tracked_follow_deltas = HashMap::<String, i64>::new();
         for update in updates {
             if let Some(did) = &update.handle_refresh {
                 transaction.execute(
@@ -1777,10 +1984,28 @@ impl Storage for SqliteStorage {
                 )?;
             }
             for follow in &update.follows {
+                let actor_is_registered: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM registered_users WHERE did=?1)",
+                    [&follow.actor],
+                    |row| row.get(0),
+                )?;
+                let was_following: Option<bool> = transaction
+                    .query_row(
+                        "SELECT following FROM follows WHERE actor=?1 AND subject=?2",
+                        params![follow.actor, follow.subject],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let was_following = was_following.unwrap_or(false);
                 transaction.execute(
                     "INSERT OR REPLACE INTO follows(actor,subject,following) VALUES(?1,?2,?3)",
                     params![follow.actor, follow.subject, follow.following],
                 )?;
+                if actor_is_registered && was_following != follow.following {
+                    *tracked_follow_deltas
+                        .entry(follow.subject.clone())
+                        .or_default() += if follow.following { 1 } else { -1 };
+                }
                 if !follow.following {
                     transaction.execute(
                         "DELETE FROM backfill_scope WHERE owner_did=?1 AND target_did=?2",
@@ -1825,6 +2050,7 @@ impl Storage for SqliteStorage {
         let apply = apply_started.elapsed();
         let commit_started = Instant::now();
         transaction.commit()?;
+        self.apply_tracked_follow_deltas(&tracked_follow_deltas)?;
         Ok(BatchApplyTiming {
             apply,
             commit: commit_started.elapsed(),
@@ -2215,6 +2441,20 @@ impl Storage for SqliteStorage {
     fn register_user(&self, did: &str) -> Result<(), StorageError> {
         let mut connection = self.conn()?;
         let transaction = connection.transaction()?;
+        let was_registered: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM registered_users WHERE did=?1)",
+            [did],
+            |row| row.get(0),
+        )?;
+        let active_subjects = if was_registered {
+            Vec::new()
+        } else {
+            let mut statement = transaction
+                .prepare("SELECT subject FROM follows WHERE actor=?1 AND following=1")?;
+            statement
+                .query_map([did], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
         transaction.execute(
             "INSERT OR IGNORE INTO registered_users(did) VALUES(?1)",
             [did],
@@ -2237,12 +2477,33 @@ impl Storage for SqliteStorage {
             [did],
         )?;
         transaction.commit()?;
+        if !was_registered {
+            let mut tracked = self.tracked.write().map_err(|_| StorageError::Poisoned)?;
+            tracked.registered.insert(did.to_owned());
+            for subject in active_subjects {
+                tracked.apply_follow_delta(&subject, 1);
+            }
+        }
         Ok(())
     }
 
     fn unregister_user(&self, did: &str) -> Result<(), StorageError> {
         let mut connection = self.conn()?;
         let transaction = connection.transaction()?;
+        let was_registered: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM registered_users WHERE did=?1)",
+            [did],
+            |row| row.get(0),
+        )?;
+        let active_subjects = if was_registered {
+            let mut statement = transaction
+                .prepare("SELECT subject FROM follows WHERE actor=?1 AND following=1")?;
+            statement
+                .query_map([did], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
         transaction.execute("DELETE FROM registered_users WHERE did=?1", [did])?;
         transaction.execute("DELETE FROM follows WHERE actor=?1", [did])?;
         transaction.execute("DELETE FROM backfill_scope WHERE owner_did=?1", [did])?;
@@ -2254,39 +2515,79 @@ impl Storage for SqliteStorage {
             [did],
         )?;
         transaction.commit()?;
-        Ok(())
-    }
-
-    fn is_registered(&self, did: &str) -> Result<bool, StorageError> {
-        Ok(self.read_conn()?.query_row(
-            "SELECT EXISTS(SELECT 1 FROM registered_users WHERE did=?1)",
-            [did],
-            |row| row.get(0),
-        )?)
-    }
-
-    fn set_follow(&self, actor: &str, subject: &str, following: bool) -> Result<(), StorageError> {
-        let connection = self.conn()?;
-        connection.execute(
-            "INSERT OR REPLACE INTO follows(actor,subject,following) VALUES(?1,?2,?3)",
-            params![actor, subject, following],
-        )?;
-        if !following {
-            connection.execute(
-                "DELETE FROM backfill_scope WHERE owner_did=?1 AND target_did=?2",
-                params![actor, subject],
-            )?;
+        if was_registered {
+            let mut tracked = self.tracked.write().map_err(|_| StorageError::Poisoned)?;
+            tracked.registered.remove(did);
+            for subject in active_subjects {
+                tracked.apply_follow_delta(&subject, -1);
+            }
         }
         Ok(())
     }
 
-    fn is_followed_by_registered(&self, did: &str) -> Result<bool, StorageError> {
+    fn is_registered(&self, did: &str) -> Result<bool, StorageError> {
+        Ok(self
+            .tracked
+            .read()
+            .map_err(|_| StorageError::Poisoned)?
+            .registered
+            .contains(did))
+    }
+
+    fn set_follow(&self, actor: &str, subject: &str, following: bool) -> Result<(), StorageError> {
+        let mut connection = self.conn()?;
+        let transaction = connection.transaction()?;
+        let actor_is_registered: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM registered_users WHERE did=?1)",
+            [actor],
+            |row| row.get(0),
+        )?;
+        let was_following: Option<bool> = transaction
+            .query_row(
+                "SELECT following FROM follows WHERE actor=?1 AND subject=?2",
+                params![actor, subject],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let was_following = was_following.unwrap_or(false);
+        transaction.execute(
+            "INSERT OR REPLACE INTO follows(actor,subject,following) VALUES(?1,?2,?3)",
+            params![actor, subject, following],
+        )?;
+        if !following {
+            transaction.execute(
+                "DELETE FROM backfill_scope WHERE owner_did=?1 AND target_did=?2",
+                params![actor, subject],
+            )?;
+        }
+        transaction.commit()?;
+        if actor_is_registered && was_following != following {
+            self.apply_tracked_follow_deltas(&HashMap::from([(
+                subject.to_owned(),
+                if following { 1 } else { -1 },
+            )]))?;
+        }
+        Ok(())
+    }
+
+    fn is_following(&self, actor: &str, subject: &str) -> Result<bool, StorageError> {
         Ok(self.read_conn()?.query_row(
-            "SELECT EXISTS(SELECT 1 FROM follows f JOIN registered_users r ON f.actor=r.did
-             WHERE f.subject=?1 AND f.following=1)",
-            [did],
+            "SELECT EXISTS(SELECT 1 FROM follows WHERE actor=?1 AND subject=?2 AND following=1)",
+            params![actor, subject],
             |row| row.get(0),
         )?)
+    }
+
+    fn tracked_follow_count(&self, did: &str) -> Result<u32, StorageError> {
+        Ok(self
+            .tracked
+            .read()
+            .map_err(|_| StorageError::Poisoned)?
+            .follow_count(did))
+    }
+
+    fn is_followed_by_registered(&self, did: &str) -> Result<bool, StorageError> {
+        Ok(self.tracked_follow_count(did)? > 0)
     }
 
     fn enqueue_backfill(&self, did: &str) -> Result<(), StorageError> {
@@ -2509,13 +2810,11 @@ impl Storage for SqliteStorage {
     }
 
     fn is_tracked_did(&self, did: &str) -> Result<bool, StorageError> {
-        Ok(self.read_conn()?.query_row(
-            "SELECT EXISTS(SELECT 1 FROM registered_users WHERE did=?1)
-                OR EXISTS(SELECT 1 FROM follows f JOIN registered_users r ON r.did=f.actor
-                          WHERE f.subject=?1 AND f.following=1)",
-            [did],
-            |row| row.get(0),
-        )?)
+        Ok(self
+            .tracked
+            .read()
+            .map_err(|_| StorageError::Poisoned)?
+            .is_tracked(did))
     }
 
     fn registered_followers(&self, did: &str) -> Result<Vec<String>, StorageError> {
@@ -2764,6 +3063,7 @@ struct IngestBatchPhases {
 #[derive(Default)]
 struct IngestBatchState {
     staged_follows: HashMap<(String, String), bool>,
+    staged_follow_deltas: HashMap<String, i64>,
     staged_records: HashMap<(String, String, String), Option<IndexedRecord>>,
     phases: IngestBatchPhases,
 }
@@ -2920,19 +3220,18 @@ impl<S: Storage> Ingestor<S> {
                     .and_then(|record| record.pointer("/subject/uri"))
                     .and_then(Value::as_str)
                     .and_then(uri_did)
-                    .map(|target_did| {
-                        self.is_tracked_in_batch(target_did, &batch_state.staged_follows)
-                    })
+                    .map(|target_did| self.is_tracked_in_batch(target_did, batch_state))
                     .transpose()?
                     .unwrap_or(false),
-                "app.bsky.feed.post" => self
-                    .post_references_tracked(commit.record.as_ref(), &batch_state.staged_follows)?,
+                "app.bsky.feed.post" => {
+                    self.post_references_tracked(commit.record.as_ref(), batch_state)?
+                }
                 _ => false,
             }
         };
         let actor_tracked = match self.scope {
             ScopeMode::Full => true,
-            ScopeMode::Scoped => self.is_tracked_in_batch(&did, &batch_state.staged_follows)?,
+            ScopeMode::Scoped => self.is_tracked_in_batch(&did, batch_state)?,
         };
         // Avoid a database record lookup for unrelated creates and updates. For a
         // delete, inspect the key so previously indexed interactions can be removed.
@@ -2983,9 +3282,7 @@ impl<S: Storage> Ingestor<S> {
                     subject: subject.to_owned(),
                     following: false,
                 });
-                batch_state
-                    .staged_follows
-                    .insert((did.clone(), subject.to_owned()), false);
+                self.stage_follow(&did, subject, false, batch_state)?;
             }
             if commit.operation != "delete"
                 && let Some(subject) = commit
@@ -2999,9 +3296,7 @@ impl<S: Storage> Ingestor<S> {
                     subject: subject.to_owned(),
                     following: true,
                 });
-                batch_state
-                    .staged_follows
-                    .insert((did.clone(), subject.to_owned()), true);
+                self.stage_follow(&did, subject, true, batch_state)?;
                 if self.scope == ScopeMode::Scoped {
                     update.backfill_for.push((did, subject.to_owned()));
                 }
@@ -3013,29 +3308,47 @@ impl<S: Storage> Ingestor<S> {
     fn is_tracked_in_batch(
         &self,
         did: &str,
-        staged_follows: &HashMap<(String, String), bool>,
+        batch_state: &IngestBatchState,
     ) -> Result<bool, IngestError> {
         if self.scope == ScopeMode::Full || self.storage.is_registered(did)? {
             return Ok(true);
         }
-        let followers = self.storage.registered_followers(did)?;
-        if followers.iter().any(|actor| {
-            staged_follows
-                .get(&(actor.clone(), did.to_owned()))
+        let count = i64::from(self.storage.tracked_follow_count(did)?)
+            + batch_state
+                .staged_follow_deltas
+                .get(did)
                 .copied()
-                .unwrap_or(true)
-        }) {
-            return Ok(true);
+                .unwrap_or_default();
+        Ok(count > 0)
+    }
+
+    fn stage_follow(
+        &self,
+        actor: &str,
+        subject: &str,
+        following: bool,
+        batch_state: &mut IngestBatchState,
+    ) -> Result<(), IngestError> {
+        let key = (actor.to_owned(), subject.to_owned());
+        let was_following = if let Some(staged) = batch_state.staged_follows.get(&key) {
+            *staged
+        } else {
+            self.storage.is_following(actor, subject)?
+        };
+        if was_following != following {
+            *batch_state
+                .staged_follow_deltas
+                .entry(subject.to_owned())
+                .or_default() += if following { 1 } else { -1 };
         }
-        Ok(staged_follows
-            .iter()
-            .any(|((_, subject), following)| subject == did && *following))
+        batch_state.staged_follows.insert(key, following);
+        Ok(())
     }
 
     fn post_references_tracked(
         &self,
         record: Option<&Value>,
-        staged_follows: &HashMap<(String, String), bool>,
+        batch_state: &IngestBatchState,
     ) -> Result<bool, IngestError> {
         let Some(record) = record else {
             return Ok(false);
@@ -3053,7 +3366,7 @@ impl<S: Storage> Ingestor<S> {
             .filter_map(|path| record.pointer(path).and_then(Value::as_str))
         {
             if let Some(did) = uri_did(uri)
-                && self.is_tracked_in_batch(did, staged_follows)?
+                && self.is_tracked_in_batch(did, batch_state)?
             {
                 return Ok(true);
             }
@@ -3071,7 +3384,7 @@ impl<S: Storage> Ingestor<S> {
             })
             .filter_map(|feature| feature.get("did").and_then(Value::as_str))
         {
-            if self.is_tracked_in_batch(did, staged_follows)? {
+            if self.is_tracked_in_batch(did, batch_state)? {
                 return Ok(true);
             }
         }

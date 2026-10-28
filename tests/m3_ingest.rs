@@ -162,18 +162,18 @@ fn jetstream_large_database_batch_ingest_benchmark() {
         );
     }
 
-    let startup_started = std::time::Instant::now();
-    let storage = Arc::new(SqliteStorage::open(&path).unwrap());
-    println!(
-        "SqliteStorage::open_ms={:.3}",
-        startup_started.elapsed().as_secs_f64() * 1000.0
-    );
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
         .with_max_level(tracing::Level::DEBUG)
         .finish();
     let dispatch = tracing::Dispatch::new(subscriber);
     let _guard = tracing::dispatcher::set_default(&dispatch);
+    let startup_started = std::time::Instant::now();
+    let storage = Arc::new(SqliteStorage::open(&path).unwrap());
+    println!(
+        "SqliteStorage::open_ms={:.3}",
+        startup_started.elapsed().as_secs_f64() * 1000.0
+    );
     let ingestor = Ingestor::new(storage, ScopeMode::Scoped);
     let events = (0..600)
         .map(|index| {
