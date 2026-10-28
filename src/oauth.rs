@@ -1,6 +1,7 @@
 use crate::identity::{HttpIdentityBackend, IdentityResolver};
 use crate::{
     api::profile_view_from_storage,
+    feeds::ResolvedFeed,
     ingest::{
         IndexedNotification, IndexedRecord, MemoryStorage, NotificationCursor, RecordCursor,
         Storage, StorageError,
@@ -2266,6 +2267,39 @@ fn html_escape(value: &str) -> String {
         }
     }
     escaped
+}
+
+fn render_feed_card(feed: &ResolvedFeed) -> String {
+    format!("<li><a href=\"/app/feed?uri={}\">{}</a><p>{}</p></li>", feed.uri, feed.display_name, feed.description.as_deref().unwrap_or(""))
+}
+
+fn render_feed_heading(feed: &ResolvedFeed) -> String {
+    format!("<header><h1>{}</h1><p>{}</p><code>{}</code></header>", feed.display_name, feed.description.as_deref().unwrap_or(""), feed.uri)
+}
+
+#[cfg(test)]
+mod feed_html_tests {
+    use super::{render_feed_card, render_feed_heading};
+    use crate::feeds::ResolvedFeed;
+
+    #[test]
+    fn generator_text_and_uri_are_escaped_on_both_feed_pages() {
+        let feed = ResolvedFeed {
+            uri: "at://did:plc:feed/app.bsky.feed.generator/x\"><script>alert(1)</script>".into(),
+            display_name: "<img src=x onerror=alert(1)>".into(),
+            description: Some("<script>feed text</script> & more".into()),
+            avatar: Some("javascript:alert(1)".into()),
+            service_did: "did:plc:generator".into(),
+            endpoint: "https://feed.example".into(),
+        };
+        for html in [render_feed_card(&feed), render_feed_heading(&feed)] {
+            assert!(!html.contains("<script>"));
+            assert!(!html.contains("<img src=x"));
+            assert!(!html.contains("onerror=alert"));
+            assert!(html.contains("&lt;script&gt;"));
+            assert!(html.contains("&lt;img src=x onerror=alert(1)&gt;"));
+        }
+    }
 }
 
 fn profile_handle(profile: &Value, did: &str) -> String {
