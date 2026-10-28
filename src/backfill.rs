@@ -82,7 +82,7 @@ pub struct HttpRepoSource {
 impl HttpRepoSource {
     pub fn new(max_bytes: usize) -> Result<Self, BackfillError> {
         Ok(Self {
-            client: SafeHttpClient::new(),
+            client: SafeHttpClient::new().background(),
             max_bytes,
         })
     }
@@ -91,7 +91,9 @@ impl HttpRepoSource {
         hosts: impl IntoIterator<Item = String>,
     ) -> Result<Self, BackfillError> {
         Ok(Self {
-            client: SafeHttpClient::new().with_http_test_hosts(hosts),
+            client: SafeHttpClient::new()
+                .background()
+                .with_http_test_hosts(hosts),
             max_bytes: MAX_REPO_CAR_BYTES,
         })
     }

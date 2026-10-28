@@ -15,6 +15,19 @@ const MAX_OAUTH_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 static OUTBOUND_REQUESTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+// Repository backfill downloads are large and keep their permits for up to REQUEST_TIMEOUT each.
+// They get their own pool so a running backfill can never queue a browser's sign-in behind it
+// (2026-10-28: logins hung until the browser gave up while a follow backfill ran).
+static BACKGROUND_REQUESTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn request_pool(background: bool) -> Arc<Semaphore> {
+    if background {
+        BACKGROUND_REQUESTS.get_or_init(|| Arc::new(Semaphore::new(6)))
+    } else {
+        OUTBOUND_REQUESTS.get_or_init(|| Arc::new(Semaphore::new(8)))
+    }
+    .clone()
+}
 
 pub fn is_forbidden_ip(ip: IpAddr) -> bool {
     match ip {
@@ -95,6 +108,7 @@ impl HostResolver for SystemResolver {
 pub struct SafeHttpClient {
     resolver: Arc<dyn HostResolver>,
     http_test_hosts: HashSet<String>,
+    background: bool,
 }
 
 impl SafeHttpClient {
@@ -102,6 +116,7 @@ impl SafeHttpClient {
         Self {
             resolver: Arc::new(SystemResolver),
             http_test_hosts: HashSet::new(),
+            background: false,
         }
     }
 
@@ -109,7 +124,14 @@ impl SafeHttpClient {
         Self {
             resolver: Arc::new(resolver),
             http_test_hosts: HashSet::new(),
+            background: false,
         }
+    }
+
+    /// Use the background request pool (bulk work such as repository backfill).
+    pub fn background(mut self) -> Self {
+        self.background = true;
+        self
     }
 
     pub fn with_http_test_hosts(mut self, hosts: impl IntoIterator<Item = String>) -> Self {
@@ -157,9 +179,7 @@ impl SafeHttpClient {
         if request.body().len() > MAX_REQUEST_BYTES {
             return Err("outbound request body is too large".to_owned());
         }
-        let permit = OUTBOUND_REQUESTS
-            .get_or_init(|| Arc::new(Semaphore::new(8)))
-            .clone()
+        let permit = request_pool(self.background)
             .acquire_owned()
             .await
             .map_err(|_| "outbound request capacity is unavailable".to_owned())?;
@@ -214,7 +234,9 @@ impl SafeHttpClient {
                 .body(request.body().clone())
                 .send()
                 .await
-                .map_err(|_| "outbound HTTP request failed".to_owned())?;
+                .map_err(|error| {
+                    format!("outbound HTTP request failed: {}", error.without_url())
+                })?;
 
             if is_redirect(response.status())
                 && let Some(location) = response.headers().get(http::header::LOCATION)
@@ -324,7 +346,7 @@ fn is_redirect(status: http::StatusCode) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{HostResolver, SafeHttpClient, is_forbidden_ip};
+    use super::{HostResolver, SafeHttpClient, is_forbidden_ip, request_pool};
     use axum::{Router, response::Redirect, routing::get};
     use std::{
         collections::VecDeque,
@@ -335,6 +357,27 @@ mod tests {
     };
     use tokio::net::TcpListener;
     use url::Url;
+
+    #[tokio::test]
+    async fn a_full_background_pool_does_not_block_interactive_requests() {
+        let background = request_pool(true);
+        let held = background
+            .clone()
+            .acquire_many_owned(background.available_permits() as u32)
+            .await
+            .unwrap();
+        assert_eq!(background.available_permits(), 0);
+        let interactive = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            request_pool(false).acquire_owned(),
+        )
+        .await;
+        assert!(
+            interactive.is_ok(),
+            "interactive request waited on background permits"
+        );
+        drop(held);
+    }
 
     #[derive(Clone)]
     struct FakeResolver(Arc<Mutex<VecDeque<Vec<IpAddr>>>>);
