@@ -521,6 +521,36 @@ async fn authorization_and_callback_reject_missing_protocol_parameters() {
 }
 
 #[tokio::test]
+async fn authorize_normalizes_the_typed_handle_but_not_a_did() {
+    // A phone keyboard sent "Ayourtch.bsky.social"; atproto handles are case-insensitive but the
+    // DID-document check downstream compares them exactly, so sign-in failed (2026-10-28).
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), Arc::new(MemoryStorage::default()));
+    for (typed, expected) in [
+        ("%40Alice.Test+", "login=alice.test"),
+        ("+did%3Aplc%3AAbC+", "login=did:plc:AbC"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/oauth/authorize")
+                    .header("origin", "https://appview.example")
+                    .header("sec-fetch-site", "same-origin")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!("handle={typed}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let location = response.headers()["location"].to_str().unwrap().to_owned();
+        assert!(location.ends_with(expected), "{typed}: {location}");
+    }
+}
+
+#[tokio::test]
 async fn callback_rejects_valid_state_without_the_matching_browser_cookie() {
     let app = OAuthPublic::new("https://appview.example")
         .unwrap()

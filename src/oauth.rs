@@ -1072,6 +1072,18 @@ async fn root() -> Redirect {
     Redirect::to("/app")
 }
 
+/// Trim, drop a leading `@`, and lowercase handles (case-insensitive in atproto; phone keyboards
+/// capitalise the first letter). DIDs are passed through unchanged.
+fn normalize_login(typed: &str) -> String {
+    let login = typed.trim();
+    let login = login.strip_prefix('@').unwrap_or(login);
+    if login.starts_with("did:") {
+        login.to_owned()
+    } else {
+        login.to_ascii_lowercase()
+    }
+}
+
 async fn login() -> Html<&'static str> {
     Html(
         "<!doctype html><html><head><title>Sign in</title></head><body><main><h1>Sign in to your AppView</h1><form action=\"/oauth/authorize\" method=\"post\"><label>AT Protocol handle or DID <input name=\"handle\" autocomplete=\"username\" required></label><button type=\"submit\">Continue</button></form></main></body></html>",
@@ -1107,7 +1119,7 @@ where
     thread_rng().fill_bytes(&mut binding_bytes);
     let browser_binding = URL_SAFE_NO_PAD.encode(binding_bytes);
     let authorize_result = std::panic::AssertUnwindSafe(state.flow.authorize(
-        form.get("handle").expect("validated above"),
+        &normalize_login(form.get("handle").expect("validated above")),
         &browser_binding,
     ))
     .catch_unwind()
