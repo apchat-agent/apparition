@@ -725,6 +725,146 @@ async fn bsky_style_shell_renders_navigation_pinned_feed_tabs_and_post_actions()
 }
 
 #[tokio::test]
+async fn quote_composer_shows_post_and_quote_write_is_indexed_with_one_notification() {
+    let storage = Arc::new(MemoryStorage::default());
+    let quote_uri = "at://did:plc:author/app.bsky.feed.post/original";
+    storage
+        .set_follow("did:plc:alice", "did:plc:author", true)
+        .unwrap();
+    storage
+        .put_record(&IndexedRecord {
+            did: "did:plc:author".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "original".into(),
+            uri: quote_uri.into(),
+            cid: Some("original-cid".into()),
+            time_us: 1,
+            record: serde_json::json!({
+                "$type":"app.bsky.feed.post",
+                "text":"quoted <script>text</script>",
+                "createdAt":"2026-10-28T00:00:00Z"
+            }),
+        })
+        .unwrap();
+    let flow = FakeOAuthFlow::default();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow.clone(), storage.clone());
+    let cookie = finish_login(&app).await;
+
+    let timeline = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let timeline_html = String::from_utf8(
+        timeline
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(timeline_html.contains("Quote post"), "{timeline_html}");
+
+    let encoded_uri =
+        url::form_urlencoded::byte_serialize(quote_uri.as_bytes()).collect::<String>();
+    let compose = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/compose?quote_uri={encoded_uri}"))
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(compose.status(), StatusCode::OK);
+    let compose_html = String::from_utf8(
+        compose
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(compose_html.contains("action=\"/quote\""), "{compose_html}");
+    assert!(
+        compose_html.contains("quoted &lt;script&gt;text&lt;/script&gt;"),
+        "{compose_html}"
+    );
+    assert!(
+        !compose_html.contains("<script>text</script>"),
+        "{compose_html}"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/quote")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", &cookie)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(format!(
+                    "quote_uri={encoded_uri}&text=adding+context"
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let records = storage.records().unwrap();
+    let quote = records
+        .iter()
+        .find(|record| record.rkey == "pds-quote-r1")
+        .expect("quote createRecord response should be indexed");
+    assert_eq!(
+        quote.record["embed"]["record"],
+        serde_json::json!({"uri":quote_uri,"cid":"original-cid"})
+    );
+    assert_eq!(storage.notification_count("did:plc:author").unwrap(), 1);
+
+    Ingestor::new(storage.clone(), ScopeMode::Full)
+        .process_json(
+            &serde_json::json!({
+                "did":"did:plc:alice",
+                "time_us":quote.time_us,
+                "kind":"commit",
+                "commit":{
+                    "operation":"create",
+                    "collection":"app.bsky.feed.post",
+                    "rkey":"pds-quote-r1",
+                    "cid":quote.cid,
+                    "record":quote.record
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    assert_eq!(storage.notification_count("did:plc:author").unwrap(), 1);
+    assert_eq!(
+        *flow.actions.lock().unwrap(),
+        [
+            "quote:did:plc:alice:adding context:at://did:plc:author/app.bsky.feed.post/original:original-cid"
+        ]
+    );
+}
+
+#[tokio::test]
 async fn sign_in_error_page_uses_the_shared_mobile_document_shell() {
     let app = OAuthPublic::new("https://appview.example")
         .unwrap()
