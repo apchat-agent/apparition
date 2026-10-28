@@ -2227,6 +2227,56 @@ async fn timeline_replies_name_the_parent_author_and_link_to_the_thread() {
 }
 
 #[tokio::test]
+async fn timeline_reply_context_uses_verified_parent_handle_when_post_is_missing() {
+    let storage = Arc::new(MemoryStorage::default());
+    storage
+        .set_verified_handle("did:plc:friend", "friend.test")
+        .unwrap();
+    storage
+        .put_record(&IndexedRecord {
+            did: "did:plc:alice".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "reply".into(),
+            uri: "at://did:plc:alice/app.bsky.feed.post/reply".into(),
+            cid: Some("reply-cid".into()),
+            time_us: 10,
+            record: serde_json::json!({
+                "text":"A reply",
+                "reply":{
+                    "parent":{"uri":"at://did:plc:friend/app.bsky.feed.post/missing","cid":"missing-cid"},
+                    "root":{"uri":"at://did:plc:friend/app.bsky.feed.post/missing","cid":"missing-cid"}
+                }
+            }),
+        })
+        .unwrap();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage);
+    let cookie = finish_login(&app).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("replying to @friend.test"), "{html}");
+}
+
+#[tokio::test]
 async fn web_thread_renders_the_parent_chain_and_nested_replies_in_time_order() {
     let storage = Arc::new(MemoryStorage::default());
     storage
