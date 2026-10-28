@@ -1,7 +1,7 @@
 use appview_rs::router;
 use appview_rs::{
     config::Config,
-    ingest::{IndexedRecord, MemoryStorage, SqliteStorage, Storage},
+    ingest::{IndexedRecord, Ingestor, MemoryStorage, ScopeMode, SqliteStorage, Storage},
     oauth::{OAuthAccount, OAuthCallback, OAuthFlow, OAuthPublic, SqliteOAuthStore},
 };
 use atrium_api::types::string::Did;
@@ -1315,6 +1315,136 @@ async fn logged_in_write_forms_use_the_account_oauth_flow() {
             "repost:did:plc:alice:at://did:plc:author/app.bsky.feed.post/r1:bafyreifake",
         ]
     );
+}
+
+#[tokio::test]
+async fn successful_pds_writes_are_indexed_and_jetstream_replays_are_idempotent() {
+    let public = OAuthPublic::new("https://appview.example").unwrap();
+    let flow = FakeOAuthFlow::default();
+    let storage = Arc::new(MemoryStorage::default());
+    let app = public.router_with_flow(flow, storage.clone());
+    let login_cookie = prelogin_cookie(&app).await;
+    let callback = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?code=valid-code&state=valid-state&scope=atproto")
+                .header("cookie", login_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let cookie = callback.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    for (path, body) in [
+        ("/post", "text=write-through-post"),
+        (
+            "/like",
+            "uri=at%3A%2F%2Fdid%3Aplc%3Aalice%2Fapp.bsky.feed.post%2Fpds-post-r1&cid=pds-post-cid",
+        ),
+        (
+            "/repost",
+            "uri=at%3A%2F%2Fdid%3Aplc%3Aalice%2Fapp.bsky.feed.post%2Fpds-post-r1&cid=pds-post-cid",
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("origin", "https://appview.example")
+                    .header("sec-fetch-site", "same-origin")
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER, "{path}");
+    }
+
+    let records = storage.records().unwrap();
+    let own_post = records
+        .iter()
+        .find(|record| record.collection == "app.bsky.feed.post")
+        .expect("createRecord response should be indexed before redirect");
+    assert_eq!(own_post.did, "did:plc:alice");
+    assert_eq!(
+        own_post.uri,
+        "at://did:plc:alice/app.bsky.feed.post/pds-post-r1"
+    );
+    assert_eq!(own_post.cid.as_deref(), Some("pds-post-cid"));
+    assert_eq!(own_post.record["text"], "write-through-post");
+    let own_like = records
+        .iter()
+        .find(|record| record.collection == "app.bsky.feed.like")
+        .expect("like createRecord response should be indexed");
+    let own_repost = records
+        .iter()
+        .find(|record| record.collection == "app.bsky.feed.repost")
+        .expect("repost createRecord response should be indexed");
+    assert_eq!(storage.notification_count("did:plc:alice").unwrap(), 2);
+
+    let replay = Ingestor::new(storage.clone(), ScopeMode::Full);
+    for (record, rkey) in [
+        (own_post, "pds-post-r1"),
+        (own_like, "pds-like-r1"),
+        (own_repost, "pds-repost-r1"),
+    ] {
+        replay
+            .process_json(
+                &serde_json::json!({
+                    "did":"did:plc:alice",
+                    "time_us":record.time_us,
+                    "kind":"commit",
+                    "commit":{
+                        "operation":"create",
+                        "collection":record.collection,
+                        "rkey":rkey,
+                        "cid":record.cid,
+                        "record":record.record
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+    }
+    assert_eq!(storage.records().unwrap().len(), 3);
+    assert_eq!(storage.notification_count("did:plc:alice").unwrap(), 2);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/like")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", &cookie)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "uri=at%3A%2F%2Fdid%3Aplc%3Aalice%2Fapp.bsky.feed.post%2Fpds-post-r1&cid=pds-post-cid&intent=delete",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert!(
+        storage
+            .record_by_uri("app.bsky.feed.like", &own_like.uri)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(storage.notification_count("did:plc:alice").unwrap(), 1);
 }
 
 #[tokio::test]
