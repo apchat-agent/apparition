@@ -139,6 +139,12 @@ pub struct PostStrongRef {
     pub cid: String,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct FetchedAuthorProfile {
+    pub profile: Option<IndexedRecord>,
+    pub verified_handle: Option<String>,
+}
+
 pub trait OAuthFlow: Clone + Send + Sync + 'static {
     fn authorize<'a>(
         &'a self,
@@ -182,6 +188,12 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
         _uri: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<IndexedRecord, String>> + Send + 'a>> {
         Box::pin(async { Err("post fetch is not available".to_owned()) })
+    }
+    fn fetch_author_profile<'a>(
+        &'a self,
+        _did: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<FetchedAuthorProfile, String>> + Send + 'a>> {
+        Box::pin(async { Err("profile fetch is not available".to_owned()) })
     }
     fn like<'a>(
         &'a self,

@@ -4,8 +4,8 @@ use appview_rs::{
     feeds::ResolvedFeed,
     ingest::{IndexedRecord, Ingestor, MemoryStorage, ScopeMode, SqliteStorage, Storage},
     oauth::{
-        OAuthAccount, OAuthCallback, OAuthFlow, OAuthPublic, PdsCreatedRecord, PostStrongRef,
-        SqliteOAuthStore,
+        FetchedAuthorProfile, OAuthAccount, OAuthCallback, OAuthFlow, OAuthPublic,
+        PdsCreatedRecord, PostStrongRef, SqliteOAuthStore,
     },
 };
 use atrium_api::types::string::Did;
@@ -33,6 +33,8 @@ struct FakeOAuthFlow {
     callback_failure: Option<String>,
     action_failure: Option<String>,
     pinned_feeds: Vec<ResolvedFeed>,
+    author_profiles: Arc<Mutex<std::collections::HashMap<String, FetchedAuthorProfile>>>,
+    profile_requests: Arc<Mutex<Vec<String>>>,
 }
 
 impl Default for FakeOAuthFlow {
@@ -44,6 +46,8 @@ impl Default for FakeOAuthFlow {
             callback_failure: None,
             action_failure: None,
             pinned_feeds: Vec::new(),
+            author_profiles: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            profile_requests: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -190,6 +194,21 @@ impl OAuthFlow for FakeOAuthFlow {
                     "embed":{"$type":"app.bsky.embed.record","record":quoted}
                 }),
             ))
+        })
+    }
+
+    fn fetch_author_profile<'a>(
+        &'a self,
+        did: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<FetchedAuthorProfile, String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.profile_requests.lock().unwrap().push(did.to_owned());
+            self.author_profiles
+                .lock()
+                .unwrap()
+                .get(did)
+                .cloned()
+                .ok_or_else(|| "fake PDS has no profile for DID".to_owned())
         })
     }
 
@@ -2799,6 +2818,89 @@ async fn timeline_profile_and_notification_pages_offer_older_cursor_links() {
             "{uri}: {html}"
         );
     }
+}
+
+#[tokio::test]
+async fn page_fetches_missing_author_profile_stores_it_and_keeps_avatar_url_safe() {
+    let storage = Arc::new(MemoryStorage::default());
+    let author = "did:plc:author";
+    storage.set_follow("did:plc:alice", author, true).unwrap();
+    storage
+        .put_record(&IndexedRecord {
+            did: author.into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "post".into(),
+            uri: format!("at://{author}/app.bsky.feed.post/post"),
+            cid: Some("post-cid".into()),
+            time_us: 2,
+            record: serde_json::json!({
+                "$type":"app.bsky.feed.post",
+                "text":"visible post",
+                "createdAt":"2026-10-28T00:00:00Z"
+            }),
+        })
+        .unwrap();
+    let flow = FakeOAuthFlow::default();
+    flow.author_profiles.lock().unwrap().insert(
+        author.into(),
+        FetchedAuthorProfile {
+            profile: Some(IndexedRecord {
+                did: author.into(),
+                collection: "app.bsky.actor.profile".into(),
+                rkey: "self".into(),
+                uri: format!("at://{author}/app.bsky.actor.profile/self"),
+                cid: Some("profile-cid".into()),
+                time_us: 1_800_000_000_000_000,
+                record: serde_json::json!({
+                    "$type":"app.bsky.actor.profile",
+                    "displayName":"<Hydrated & Co>",
+                    "avatar":{"$type":"blob","ref":{"$link":"avatar-cid"}}
+                }),
+            }),
+            verified_handle: Some("author.test".into()),
+        },
+    );
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow.clone(), storage.clone());
+    let cookie = finish_login(&app).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("&lt;Hydrated &amp; Co&gt;"), "{html}");
+    assert!(
+        html.contains(&format!(
+            "src=\"https://cdn.bsky.app/img/avatar/plain/{author}/avatar-cid\""
+        )),
+        "{html}"
+    );
+    assert_eq!(flow.profile_requests.lock().unwrap().as_slice(), [author]);
+    assert_eq!(
+        storage
+            .get_record(author, "app.bsky.actor.profile", "self")
+            .unwrap()
+            .unwrap()
+            .record["displayName"],
+        "<Hydrated & Co>"
+    );
 }
 
 #[tokio::test]
