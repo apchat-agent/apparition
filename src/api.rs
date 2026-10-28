@@ -658,7 +658,9 @@ pub(crate) fn profile_view_from_storage<S: Storage>(
     } else if storage.handle_is_invalid(did)? {
         "handle.invalid".to_owned()
     } else {
-        storage.queue_handle_refresh(did)?;
+        if storage.is_tracked_did(did)? || storage.is_displayed_did(did)? {
+            storage.queue_handle_refresh(did)?;
+        }
         did.to_owned()
     };
     let mut view = json!({
