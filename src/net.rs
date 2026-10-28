@@ -1,4 +1,11 @@
-use std::net::{IpAddr, Ipv4Addr};
+use std::{
+    collections::VecDeque,
+    future::Future,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    pin::Pin,
+    sync::{Arc, Mutex},
+};
+use url::Url;
 
 pub fn is_forbidden_ip(ip: IpAddr) -> bool {
     match ip {
@@ -49,10 +56,75 @@ fn forbidden_v4(ip: Ipv4Addr) -> bool {
         || octets[0] >= 240
 }
 
+pub trait HostResolver: Send + Sync {
+    fn resolve<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, String>> + Send + 'a>>;
+}
+
+pub struct SafeHttpClient {
+    resolver: Arc<dyn HostResolver>,
+}
+
+impl SafeHttpClient {
+    pub fn with_resolver(resolver: impl HostResolver + 'static) -> Self {
+        Self {
+            resolver: Arc::new(resolver),
+        }
+    }
+
+    pub async fn resolve_safe(&self, url: &Url) -> Result<Vec<SocketAddr>, String> {
+        let host = url.host_str().ok_or_else(|| "URL has no host".to_owned())?;
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| "URL has no port".to_owned())?;
+        self.resolver.resolve(host, port).await.map(|addresses| {
+            addresses
+                .into_iter()
+                .map(|address| SocketAddr::new(address, port))
+                .collect()
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_forbidden_ip;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use super::{HostResolver, SafeHttpClient, is_forbidden_ip};
+    use std::{
+        collections::VecDeque,
+        future::Future,
+        net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+        pin::Pin,
+        sync::{Arc, Mutex},
+    };
+    use url::Url;
+
+    #[derive(Clone)]
+    struct FakeResolver(Arc<Mutex<VecDeque<Vec<IpAddr>>>>);
+
+    impl FakeResolver {
+        fn new(responses: impl IntoIterator<Item = Vec<IpAddr>>) -> Self {
+            Self(Arc::new(Mutex::new(responses.into_iter().collect())))
+        }
+    }
+
+    impl HostResolver for FakeResolver {
+        fn resolve<'a>(
+            &'a self,
+            _: &'a str,
+            _: u16,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, String>> + Send + 'a>> {
+            Box::pin(async move {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .ok_or_else(|| "no fake answer".to_owned())
+            })
+        }
+    }
 
     #[test]
     fn rejects_non_public_ipv4_and_ipv6_ranges() {
@@ -91,5 +163,54 @@ mod tests {
         ] {
             assert!(!is_forbidden_ip(ip), "{ip} should be allowed");
         }
+    }
+
+    #[tokio::test]
+    async fn resolver_policy_rejects_private_answers_and_private_redirect_targets() {
+        for address in ["127.0.0.1", "10.0.0.8", "100.64.0.1", "169.254.169.254"] {
+            let client =
+                SafeHttpClient::with_resolver(FakeResolver::new([vec![address.parse().unwrap()]]));
+            let url = Url::parse("https://remote.example/resource").unwrap();
+            assert!(
+                client.resolve_safe(&url).await.is_err(),
+                "{address} must be blocked"
+            );
+        }
+
+        let client = SafeHttpClient::with_resolver(FakeResolver::new([]));
+        let redirect = Url::parse("https://127.0.0.1/private").unwrap();
+        assert!(client.resolve_safe(&redirect).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn resolver_policy_rejects_mixed_and_rebound_dns_answers() {
+        let mixed = SafeHttpClient::with_resolver(FakeResolver::new([vec![
+            "1.1.1.1".parse().unwrap(),
+            "192.168.1.10".parse().unwrap(),
+        ]]));
+        let url = Url::parse("https://remote.example/resource").unwrap();
+        assert!(mixed.resolve_safe(&url).await.is_err());
+
+        let rebind = SafeHttpClient::with_resolver(FakeResolver::new([
+            vec!["1.1.1.1".parse().unwrap()],
+            vec!["127.0.0.1".parse().unwrap()],
+        ]));
+        assert_eq!(
+            rebind.resolve_safe(&url).await.unwrap(),
+            [SocketAddr::from(([1, 1, 1, 1], 443))]
+        );
+        assert!(rebind.resolve_safe(&url).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn resolver_policy_allows_a_public_dns_answer() {
+        let client = SafeHttpClient::with_resolver(FakeResolver::new([vec![
+            "93.184.216.34".parse().unwrap(),
+        ]]));
+        let url = Url::parse("https://remote.example/resource").unwrap();
+        assert_eq!(
+            client.resolve_safe(&url).await.unwrap(),
+            [SocketAddr::from(([93, 184, 216, 34], 443))]
+        );
     }
 }
