@@ -151,8 +151,7 @@ impl<B: IdentityBackend> FeedClient<B> {
                 .map(str::to_owned),
             avatar: value
                 .get("avatar")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
+                .and_then(|avatar| feed_avatar_url(avatar, &creator_did)),
             service_did,
             endpoint: endpoint.trim_end_matches('/').to_owned(),
         };
@@ -421,8 +420,24 @@ fn parse_post_uri(uri: &str) -> Result<(String, String, String), String> {
     Ok((did.to_owned(), collection.to_owned(), rkey.to_owned()))
 }
 
-pub fn feed_avatar_url(_avatar: &Value, _creator_did: &str) -> Option<String> {
-    None
+pub fn feed_avatar_url(avatar: &Value, creator_did: &str) -> Option<String> {
+    if let Some(url) = avatar.as_str() {
+        return Some(url.to_owned());
+    }
+    let cid = avatar
+        .pointer("/ref/$link")
+        .and_then(Value::as_str)
+        .or_else(|| avatar.get("ref").and_then(Value::as_str))?;
+    if cid.is_empty()
+        || !cid
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return None;
+    }
+    Some(format!(
+        "https://cdn.bsky.app/img/feed_thumbnail/plain/{creator_did}/{cid}@jpeg"
+    ))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
