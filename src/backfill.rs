@@ -421,6 +421,42 @@ fn parse_rfc3339_micros(value: &str) -> Option<u64> {
     u64::try_from(parsed.unix_timestamp_nanos() / 1_000).ok()
 }
 
+/// WAL frames (4 KiB pages) the backfill may run ahead of the checkpointer: on
+/// appview-host's disk an unthrottled backfill grew the WAL past 1.5 GB and every
+/// write, sign-in included, queued behind the flush.
+pub const MAX_WRITE_BACKLOG: u64 = 16_384;
+
+/// Waits while `backlog()` exceeds `limit`, or until shutdown.
+pub async fn wait_for_write_backlog(
+    backlog: impl Fn() -> u64,
+    limit: u64,
+    poll: Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut logged = false;
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        let frames = backlog();
+        if frames <= limit {
+            return;
+        }
+        if !logged {
+            tracing::info!(frames, limit, "backfill paused until the disk catches up");
+            logged = true;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(poll) => {},
+            changed = shutdown.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 pub struct BackfillWorker<S, F, V, B>
 where
     S: Storage,
@@ -464,6 +500,13 @@ where
                 return Ok(());
             }
             for did in self.storage.pending_backfills()? {
+                wait_for_write_backlog(
+                    || self.storage.write_backlog(),
+                    MAX_WRITE_BACKLOG,
+                    Duration::from_secs(1),
+                    shutdown.clone(),
+                )
+                .await;
                 if *shutdown.borrow() {
                     return Ok(());
                 }

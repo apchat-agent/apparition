@@ -263,6 +263,10 @@ fn notification_matches_cursor(
 }
 
 pub trait Storage: Send + Sync {
+    /// WAL frames written but not yet checkpointed into the database file.
+    fn write_backlog(&self) -> u64 {
+        0
+    }
     fn put_record(&self, record: &IndexedRecord) -> Result<(), StorageError>;
     fn replace_repo_snapshot(
         &self,
@@ -1127,6 +1131,7 @@ pub struct SqliteStorage {
     connection: Mutex<Connection>,
     path: PathBuf,
     checkpointer_stop: Arc<AtomicBool>,
+    checkpoint_backlog: Arc<AtomicU64>,
 }
 
 impl Drop for SqliteStorage {
@@ -1137,7 +1142,11 @@ impl Drop for SqliteStorage {
 
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
 
-fn spawn_checkpointer(path: PathBuf, stop: Arc<AtomicBool>) -> Result<(), StorageError> {
+fn spawn_checkpointer(
+    path: PathBuf,
+    stop: Arc<AtomicBool>,
+    backlog: Arc<AtomicU64>,
+) -> Result<(), StorageError> {
     let connection = Connection::open(&path)?;
     connection.execute_batch("PRAGMA busy_timeout = 5000;")?;
     std::thread::Builder::new()
@@ -1145,10 +1154,14 @@ fn spawn_checkpointer(path: PathBuf, stop: Arc<AtomicBool>) -> Result<(), Storag
         .spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(CHECKPOINT_INTERVAL);
-                if let Err(error) =
-                    connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))
-                {
-                    tracing::warn!(%error, "WAL checkpoint failed");
+                // Row: (busy, frames in the WAL, frames checkpointed).
+                match connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                    Ok((row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+                }) {
+                    Ok((log, done)) => {
+                        backlog.store(log.saturating_sub(done).max(0) as u64, Ordering::Relaxed)
+                    }
+                    Err(error) => tracing::warn!(%error, "WAL checkpoint failed"),
                 }
             }
         })?;
@@ -1266,15 +1279,18 @@ impl SqliteStorage {
         // SQLite's automatic checkpoint runs inside a commit, i.e. under our one
         // connection lock; on appview-host's disk a 1 GB WAL took minutes and froze every
         // request. A side connection checkpoints instead (PASSIVE never blocks writers).
-        connection.execute_batch("PRAGMA wal_autocheckpoint = 0; PRAGMA busy_timeout = 5000;")?;
+        connection.execute_batch("PRAGMA wal_autocheckpoint = 0; PRAGMA busy_timeout = 5000;
+             PRAGMA journal_size_limit = 67108864;")?;
         let stop = Arc::new(AtomicBool::new(false));
+        let backlog = Arc::new(AtomicU64::new(0));
         if path.as_os_str() != ":memory:" {
-            spawn_checkpointer(path.clone(), Arc::clone(&stop))?;
+            spawn_checkpointer(path.clone(), Arc::clone(&stop), Arc::clone(&backlog))?;
         }
         Ok(Self {
             connection: Mutex::new(connection),
             path,
             checkpointer_stop: stop,
+            checkpoint_backlog: backlog,
         })
     }
 
@@ -1291,6 +1307,10 @@ impl SqliteStorage {
 }
 
 impl Storage for SqliteStorage {
+    fn write_backlog(&self) -> u64 {
+        self.checkpoint_backlog.load(Ordering::Relaxed)
+    }
+
     fn put_record(&self, record: &IndexedRecord) -> Result<(), StorageError> {
         let record_json = serde_json::to_string(&record.record)?;
         let connection = self.conn()?;

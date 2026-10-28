@@ -83,3 +83,28 @@ fn record_writes_never_run_the_wal_checkpoint_under_the_lock() {
     drop(storage);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// The backfill must not outrun the disk: it waits while the WAL has more than
+// `limit` frames not yet checkpointed.
+#[tokio::test]
+async fn backfill_waits_for_the_checkpoint_backlog_to_drain() {
+    use appview_rs::backfill::wait_for_write_backlog;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let (_tx, rx) = tokio::sync::watch::channel(false);
+    let calls = AtomicU64::new(0);
+    let backlog = || match calls.fetch_add(1, Ordering::Relaxed) {
+        0 | 1 => 10,
+        _ => 0,
+    };
+    wait_for_write_backlog(backlog, 5, Duration::from_millis(1), rx.clone()).await;
+    assert_eq!(calls.load(Ordering::Relaxed), 3);
+
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    tx.send(true).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        wait_for_write_backlog(|| 10, 5, Duration::from_millis(1), rx),
+    )
+    .await
+    .expect("shutdown must end the wait");
+}
