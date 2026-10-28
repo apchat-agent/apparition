@@ -2179,7 +2179,11 @@ fn render_web_external(embed: &Value) -> String {
     }
     let title = html_escape(title);
     let uri_markup = if safe_external_url(uri) {
-        format!("<a href=\"{}\">{}</a>", html_escape(uri), html_escape(uri))
+        format!(
+            "<a href=\"{}\" rel=\"nofollow noopener noreferrer ugc\">{}</a>",
+            html_escape(uri),
+            html_escape(uri)
+        )
     } else {
         html_escape(uri)
     };
