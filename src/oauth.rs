@@ -68,7 +68,7 @@ const LOGIN_COOKIE: &str = "appview_login";
 const SESSION_TTL_SECONDS: u64 = 30 * 24 * 60 * 60;
 const LOGIN_COOKIE_TTL_SECONDS: u64 = 10 * 60;
 const MAX_RENDERED_REMOTE_CHARS: usize = 4096;
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=av16";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=av18";
 const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=*";
 const WRITE_SCOPES: [&str; 3] = [
     "repo:app.bsky.feed.post?action=create",
@@ -1356,15 +1356,150 @@ async fn app_stylesheet() -> Response {
 }
 
 fn page_shell(title: &str, content: &str, authenticated: bool) -> String {
+    page_shell_with_feeds(title, content, authenticated, &[], None, false)
+}
+
+fn page_shell_with_feeds(
+    title: &str,
+    content: &str,
+    authenticated: bool,
+    feeds: &[ResolvedFeed],
+    active_feed: Option<&str>,
+    following_active: bool,
+) -> String {
     let navigation = if authenticated {
-        "<nav class=\"site-nav\" aria-label=\"Main navigation\"><a href=\"/app\">Timeline</a><a href=\"/feeds\">Feeds</a><a href=\"/notifications\">Notifications</a><a href=\"/profile\">Profile</a><form action=\"/logout\" method=\"post\"><button type=\"submit\">Sign out</button></form></nav>"
+        format!(
+            "<nav class=\"primary-nav\" aria-label=\"Main navigation\"><a href=\"/app\">{}<span>Home</span></a><a href=\"/feeds\">{}<span>Feeds</span></a><a href=\"/notifications\">{}<span>Notifications</span></a><a href=\"/profile\">{}<span>Profile</span></a><a class=\"compose-link\" href=\"/app#new-post\">{}<span>New post</span></a><form action=\"/logout\" method=\"post\"><button type=\"submit\">Sign out</button></form></nav>",
+            icon_svg("home"),
+            icon_svg("feeds"),
+            icon_svg("notifications"),
+            icon_svg("profile"),
+            icon_svg("compose")
+        )
     } else {
-        "<nav class=\"site-nav\" aria-label=\"Main navigation\"><a href=\"/login\">Sign in</a></nav>"
+        "<nav class=\"primary-nav\" aria-label=\"Main navigation\"><a href=\"/login\">Sign in</a></nav>".to_owned()
+    };
+    let tabs = if authenticated {
+        render_feed_tabs(feeds, active_feed, following_active)
+    } else {
+        String::new()
+    };
+    let right_sidebar = if authenticated {
+        render_right_sidebar(feeds)
+    } else {
+        String::new()
+    };
+    let mobile_navigation = if authenticated {
+        format!(
+            "<nav class=\"mobile-nav\" aria-label=\"Mobile navigation\"><a href=\"/app\">{}<span>Home</span></a><a href=\"/feeds\">{}<span>Feeds</span></a><a href=\"/notifications\">{}<span>Alerts</span></a><a href=\"/profile\">{}<span>Profile</span></a></nav><a class=\"mobile-compose\" href=\"/app#new-post\" aria-label=\"New post\">{}</a>",
+            icon_svg("home"),
+            icon_svg("feeds"),
+            icon_svg("notifications"),
+            icon_svg("profile"),
+            icon_svg("compose")
+        )
+    } else {
+        String::new()
+    };
+    let layout = if authenticated {
+        "app-layout"
+    } else {
+        "app-layout guest-layout"
     };
     format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>{}</title><link rel=\"stylesheet\" href=\"{}\"></head><body><a class=\"skip-link\" href=\"#main-content\">Skip to content</a><div class=\"site-shell\"><header class=\"site-header\"><a class=\"brand\" href=\"/app\">AppView</a>{navigation}</header><main id=\"main-content\" class=\"page-content\">{content}</main></div></body></html>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>{}</title><link rel=\"stylesheet\" href=\"{}\"></head><body><a class=\"skip-link\" href=\"#main-content\">Skip to content</a><div class=\"{layout}\"><aside class=\"left-sidebar\"><a class=\"brand\" href=\"/app\">AppView</a>{navigation}</aside><div class=\"center-column\"><header class=\"center-sticky\">{tabs}</header><main id=\"main-content\" class=\"page-content\">{content}</main></div>{right_sidebar}</div>{mobile_navigation}</body></html>",
         html_escape(title),
         WEB_STYLESHEET_URL
+    )
+}
+
+fn render_feed_tabs(
+    feeds: &[ResolvedFeed],
+    active_feed: Option<&str>,
+    following_active: bool,
+) -> String {
+    let following_current = if following_active {
+        " aria-current=\"page\""
+    } else {
+        ""
+    };
+    let mut tabs = format!(
+        "<nav class=\"feed-tabs\" aria-label=\"Feed tabs\"><a class=\"feed-tab{}\" href=\"/app\"{following_current}>Following</a>",
+        if following_active { " is-active" } else { "" }
+    );
+    for feed in feeds {
+        let active = active_feed == Some(feed.uri.as_str());
+        let current = if active { " aria-current=\"page\"" } else { "" };
+        tabs.push_str(&format!(
+            "<a class=\"feed-tab{}\" href=\"{}\"{current}>{}</a>",
+            if active { " is-active" } else { "" },
+            feed_link_href(feed),
+            html_escape(&feed.display_name)
+        ));
+    }
+    tabs.push_str("</nav>");
+    tabs
+}
+
+fn render_right_sidebar(feeds: &[ResolvedFeed]) -> String {
+    let feed_links = if feeds.is_empty() {
+        "<li><a href=\"/feeds\">Explore saved feeds</a></li>".to_owned()
+    } else {
+        feeds
+            .iter()
+            .map(|feed| {
+                format!(
+                    "<li><a href=\"{}\">{}</a></li>",
+                    feed_link_href(feed),
+                    html_escape(&feed.display_name)
+                )
+            })
+            .collect::<String>()
+    };
+    format!(
+        "<aside class=\"right-sidebar\"><form class=\"search-form\" role=\"search\"><label class=\"sr-only\" for=\"site-search\">Search</label><span aria-hidden=\"true\">{}</span><input id=\"site-search\" type=\"search\" placeholder=\"Search\" disabled></form><section class=\"sidebar-section\"><h2>Feeds</h2><ul>{feed_links}</ul><a class=\"sidebar-more\" href=\"/feeds\">All feeds</a></section></aside>",
+        icon_svg("search")
+    )
+}
+
+async fn pinned_feeds_for_layout<F: OAuthFlow>(
+    flow: &F,
+    did: &str,
+    has_permission: bool,
+) -> Vec<ResolvedFeed> {
+    if !has_permission {
+        return Vec::new();
+    }
+    match flow.pinned_feeds(did).await {
+        Ok(feeds) => feeds,
+        Err(error) => {
+            tracing::warn!(%error, "could not load pinned feed tabs");
+            Vec::new()
+        }
+    }
+}
+
+fn icon_svg(name: &str) -> String {
+    let content = match name {
+        "home" => "<path d=\"m3 10 9-7 9 7\"/><path d=\"M5 9v11h14V9M9 20v-6h6v6\"/>",
+        "feeds" => {
+            "<path d=\"M4 5h16M4 12h16M4 19h16\"/><circle cx=\"7\" cy=\"5\" r=\"1\"/><circle cx=\"17\" cy=\"12\" r=\"1\"/><circle cx=\"10\" cy=\"19\" r=\"1\"/>"
+        }
+        "notifications" => "<path d=\"M18 9a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4\"/>",
+        "profile" => "<circle cx=\"12\" cy=\"8\" r=\"4\"/><path d=\"M4 21a8 8 0 0 1 16 0\"/>",
+        "compose" => "<path d=\"M12 5v14M5 12h14\"/>",
+        "search" => "<circle cx=\"10.8\" cy=\"10.8\" r=\"6.8\"/><path d=\"m16 16 5 5\"/>",
+        "reply" => "<path d=\"M10 8 5 12l5 4\"/><path d=\"M5 12h8a6 6 0 0 1 6 6v1\"/>",
+        "repost" => {
+            "<path d=\"m16 3 4 4-4 4\"/><path d=\"M4 11V9a2 2 0 0 1 2-2h14M8 21l-4-4 4-4\"/><path d=\"M20 13v2a2 2 0 0 1-2 2H4\"/>"
+        }
+        "like" => {
+            "<path d=\"M20.8 8.8c0 5.2-8.8 10.2-8.8 10.2S3.2 14 3.2 8.8A4.8 4.8 0 0 1 12 6.1a4.8 4.8 0 0 1 8.8 2.7Z\"/>"
+        }
+        _ => return String::new(),
+    };
+    format!(
+        "<svg class=\"icon\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\">{content}</svg>"
     )
 }
 
@@ -1702,6 +1837,12 @@ where
     let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return Redirect::to("/login").into_response();
     };
+    let pinned_feeds = pinned_feeds_for_layout(
+        &state.flow,
+        &did,
+        verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()),
+    )
+    .await;
     let limit = query
         .get("limit")
         .and_then(|value| value.parse::<usize>().ok())
@@ -1797,11 +1938,14 @@ where
     } else {
         String::new()
     };
-    Html(page_shell(
+    Html(page_shell_with_feeds(
         "Timeline",
         &format!(
             "<header class=\"page-heading\"><p class=\"eyebrow\">Your feed</p><h1>Timeline</h1><p class=\"page-subtitle\">Posts from accounts in your local view.</p></header>{read_only_message}{indexing_status}{post_form}<ol class=\"post-list\">{posts}</ol>{older}",
         ),
+        true,
+        &pinned_feeds,
+        None,
         true,
     ))
     .into_response()
@@ -1831,12 +1975,15 @@ where
     } else {
         entries
     };
-    Html(page_shell(
+    Html(page_shell_with_feeds(
         "Feeds",
         &format!(
             "<header class=\"page-heading\"><p class=\"eyebrow\">Your saved algorithms</p><h1>Feeds</h1><p class=\"page-subtitle\">Pinned custom feeds from your account.</p></header><ol class=\"feed-list\">{entries}</ol>"
         ),
         true,
+        &feeds,
+        None,
+        false,
     ))
     .into_response()
 }
@@ -1926,7 +2073,8 @@ where
             )
         })
         .unwrap_or_default();
-    Html(page_shell(
+    let pinned_feeds = pinned_feeds_for_layout(&state.flow, &did, true).await;
+    Html(page_shell_with_feeds(
         &page.generator.display_name,
         &format!(
             "{}{}<ol class=\"post-list\">{posts}</ol>{older}",
@@ -1934,6 +2082,9 @@ where
             skipped
         ),
         true,
+        &pinned_feeds,
+        Some(&page.generator.uri),
+        false,
     ))
     .into_response()
 }
@@ -1950,6 +2101,12 @@ where
     let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return Redirect::to("/login").into_response();
     };
+    let pinned_feeds = pinned_feeds_for_layout(
+        &state.flow,
+        &did,
+        verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()),
+    )
+    .await;
     let limit = query
         .get("limit")
         .and_then(|value| value.parse::<usize>().ok())
@@ -1996,12 +2153,15 @@ where
     } else {
         String::new()
     };
-    Html(page_shell(
+    Html(page_shell_with_feeds(
         "Notifications",
         &format!(
             "<header class=\"page-heading\"><p class=\"eyebrow\">What’s happening</p><h1>Notifications</h1><p class=\"page-subtitle\">Recent activity around your posts and profile.</p></header><ol class=\"notification-list\">{items}</ol>{older}"
         ),
         true,
+        &pinned_feeds,
+        None,
+        false,
     ))
     .into_response()
 }
@@ -2068,6 +2228,12 @@ where
     let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return Redirect::to("/login").into_response();
     };
+    let pinned_feeds = pinned_feeds_for_layout(
+        &state.flow,
+        &did,
+        verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()),
+    )
+    .await;
     let subject = query.get("did").map(String::as_str).unwrap_or(&did);
     let profile = match profile_view_from_storage(state.storage.as_ref(), subject) {
         Ok(profile) => profile,
@@ -2138,7 +2304,7 @@ where
     } else {
         String::new()
     };
-    Html(page_shell(
+    Html(page_shell_with_feeds(
         display_name,
         &format!(
             "<section class=\"profile-card\">{}<div><h1>{}</h1><p class=\"profile-handle\">@{}</p></div></section><header class=\"section-heading\"><h2>Posts</h2></header><ol class=\"post-list\">{posts}</ol>{older}",
@@ -2147,6 +2313,9 @@ where
             html_escape(&handle)
         ),
         true,
+        &pinned_feeds,
+        None,
+        false,
     ))
     .into_response()
 }
@@ -2164,6 +2333,12 @@ where
     else {
         return Redirect::to("/login").into_response();
     };
+    let pinned_feeds = pinned_feeds_for_layout(
+        &state.flow,
+        &viewer_did,
+        verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()),
+    )
+    .await;
     let Some(uri) = query.get("uri") else {
         return oauth_error(StatusCode::BAD_REQUEST, "uri is required");
     };
@@ -2226,7 +2401,7 @@ where
     } else {
         String::new()
     };
-    Html(page_shell(
+    Html(page_shell_with_feeds(
         "Thread",
         &format!(
             "<header class=\"page-heading\"><p class=\"eyebrow\">Conversation</p><h1>Thread</h1></header>{read_only_message}<section class=\"thread-ancestors\" aria-label=\"Earlier posts in this thread\"><ol class=\"post-list\">{ancestors_html}</ol></section><section class=\"thread-focus\" aria-label=\"Selected post\">{}</section><section class=\"thread-replies\"><h2>Replies</h2>{replies_html}</section>{reply_composer}",
@@ -2239,6 +2414,9 @@ where
             )
         ),
         true,
+        &pinned_feeds,
+        None,
+        false,
     ))
     .into_response()
 }
@@ -3010,34 +3188,14 @@ fn render_web_post<S: Storage>(
     let interactions = storage
         .post_interaction_summary(&record.uri, Some(viewer_did))
         .unwrap_or_default();
-    let counts = format!(
-        "<ul class=\"post-counts\" aria-label=\"Post engagement\"><li>{} {}</li><li>{} {}</li><li>{} {}</li></ul>",
-        interactions.like_count,
-        if interactions.like_count == 1 {
-            "like"
-        } else {
-            "likes"
-        },
-        interactions.repost_count,
-        if interactions.repost_count == 1 {
-            "repost"
-        } else {
-            "reposts"
-        },
-        interactions.reply_count,
-        if interactions.reply_count == 1 {
-            "reply"
-        } else {
-            "replies"
-        },
-    );
     let thread_uri = format!(
         "/app/thread?uri={}",
         url::form_urlencoded::byte_serialize(record.uri.as_bytes()).collect::<String>()
     );
     let reply_action = format!(
-        "<a class=\"post-action\" href=\"{}\" aria-label=\"Open replies\"><span>Reply</span><span class=\"action-count\">{}</span></a>",
+        "<a class=\"post-action\" href=\"{}\" aria-label=\"Open replies\">{}<span>Reply</span><span class=\"action-count\">{}</span></a>",
         html_escape(&thread_uri),
+        icon_svg("reply"),
         interactions.reply_count
     );
     let actions = if write_forms_enabled {
@@ -3062,13 +3220,17 @@ fn render_web_post<S: Storage>(
             format!("Like post by @{}", html_escape(&handle))
         };
         format!(
-            "{reply_action}<form class=\"post-action-form\" action=\"/like\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\">{like_intent}<button class=\"post-action\" type=\"submit\" aria-label=\"{like_aria}\" aria-pressed=\"{}\">{like_label}</button></form><form class=\"post-action-form\" action=\"/repost\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\"><button class=\"post-action\" type=\"submit\" aria-label=\"Repost by @{}\">{repost_label}</button></form>",
+            "{reply_action}<form class=\"post-action-form\" action=\"/like\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\">{like_intent}<button class=\"post-action\" type=\"submit\" aria-label=\"{like_aria}\" aria-pressed=\"{}\">{}{like_label}<span class=\"action-count\">{}</span></button></form><form class=\"post-action-form\" action=\"/repost\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\"><button class=\"post-action\" type=\"submit\" aria-label=\"Repost by @{}\">{}{repost_label}<span class=\"action-count\">{}</span></button></form>",
             if interactions.viewer_like.is_some() {
                 "true"
             } else {
                 "false"
             },
-            html_escape(&handle)
+            icon_svg("like"),
+            interactions.like_count,
+            html_escape(&handle),
+            icon_svg("repost"),
+            interactions.repost_count
         )
     } else {
         reply_action
@@ -3079,7 +3241,7 @@ fn render_web_post<S: Storage>(
         .map(|embed| render_web_embed(storage, &record.did, embed))
         .unwrap_or_default();
     format!(
-        "<article class=\"post-card\"><header class=\"post-header\">{author}{time}</header>{reply_context}<p class=\"post-text\">{text}</p>{embed}{counts}<div class=\"post-actions\" aria-label=\"Post actions\">{actions}</div></article>"
+        "<article class=\"post-card\"><header class=\"post-header\">{author}{time}</header>{reply_context}<p class=\"post-text\">{text}</p>{embed}<div class=\"post-actions\" aria-label=\"Post actions\">{actions}</div></article>"
     )
 }
 

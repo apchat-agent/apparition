@@ -373,6 +373,7 @@ async fn pds_4xx_logs_safe_error_details_without_credentials() {
     drop(_guard);
 
     let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("403"), "{logs}");
     assert!(logs.contains("MissingPermission"), "{logs}");
     assert!(
         logs.contains("saved feed preferences are not permitted"),

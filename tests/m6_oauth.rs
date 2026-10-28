@@ -611,7 +611,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
             ),
             "{path}"
         );
-        assert!(html.contains("href=\"/static/app.css?v=av16\""), "{path}");
+        assert!(html.contains("href=\"/static/app.css?v=av18\""), "{path}");
         assert!(!html.contains("style="), "{path}");
         assert!(!html.contains("<script"), "{path}");
     }
@@ -619,7 +619,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
     let stylesheet = app
         .oneshot(
             Request::builder()
-                .uri("/static/app.css?v=av16")
+                .uri("/static/app.css?v=av18")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -638,6 +638,20 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
             .unwrap()
             .contains("max-age=")
     );
+    let css = String::from_utf8(
+        stylesheet
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(css.contains("grid-template-columns: 190px minmax(0, 600px)"));
+    assert!(css.contains("@media (max-width: 799px)"));
+    assert!(css.contains("prefers-color-scheme: dark"));
+    assert!(css.contains(".post-author {\n  display: flex;"));
 }
 
 #[tokio::test]
@@ -690,12 +704,12 @@ async fn bsky_style_shell_renders_navigation_pinned_feed_tabs_and_post_actions()
     )
     .unwrap();
     assert!(html.contains("aria-label=\"Main navigation\""), "{html}");
-    assert!(html.contains("href=\"/app\">Home</a>"), "{html}");
-    assert!(html.contains("href=\"/feeds\">Feeds</a>"), "{html}");
-    assert!(
-        html.contains("href=\"/notifications\">Notifications</a>"),
-        "{html}"
-    );
+    assert!(html.contains("href=\"/app\">"), "{html}");
+    assert!(html.contains("<span>Home</span>"), "{html}");
+    assert!(html.contains("href=\"/feeds\">"), "{html}");
+    assert!(html.contains("<span>Feeds</span>"), "{html}");
+    assert!(html.contains("href=\"/notifications\">"), "{html}");
+    assert!(html.contains("<span>Notifications</span>"), "{html}");
     assert!(html.contains("New post"), "{html}");
     assert!(html.contains("aria-label=\"Feed tabs\""), "{html}");
     assert!(html.contains(">Following</a>"), "{html}");
@@ -740,7 +754,7 @@ async fn sign_in_error_page_uses_the_shared_mobile_document_shell() {
     assert!(
         html.contains("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">")
     );
-    assert!(html.contains("href=\"/static/app.css?v=av16\""));
+    assert!(html.contains("href=\"/static/app.css?v=av18\""));
     assert!(!html.contains("style="));
     assert!(!html.contains("<script"));
 }
@@ -1432,7 +1446,8 @@ async fn pinned_feed_list_and_feed_timeline_routes_are_available_to_signed_in_us
         if uri == "/feeds" {
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let html = String::from_utf8(body.to_vec()).unwrap();
-            assert!(html.contains("href=\"/feeds\">Feeds</a>"));
+            assert!(html.contains("href=\"/feeds\">"));
+            assert!(html.contains("<span>Feeds</span>"));
         }
     }
 }
@@ -2122,10 +2137,11 @@ async fn web_posts_show_local_counts_and_liked_state_and_submit_unlike() {
             .to_vec(),
     )
     .unwrap();
-    assert!(html.contains("1 like"), "{html}");
-    assert!(html.contains("1 repost"), "{html}");
-    assert!(html.contains("1 reply"), "{html}");
-    assert!(html.contains(">Liked</button>"), "{html}");
+    assert_eq!(html.matches("class=\"action-count\">1</span>").count(), 3);
+    assert!(
+        html.contains("Liked<span class=\"action-count\">1</span>"),
+        "{html}"
+    );
 
     let response = app.oneshot(
         Request::builder()
@@ -2461,7 +2477,11 @@ async fn notifications_page_is_linked_and_shows_all_local_notification_reasons()
     )
     .unwrap();
     assert!(
-        home_html.contains("href=\"/notifications\">Notifications</a>"),
+        home_html.contains("href=\"/notifications\">"),
+        "{home_html}"
+    );
+    assert!(
+        home_html.contains("<span>Notifications</span>"),
         "{home_html}"
     );
 
