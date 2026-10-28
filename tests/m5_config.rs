@@ -29,6 +29,15 @@ fn backfill_record_rate_rejects_zero_and_non_numbers() {
 }
 
 #[test]
+fn repository_backfill_is_disabled_by_default_and_requires_explicit_enablement() {
+    let default = Config::from_toml_and_env("", std::iter::empty::<(&str, &str)>()).unwrap();
+    assert!(format!("{default:?}").contains("backfill_enabled: false"));
+
+    let enabled = Config::from_toml_and_env("", [("APPVIEW_BACKFILL_ENABLED", "true")]).unwrap();
+    assert!(format!("{enabled:?}").contains("backfill_enabled: true"));
+}
+
+#[test]
 fn loopback_oauth_mode_can_be_selected_and_defaults_to_confidential() {
     let default = Config::from_toml_and_env("", std::iter::empty::<(&str, &str)>()).unwrap();
     assert!(format!("{default:?}").contains("oauth_mode: Confidential"));
