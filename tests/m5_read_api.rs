@@ -13,6 +13,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use http_body_util::BodyExt;
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::{
     sync::Arc,
@@ -442,6 +443,71 @@ async fn author_feed_caps_a_million_item_page_at_one_hundred() {
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["feed"].as_array().unwrap().len(), 100);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_api_storage_read_does_not_block_the_runtime_timer() {
+    let dir = std::env::temp_dir().join(format!(
+        "appview-handler-read-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("appview.db");
+    let storage = Arc::new(SqliteStorage::open(&path).unwrap());
+    let (router, _) = api_for_storage(storage.clone());
+
+    let blocker = Connection::open(&path).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let writer_storage = storage.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        writer_storage.put_record(&IndexedRecord {
+            did: ALICE.to_owned(),
+            collection: "app.bsky.feed.post".to_owned(),
+            rkey: "held-write".to_owned(),
+            uri: format!("at://{ALICE}/app.bsky.feed.post/held-write"),
+            cid: None,
+            time_us: 1,
+            record: json!({"text":"writer"}),
+        })
+    });
+    started_rx.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(700));
+        blocker.execute_batch("COMMIT").unwrap();
+    });
+
+    let (timer_tx, timer_rx) = tokio::sync::oneshot::channel();
+    let timer_started = std::time::Instant::now();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = timer_tx.send(timer_started.elapsed());
+    });
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/xrpc/app.bsky.actor.getProfile?actor=did%3Aplc%3Aalice")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let timer_delay = timer_rx.await.unwrap();
+    writer.join().unwrap().unwrap();
+    release.join().unwrap();
+    assert!(
+        timer_delay < Duration::from_millis(200),
+        "runtime timer fired after {timer_delay:?} while an API read ran"
+    );
+    drop(storage);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
