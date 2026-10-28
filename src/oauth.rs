@@ -1241,7 +1241,10 @@ where
     let Some((did, session_id, _, _)) =
         verified_cookie_session(&state.public, &headers, state.storage.as_ref())
     else {
-        return clear_session_cookie(Redirect::to("/login").into_response());
+        return clear_session_cookie(
+            Redirect::to("/login").into_response(),
+            state.public.secure_cookies(),
+        );
     };
     if let Err(error) = state.storage.rotate_web_session(&did, &session_id) {
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
@@ -1250,7 +1253,10 @@ where
     if let Err(error) = state.storage.unregister_user(&did) {
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
-    let response = clear_session_cookie(Redirect::to("/login").into_response());
+    let response = clear_session_cookie(
+        Redirect::to("/login").into_response(),
+        state.public.secure_cookies(),
+    );
     if remote_result.is_err() {
         return response;
     }
@@ -1917,10 +1923,14 @@ fn clear_login_cookie(public: &OAuthPublic) -> String {
     )
 }
 
-fn clear_session_cookie(mut response: Response) -> Response {
+fn clear_session_cookie(mut response: Response, secure: bool) -> Response {
     response.headers_mut().insert(
         header::SET_COOKIE,
-        HeaderValue::from_static("appview_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
+        HeaderValue::from_str(&format!(
+            "{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{}",
+            if secure { "; Secure" } else { "" }
+        ))
+        .expect("session cookie clearing header is valid"),
     );
     response
 }
