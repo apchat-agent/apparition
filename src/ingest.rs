@@ -2310,8 +2310,22 @@ struct JetstreamConnectionLog(String);
 
 impl Drop for JetstreamConnectionLog {
     fn drop(&mut self) {
-        tracing::info!(url = %self.0, "Jetstream disconnected");
+        tracing::info!(endpoint = %self.0, "Jetstream disconnected");
     }
+}
+
+fn safe_jetstream_endpoint(value: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(value) else {
+        return "invalid endpoint".to_owned();
+    };
+    let Some(host) = url.host_str() else {
+        return "invalid endpoint".to_owned();
+    };
+    let port = url
+        .port()
+        .map(|port| format!(":{port}"))
+        .unwrap_or_default();
+    format!("{}://{host}{port}", url.scheme())
 }
 
 impl<S: Storage + 'static> JetstreamConsumer<S> {
@@ -2341,11 +2355,12 @@ impl<S: Storage + 'static> JetstreamConsumer<S> {
     }
 
     pub async fn consume_connection(&self, url: &str) -> Result<(), IngestError> {
+        let endpoint = safe_jetstream_endpoint(url);
         let (mut websocket, _) = connect_async(url)
             .await
-            .map_err(|error| IngestError::WebSocket(error.to_string()))?;
-        tracing::info!(%url, "Jetstream connected");
-        let _connection_log = JetstreamConnectionLog(url.to_owned());
+            .map_err(|_| IngestError::WebSocket("Jetstream connection failed".to_owned()))?;
+        tracing::info!(%endpoint, "Jetstream connected");
+        let _connection_log = JetstreamConnectionLog(endpoint);
         async {
             let mut idle_deadline = tokio::time::Instant::now() + self.idle_timeout;
             loop {
@@ -2446,6 +2461,7 @@ impl<S: Storage + 'static> JetstreamConsumer<S> {
             let base_url = &urls[next_url % urls.len()];
             next_url += 1;
             let url = self.url_with_cursor(base_url)?;
+            let endpoint = safe_jetstream_endpoint(&url);
             let connection_result = {
                 let connection = self.consume_connection(&url);
                 tokio::pin!(connection);
@@ -2463,7 +2479,7 @@ impl<S: Storage + 'static> JetstreamConsumer<S> {
             };
             match connection_result {
                 Ok(()) => backoff = self.reconnect_delay,
-                Err(error) => tracing::warn!(%error, %url, "Jetstream connection ended"),
+                Err(error) => tracing::warn!(%error, %endpoint, "Jetstream connection ended"),
             }
             tokio::select! {
                 _ = tokio::time::sleep(backoff) => {},
