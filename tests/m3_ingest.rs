@@ -406,6 +406,91 @@ async fn websocket_consumer_processes_events_and_persists_cursor_to_sqlite() {
 }
 
 #[tokio::test]
+async fn websocket_event_batch_rolls_back_records_and_cursor_on_failed_commit() {
+    let db_path = std::env::temp_dir().join(format!(
+        "appview-rs-m3-batch-red-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let storage = Arc::new(SqliteStorage::open(&db_path).unwrap());
+    Connection::open(&db_path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_batch_event BEFORE INSERT ON records
+             WHEN NEW.rkey='fail'
+             BEGIN SELECT RAISE(ABORT, 'injected batch failure'); END;",
+        )
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_async(stream).await.unwrap();
+        websocket
+            .send(Message::Text(
+                event(
+                    "did:plc:batch",
+                    100,
+                    "create",
+                    "app.bsky.feed.post",
+                    "first",
+                    Some(post("first")),
+                )
+                .into(),
+            ))
+            .await
+            .unwrap();
+        websocket
+            .send(Message::Text(
+                event(
+                    "did:plc:batch",
+                    200,
+                    "create",
+                    "app.bsky.feed.post",
+                    "fail",
+                    Some(post("fail")),
+                )
+                .into(),
+            ))
+            .await
+            .unwrap();
+        websocket.close(None).await.unwrap();
+    });
+
+    let consumer = JetstreamConsumer::new(
+        Ingestor::new(storage.clone(), ScopeMode::Full),
+        Duration::from_millis(1),
+    );
+    let result = timeout(
+        Duration::from_secs(3),
+        consumer.consume_connection(&format!("ws://{address}/subscribe")),
+    )
+    .await
+    .expect("consumer should flush the final batch on close");
+    assert!(
+        result.is_err(),
+        "injected storage failure should fail the batch"
+    );
+    assert_eq!(storage.cursor().unwrap(), None);
+    assert!(
+        storage
+            .get_record("did:plc:batch", "app.bsky.feed.post", "first")
+            .unwrap()
+            .is_none()
+    );
+
+    server.await.unwrap();
+    drop(storage);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
+    }
+}
+
+#[tokio::test]
 async fn consumer_reconnects_after_a_silent_websocket_and_rotates_urls() {
     let storage = Arc::new(MemoryStorage::default());
     let ingestor = Ingestor::new(storage.clone(), ScopeMode::Full);

@@ -2918,3 +2918,51 @@ mod backfill_resource_tests {
         assert!(queue_count <= 1_000, "SQLite queue has {queue_count} items");
     }
 }
+
+#[cfg(test)]
+mod jetstream_catchup_tests {
+    use super::*;
+
+    #[test]
+    fn stale_saved_cursor_starts_recently_and_records_the_skipped_window() {
+        let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
+        let now_us = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64;
+        let stale_cursor = now_us - 30 * 60 * 1_000_000;
+        storage.set_cursor(stale_cursor).unwrap();
+        let consumer = JetstreamConsumer::new(
+            Ingestor::new(storage.clone(), ScopeMode::Full),
+            Duration::from_millis(1),
+        );
+
+        let url = consumer
+            .url_with_cursor("wss://jetstream.example/subscribe")
+            .unwrap();
+        let url = reqwest::Url::parse(&url).unwrap();
+        let reconnect_cursor = url
+            .query_pairs()
+            .find(|(key, _)| key == "cursor")
+            .unwrap()
+            .1
+            .parse::<u64>()
+            .unwrap();
+        assert!(reconnect_cursor > stale_cursor, "{reconnect_cursor}");
+        assert!(now_us.saturating_sub(reconnect_cursor) <= 31_000_000);
+
+        let skipped: String = storage
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM appview_state WHERE key='jetstream_skipped_window'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let skipped: Value = serde_json::from_str(&skipped).unwrap();
+        assert_eq!(skipped["from"], stale_cursor);
+        assert_eq!(skipped["to"], reconnect_cursor);
+        assert_eq!(storage.cursor().unwrap(), Some(reconnect_cursor));
+    }
+}
