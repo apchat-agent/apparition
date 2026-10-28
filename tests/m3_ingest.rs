@@ -1,5 +1,6 @@
 use appview_rs::ingest::{
-    IndexedRecord, Ingestor, JetstreamConsumer, MemoryStorage, ScopeMode, SqliteStorage, Storage,
+    FollowUpdate, IndexedRecord, Ingestor, JetstreamConsumer, JetstreamStorageUpdate,
+    MemoryStorage, ScopeMode, SqliteStorage, Storage,
 };
 use futures_util::{SinkExt, StreamExt};
 use rusqlite::Connection;
@@ -327,6 +328,157 @@ fn scoped_batch_applies_new_follow_scope_to_later_events_in_the_same_batch() {
             .is_some(),
         "events later in the committed batch must see earlier scope changes"
     );
+}
+
+#[test]
+fn tracked_follow_count_keeps_a_did_tracked_until_its_last_local_follower_unfollows() {
+    let storage = SqliteStorage::open(":memory:").unwrap();
+    storage.register_user("did:plc:alice").unwrap();
+    storage.register_user("did:plc:bob").unwrap();
+    storage
+        .set_follow("did:plc:alice", "did:plc:shared", true)
+        .unwrap();
+    storage
+        .set_follow("did:plc:bob", "did:plc:shared", true)
+        .unwrap();
+
+    assert_eq!(storage.tracked_follow_count("did:plc:shared").unwrap(), 2);
+    storage
+        .set_follow("did:plc:alice", "did:plc:shared", false)
+        .unwrap();
+    assert_eq!(storage.tracked_follow_count("did:plc:shared").unwrap(), 1);
+    assert!(storage.is_tracked_did("did:plc:shared").unwrap());
+    storage
+        .set_follow("did:plc:bob", "did:plc:shared", false)
+        .unwrap();
+    assert_eq!(storage.tracked_follow_count("did:plc:shared").unwrap(), 0);
+    assert!(!storage.is_tracked_did("did:plc:shared").unwrap());
+}
+
+#[test]
+fn failed_jetstream_batch_does_not_change_tracked_follow_counts() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+        "target/av17-rollback-{}-{}.sqlite3",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let storage = SqliteStorage::open(&path).unwrap();
+    storage.register_user("did:plc:alice").unwrap();
+    storage
+        .set_follow("did:plc:alice", "did:plc:shared", true)
+        .unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_av17_record BEFORE INSERT ON records
+             BEGIN SELECT RAISE(ABORT, 'injected av17 batch failure'); END;",
+        )
+        .unwrap();
+
+    let updates = [
+        JetstreamStorageUpdate {
+            time_us: 1,
+            follows: vec![FollowUpdate {
+                actor: "did:plc:alice".into(),
+                subject: "did:plc:shared".into(),
+                following: false,
+            }],
+            ..JetstreamStorageUpdate::default()
+        },
+        JetstreamStorageUpdate {
+            time_us: 2,
+            upsert: Some(IndexedRecord {
+                did: "did:plc:rejected".into(),
+                collection: "app.bsky.feed.post".into(),
+                rkey: "reject".into(),
+                uri: "at://did:plc:rejected/app.bsky.feed.post/reject".into(),
+                cid: None,
+                time_us: 2,
+                record: post("force rollback"),
+            }),
+            ..JetstreamStorageUpdate::default()
+        },
+    ];
+    assert!(storage.apply_jetstream_batch(&updates).is_err());
+    assert_eq!(storage.tracked_follow_count("did:plc:shared").unwrap(), 1);
+    assert!(storage.tracked_set_matches_sqlite().unwrap());
+    drop(storage);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn tracked_set_rebuild_matches_after_seeded_registration_follow_and_rollback_operations() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+        "target/av17-random-{}-{}.sqlite3",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let storage = SqliteStorage::open(&path).unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_av17_record BEFORE INSERT ON records
+             BEGIN SELECT RAISE(ABORT, 'injected av17 batch failure'); END;",
+        )
+        .unwrap();
+    let actors = (0..5)
+        .map(|index| format!("did:plc:random-user-{index}"))
+        .collect::<Vec<_>>();
+    let subjects = (0..11)
+        .map(|index| format!("did:plc:random-subject-{index}"))
+        .collect::<Vec<_>>();
+    let mut random = 0x17a5_cafe_u32;
+
+    for step in 0..240 {
+        random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let actor = &actors[(random as usize >> 8) % actors.len()];
+        let subject = &subjects[(random as usize >> 16) % subjects.len()];
+        match random % 4 {
+            0 => storage.register_user(actor).unwrap(),
+            1 => storage.unregister_user(actor).unwrap(),
+            2 => storage
+                .set_follow(actor, subject, random & 0x100 != 0)
+                .unwrap(),
+            _ => {
+                let update = JetstreamStorageUpdate {
+                    time_us: step,
+                    follows: vec![FollowUpdate {
+                        actor: actor.clone(),
+                        subject: subject.clone(),
+                        following: random & 0x100 != 0,
+                    }],
+                    ..JetstreamStorageUpdate::default()
+                };
+                let reject = JetstreamStorageUpdate {
+                    time_us: step + 1,
+                    upsert: Some(IndexedRecord {
+                        did: "did:plc:rejected".into(),
+                        collection: "app.bsky.feed.post".into(),
+                        rkey: format!("reject-{step}"),
+                        uri: format!("at://did:plc:rejected/app.bsky.feed.post/reject-{step}"),
+                        cid: None,
+                        time_us: step + 1,
+                        record: post("force rollback"),
+                    }),
+                    ..JetstreamStorageUpdate::default()
+                };
+                assert!(storage.apply_jetstream_batch(&[update, reject]).is_err());
+            }
+        }
+        assert!(
+            storage.tracked_set_matches_sqlite().unwrap(),
+            "tracked set diverged from SQLite after seeded step {step}"
+        );
+    }
+
+    drop(storage);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
