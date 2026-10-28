@@ -4,6 +4,7 @@ pub mod config;
 pub mod identity;
 pub mod ingest;
 pub mod jwt;
+pub mod net;
 pub mod oauth;
 
 use axum::{Json, Router, routing::get};
