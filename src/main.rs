@@ -85,7 +85,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     });
     let backfill_shutdown = shutdown_rx.clone();
+    // Operator stop for repository backfill (appview-host's disk could not keep up and
+    // sign-in hung behind it, 2026-10-28); live ingest keeps running.
+    let backfill_paused = std::env::var_os("APPVIEW_BACKFILL_PAUSED").is_some();
+    if backfill_paused {
+        info!("repository backfill paused by APPVIEW_BACKFILL_PAUSED");
+    }
     let backfill_task = tokio::spawn(async move {
+        if backfill_paused {
+            return;
+        }
         if let Err(error) = worker.run(backfill_shutdown).await {
             error!(%error, "backfill worker stopped");
         }
