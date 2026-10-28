@@ -11,6 +11,7 @@ use url::Url;
 
 const MAX_REDIRECTS: usize = 5;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_OAUTH_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 static OUTBOUND_REQUESTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
@@ -90,6 +91,7 @@ impl HostResolver for SystemResolver {
     }
 }
 
+#[derive(Clone)]
 pub struct SafeHttpClient {
     resolver: Arc<dyn HostResolver>,
     http_test_hosts: HashSet<String>,
@@ -156,7 +158,7 @@ impl SafeHttpClient {
             return Err("outbound request body is too large".to_owned());
         }
         let permit = OUTBOUND_REQUESTS
-            .get_or_init(|| Arc::new(Semaphore::new(32)))
+            .get_or_init(|| Arc::new(Semaphore::new(8)))
             .clone()
             .acquire_owned()
             .await
@@ -166,6 +168,21 @@ impl SafeHttpClient {
             .map_err(|_| "outbound request timed out".to_owned())?;
         drop(permit);
         result
+    }
+
+    pub async fn get(
+        &self,
+        url: &Url,
+        headers: http::HeaderMap,
+        max_bytes: usize,
+    ) -> Result<http::Response<Vec<u8>>, String> {
+        let request = http::Request::get(url.as_str())
+            .body(Vec::new())
+            .map_err(|_| "outbound request is invalid".to_owned())?;
+        let (mut parts, body) = request.into_parts();
+        parts.headers = headers;
+        self.send(http::Request::from_parts(parts, body), max_bytes)
+            .await
     }
 
     async fn send_inner(
@@ -279,6 +296,18 @@ impl SafeHttpClient {
 impl Default for SafeHttpClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl atrium_xrpc::HttpClient for SafeHttpClient {
+    async fn send_http(
+        &self,
+        request: http::Request<Vec<u8>>,
+    ) -> Result<http::Response<Vec<u8>>, Box<dyn std::error::Error + Send + Sync + 'static>> {
+        self.send(request, MAX_OAUTH_RESPONSE_BYTES)
+            .await
+            .map_err(std::io::Error::other)
+            .map_err(Into::into)
     }
 }
 

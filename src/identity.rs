@@ -1,5 +1,8 @@
-use crate::ingest::{Storage, StorageError};
-use reqwest::{Client, Url};
+use crate::{
+    ingest::{Storage, StorageError},
+    net::SafeHttpClient,
+};
+use http::{HeaderMap, HeaderValue, header};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -9,6 +12,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, watch};
+use url::Url;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct DidDocument {
@@ -63,7 +67,7 @@ impl DidDocument {
             if !service_id_matches || service.type_name != "AtprotoPersonalDataServer" {
                 return None;
             }
-            let url = reqwest::Url::parse(&service.service_endpoint).ok()?;
+            let url = Url::parse(&service.service_endpoint).ok()?;
             let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
             let valid_scheme = url.scheme() == "https" || (local && url.scheme() == "http");
             (valid_scheme
@@ -443,18 +447,21 @@ fn is_supported_did(did: &str) -> bool {
 
 #[derive(Clone)]
 pub struct HttpIdentityBackend {
-    client: Client,
+    client: SafeHttpClient,
     plc_directory: Url,
     dns_over_https: Url,
 }
 
 impl HttpIdentityBackend {
     pub fn new(plc_directory: &str, dns_over_https: &str) -> Result<Self, ResolutionError> {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::limited(5))
-            .build()
-            .map_err(backend_error)?;
+        Self::with_client(plc_directory, dns_over_https, SafeHttpClient::new())
+    }
+
+    pub fn with_client(
+        plc_directory: &str,
+        dns_over_https: &str,
+        client: SafeHttpClient,
+    ) -> Result<Self, ResolutionError> {
         let mut plc_directory = Url::parse(plc_directory).map_err(backend_error)?;
         if !plc_directory.path().ends_with('/') {
             plc_directory.set_path(&format!("{}/", plc_directory.path()));
@@ -508,16 +515,21 @@ impl IdentityBackend for HttpIdentityBackend {
             return Err(ResolutionError::UnsupportedDid(did.to_owned()));
         };
 
-        let response = self.client.get(url).send().await.map_err(backend_error)?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        let document = response
-            .error_for_status()
-            .map_err(backend_error)?
-            .json::<DidDocument>()
+        let response = self
+            .client
+            .get(&url, HeaderMap::new(), 1024 * 1024)
             .await
             .map_err(backend_error)?;
+        if response.status() == http::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(backend_error(
+                "DID document service returned an error status",
+            ));
+        }
+        let document =
+            serde_json::from_slice::<DidDocument>(response.body()).map_err(backend_error)?;
         Ok(Some(document))
     }
 
@@ -526,18 +538,21 @@ impl IdentityBackend for HttpIdentityBackend {
         url.query_pairs_mut()
             .append_pair("name", &format!("_atproto.{handle}"))
             .append_pair("type", "TXT");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("application/dns-json"),
+        );
         let response = self
             .client
-            .get(url)
-            .header(reqwest::header::ACCEPT, "application/dns-json")
-            .send()
-            .await
-            .map_err(backend_error)?
-            .error_for_status()
-            .map_err(backend_error)?
-            .json::<DohResponse>()
+            .get(&url, headers, 64 * 1024)
             .await
             .map_err(backend_error)?;
+        if !response.status().is_success() {
+            return Err(backend_error("DNS service returned an error status"));
+        }
+        let response =
+            serde_json::from_slice::<DohResponse>(response.body()).map_err(backend_error)?;
 
         for answer in response.answers {
             let record = answer.data.trim_matches('"').replace("\\\"", "\"");
@@ -556,16 +571,18 @@ impl IdentityBackend for HttpIdentityBackend {
         };
         let url = Url::parse(&format!("{scheme}://{handle}/.well-known/atproto-did"))
             .map_err(backend_error)?;
-        let response = self.client.get(url).send().await.map_err(backend_error)?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        let body = response
-            .error_for_status()
-            .map_err(backend_error)?
-            .text()
+        let response = self
+            .client
+            .get(&url, HeaderMap::new(), 4096)
             .await
             .map_err(backend_error)?;
+        if response.status() == http::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            return Err(backend_error("handle service returned an error status"));
+        }
+        let body = std::str::from_utf8(response.body()).map_err(backend_error)?;
         let did = body.trim();
         if is_supported_did(did) {
             Ok(Some(did.to_owned()))

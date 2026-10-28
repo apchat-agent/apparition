@@ -401,7 +401,7 @@ async fn get_repo_car_is_verified_and_reconciled_with_a_per_host_rate_limit() {
         .unwrap();
     let backfiller = RepoBackfiller::new(
         storage.clone(),
-        HttpRepoSource::default(),
+        HttpRepoSource::with_http_test_hosts(["127.0.0.1".to_owned()]).unwrap(),
         AtriumRepoVerifier,
         HostRateLimiter::new(Duration::from_millis(20)),
     );
@@ -557,7 +557,7 @@ async fn backfill_worker_drains_new_scope_entries_from_resolved_did_docs() {
     storage.register_user(did).unwrap();
     let backfiller = RepoBackfiller::new(
         storage.clone(),
-        HttpRepoSource::default(),
+        HttpRepoSource::with_http_test_hosts(["127.0.0.1".to_owned()]).unwrap(),
         AtriumRepoVerifier,
         HostRateLimiter::new(Duration::ZERO),
     );

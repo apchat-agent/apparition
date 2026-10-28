@@ -3,6 +3,7 @@ use appview_rs::{
         DidDocument as AppDidDocument, DidService, IdentityBackend, IdentityResolver,
         ResolutionError,
     },
+    net::SafeHttpClient,
     oauth::{OAuthCallback, OAuthFlow, OAuthPublic, SqliteOAuthStore},
 };
 use atrium_api::{
@@ -152,6 +153,7 @@ async fn oauth_protocol_checks_state_issuer_nonce_and_refresh_against_fake_pds()
             authorization_server_metadata: Default::default(),
             protected_resource_metadata: Default::default(),
         },
+        http_client: SafeHttpClient::new().with_http_test_hosts(["127.0.0.1".to_owned()]),
     })
     .unwrap();
 

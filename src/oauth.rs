@@ -5,6 +5,7 @@ use crate::{
         IndexedNotification, IndexedRecord, MemoryStorage, NotificationCursor, RecordCursor,
         Storage, StorageError,
     },
+    net::SafeHttpClient,
 };
 use atrium_api::{
     agent::{Agent, SessionManager},
@@ -16,9 +17,8 @@ use atrium_identity::{
     handle::{AtprotoHandleResolver, AtprotoHandleResolverConfig, DnsTxtResolver},
 };
 use atrium_oauth::{
-    AtprotoClientMetadata, AtprotoLocalhostClientMetadata, AuthMethod, AuthorizeOptions,
-    DefaultHttpClient, GrantType, KnownScope, OAuthClient, OAuthClientConfig, OAuthResolverConfig,
-    Scope,
+    AtprotoClientMetadata, AtprotoLocalhostClientMetadata, AuthMethod, AuthorizeOptions, GrantType,
+    KnownScope, OAuthClient, OAuthClientConfig, OAuthResolverConfig, Scope,
     store::{
         session::{Session, SessionStore},
         state::{InternalStateData, StateStore},
@@ -247,7 +247,13 @@ impl OAuthPublic {
         identity_resolver: Arc<IdentityResolver<HttpIdentityBackend>>,
         store: SqliteOAuthStore,
     ) -> Result<AtriumOAuthFlow, String> {
-        AtriumOAuthFlow::new(self, identity_resolver, store, DEFAULT_PLC_DIRECTORY_URL)
+        AtriumOAuthFlow::new(
+            self,
+            identity_resolver,
+            store,
+            DEFAULT_PLC_DIRECTORY_URL,
+            SafeHttpClient::new(),
+        )
     }
 
     /// Construct the production flow against an injectable PLC directory.
@@ -258,7 +264,19 @@ impl OAuthPublic {
         store: SqliteOAuthStore,
         plc_directory_url: &str,
     ) -> Result<AtriumOAuthFlow<B>, String> {
-        AtriumOAuthFlow::new(self, identity_resolver, store, plc_directory_url)
+        let http_test_hosts = reqwest::Url::parse(plc_directory_url)
+            .ok()
+            .filter(|url| url.scheme() == "http")
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .into_iter()
+            .collect::<Vec<_>>();
+        AtriumOAuthFlow::new(
+            self,
+            identity_resolver,
+            store,
+            plc_directory_url,
+            SafeHttpClient::new().with_http_test_hosts(http_test_hosts),
+        )
     }
 
     pub fn router(&self) -> Router {
@@ -449,10 +467,15 @@ impl OAuthPublic {
     }
 }
 
-type OAuthDidResolver = CommonDidResolver<DefaultHttpClient>;
-type OAuthHandleResolver = AtprotoHandleResolver<CloudflareDnsTxtResolver, DefaultHttpClient>;
-type AppOAuthClient =
-    OAuthClient<SqliteOAuthStore, SqliteOAuthStore, OAuthDidResolver, OAuthHandleResolver>;
+type OAuthDidResolver = CommonDidResolver<SafeHttpClient>;
+type OAuthHandleResolver = AtprotoHandleResolver<CloudflareDnsTxtResolver, SafeHttpClient>;
+type AppOAuthClient = OAuthClient<
+    SqliteOAuthStore,
+    SqliteOAuthStore,
+    OAuthDidResolver,
+    OAuthHandleResolver,
+    SafeHttpClient,
+>;
 
 pub struct AtriumOAuthFlow<B: crate::identity::IdentityBackend = HttpIdentityBackend> {
     client: Arc<AppOAuthClient>,
@@ -642,8 +665,9 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         identity_resolver: Arc<IdentityResolver<B>>,
         store: SqliteOAuthStore,
         plc_directory_url: &str,
+        guarded_client: SafeHttpClient,
     ) -> Result<Self, String> {
-        let http_client = Arc::new(DefaultHttpClient::default());
+        let http_client = Arc::new(guarded_client);
         let redirect_uri = public.metadata["redirect_uris"][0]
             .as_str()
             .ok_or_else(|| "OAuth client metadata has no redirect URI".to_owned())?
@@ -654,7 +678,9 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                 http_client: http_client.clone(),
             }),
             handle_resolver: AtprotoHandleResolver::new(AtprotoHandleResolverConfig {
-                dns_txt_resolver: CloudflareDnsTxtResolver::default(),
+                dns_txt_resolver: CloudflareDnsTxtResolver {
+                    client: (*http_client).clone(),
+                },
                 http_client: http_client.clone(),
             }),
             authorization_server_metadata: Default::default(),
@@ -670,6 +696,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                 state_store: store.clone(),
                 session_store: store.clone(),
                 resolver: make_resolver(),
+                http_client: (*http_client).clone(),
             }),
             OAuthClientMode::Confidential => {
                 let metadata = AtprotoClientMetadata {
@@ -691,6 +718,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                     state_store: store.clone(),
                     session_store: store.clone(),
                     resolver: make_resolver(),
+                    http_client: (*http_client).clone(),
                 })
             }
         }
@@ -984,9 +1012,9 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct CloudflareDnsTxtResolver {
-    client: reqwest::Client,
+    client: SafeHttpClient,
 }
 
 impl DnsTxtResolver for CloudflareDnsTxtResolver {
@@ -1003,16 +1031,24 @@ impl DnsTxtResolver for CloudflareDnsTxtResolver {
         struct DohAnswer {
             data: String,
         }
+        let mut url = reqwest::Url::parse("https://cloudflare-dns.com/dns-query")?;
+        url.query_pairs_mut()
+            .append_pair("name", query)
+            .append_pair("type", "TXT");
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::ACCEPT,
+            http::HeaderValue::from_static("application/dns-json"),
+        );
         let response = self
             .client
-            .get("https://cloudflare-dns.com/dns-query")
-            .query(&[("name", query), ("type", "TXT")])
-            .header(reqwest::header::ACCEPT, "application/dns-json")
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<DohResponse>()
-            .await?;
+            .get(&url, headers, 64 * 1024)
+            .await
+            .map_err(std::io::Error::other)?;
+        if !response.status().is_success() {
+            return Err(std::io::Error::other("DNS service returned an error status").into());
+        }
+        let response = serde_json::from_slice::<DohResponse>(response.body())?;
         Ok(response
             .answers
             .into_iter()

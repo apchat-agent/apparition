@@ -1,4 +1,5 @@
 use crate::ingest::{IndexedRecord, Storage, StorageError};
+use crate::net::SafeHttpClient;
 use atrium_crypto::{did::parse_did_key, verify::Verifier};
 use atrium_repo::{
     Repository,
@@ -20,7 +21,7 @@ use std::{
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-const MAX_REPO_CAR_BYTES: usize = 512 * 1024 * 1024;
+const MAX_REPO_CAR_BYTES: usize = 64 * 1024 * 1024;
 const INDEXED_COLLECTIONS: &[&str] = &[
     "app.bsky.feed.post",
     "app.bsky.feed.like",
@@ -74,17 +75,25 @@ pub trait RepoVerifier: Send + Sync {
 
 #[derive(Clone)]
 pub struct HttpRepoSource {
-    client: reqwest::Client,
+    client: SafeHttpClient,
     max_bytes: usize,
 }
 
 impl HttpRepoSource {
     pub fn new(max_bytes: usize) -> Result<Self, BackfillError> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()
-            .map_err(|error| BackfillError::Fetch(error.to_string()))?;
-        Ok(Self { client, max_bytes })
+        Ok(Self {
+            client: SafeHttpClient::new(),
+            max_bytes,
+        })
+    }
+
+    pub fn with_http_test_hosts(
+        hosts: impl IntoIterator<Item = String>,
+    ) -> Result<Self, BackfillError> {
+        Ok(Self {
+            client: SafeHttpClient::new().with_http_test_hosts(hosts),
+            max_bytes: MAX_REPO_CAR_BYTES,
+        })
     }
 }
 
@@ -101,37 +110,24 @@ impl RepoFetcher for HttpRepoSource {
         let mut url = reqwest::Url::parse(&endpoint.to_string())
             .map_err(|error| BackfillError::InvalidPds(error.to_string()))?;
         url.query_pairs_mut().append_pair("did", did);
-        let mut response = self
+        let response = self
             .client
-            .get(url)
-            .header(reqwest::header::ACCEPT, "application/vnd.ipld.car")
-            .send()
+            .get(
+                &url,
+                http::HeaderMap::from_iter([(
+                    http::header::ACCEPT,
+                    http::HeaderValue::from_static("application/vnd.ipld.car"),
+                )]),
+                self.max_bytes,
+            )
             .await
-            .map_err(|error| BackfillError::Fetch(error.to_string()))?
-            .error_for_status()
             .map_err(|error| BackfillError::Fetch(error.to_string()))?;
-        if response
-            .content_length()
-            .is_some_and(|length| length > self.max_bytes as u64)
-        {
+        if !response.status().is_success() {
             return Err(BackfillError::Fetch(
-                "repository CAR exceeds size limit".into(),
+                "repository fetch returned an error status".into(),
             ));
         }
-        let mut body = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|error| BackfillError::Fetch(error.to_string()))?
-        {
-            if body.len() + chunk.len() > self.max_bytes {
-                return Err(BackfillError::Fetch(
-                    "repository CAR exceeds size limit".into(),
-                ));
-            }
-            body.extend_from_slice(&chunk);
-        }
-        Ok(body)
+        Ok(response.into_body())
     }
 }
 

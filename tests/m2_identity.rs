@@ -1,6 +1,7 @@
 use appview_rs::identity::{
     DidDocument, HttpIdentityBackend, Identity, IdentityBackend, IdentityResolver, ResolutionError,
 };
+use appview_rs::net::SafeHttpClient;
 use std::{
     collections::HashMap,
     sync::{
@@ -157,9 +158,10 @@ async fn http_identity_backend_reaches_fake_plc_server_using_did_path() {
         String::from_utf8(request).unwrap()
     });
 
-    let backend = HttpIdentityBackend::new(
+    let backend = HttpIdentityBackend::with_client(
         &format!("http://{address}/plc"),
         "https://dns.example/query",
+        SafeHttpClient::new().with_http_test_hosts(["127.0.0.1".to_owned()]),
     )
     .unwrap();
     let document = backend.did_document(DID).await.unwrap().unwrap();

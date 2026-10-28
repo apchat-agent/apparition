@@ -33,7 +33,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 thiserror = "2"
-atrium-oauth = "0.1.7"
+atrium-oauth = { version = "0.1.7", default-features = false }
+atrium-xrpc = "0.12.4"
 jose-jwk = "0.1.2"
 p256 = "0.13.2"
 rand = "0.8"
