@@ -1490,3 +1490,57 @@ a.quoted-post-card:hover,
     font-size: 0.92rem;
   }
 }
+
+/* Density (owner, 2026-10-29: "much more compact and dense ... use all available space"). Kept as one block so it is
+   easy to tune; it overrides the roomier defaults above. Tap targets stay >= 36 px. */
+body {
+  line-height: 1.4;
+}
+
+.page-content {
+  padding-top: 0.25rem;
+}
+
+.feed-tabs,
+.feed-tab {
+  min-height: 2.5rem;
+}
+
+.feed-tab {
+  line-height: 2.5rem;
+}
+
+.post-card,
+.notification-card {
+  padding: 0.55rem 0.75rem 0.2rem;
+}
+
+.post-header,
+.notification-heading {
+  gap: 0.5rem;
+}
+
+.avatar,
+.avatar-placeholder {
+  width: 2.25rem;
+  height: 2.25rem;
+  flex-basis: 2.25rem;
+}
+
+.post-text {
+  margin: 0.3rem 0 0.15rem;
+}
+
+.post-actions {
+  margin-top: 0;
+}
+
+.post-action {
+  min-height: 36px;
+  gap: 0.3rem;
+  padding: 0.1rem 0.2rem;
+}
+
+.reply-context {
+  margin: 0.15rem 0 0;
+}
