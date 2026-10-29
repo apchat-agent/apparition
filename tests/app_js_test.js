@@ -592,3 +592,154 @@ Deno.test("infinite scroll loads once past the newest page midpoint in the pinne
   assertEquals(requests.length, 1, "the end of the list must stop future requests");
   assert((link.afterNodes || []).some((node) => node.textContent.includes("caught up")), "the end should have a readable status");
 });
+
+async function createInfiniteScrollHarness({ cards = ["post-1", "post-2"], mobile = false, responses = [], pages = {} } = {}) {
+  class Element {
+    constructor(tag = "div", uri = "") {
+      this.tag = tag;
+      this.children = [];
+      this.attributes = new Map(uri ? [["data-post-uri", uri]] : []);
+      this.listeners = new Map();
+      this.className = "";
+      this.textContent = "";
+      this.top = 100;
+      this.parentElement = null;
+      this.removed = false;
+      this.hidden = false;
+    }
+    append(...nodes) {
+      for (const node of nodes) {
+        node.parentElement = this;
+        this.children.push(node);
+      }
+    }
+    after(...nodes) { this.afterNodes = [...(this.afterNodes || []), ...nodes]; }
+    addEventListener(name, listener) { this.listeners.set(name, listener); }
+    setAttribute(name, value) { this.attributes.set(name, String(value)); }
+    getAttribute(name) { return this.attributes.get(name) ?? null; }
+    remove() {
+      this.removed = true;
+      if (this.parentElement) this.parentElement.children = this.parentElement.children.filter((child) => child !== this);
+    }
+    getBoundingClientRect() { return { top: this.top }; }
+  }
+  class Link extends Element {
+    constructor(href) { super("a"); this.href = href; this.setAttribute("href", href); }
+  }
+  class Observer {
+    constructor(callback, options) {
+      this.callback = callback;
+      this.options = options;
+      Observer.latest = this;
+    }
+    observe(target) { this.target = target; }
+    unobserve(target) { if (this.target === target) this.target = null; }
+    disconnect() { this.target = null; }
+    fire() { this.callback([{ target: this.target, isIntersecting: true }]); }
+  }
+  const list = new Element("ol");
+  list.className = "post-list";
+  list.append(...cards.map((uri) => new Element("li", uri)));
+  const layout = new Element("div");
+  layout.top = 0;
+  const link = new Link("/older-a");
+  const windowListeners = new Map();
+  const documentMock = {
+    addEventListener() {},
+    querySelector(selector) {
+      if (selector === '.pagination-link[rel="next"]') return link;
+      if (selector === ".post-list, .notification-list") return list;
+      if (selector === ".app-layout") return layout;
+      if (selector === ".mobile-nav") return mobile ? {} : null;
+      return null;
+    },
+    querySelectorAll() { return []; },
+    createElement(tag) { return new Element(tag); },
+  };
+  const windowMock = {
+    visualViewport: { addEventListener() {} },
+    matchMedia() { return { matches: mobile }; },
+    addEventListener(name, listener) { windowListeners.set(name, listener); },
+    listeners: windowListeners,
+    EventSource: class { addEventListener() {} },
+  };
+  globalThis.document = documentMock;
+  globalThis.window = windowMock;
+  globalThis.EventSource = windowMock.EventSource;
+  globalThis.HTMLFormElement = class {};
+  globalThis.Node = { TEXT_NODE: 3 };
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  const setupSourceEnd = source.indexOf("\ninstallInfiniteScroll();");
+  const installInfiniteScroll = new Function(`${source.slice(0, setupSourceEnd)}; return installInfiniteScroll;`)();
+  const requests = [];
+  installInfiniteScroll({
+    pageDocument: documentMock,
+    pageWindow: windowMock,
+    fetchPage: (href) => {
+      requests.push(href);
+      const response = responses[requests.length - 1];
+      return typeof response === "function" ? response() : response;
+    },
+    parsePage: (html) => pages[html],
+    Observer,
+  });
+  const status = link.afterNodes[0];
+  const retry = link.afterNodes[1];
+  return {
+    Element,
+    Link,
+    Observer,
+    documentMock,
+    layout,
+    link,
+    list,
+    requests,
+    retry,
+    scroll: () => (mobile ? layout : windowMock).listeners.get("scroll")(),
+    status,
+    windowMock,
+  };
+}
+
+Deno.test("infinite scroll errors wait for an explicit retry and do not storm requests", async () => {
+  const pages = {};
+  const harness = await createInfiniteScrollHarness({
+    responses: [
+      { ok: false, status: 503 },
+      { ok: true, text: async () => "page-two" },
+    ],
+    pages,
+  });
+  const nextList = new harness.Element("ol");
+  nextList.className = "post-list";
+  nextList.append(new harness.Element("li", "post-3"));
+  pages["page-two"] = { list: nextList, link: null };
+  harness.Observer.latest.target.top = -1;
+  harness.scroll();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assertEquals(harness.requests.length, 1);
+  assert(harness.status.textContent.includes("Couldn’t load"));
+  assert(!harness.retry.hidden, "an error should reveal a retry button");
+  harness.Observer.latest.fire();
+  harness.scroll();
+  await Promise.resolve();
+  assertEquals(harness.requests.length, 1, "observer events after an error must not retry automatically");
+  harness.retry.listeners.get("click")();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assertEquals(harness.requests.length, 2, "one deliberate retry should make one request");
+  assert(harness.link.removed, "a successful retry that reaches the end should remove the Older link");
+  assertEquals(harness.list.children.at(-1).getAttribute("data-post-uri"), "post-3");
+});
+
+Deno.test("infinite scroll stops before retaining more than 500 cards", async () => {
+  const harness = await createInfiniteScrollHarness({
+    cards: Array.from({ length: 500 }, (_, index) => `post-${index}`),
+  });
+  harness.Observer.latest.target.top = -1;
+  harness.scroll();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assertEquals(harness.requests.length, 0, "the 500-card cap should prevent another page request");
+  assertEquals(harness.list.children.length, 500);
+  assert(!harness.link.removed, "the Older link should remain available to continue with a full navigation");
+  assert(harness.status.textContent.includes("500"), "the status should explain why automatic loading stopped");
+});
