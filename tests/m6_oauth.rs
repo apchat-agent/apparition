@@ -1115,6 +1115,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
     assert!(css.contains("@media (max-width: 799px)"));
     assert!(css.contains("prefers-color-scheme: dark"));
     assert!(css.contains(".post-author {\n  display: flex;"));
+    assert!(css.contains(".action-confirm input {\n  width: 1rem;"));
 }
 
 #[tokio::test]
