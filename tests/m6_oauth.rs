@@ -3,8 +3,9 @@ use appview_rs::{
     feeds::{FeedTimeline, FeedTimelineTiming, HydratedFeedPage, ResolvedFeed},
     ingest::{IndexedRecord, Ingestor, MemoryStorage, ScopeMode, SqliteStorage, Storage},
     oauth::{
-        FetchedAuthorProfile, OAuthAccount, OAuthCallback, OAuthFlow, OAuthPublic, WebShutdown,
+        FetchedAuthorProfile, OAuthAccount, OAuthCallback, OAuthFlow, OAuthPublic,
         PdsCreatedRecord, PinnedFeedTabs, PostStrongRef, ProfileRefreshWorker, SqliteOAuthStore,
+        WebShutdown,
     },
 };
 use appview_rs::{router, router_with_oauth_flow};
@@ -3607,6 +3608,7 @@ async fn graceful_shutdown_ends_connected_notification_stream_and_server() {
     .expect("notification stream should connect within one second")
     .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(shutdown.active_notification_streams(), 1);
     let first = tokio::time::timeout(Duration::from_secs(1), response.chunk())
         .await
         .expect("stream should send its initial count")
@@ -3620,6 +3622,7 @@ async fn graceful_shutdown_ends_connected_notification_stream_and_server() {
         .expect("shutdown should end the notification stream within one second")
         .unwrap();
     assert!(end.is_none(), "notification stream must finish on shutdown");
+    assert_eq!(shutdown.active_notification_streams(), 0);
     tokio::time::timeout(Duration::from_secs(1), server)
         .await
         .expect("server should finish graceful shutdown with the stream")

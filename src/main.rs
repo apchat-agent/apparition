@@ -8,10 +8,12 @@ use appview_rs::{
     ingest::{Ingestor, JetstreamConsumer, SqliteStorage},
     init_tracing,
     jwt::ServiceJwtVerifier,
-    oauth::{OAuthPublic, ProfileRefreshWorker, SqliteOAuthStore},
-    router_with_oauth_flow_and_alt_model_dir,
+    oauth::{OAuthPublic, ProfileRefreshWorker, SqliteOAuthStore, WebShutdown},
+    router_with_oauth_flow_and_alt_model_dir_and_shutdown,
 };
-use std::{error::Error, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    error::Error, future::IntoFuture, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration,
+};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
@@ -61,11 +63,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         jwt_resolver,
         config.appview_did.clone(),
     ));
-    let app_router = router_with_oauth_flow_and_alt_model_dir(
+    let web_shutdown = WebShutdown::new();
+    let app_router = router_with_oauth_flow_and_alt_model_dir_and_shutdown(
         oauth,
         oauth_flow.clone(),
         storage.clone(),
         config.alt_model_dir.clone(),
+        web_shutdown.clone(),
     )
     .merge(api_router_with_https(
         storage.clone(),
@@ -146,20 +150,50 @@ async fn main() -> Result<(), Box<dyn Error>> {
         };
         info!(%login_url, "development login URL");
     }
-    axum::serve(
-        listener,
-        app_router.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
-    let _ = shutdown_tx.send(true);
-    let _ = tokio::time::timeout(Duration::from_secs(3), async {
+    let signal_web_shutdown = web_shutdown.clone();
+    let signal_worker_shutdown = shutdown_tx.clone();
+    let (shutdown_started_tx, mut shutdown_started_rx) = tokio::sync::oneshot::channel();
+    let mut server = Box::pin(
+        axum::serve(
+            listener,
+            app_router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            signal_web_shutdown.shutdown();
+            let _ = signal_worker_shutdown.send(true);
+            let _ = shutdown_started_tx.send(());
+        })
+        .into_future(),
+    );
+    let server_finished = tokio::select! {
+        result = &mut server => {
+            result?;
+            true
+        }
+        _ = &mut shutdown_started_rx => false,
+    };
+    let shutdown_result = tokio::time::timeout(Duration::from_secs(5), async {
+        if !server_finished {
+            (&mut server).await?;
+        }
         let _ = ingestion_task.await;
         let _ = backfill_task.await;
         let _ = handle_refresh_task.await;
         let _ = profile_refresh_task.await;
+        Ok::<(), std::io::Error>(())
     })
     .await;
+    match shutdown_result {
+        Ok(result) => result?,
+        Err(_) => {
+            let connections_cut = web_shutdown.active_notification_streams();
+            error!(
+                connections_cut,
+                "shutdown deadline reached; forcing process exit"
+            );
+        }
+    }
     Ok(())
 }
 

@@ -3995,28 +3995,41 @@ fn notification_count_stream<S: Storage + 'static>(
             shutdown,
             guard,
         ),
-        |(initial, mut receiver, mut heartbeat, storage, did, _shutdown, _guard)| async move {
+        |(initial, mut receiver, mut heartbeat, storage, did, mut shutdown, _guard)| async move {
+            if *shutdown.borrow() {
+                return None;
+            }
             if let Some(count) = initial {
                 return Some((
                     Ok(unread_count_event(count)),
-                    (None, receiver, heartbeat, storage, did, _shutdown, _guard),
+                    (None, receiver, heartbeat, storage, did, shutdown, _guard),
                 ));
             }
             tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        None
+                    } else {
+                        Some((
+                            Ok(Event::default().comment("heartbeat")),
+                            (None, receiver, heartbeat, storage, did, shutdown, _guard),
+                        ))
+                    }
+                },
                 _ = heartbeat.tick() => Some((
                     Ok(Event::default().comment("heartbeat")),
-                    (None, receiver, heartbeat, storage, did, _shutdown, _guard),
+                    (None, receiver, heartbeat, storage, did, shutdown, _guard),
                 )),
                 result = receiver.recv() => match result {
                     Ok(count) => Some((
                         Ok(unread_count_event(count)),
-                        (None, receiver, heartbeat, storage, did, _shutdown, _guard),
+                        (None, receiver, heartbeat, storage, did, shutdown, _guard),
                     )),
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         let count = storage.unread_notification_count(&did).unwrap_or_default();
                         Some((
                             Ok(unread_count_event(count)),
-                            (None, receiver, heartbeat, storage, did, _shutdown, _guard),
+                            (None, receiver, heartbeat, storage, did, shutdown, _guard),
                         ))
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
@@ -7211,12 +7224,9 @@ mod tests {
         let receiver = storage.subscribe_notification_counts(&did);
         let registry = Arc::new(Mutex::new(HashMap::new()));
         let shutdown = WebShutdown::new();
-        let guard = NotificationStreamGuard::acquire(
-            registry,
-            shutdown.notification_streams.clone(),
-            &did,
-        )
-        .unwrap();
+        let guard =
+            NotificationStreamGuard::acquire(registry, shutdown.notification_streams.clone(), &did)
+                .unwrap();
         let events = notification_count_stream(
             receiver,
             3,
