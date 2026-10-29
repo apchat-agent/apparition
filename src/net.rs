@@ -353,9 +353,15 @@ mod tests {
         future::Future,
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
         pin::Pin,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
-    use tokio::net::TcpListener;
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        net::TcpListener,
+    };
     use url::Url;
 
     #[tokio::test]
@@ -561,6 +567,71 @@ mod tests {
             )
             .await;
         assert!(response.is_err(), "redirect to loopback must be refused");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn repeated_requests_to_one_host_reuse_one_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let server_accepts = accepts.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                server_accepts.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut reader = BufReader::new(reader);
+                    loop {
+                        let mut line = Vec::new();
+                        if reader
+                            .read_until(b'\n', &mut line)
+                            .await
+                            .unwrap_or_default()
+                            == 0
+                        {
+                            break;
+                        }
+                        loop {
+                            line.clear();
+                            if reader
+                                .read_until(b'\n', &mut line)
+                                .await
+                                .unwrap_or_default()
+                                == 0
+                            {
+                                return;
+                            }
+                            if line == b"\r\n" {
+                                break;
+                            }
+                        }
+                        if writer
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let client = SafeHttpClient::with_resolver(FakeResolver::new(
+            (0..5).map(|_| vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]),
+        ))
+        .with_http_test_hosts(["safe.example".to_owned()]);
+        for _ in 0..5 {
+            let url = Url::parse(&format!("http://safe.example:{}/body", address.port())).unwrap();
+            let response = client.get(&url, http::HeaderMap::new(), 16).await.unwrap();
+            assert_eq!(response.body(), b"ok");
+        }
+
+        assert_eq!(accepts.load(Ordering::Relaxed), 1);
         server.abort();
     }
 }
