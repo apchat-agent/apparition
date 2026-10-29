@@ -255,3 +255,55 @@ async fn identity_cache_writer_lock_never_blocks_resolution_or_tokio_progress() 
     drop(cache);
     cleanup_database(&path);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn account_event_evicts_identity_cache_immediately_while_sqlite_is_locked() {
+    let path = database_path();
+    let cache = Arc::new(SqliteIdentityCache::open(&path).unwrap());
+    let backend = FakeIdentityBackend::default();
+    backend.publish(ALICE, Some("alice.test"), "https://old-alice-pds.test");
+    let resolver = IdentityResolver::new(backend.clone(), Duration::from_secs(30))
+        .with_persistent_cache(cache.clone());
+    assert_eq!(
+        resolver
+            .resolve_did_document(ALICE)
+            .await
+            .unwrap()
+            .pds_endpoint()
+            .as_deref(),
+        Some("https://old-alice-pds.test")
+    );
+    backend.publish(ALICE, Some("alice.test"), "https://new-alice-pds.test");
+
+    let blocker = rusqlite::Connection::open(&path).unwrap();
+    blocker
+        .execute_batch("PRAGMA journal_mode = WAL; BEGIN IMMEDIATE;")
+        .unwrap();
+    let release_thread = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(3));
+        blocker.execute_batch("ROLLBACK;").unwrap();
+    });
+
+    let ingestor = Ingestor::new(Arc::new(MemoryStorage::default()), ScopeMode::Full)
+        .with_identity_cache(cache.clone());
+    let started = std::time::Instant::now();
+    ingestor
+        .process_json_batch(&[json!({"did":ALICE,"time_us":1,"kind":"account"}).to_string()])
+        .unwrap();
+    let invalidation_elapsed = started.elapsed();
+
+    let refreshed = resolver.resolve_did_document(ALICE).await.unwrap();
+    assert_eq!(
+        refreshed.pds_endpoint().as_deref(),
+        Some("https://new-alice-pds.test")
+    );
+    assert_eq!(backend.document_call_count(), 2);
+    release_thread.join().unwrap();
+    assert!(
+        invalidation_elapsed < Duration::from_millis(100),
+        "Jetstream account invalidation waited {invalidation_elapsed:?} for SQLite"
+    );
+
+    drop(cache);
+    cleanup_database(&path);
+}
