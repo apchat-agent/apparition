@@ -292,6 +292,85 @@ Deno.test("alt suggestion loads only after its button is clicked and protects ed
   assertEquals(altInput.value, "A dog beside the sea.", "the previous suggestion may be replaced");
 });
 
+Deno.test("video selection metadata and upload progress use the dedicated video route", async () => {
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  globalThis.document = {
+    addEventListener() {},
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+  };
+  globalThis.window = { visualViewport: { addEventListener() {} }, scrollY: 0, scrollX: 0 };
+  const helpers = new Function(`${source}; return { videoMimeType, formatVideoDuration, handleVideoComposerSubmit };`)();
+  assertEquals(helpers.videoMimeType({ type: "", name: "clip.mov" }), "video/quicktime");
+  assertEquals(helpers.formatVideoDuration(71.9), "1:11");
+
+  const button = { disabled: false };
+  const error = { hidden: true, textContent: "" };
+  const status = { textContent: "" };
+  const progress = { hidden: true, max: 0, value: 0 };
+  const alt = { value: "A cyclist crosses the road" };
+  const form = {
+    querySelector(selector) {
+      return ({
+        'button[type="submit"]': button,
+        "[data-composer-error]": error,
+        "[data-video-upload-status]": status,
+        "[data-video-progress]": progress,
+        "[data-video-alt]": alt,
+      })[selector] || null;
+    },
+  };
+  class FakeFormData {
+    values = new Map();
+    constructor() {}
+    set(name, value) { this.values.set(name, value); }
+    get(name) { return this.values.get(name); }
+  }
+  class FakeFile {
+    constructor(parts, name, options) {
+      this.parts = parts;
+      this.name = name;
+      this.type = options.type;
+    }
+  }
+  class FakeXmlHttpRequest {
+    upload = {};
+    open(method, url) { this.method = method; this.url = url; }
+    send(body) {
+      this.body = body;
+      this.upload.onprogress({ lengthComputable: true, loaded: 42, total: 42 });
+      this.status = 200;
+      this.responseURL = "/app";
+      this.onload();
+    }
+  }
+  let destination;
+  const selected = {
+    file: { name: "clip.mp4", size: 42 },
+    mimeType: "video/mp4",
+    valid: true,
+    metadata: { duration: 12.5, width: 640, height: 360 },
+  };
+  let prevented = false;
+  await helpers.handleVideoComposerSubmit(
+    form,
+    selected,
+    { preventDefault() { prevented = true; } },
+    {
+      FormData: FakeFormData,
+      File: FakeFile,
+      XMLHttpRequest: FakeXmlHttpRequest,
+      navigate(url) { destination = url; },
+    },
+  );
+  assert(prevented);
+  assertEquals(destination, "/app");
+  assertEquals(status.textContent, "Video received. Bluesky is processing it…");
+  assertEquals(progress.value, 100);
+  assertEquals(error.hidden, true);
+  assertEquals(button.disabled, false);
+});
+
 Deno.test("alt suggestion failure leaves the alt text alone and reports a short message", async () => {
   const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
   globalThis.document = {

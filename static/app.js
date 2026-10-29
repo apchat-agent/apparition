@@ -242,6 +242,198 @@ async function handleImageComposerSubmit(form, selected, selectionInvalid, event
   }
 }
 
+const MAX_VIDEO_BYTES = 300_000_000;
+const MAX_VIDEO_DURATION_SECONDS = 600;
+const MAX_VIDEO_ALT_CHARS = 2000;
+
+function videoMimeType(file) {
+  if (["video/mp4", "video/webm", "video/quicktime"].includes(file.type)) return file.type;
+  const extension = (file.name || "").split(".").pop()?.toLowerCase();
+  return ({ mp4: "video/mp4", webm: "video/webm", mov: "video/quicktime" })[extension] || "";
+}
+
+function formatVideoDuration(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return "Unknown duration";
+  const whole = Math.floor(seconds);
+  const minutes = Math.floor(whole / 60);
+  const remainder = String(whole % 60).padStart(2, "0");
+  return `${minutes}:${remainder}`;
+}
+
+function probeVideoMetadata(videoUrl, createElement = (tag) => document.createElement(tag)) {
+  return new Promise((resolve, reject) => {
+    const video = createElement("video");
+    video.preload = "metadata";
+    video.onloadedmetadata = () => resolve({
+      duration: video.duration,
+      width: video.videoWidth,
+      height: video.videoHeight,
+    });
+    video.onerror = () => reject(new Error("The selected video could not be opened."));
+    video.src = videoUrl;
+  });
+}
+
+async function handleVideoComposerSubmit(form, selected, event, helpers = {}) {
+  if (!selected) return;
+  event.preventDefault();
+  const button = form.querySelector('button[type="submit"]');
+  const error = form.querySelector("[data-composer-error]");
+  const status = form.querySelector("[data-video-upload-status]");
+  const progress = form.querySelector("[data-video-progress]");
+  if (button?.disabled) return;
+  if (button) button.disabled = true;
+  if (error) {
+    error.hidden = true;
+    error.textContent = "";
+  }
+  try {
+    if (!selected.valid) throw new Error(selected.error || "Wait until video details are ready.");
+    if (selected.file.size > MAX_VIDEO_BYTES) throw new Error("Videos can be up to 300 MB.");
+    if (selected.metadata.duration > MAX_VIDEO_DURATION_SECONDS) throw new Error("Videos can be up to 10 minutes long.");
+    const alt = form.querySelector("[data-video-alt]")?.value || "";
+    if ([...alt].length > MAX_VIDEO_ALT_CHARS) throw new Error("Video alt text must be no more than 2,000 characters.");
+    const Data = helpers.FormData || FormData;
+    const data = new Data(form);
+    const FileType = helpers.File || File;
+    data.set("video", new FileType([selected.file], selected.file.name || "video", { type: selected.mimeType }));
+    data.set("video_duration", String(selected.metadata.duration));
+    data.set("video_width", String(selected.metadata.width));
+    data.set("video_height", String(selected.metadata.height));
+    if (progress) {
+      progress.max = 100;
+      progress.value = 0;
+      progress.hidden = false;
+    }
+    if (status) status.textContent = "Starting video upload…";
+    const Xhr = helpers.XMLHttpRequest || XMLHttpRequest;
+    await new Promise((resolve, reject) => {
+      const xhr = new Xhr();
+      xhr.open("POST", "/video");
+      xhr.withCredentials = true;
+      xhr.upload.onprogress = (uploadEvent) => {
+        if (uploadEvent.lengthComputable && progress) {
+          progress.value = Math.min(100, Math.round((uploadEvent.loaded / uploadEvent.total) * 100));
+        }
+        if (status) {
+          status.textContent = uploadEvent.lengthComputable && uploadEvent.loaded >= uploadEvent.total
+            ? "Video received. Bluesky is processing it…"
+            : uploadEvent.lengthComputable
+              ? `Uploading video: ${Math.round((uploadEvent.loaded / uploadEvent.total) * 100)}%`
+              : "Uploading video…";
+        }
+      };
+      xhr.onerror = () => reject(new Error("The video upload connection failed."));
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 400) {
+          (helpers.navigate || ((url) => window.location.assign(url)))(xhr.responseURL || "/app");
+          resolve();
+          return;
+        }
+        let message = "The video could not be posted.";
+        try {
+          message = JSON.parse(xhr.responseText).message || message;
+        } catch {
+          // Keep the concise default for non-JSON server errors.
+        }
+        reject(new Error(message));
+      };
+      xhr.send(data);
+    });
+  } catch (reason) {
+    const message = reason instanceof Error ? reason.message : "The video could not be posted.";
+    if (error) {
+      error.textContent = message;
+      error.hidden = false;
+    } else if (status) {
+      status.textContent = message;
+    }
+  } finally {
+    if (progress) progress.hidden = true;
+    if (button) button.disabled = false;
+  }
+}
+
+function attachVideoComposer(form, helpers = {}) {
+  const input = form.querySelector("[data-video-input]");
+  const preview = form.querySelector("[data-video-preview]");
+  const summary = form.querySelector("[data-video-summary]");
+  const removeButton = form.querySelector("[data-video-remove]");
+  const imageInput = form.querySelector("[data-image-input]");
+  if (!input || !preview || !summary) return null;
+  let selected = null;
+  let previewUrl = "";
+  const makeUrl = helpers.createObjectURL || ((file) => URL.createObjectURL(file));
+  const revokeUrl = helpers.revokeObjectURL || ((url) => URL.revokeObjectURL(url));
+  const reset = (clearInput = true) => {
+    if (previewUrl) revokeUrl(previewUrl);
+    previewUrl = "";
+    selected = null;
+    if (clearInput) input.value = "";
+    preview.removeAttribute("src");
+    preview.hidden = true;
+    summary.textContent = "No video selected.";
+    if (removeButton) removeButton.hidden = true;
+    if (imageInput) imageInput.disabled = false;
+  };
+  input.addEventListener("change", async () => {
+    const file = input.files?.[0];
+    reset(false);
+    if (!file) return;
+    const mimeType = videoMimeType(file);
+    if (!mimeType) {
+      summary.textContent = "Choose an MP4, WebM, or MOV video.";
+      selected = { file, valid: false, error: summary.textContent };
+      if (imageInput) imageInput.disabled = true;
+      return;
+    }
+    if (file.size > MAX_VIDEO_BYTES) {
+      summary.textContent = "Videos can be up to 300 MB. Choose a smaller file.";
+      selected = { file, valid: false, error: summary.textContent };
+      if (imageInput) imageInput.disabled = true;
+      return;
+    }
+    if (imageInput?.files?.length) {
+      summary.textContent = "Remove the selected images before choosing a video.";
+      input.value = "";
+      return;
+    }
+    if (imageInput) imageInput.disabled = true;
+    previewUrl = makeUrl(file);
+    preview.src = previewUrl;
+    preview.hidden = false;
+    if (removeButton) removeButton.hidden = false;
+    selected = { file, mimeType, valid: false, metadata: null };
+    summary.textContent = `Video size: ${new Intl.NumberFormat().format(file.size)} bytes. Reading duration…`;
+    try {
+      const metadata = await (helpers.probe || probeVideoMetadata)(previewUrl, helpers.createElement);
+      if (selected?.file !== file) return;
+      if (!Number.isFinite(metadata.duration) || metadata.duration <= 0) {
+        throw new Error("The video duration could not be read.");
+      }
+      selected.metadata = metadata;
+      selected.valid = metadata.duration <= MAX_VIDEO_DURATION_SECONDS && metadata.width > 0 && metadata.height > 0;
+      selected.error = metadata.duration > MAX_VIDEO_DURATION_SECONDS
+        ? "Videos can be up to 10 minutes long."
+        : "The video dimensions could not be read.";
+      summary.textContent = `${new Intl.NumberFormat().format(file.size)} bytes · ${formatVideoDuration(metadata.duration)} · ${metadata.width}×${metadata.height}${selected.valid ? "" : ` · ${selected.error}`}`;
+    } catch (reason) {
+      if (selected?.file !== file) return;
+      selected.error = reason instanceof Error ? reason.message : "Video details could not be read.";
+      summary.textContent = `${new Intl.NumberFormat().format(file.size)} bytes · ${selected.error}`;
+    }
+  });
+  removeButton?.addEventListener("click", reset);
+  form.addEventListener("submit", (event) => {
+    if (selected) void handleVideoComposerSubmit(form, selected, event, helpers);
+  });
+  return {
+    setImagesSelected(selectedImages) {
+      input.disabled = selectedImages;
+    },
+  };
+}
+
 function previewImageObjectUrl(dataUrl) {
   const match = /^data:(image\/[^;,]+);base64,([A-Za-z0-9+/]+=*)$/.exec(dataUrl || "");
   if (!match) return "";
@@ -353,6 +545,7 @@ function attachLinkPreview(form, helpers = {}) {
 
 (document.querySelectorAll?.("form[data-image-composer]") || []).forEach((form) => {
   const linkPreview = attachLinkPreview(form);
+  const videoComposer = attachVideoComposer(form);
   const input = form.querySelector("[data-image-input]");
   const previews = form.querySelector("[data-image-previews]");
   const status = form.querySelector("[data-image-status]");
@@ -401,6 +594,7 @@ function attachLinkPreview(form, helpers = {}) {
         URL.revokeObjectURL(item.previewUrl);
         selected.splice(index, 1);
         status.textContent = "";
+        videoComposer?.setImagesSelected(selected.length > 0);
         linkPreview.updateImagePrecedence(selected.length);
         drawPreviews();
       });
@@ -415,6 +609,7 @@ function attachLinkPreview(form, helpers = {}) {
     selected.length = 0;
     linkPreview.updateImagePrecedence(0);
     const files = [...(input.files || [])];
+    videoComposer?.setImagesSelected(files.length > 0);
     if (files.length > 4) {
       selectionInvalid = true;
       status.textContent = "Choose no more than 4 images.";
@@ -426,6 +621,7 @@ function attachLinkPreview(form, helpers = {}) {
     for (const file of files) {
       selected.push({ file, alt: "", previewUrl: URL.createObjectURL(file) });
     }
+    videoComposer?.setImagesSelected(selected.length > 0);
     linkPreview.updateImagePrecedence(selected.length);
     drawPreviews();
   });
@@ -737,3 +933,20 @@ window.visualViewport?.addEventListener("resize", resetDocumentScroll);
     if (!document.hidden) refreshCount();
   });
 })();
+
+// HLS.js is bundled locally under the same-origin script policy. Safari uses its
+// native HLS implementation; Firefox and other MediaSource browsers use HLS.js.
+(document.querySelectorAll?.("video[data-video-playlist]") || []).forEach((video) => {
+  const playlist = video.getAttribute("data-video-playlist");
+  if (!playlist) return;
+  if (video.canPlayType?.("application/vnd.apple.mpegurl")) {
+    video.src = playlist;
+    return;
+  }
+  const HlsClient = window.Hls || globalThis.Hls;
+  if (!HlsClient?.isSupported?.()) return;
+  const player = new HlsClient({ enableWorker: false });
+  player.loadSource(playlist);
+  player.attachMedia(video);
+  video.dataset.videoReady = "true";
+});

@@ -64,6 +64,31 @@ async fn picture_route_rejects_bodies_over_five_mib() {
 }
 
 #[tokio::test]
+async fn video_route_is_not_limited_to_the_picture_upload_size() {
+    let app = router_with_oauth_flow(
+        OAuthPublic::new("https://appview.example").unwrap(),
+        DisabledOAuthFlow,
+        Arc::new(MemoryStorage::default()),
+    );
+    let body = vec![b'x'; 6 * 1024 * 1024];
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/video")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("content-type", "multipart/form-data; boundary=unused")
+                .header("content-length", body.len().to_string())
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+}
+
+#[tokio::test]
 async fn non_picture_post_route_rejects_a_forty_kib_form() {
     let app = router_with_oauth_flow(
         OAuthPublic::new("https://appview.example").unwrap(),

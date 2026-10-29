@@ -73,6 +73,7 @@ use std::{
 };
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::io::AsyncWriteExt;
 
 const METADATA_PATH: &str = "/.well-known/oauth-client-metadata.json";
 const CALLBACK_PATH: &str = "/oauth/callback";
@@ -86,13 +87,23 @@ const PROFILE_NEGATIVE_TTL: Duration = Duration::from_secs(60 * 60);
 const PAGE_PROFILE_BUDGET: Duration = Duration::from_millis(1500);
 const PAGE_PROFILE_CONCURRENCY: usize = 8;
 const PAGE_QUOTE_CONCURRENCY: usize = 16;
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m12";
-const WEB_SCRIPT_URL: &str = "/static/app.js?v=js10";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m13";
+const WEB_SCRIPT_URL: &str = "/static/app.js?v=js11";
+const HLS_SCRIPT_URL: &str = "/static/vendor/hls.min.js?v=1.7.3";
 const ALT_MODEL_DOWNLOAD_BYTES: u64 = 264_713_119;
 const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
 const SAVED_FEED_CACHE_PREFIX: &str = "saved-feed-preferences:";
-const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=*";
+const VIDEO_SERVICE_DID: &str = "did:web:video.bsky.app";
+const VIDEO_SERVICE_URL: &str = "https://video.bsky.app";
+const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=did:web:video.bsky.app rpc:app.bsky.video.uploadVideo?aud=did:web:video.bsky.app rpc:app.bsky.video.getJobStatus?aud=did:web:video.bsky.app";
 const BLOB_SCOPE: &str = "blob:image/*";
+const VIDEO_BLOB_SCOPE: &str = "blob:video/*";
+const VIDEO_SCOPES: [&str; 4] = [
+    VIDEO_BLOB_SCOPE,
+    "rpc:app.bsky.video.getUploadLimits?aud=did:web:video.bsky.app",
+    "rpc:app.bsky.video.uploadVideo?aud=did:web:video.bsky.app",
+    "rpc:app.bsky.video.getJobStatus?aud=did:web:video.bsky.app",
+];
 const WRITE_SCOPES: [&str; 3] = [
     "repo:app.bsky.feed.post?action=create",
     "repo:app.bsky.feed.like?action=create&action=delete",
@@ -102,6 +113,12 @@ const FEED_SCOPES: [&str; 2] = [
     "rpc:app.bsky.actor.getPreferences?aud=*",
     "rpc:app.bsky.feed.getFeedSkeleton?aud=*",
 ];
+const MAX_VIDEO_BYTES: u64 = 300_000_000;
+const MAX_VIDEO_DURATION_SECONDS: f64 = 600.0;
+const MAX_VIDEO_ALT_CHARS: usize = 2000;
+const MAX_VIDEO_REQUEST_BODY_BYTES: usize = MAX_VIDEO_BYTES as usize + 1024 * 1024;
+const VIDEO_JOB_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const VIDEO_JOB_MAX_POLLS: usize = 300;
 type HmacSha256 = Hmac<Sha256>;
 
 fn saved_feed_cache_key(did: &str) -> String {
@@ -143,6 +160,14 @@ pub struct OAuthPublic {
     mode: OAuthClientMode,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SessionPermissions {
+    write: bool,
+    feed: bool,
+    blob: bool,
+    video: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OAuthCallback {
     pub code: String,
@@ -180,6 +205,188 @@ pub struct PostImage {
     pub alt: String,
     pub width: u32,
     pub height: u32,
+}
+
+#[derive(Debug)]
+pub struct PostVideo {
+    pub path: PathBuf,
+    pub mime_type: String,
+    pub alt: String,
+    pub width: u32,
+    pub height: u32,
+    pub duration_seconds: f64,
+    pub size_bytes: u64,
+    pub filename: String,
+}
+
+impl Drop for PostVideo {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_file(&self.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %self.path.display(), %error, "could not remove temporary video upload");
+        }
+    }
+}
+
+fn validate_video_properties(
+    size_bytes: u64,
+    duration_seconds: f64,
+    mime_type: &str,
+) -> Result<(), String> {
+    if size_bytes == 0 || size_bytes > MAX_VIDEO_BYTES {
+        return Err("Videos must be no larger than 300,000,000 bytes.".to_owned());
+    }
+    if !duration_seconds.is_finite()
+        || duration_seconds <= 0.0
+        || duration_seconds > MAX_VIDEO_DURATION_SECONDS
+    {
+        return Err("Videos can be up to 10 minutes long.".to_owned());
+    }
+    if !matches!(mime_type, "video/mp4" | "video/webm" | "video/quicktime") {
+        return Err("Choose an MP4, WebM, or MOV video.".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_video_upload_limits(limits: &Value, upload_size: u64) -> Result<(), String> {
+    if limits.get("canUpload").and_then(Value::as_bool) != Some(true) {
+        return Err(limits
+            .get("message")
+            .and_then(Value::as_str)
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or("This account cannot upload videos right now.")
+            .to_owned());
+    }
+    if limits
+        .get("remainingDailyVideos")
+        .and_then(Value::as_i64)
+        .is_some_and(|remaining| remaining <= 0)
+    {
+        return Err("The daily video upload limit has been reached.".to_owned());
+    }
+    if limits
+        .get("remainingDailyBytes")
+        .and_then(Value::as_u64)
+        .is_some_and(|remaining| remaining < upload_size)
+    {
+        return Err("The daily video upload data limit has been reached.".to_owned());
+    }
+    Ok(())
+}
+
+fn build_video_post_record(
+    text: &str,
+    blob: Value,
+    alt: &str,
+    width: u32,
+    height: u32,
+    reply: Option<Value>,
+    quote: Option<PostStrongRef>,
+) -> Value {
+    let video_embed = json!({
+        "$type":"app.bsky.embed.video",
+        "video":blob,
+        "alt":alt,
+        "aspectRatio":{"width":width,"height":height}
+    });
+    let embed = if let Some(quote) = quote {
+        json!({
+            "$type":"app.bsky.embed.recordWithMedia",
+            "record":{"$type":"app.bsky.embed.record","record":quote},
+            "media":video_embed
+        })
+    } else {
+        video_embed
+    };
+    let mut record = json!({
+        "$type":"app.bsky.feed.post",
+        "text":text,
+        "createdAt":Datetime::now(),
+        "embed":embed
+    });
+    if let Some(reply) = reply {
+        record["reply"] = reply;
+    }
+    record
+}
+
+fn job_status_value(response: &Value) -> &Value {
+    response.get("jobStatus").unwrap_or(response)
+}
+
+async fn poll_video_job<F>(
+    job_id: &str,
+    interval: Duration,
+    max_polls: usize,
+    mut fetch_status: F,
+) -> Result<Value, String>
+where
+    F: FnMut(String) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>,
+{
+    for attempt in 0..max_polls {
+        let response = fetch_status(job_id.to_owned()).await?;
+        let status = job_status_value(&response);
+        match status
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        {
+            "JOB_STATE_COMPLETED" => {
+                return status
+                    .get("blob")
+                    .cloned()
+                    .ok_or_else(|| "video service completed without returning a blob".to_owned());
+            }
+            "JOB_STATE_FAILED" => {
+                let message = status
+                    .get("message")
+                    .or_else(|| status.get("error"))
+                    .and_then(Value::as_str)
+                    .filter(|message| !message.trim().is_empty())
+                    .unwrap_or("Video processing failed.");
+                return Err(message.to_owned());
+            }
+            _ if attempt + 1 < max_polls => tokio::time::sleep(interval).await,
+            _ => return Err("Video processing did not finish in time.".to_owned()),
+        }
+    }
+    Err("Video processing did not finish in time.".to_owned())
+}
+
+async fn read_video_service_response(response: reqwest::Response) -> Result<Value, String> {
+    const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+    let status = response.status();
+    let mut response = response;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("video service response could not be read: {error}"))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+            return Err("video service returned an unexpectedly large response".to_owned());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| format!("video service returned invalid JSON ({status})"))?;
+    let completed_conflict = status == StatusCode::CONFLICT
+        && job_status_value(&value)
+            .get("state")
+            .and_then(Value::as_str)
+            == Some("JOB_STATE_COMPLETED");
+    if !status.is_success() && !completed_conflict {
+        let message = value
+            .get("message")
+            .or_else(|| value.get("error"))
+            .and_then(Value::as_str)
+            .unwrap_or("request failed");
+        return Err(format!(
+            "video service request failed ({status}): {message}"
+        ));
+    }
+    Ok(value)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -256,6 +463,16 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
         _external: PostExternal,
     ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
         Box::pin(async { Err("link card post action is not available".to_owned()) })
+    }
+    fn create_post_with_video<'a>(
+        &'a self,
+        _did: &'a str,
+        _text: &'a str,
+        _video: PostVideo,
+        _reply: Option<Value>,
+        _quote: Option<PostStrongRef>,
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+        Box::pin(async { Err("video post action is not available".to_owned()) })
     }
     fn create_reply_with_images<'a>(
         &'a self,
@@ -643,7 +860,17 @@ impl OAuthPublic {
         F: OAuthFlow,
         S: Storage + 'static,
     {
-        Router::new()
+        let state = Arc::new(OAuthWebState {
+            public: self.clone(),
+            flow,
+            storage,
+            alt_model_dir,
+            link_card_fetcher: LinkCardFetcher::new(),
+            shutdown,
+            feed_page_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            notification_streams: Arc::new(Mutex::new(HashMap::new())),
+        });
+        let regular_routes = Router::new()
             .route(METADATA_PATH, get(metadata::<F, S>))
             .route("/static/app.css", get(app_stylesheet))
             .route("/static/app.js", get(app_script))
@@ -676,16 +903,12 @@ impl OAuthPublic {
             .route("/like", post(write_like::<F, S>))
             .route("/repost", post(write_repost::<F, S>))
             .layer(DefaultBodyLimit::max(MAX_POST_BODY_BYTES))
-            .with_state(Arc::new(OAuthWebState {
-                public: self.clone(),
-                flow,
-                storage,
-                alt_model_dir,
-                link_card_fetcher: LinkCardFetcher::new(),
-                shutdown,
-                feed_page_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-                notification_streams: Arc::new(Mutex::new(HashMap::new())),
-            }))
+            .with_state(state.clone());
+        let video_routes = Router::new()
+            .route("/video", post(upload_video::<F, S>))
+            .layer(DefaultBodyLimit::max(MAX_VIDEO_REQUEST_BODY_BYTES))
+            .with_state(state);
+        regular_routes.merge(video_routes)
     }
 
     fn from_key(public_url: &str, private_key: Jwk) -> Result<Self, OAuthConfigError> {
@@ -757,13 +980,12 @@ impl OAuthPublic {
         did: &str,
         session_id: &str,
         generation: u64,
-        write_access: bool,
-        feed_access: bool,
-        blob_access: bool,
+        permissions: SessionPermissions,
     ) -> String {
         let expires = unix_time().saturating_add(SESSION_TTL_SECONDS);
         let payload = format!(
-            "{did}\n{expires}\n{session_id}\n{generation}\n{write_access}\n{feed_access}\n{blob_access}"
+            "{did}\n{expires}\n{session_id}\n{generation}\n{}\n{}\n{}\n{}",
+            permissions.write, permissions.feed, permissions.blob, permissions.video
         );
         let encoded = URL_SAFE_NO_PAD.encode(payload.as_bytes());
         let mut mac = HmacSha256::new_from_slice(&self.cookie_key())
@@ -808,7 +1030,7 @@ impl OAuthPublic {
     fn verify_session_cookie(
         &self,
         token: &str,
-    ) -> Option<(String, String, u64, bool, bool, bool)> {
+    ) -> Option<(String, String, u64, bool, bool, bool, bool)> {
         let (payload, signature) = token.split_once('.')?;
         let signature = URL_SAFE_NO_PAD.decode(signature).ok()?;
         let mut mac = HmacSha256::new_from_slice(&self.cookie_key()).ok()?;
@@ -824,7 +1046,10 @@ impl OAuthPublic {
         let (write_access, permissions) = permissions
             .split_once('\n')
             .unwrap_or((permissions, "false\nfalse"));
-        let (feed_access, blob_access) = permissions
+        let (feed_access, permissions) = permissions
+            .split_once('\n')
+            .unwrap_or((permissions, "false\nfalse"));
+        let (blob_access, video_access) = permissions
             .split_once('\n')
             .unwrap_or((permissions, "false"));
         if expires.parse::<u64>().ok()? <= unix_time()
@@ -840,6 +1065,7 @@ impl OAuthPublic {
             write_access.parse().ok()?,
             feed_access.parse().ok()?,
             blob_access.parse().ok()?,
+            video_access.parse().ok()?,
         ))
     }
 
@@ -874,9 +1100,9 @@ type AppOAuthClient = OAuthClient<
 type SavedFeedCache =
     Arc<tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, Vec<SavedFeedPreference>)>>>;
 type SavedFeedRefreshes = Arc<tokio::sync::Mutex<HashSet<String>>>;
-// Keyed by (viewer DID, feed generator service DID).
+// Keyed by (viewer DID, service DID, XRPC method).
 type ServiceAuthCache =
-    Arc<tokio::sync::Mutex<HashMap<(String, String), (tokio::time::Instant, String)>>>;
+    Arc<tokio::sync::Mutex<HashMap<(String, String, String), (tokio::time::Instant, String)>>>;
 // Keyed by (viewer DID, feed URI, cursor); switching between feed tabs reuses a page for a minute.
 type FeedPageCache = Arc<
     tokio::sync::Mutex<HashMap<(String, String, String), (tokio::time::Instant, FeedTimeline)>>,
@@ -893,6 +1119,7 @@ pub struct AtriumOAuthFlow<B: crate::identity::IdentityBackend = HttpIdentityBac
     store: SqliteOAuthStore,
     feed_client: Arc<FeedClient<B>>,
     http_client: SafeHttpClient,
+    video_http_client: reqwest::Client,
     saved_feed_cache: SavedFeedCache,
     saved_feed_refreshes: SavedFeedRefreshes,
     service_auth_cache: ServiceAuthCache,
@@ -908,6 +1135,7 @@ impl<B: crate::identity::IdentityBackend> Clone for AtriumOAuthFlow<B> {
             store: self.store.clone(),
             feed_client: self.feed_client.clone(),
             http_client: self.http_client.clone(),
+            video_http_client: self.video_http_client.clone(),
             saved_feed_cache: self.saved_feed_cache.clone(),
             saved_feed_refreshes: self.saved_feed_refreshes.clone(),
             service_auth_cache: self.service_auth_cache.clone(),
@@ -1199,6 +1427,10 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             store,
             feed_client,
             http_client: retained_http_client,
+            video_http_client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|error| error.to_string())?,
             saved_feed_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             saved_feed_refreshes: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             service_auth_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -1299,15 +1531,20 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         &self,
         viewer_did: &str,
         service_did: &str,
+        lexicon: &str,
     ) -> Result<String, String> {
-        let key = (viewer_did.to_owned(), service_did.to_owned());
+        let key = (
+            viewer_did.to_owned(),
+            service_did.to_owned(),
+            lexicon.to_owned(),
+        );
         if let Some((expires, token)) = self.service_auth_cache.lock().await.get(&key).cloned()
             && expires > tokio::time::Instant::now()
         {
             return Ok(token);
         }
         let token = self
-            .fetch_service_auth_token(viewer_did, service_did)
+            .fetch_service_auth_token(viewer_did, service_did, lexicon)
             .await?;
         let mut cache = self.service_auth_cache.lock().await;
         cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
@@ -1329,6 +1566,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         &self,
         viewer_did: &str,
         service_did: &str,
+        lexicon: &str,
     ) -> Result<String, String> {
         let did = viewer_did
             .parse::<Did>()
@@ -1346,9 +1584,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         let request = XrpcRequest {
             method: http::Method::GET,
             nsid: "com.atproto.server.getServiceAuth".to_owned(),
-            parameters: Some(
-                json!({"aud":service_did,"lxm":"app.bsky.feed.getFeedSkeleton","exp":exp}),
-            ),
+            parameters: Some(json!({"aud":service_did,"lxm":lexicon,"exp":exp})),
             input: None,
             encoding: None,
         };
@@ -1370,6 +1606,96 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                 Err("PDS getServiceAuth returned a non-JSON response".to_owned())
             }
         }
+    }
+
+    async fn video_service_json(
+        &self,
+        viewer_did: &str,
+        lexicon: &str,
+        parameters: &[(&str, &str)],
+    ) -> Result<Value, String> {
+        let token = self
+            .service_auth_token(viewer_did, VIDEO_SERVICE_DID, lexicon)
+            .await?;
+        let mut url = reqwest::Url::parse(VIDEO_SERVICE_URL)
+            .map_err(|error| format!("video service URL is invalid: {error}"))?;
+        url.set_path(&format!("/xrpc/{lexicon}"));
+        url.query_pairs_mut()
+            .extend_pairs(parameters.iter().copied());
+        let response = self
+            .video_http_client
+            .get(url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|error| format!("video service {lexicon} request failed: {error}"))?;
+        read_video_service_response(response).await
+    }
+
+    async fn upload_video_blob(&self, did: &str, video: &PostVideo) -> Result<Value, String> {
+        let limits = self
+            .video_service_json(did, "app.bsky.video.getUploadLimits", &[])
+            .await?;
+        validate_video_upload_limits(&limits, video.size_bytes)?;
+
+        let token = self
+            .service_auth_token(did, VIDEO_SERVICE_DID, "app.bsky.video.uploadVideo")
+            .await?;
+        let mut url = reqwest::Url::parse(VIDEO_SERVICE_URL)
+            .map_err(|error| format!("video service URL is invalid: {error}"))?;
+        url.set_path("/xrpc/app.bsky.video.uploadVideo");
+        url.query_pairs_mut()
+            .append_pair("did", did)
+            .append_pair("name", &video.filename);
+        let file = tokio::fs::File::open(&video.path)
+            .await
+            .map_err(|error| format!("temporary video file could not be reopened: {error}"))?;
+        let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+        let response = self
+            .video_http_client
+            .post(url)
+            .bearer_auth(token)
+            .header(header::CONTENT_TYPE, &video.mime_type)
+            .header(header::CONTENT_LENGTH, video.size_bytes)
+            .body(body)
+            .send()
+            .await
+            .map_err(|error| format!("video service upload request failed: {error}"))?;
+        let initial = read_video_service_response(response).await?;
+        let initial_status = job_status_value(&initial);
+        let state = initial_status
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let job_id = initial_status
+            .get("jobId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "video service upload returned no job ID".to_owned())?;
+        if state == "JOB_STATE_COMPLETED" {
+            return initial_status
+                .get("blob")
+                .cloned()
+                .ok_or_else(|| "video service completed without returning a blob".to_owned());
+        }
+        poll_video_job(
+            job_id,
+            VIDEO_JOB_POLL_INTERVAL,
+            VIDEO_JOB_MAX_POLLS,
+            |job_id| {
+                let service = self.clone();
+                let did = did.to_owned();
+                Box::pin(async move {
+                    service
+                        .video_service_json(
+                            &did,
+                            "app.bsky.video.getJobStatus",
+                            &[("jobId", job_id.as_str())],
+                        )
+                        .await
+                })
+            },
+        )
+        .await
     }
 
     async fn create_record(
@@ -1575,6 +1901,27 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         if let Some(reply) = reply {
             record["reply"] = reply;
         }
+        self.create_record(did, "app.bsky.feed.post", record).await
+    }
+
+    async fn create_post_with_video(
+        &self,
+        did: &str,
+        text: &str,
+        video: PostVideo,
+        reply: Option<Value>,
+        quote: Option<PostStrongRef>,
+    ) -> Result<PdsCreatedRecord, String> {
+        let blob = self.upload_video_blob(did, &video).await?;
+        let record = build_video_post_record(
+            text,
+            blob,
+            &video.alt,
+            video.width,
+            video.height,
+            reply,
+            quote,
+        );
         self.create_record(did, "app.bsky.feed.post", record).await
     }
 
@@ -1807,6 +2154,19 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
     ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
         Box::pin(async move {
             AtriumOAuthFlow::create_post_with_external(self, did, text, external, None, None).await
+        })
+    }
+
+    fn create_post_with_video<'a>(
+        &'a self,
+        did: &'a str,
+        text: &'a str,
+        video: PostVideo,
+        reply: Option<Value>,
+        quote: Option<PostStrongRef>,
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+        Box::pin(async move {
+            AtriumOAuthFlow::create_post_with_video(self, did, text, video, reply, quote).await
         })
     }
 
@@ -2167,7 +2527,11 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
                 } else {
                     let auth_started = std::time::Instant::now();
                     let token = self
-                        .service_auth_token(did, &generator.service_did)
+                        .service_auth_token(
+                            did,
+                            &generator.service_did,
+                            "app.bsky.feed.getFeedSkeleton",
+                        )
                         .await
                         .ok();
                     auth_ms = auth_started.elapsed().as_millis() as u64;
@@ -2339,6 +2703,10 @@ async fn vendor_asset(AxumPath(path): AxumPath<String>) -> Response {
             include_bytes!("../static/vendor/transformers-4.3.2.min.js"),
             "text/javascript; charset=utf-8",
         ),
+        "hls.min.js" => (
+            include_bytes!("../static/vendor/hls.min.js"),
+            "text/javascript; charset=utf-8",
+        ),
         "ort-wasm-simd-threaded.mjs" => (
             include_bytes!("../static/vendor/ort-wasm-simd-threaded.mjs"),
             "text/javascript; charset=utf-8",
@@ -2365,6 +2733,10 @@ async fn vendor_asset(AxumPath(path): AxumPath<String>) -> Response {
         ),
         "LICENSE-transformers-js" => (
             include_bytes!("../static/vendor/LICENSE-transformers-js"),
+            "text/plain; charset=utf-8",
+        ),
+        "LICENSE-hls.js" => (
+            include_bytes!("../static/vendor/LICENSE-hls.js"),
             "text/plain; charset=utf-8",
         ),
         "LICENSE-onnxruntime-web" => (
@@ -2591,9 +2963,10 @@ fn page_shell_with_options(
         "app-layout guest-layout"
     };
     format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\"><title>{}</title><link rel=\"stylesheet\" href=\"{}\"><script src=\"{}\" defer></script></head><body>{}<a class=\"skip-link\" href=\"#main-content\">Skip to content</a><div class=\"{layout}\"><aside class=\"left-sidebar\"><a class=\"brand\" href=\"/app\">AppView</a>{navigation}</aside><div class=\"center-column\"><header class=\"center-sticky\">{tabs}</header><main id=\"main-content\" class=\"page-content\">{content}</main></div>{right_sidebar}</div>{mobile_navigation}</body></html>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\"><title>{}</title><link rel=\"stylesheet\" href=\"{}\"><script src=\"{}\" defer></script><script src=\"{}\" defer></script></head><body>{}<a class=\"skip-link\" href=\"#main-content\">Skip to content</a><div class=\"{layout}\"><aside class=\"left-sidebar\"><a class=\"brand\" href=\"/app\">AppView</a>{navigation}</aside><div class=\"center-column\"><header class=\"center-sticky\">{tabs}</header><main id=\"main-content\" class=\"page-content\">{content}</main></div>{right_sidebar}</div>{mobile_navigation}</body></html>",
         html_escape(title),
         WEB_STYLESHEET_URL,
+        HLS_SCRIPT_URL,
         WEB_SCRIPT_URL,
         icon_sprite()
     )
@@ -3649,15 +4022,19 @@ where
     let write_access = has_all_write_scopes(account.granted_scope.as_deref());
     let feed_access = has_all_feed_scopes(account.granted_scope.as_deref());
     let blob_access = has_blob_scope(account.granted_scope.as_deref());
+    let video_access = has_all_video_scopes(account.granted_scope.as_deref());
     let cookie = format!(
         "{SESSION_COOKIE}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL_SECONDS}{}",
         state.public.issue_session_cookie(
             &account.did,
             &session_id,
             generation,
-            write_access,
-            feed_access,
-            blob_access,
+            SessionPermissions {
+                write: write_access,
+                feed: feed_access,
+                blob: blob_access,
+                video: video_access,
+            },
         ),
         if state.public.secure_cookies() {
             "; Secure"
@@ -3685,7 +4062,7 @@ where
     if !same_origin_request(&headers, &state.public.public_url) {
         return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
     }
-    let Some((did, session_id, _, _, _, _)) =
+    let Some((did, session_id, _, _, _, _, _)) =
         verified_cookie_session(&state.public, &headers, state.storage.as_ref())
     else {
         return clear_session_cookie(
@@ -3878,10 +4255,14 @@ where
     };
     let post_form = if write_forms_enabled {
         format!(
-            "<form class=\"composer image-composer\" action=\"/post\" method=\"post\" enctype=\"multipart/form-data\" data-image-composer><label for=\"new-post\">Write a post</label><textarea id=\"new-post\" name=\"text\" rows=\"3\" maxlength=\"300\" required></textarea>{}{}<button type=\"submit\">Post</button><p class=\"composer-error\" data-composer-error role=\"alert\" hidden></p></form>",
+            "<form class=\"composer image-composer\" action=\"/post\" method=\"post\" enctype=\"multipart/form-data\" data-image-composer><label for=\"new-post\">Write a post</label><textarea id=\"new-post\" name=\"text\" rows=\"3\" maxlength=\"300\" required></textarea>{}{}{}<button type=\"submit\">Post</button><p class=\"composer-error\" data-composer-error role=\"alert\" hidden></p></form>",
             render_image_picker(
                 verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref()),
                 "post-images"
+            ),
+            render_video_picker(
+                verified_cookie_video_access(&state.public, &headers, state.storage.as_ref()),
+                "post-video",
             ),
             render_link_picker("post-link")
         )
@@ -5049,6 +5430,7 @@ where
             state.storage.as_ref(),
             &record,
             verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref()),
+            verified_cookie_video_access(&state.public, &headers, state.storage.as_ref()),
         )
     } else {
         String::new()
@@ -5130,11 +5512,15 @@ where
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
     let composer = if write_forms_enabled {
         format!(
-            "<form class=\"composer quote-composer image-composer\" action=\"/quote\" method=\"post\" enctype=\"multipart/form-data\" data-image-composer><label for=\"quote-text\">Write a quote post</label><input type=\"hidden\" name=\"quote_uri\" value=\"{}\"><textarea id=\"quote-text\" name=\"text\" rows=\"4\" maxlength=\"300\" required></textarea>{}{}{}<button type=\"submit\">Post</button><p class=\"composer-error\" data-composer-error role=\"alert\" hidden></p></form>",
+            "<form class=\"composer quote-composer image-composer\" action=\"/quote\" method=\"post\" enctype=\"multipart/form-data\" data-image-composer><label for=\"quote-text\">Write a quote post</label><input type=\"hidden\" name=\"quote_uri\" value=\"{}\"><textarea id=\"quote-text\" name=\"text\" rows=\"4\" maxlength=\"300\" required></textarea>{}{}{}{}<button type=\"submit\">Post</button><p class=\"composer-error\" data-composer-error role=\"alert\" hidden></p></form>",
             html_escape(&quoted.uri),
             render_image_picker(
                 verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref()),
                 "quote-images"
+            ),
+            render_video_picker(
+                verified_cookie_video_access(&state.public, &headers, state.storage.as_ref()),
+                "quote-video",
             ),
             render_link_picker("quote-link"),
             render_quote_preview(state.storage.as_ref(), &quoted)
@@ -5381,15 +5767,17 @@ fn render_reply_composer<S: Storage>(
     storage: &S,
     parent: &IndexedRecord,
     blob_access: bool,
+    video_access: bool,
 ) -> String {
     let profile = profile_view_from_storage(storage, &parent.did)
         .unwrap_or_else(|_| json!({"did":parent.did,"handle":parent.did}));
     let handle = profile_handle(&profile, &parent.did);
     format!(
-        "<form id=\"reply-composer\" class=\"composer reply-composer image-composer\" action=\"/reply\" method=\"post\" enctype=\"multipart/form-data\" data-image-composer><p class=\"reply-context\">Replying to @{}</p><input type=\"hidden\" name=\"parent_uri\" value=\"{}\"><label for=\"reply-text\">Write a reply</label><textarea id=\"reply-text\" name=\"text\" rows=\"3\" maxlength=\"300\" required></textarea>{}{}<button type=\"submit\">Reply</button><p class=\"composer-error\" data-composer-error role=\"alert\" hidden></p></form>",
+        "<form id=\"reply-composer\" class=\"composer reply-composer image-composer\" action=\"/reply\" method=\"post\" enctype=\"multipart/form-data\" data-image-composer><p class=\"reply-context\">Replying to @{}</p><input type=\"hidden\" name=\"parent_uri\" value=\"{}\"><label for=\"reply-text\">Write a reply</label><textarea id=\"reply-text\" name=\"text\" rows=\"3\" maxlength=\"300\" required></textarea>{}{}{}<button type=\"submit\">Reply</button><p class=\"composer-error\" data-composer-error role=\"alert\" hidden></p></form>",
         html_escape(&handle),
         html_escape(&parent.uri),
         render_image_picker(blob_access, "reply-images"),
+        render_video_picker(video_access, "reply-video"),
         render_link_picker("reply-link")
     )
 }
@@ -5400,6 +5788,15 @@ fn render_image_picker(blob_access: bool, id: &str) -> String {
     }
     format!(
         "<fieldset class=\"image-picker\"><legend>Add pictures</legend><label for=\"{id}\">Choose up to 4 images</label><input id=\"{id}\" type=\"file\" name=\"images\" accept=\"image/*\" multiple data-image-input><div class=\"image-previews\" data-image-previews></div><p class=\"image-picker-status\" data-image-status role=\"status\"></p></fieldset>"
+    )
+}
+
+fn render_video_picker(video_access: bool, id: &str) -> String {
+    if !video_access {
+        return "<p class=\"video-permission-hint\" role=\"status\"><a href=\"/login\">sign in again to post videos</a></p>".to_owned();
+    }
+    format!(
+        "<fieldset class=\"video-picker\"><legend>Add a video</legend><label for=\"{id}\">Choose one MP4, WebM, or MOV video (up to 300 MB and 10 minutes)</label><input id=\"{id}\" type=\"file\" name=\"video\" accept=\"video/mp4,video/webm,video/quicktime,.mp4,.webm,.mov\" data-video-input><video class=\"video-picker-preview\" data-video-preview muted controls playsinline preload=\"metadata\" hidden></video><p class=\"video-picker-status\" data-video-summary role=\"status\" aria-live=\"polite\">No video selected.</p><label class=\"video-alt-label\" for=\"{id}-alt\">Video alt text (optional)<textarea id=\"{id}-alt\" name=\"video_alt\" maxlength=\"2000\" rows=\"2\" data-video-alt></textarea></label><button type=\"button\" data-video-remove hidden>Remove video</button><progress data-video-progress max=\"100\" value=\"0\" hidden></progress><p class=\"video-upload-status\" data-video-upload-status role=\"status\" aria-live=\"polite\"></p></fieldset>"
     )
 }
 
@@ -5688,6 +6085,274 @@ struct PostSubmission {
     images: Vec<PostImage>,
 }
 
+struct VideoSubmission {
+    text: String,
+    parent_uri: Option<String>,
+    quote_uri: Option<String>,
+    video: PostVideo,
+}
+
+struct TemporaryVideoFile(Option<PathBuf>);
+
+impl TemporaryVideoFile {
+    fn take_path(&mut self) -> PathBuf {
+        self.0.take().expect("temporary video path is present")
+    }
+}
+
+impl Drop for TemporaryVideoFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take()
+            && let Err(error) = fs::remove_file(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %path.display(), %error, "could not remove incomplete video upload");
+        }
+    }
+}
+
+fn create_temporary_video_file() -> Result<(TemporaryVideoFile, tokio::fs::File), String> {
+    for _ in 0..4 {
+        let mut nonce = [0u8; 18];
+        thread_rng().fill_bytes(&mut nonce);
+        let path = std::env::temp_dir().join(format!(
+            "appview-video-{}-{}",
+            std::process::id(),
+            URL_SAFE_NO_PAD.encode(nonce)
+        ));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(file) => {
+                return Ok((
+                    TemporaryVideoFile(Some(path)),
+                    tokio::fs::File::from_std(file),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "temporary video file could not be created: {error}"
+                ));
+            }
+        }
+    }
+    Err("temporary video file could not be created".to_owned())
+}
+
+async fn parse_video_submission<F, S>(
+    request: Request,
+    state: &Arc<OAuthWebState<F, S>>,
+) -> Result<VideoSubmission, (StatusCode, String)>
+where
+    F: OAuthFlow,
+    S: Storage + 'static,
+{
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !content_type.starts_with("multipart/form-data") {
+        return Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Use a multipart form to upload a video.".to_owned(),
+        ));
+    }
+    let mut multipart = Multipart::from_request(request, state).await.map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "The video form could not be read.".to_owned(),
+        )
+    })?;
+    let mut text = String::new();
+    let mut parent_uri = None;
+    let mut quote_uri = None;
+    let mut alt = String::new();
+    let mut duration = None;
+    let mut width = None;
+    let mut height = None;
+    let mut video_file: Option<(TemporaryVideoFile, String, u64, Vec<u8>)> = None;
+    while let Some(mut field) = multipart.next_field().await.map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "The video form could not be read.".to_owned(),
+        )
+    })? {
+        let name = field.name().unwrap_or_default().to_owned();
+        if name == "video" {
+            if video_file.is_some() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Choose one video per post.".to_owned(),
+                ));
+            }
+            let mime_type = field
+                .content_type()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            let (temporary, mut file) = create_temporary_video_file()
+                .map_err(|message| (StatusCode::INTERNAL_SERVER_ERROR, message))?;
+            let mut size = 0u64;
+            let mut prefix = Vec::with_capacity(16);
+            while let Some(chunk) = field.chunk().await.map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "The video file could not be read.".to_owned(),
+                )
+            })? {
+                size = size.saturating_add(chunk.len() as u64);
+                if size > MAX_VIDEO_BYTES {
+                    return Err((
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "Videos must be no larger than 300,000,000 bytes.".to_owned(),
+                    ));
+                }
+                if prefix.len() < 16 {
+                    prefix.extend_from_slice(&chunk[..chunk.len().min(16 - prefix.len())]);
+                }
+                file.write_all(&chunk).await.map_err(|error| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Video could not be saved temporarily: {error}"),
+                    )
+                })?;
+            }
+            file.flush().await.map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Video could not be saved temporarily: {error}"),
+                )
+            })?;
+            drop(file);
+            video_file = Some((temporary, mime_type, size, prefix));
+        } else {
+            const MAX_VIDEO_FORM_FIELD_BYTES: usize = 8192;
+            let mut value = Vec::new();
+            while let Some(chunk) = field.chunk().await.map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "A video form field could not be read.".to_owned(),
+                )
+            })? {
+                if value.len().saturating_add(chunk.len()) > MAX_VIDEO_FORM_FIELD_BYTES {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "A video form field is too long.".to_owned(),
+                    ));
+                }
+                value.extend_from_slice(&chunk);
+            }
+            let value = String::from_utf8(value).map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "A video form field is invalid.".to_owned(),
+                )
+            })?;
+            match name.as_str() {
+                "text" => text = value,
+                "parent_uri" => parent_uri = Some(value),
+                "quote_uri" => quote_uri = Some(value),
+                "video_alt" => alt = value,
+                "video_duration" => duration = value.parse::<f64>().ok(),
+                "video_width" => width = value.parse::<u32>().ok(),
+                "video_height" => height = value.parse::<u32>().ok(),
+                _ => {}
+            }
+        }
+    }
+    let Some((mut temporary, mime_type, size_bytes, prefix)) = video_file else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Choose a video to post.".to_owned(),
+        ));
+    };
+    let duration_seconds = duration.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Video duration could not be read. Choose the video again.".to_owned(),
+        )
+    })?;
+    validate_video_properties(size_bytes, duration_seconds, &mime_type)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    if alt.chars().count() > MAX_VIDEO_ALT_CHARS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Video alt text must be no more than 2,000 characters.".to_owned(),
+        ));
+    }
+    let (Some(width), Some(height)) = (
+        width.filter(|value| (1..=10_000).contains(value)),
+        height.filter(|value| (1..=10_000).contains(value)),
+    ) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Video dimensions could not be read. Choose the video again.".to_owned(),
+        ));
+    };
+    if !video_content_matches(&prefix, &mime_type) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "The video contents do not match the declared video type.".to_owned(),
+        ));
+    }
+    let extension = video_extension(&mime_type);
+    let stored_path = temporary.0.as_deref().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Video temporary file was lost.".to_owned(),
+        )
+    })?;
+    let filename = format!(
+        "{}.{}",
+        stored_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy(),
+        extension
+    );
+    let path = temporary.take_path();
+    let video = PostVideo {
+        path,
+        mime_type,
+        alt,
+        width,
+        height,
+        duration_seconds,
+        size_bytes,
+        filename,
+    };
+    Ok(VideoSubmission {
+        text,
+        parent_uri,
+        quote_uri,
+        video,
+    })
+}
+
+fn video_content_matches(prefix: &[u8], mime_type: &str) -> bool {
+    match mime_type {
+        "video/mp4" | "video/quicktime" => prefix.len() >= 12 && &prefix[4..8] == b"ftyp",
+        "video/webm" => prefix.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]),
+        _ => false,
+    }
+}
+
+fn video_extension(mime_type: &str) -> &'static str {
+    match mime_type {
+        "video/webm" => "webm",
+        "video/quicktime" => "mov",
+        _ => "mp4",
+    }
+}
+
 async fn parse_post_submission<F, S>(
     request: Request,
     state: &Arc<OAuthWebState<F, S>>,
@@ -5728,6 +6393,12 @@ where
             )
         })? {
             let name = field.name().unwrap_or_default().to_owned();
+            if name == "video" {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Enable JavaScript to validate and upload videos.".to_owned(),
+                ));
+            }
             if name == "images" {
                 let filename = field.file_name().unwrap_or_default().to_owned();
                 let mime_type = field.content_type().unwrap_or_default().to_owned();
@@ -5902,6 +6573,121 @@ fn selected_link_url(has_images: bool, link_url: Option<&str>) -> Option<&str> {
         None
     } else {
         link_url.map(str::trim).filter(|value| !value.is_empty())
+    }
+}
+
+async fn upload_video<F, S>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    request: Request,
+) -> Response
+where
+    F: OAuthFlow,
+    S: Storage + 'static,
+{
+    let headers = request.headers().clone();
+    if !same_origin_request(&headers, &state.public.public_url) {
+        return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
+    }
+    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+        return Redirect::to("/login").into_response();
+    };
+    if !verified_cookie_write_access(&state.public, &headers, state.storage.as_ref()) {
+        return oauth_error(StatusCode::FORBIDDEN, "write permissions were not granted");
+    }
+    if !verified_cookie_video_access(&state.public, &headers, state.storage.as_ref()) {
+        return oauth_error(StatusCode::FORBIDDEN, "sign in again to post videos");
+    }
+    let submission = match parse_video_submission(request, &state).await {
+        Ok(submission) => submission,
+        Err((status, message)) => return oauth_error(status, &message),
+    };
+    let text = submission.text.trim();
+    if text.is_empty() || text.chars().count() > 300 {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "post text must contain 1 to 300 characters",
+        );
+    }
+    if submission.parent_uri.is_some() && submission.quote_uri.is_some() {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "A video post cannot be both a reply and a quote.",
+        );
+    }
+
+    let mut reply = None;
+    let mut quote = None;
+    let mut redirect = "/app".to_owned();
+    if let Some(parent_uri) = submission.parent_uri.as_deref() {
+        if post_uri_did(parent_uri).is_none() {
+            return oauth_error(StatusCode::BAD_REQUEST, "parent_uri is not a post URI");
+        }
+        let parent = match load_post_record(&state.flow, state.storage.as_ref(), parent_uri).await {
+            Ok(Some(record)) => record,
+            Ok(None) => return oauth_error(StatusCode::NOT_FOUND, "parent post not found"),
+            Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
+        };
+        let Some(parent_cid) = parent.cid.as_deref().filter(|cid| !cid.is_empty()) else {
+            return oauth_error(StatusCode::BAD_REQUEST, "parent post has no CID");
+        };
+        let parent_ref = PostStrongRef {
+            uri: parent.uri.clone(),
+            cid: parent_cid.to_owned(),
+        };
+        let root_ref = if let Some(root) = parent.record.pointer("/reply/root") {
+            let (Some(uri), Some(cid)) = (
+                root.get("uri").and_then(Value::as_str),
+                root.get("cid").and_then(Value::as_str),
+            ) else {
+                return oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "parent reply has no root reference",
+                );
+            };
+            PostStrongRef {
+                uri: uri.to_owned(),
+                cid: cid.to_owned(),
+            }
+        } else {
+            parent_ref.clone()
+        };
+        reply = Some(json!({"root":root_ref,"parent":parent_ref}));
+    }
+    if let Some(quote_uri) = submission.quote_uri.as_deref() {
+        if post_uri_did(quote_uri).is_none() {
+            return oauth_error(StatusCode::BAD_REQUEST, "quote_uri is not a post URI");
+        }
+        let quoted = match load_post_record(&state.flow, state.storage.as_ref(), quote_uri).await {
+            Ok(Some(record)) => record,
+            Ok(None) => return oauth_error(StatusCode::NOT_FOUND, "quoted post not found"),
+            Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
+        };
+        let Some(cid) = quoted.cid.as_deref().filter(|cid| !cid.is_empty()) else {
+            return oauth_error(StatusCode::BAD_REQUEST, "quoted post has no CID");
+        };
+        quote = Some(PostStrongRef {
+            uri: quoted.uri,
+            cid: cid.to_owned(),
+        });
+    }
+
+    let created = state
+        .flow
+        .create_post_with_video(&did, text, submission.video, reply, quote)
+        .await;
+    let created = match created {
+        Ok(created) => created,
+        Err(error) => {
+            tracing::warn!(%error, "video upload or processing failed before record creation");
+            return oauth_error(StatusCode::BAD_GATEWAY, &error);
+        }
+    };
+    if submission.parent_uri.is_some() {
+        redirect = format!("/app/thread?uri={}", form_encoded(&created.uri));
+    }
+    match persist_created_record(state.storage.clone(), &did, "app.bsky.feed.post", created).await {
+        Ok(()) => Redirect::to(&redirect).into_response(),
+        Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
     }
 }
 
@@ -6452,7 +7238,7 @@ fn verified_cookie_did<S: Storage>(
     headers: &HeaderMap,
     storage: &S,
 ) -> Option<String> {
-    verified_cookie_session(public, headers, storage).map(|(did, _, _, _, _, _)| did)
+    verified_cookie_session(public, headers, storage).map(|(did, _, _, _, _, _, _)| did)
 }
 
 fn verified_cookie_write_access<S: Storage>(
@@ -6461,7 +7247,7 @@ fn verified_cookie_write_access<S: Storage>(
     storage: &S,
 ) -> bool {
     verified_cookie_session(public, headers, storage)
-        .is_some_and(|(_, _, _, write_access, _, _)| write_access)
+        .is_some_and(|(_, _, _, write_access, _, _, _)| write_access)
 }
 
 fn verified_cookie_blob_access<S: Storage>(
@@ -6470,7 +7256,16 @@ fn verified_cookie_blob_access<S: Storage>(
     storage: &S,
 ) -> bool {
     verified_cookie_session(public, headers, storage)
-        .is_some_and(|(_, _, _, _, _, blob_access)| blob_access)
+        .is_some_and(|(_, _, _, _, _, blob_access, _)| blob_access)
+}
+
+fn verified_cookie_video_access<S: Storage>(
+    public: &OAuthPublic,
+    headers: &HeaderMap,
+    storage: &S,
+) -> bool {
+    verified_cookie_session(public, headers, storage)
+        .is_some_and(|(_, _, _, _, _, _, video_access)| video_access)
 }
 
 fn verified_cookie_feed_access<S: Storage>(
@@ -6479,15 +7274,15 @@ fn verified_cookie_feed_access<S: Storage>(
     storage: &S,
 ) -> bool {
     verified_cookie_session(public, headers, storage)
-        .is_some_and(|(_, _, _, _, feed_access, _)| feed_access)
+        .is_some_and(|(_, _, _, _, feed_access, _, _)| feed_access)
 }
 
 fn verified_cookie_session<S: Storage>(
     public: &OAuthPublic,
     headers: &HeaderMap,
     storage: &S,
-) -> Option<(String, String, u64, bool, bool, bool)> {
-    let (did, session_id, generation, write_access, feed_access, blob_access) =
+) -> Option<(String, String, u64, bool, bool, bool, bool)> {
+    let (did, session_id, generation, write_access, feed_access, blob_access, video_access) =
         cookie_value(headers).and_then(|value| public.verify_session_cookie(value))?;
     (storage
         .web_session_generation(&did, &session_id)
@@ -6501,6 +7296,7 @@ fn verified_cookie_session<S: Storage>(
         write_access,
         feed_access,
         blob_access,
+        video_access,
     ))
 }
 
@@ -7214,6 +8010,9 @@ fn render_web_embed_with_quotes<S: Storage>(
     }
     match embed.get("$type").and_then(Value::as_str) {
         Some("app.bsky.embed.images") => render_web_images(author_did, embed),
+        Some("app.bsky.embed.video") | Some("app.bsky.embed.video#view") => {
+            render_web_video(author_did, embed)
+        }
         Some("app.bsky.embed.external") => render_web_external(author_did, embed),
         Some("app.bsky.embed.record") | Some("app.bsky.embed.record#view") => {
             render_web_quote(storage, embed, quote_index, quote_depth)
@@ -7239,6 +8038,63 @@ fn render_web_embed_with_quotes<S: Storage>(
         }
         _ => String::new(),
     }
+}
+
+fn render_web_video(author_did: &str, embed: &Value) -> String {
+    let cid = embed.get("cid").and_then(Value::as_str).or_else(|| {
+        embed
+            .pointer("/video/ref/$link")
+            .or_else(|| embed.pointer("/video/ref"))
+            .and_then(Value::as_str)
+    });
+    let canonical_url = |asset: &str| {
+        let did = url::form_urlencoded::byte_serialize(author_did.as_bytes()).collect::<String>();
+        let cid = url::form_urlencoded::byte_serialize(cid?.as_bytes()).collect::<String>();
+        Some(format!("{VIDEO_SERVICE_URL}/watch/{did}/{cid}/{asset}"))
+    };
+    let playlist = embed
+        .get("playlist")
+        .and_then(Value::as_str)
+        .and_then(approved_video_cdn_url)
+        .or_else(|| canonical_url("playlist.m3u8"));
+    let Some(playlist) = playlist else {
+        return String::new();
+    };
+    let thumbnail = embed
+        .get("thumbnail")
+        .and_then(Value::as_str)
+        .and_then(approved_video_cdn_url)
+        .or_else(|| canonical_url("thumbnail.jpg"));
+    let alt = embed.get("alt").and_then(Value::as_str).unwrap_or_default();
+    let (dimensions, ratio_class) = embed
+        .get("aspectRatio")
+        .and_then(|ratio| {
+            let width = ratio.get("width")?.as_u64()?;
+            let height = ratio.get("height")?.as_u64()?;
+            (width > 0 && height > 0 && width <= 10_000 && height <= 10_000)
+                .then(|| (format!(" width=\"{width}\" height=\"{height}\""), ""))
+        })
+        .unwrap_or_else(|| (String::new(), " video-default-ratio"));
+    let poster = thumbnail
+        .as_deref()
+        .map(|url| format!(" poster=\"{}\"", html_escape(url)))
+        .unwrap_or_default();
+    format!(
+        "<figure class=\"post-video{ratio_class}\"><video controls muted playsinline preload=\"none\" data-video-playlist=\"{}\" aria-label=\"{}\"{poster}{dimensions}></video><a class=\"video-playlist-link\" href=\"{}\" rel=\"nofollow noopener noreferrer\">Open video playlist</a></figure>",
+        html_escape(&playlist),
+        html_escape(alt),
+        html_escape(&playlist)
+    )
+}
+
+fn approved_video_cdn_url(value: &str) -> Option<String> {
+    let url = reqwest::Url::parse(value).ok()?;
+    (url.scheme() == "https"
+        && url.host_str() == Some("video.bsky.app")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.path().starts_with("/watch/"))
+    .then(|| value.to_owned())
 }
 
 fn render_web_images(author_did: &str, embed: &Value) -> String {
@@ -7518,6 +8374,16 @@ fn has_blob_scope(scope: Option<&str>) -> bool {
     scope.is_some_and(|scope| scope.split_whitespace().any(|value| value == BLOB_SCOPE))
 }
 
+fn has_all_video_scopes(scope: Option<&str>) -> bool {
+    let Some(scope) = scope else {
+        return false;
+    };
+    let granted = scope.split_whitespace().collect::<HashSet<_>>();
+    VIDEO_SCOPES
+        .iter()
+        .all(|required| granted.contains(required))
+}
+
 fn requested_scopes() -> Vec<Scope> {
     std::iter::once(Scope::Known(KnownScope::Atproto))
         .chain(
@@ -7528,6 +8394,11 @@ fn requested_scopes() -> Vec<Scope> {
         .chain(std::iter::once(Scope::Unknown(BLOB_SCOPE.to_owned())))
         .chain(
             FEED_SCOPES
+                .iter()
+                .map(|scope| Scope::Unknown((*scope).to_owned())),
+        )
+        .chain(
+            VIDEO_SCOPES
                 .iter()
                 .map(|scope| Scope::Unknown((*scope).to_owned())),
         )
@@ -7695,13 +8566,171 @@ mod tests {
         );
         assert!(rendered.contains("<video"), "{rendered}");
         assert!(rendered.contains("playlist.m3u8"), "{rendered}");
-        assert!(rendered.contains("A red bicycle rides past a park"), "{rendered}");
+        assert!(
+            rendered.contains("A red bicycle rides past a park"),
+            "{rendered}"
+        );
         assert!(rendered.contains("width=\"1920\""), "{rendered}");
         assert!(rendered.contains("height=\"1080\""), "{rendered}");
         assert!(rendered.contains("thumbnail.jpg"), "{rendered}");
         assert!(rendered.contains("controls"), "{rendered}");
         assert!(rendered.contains("muted"), "{rendered}");
         assert!(!rendered.contains("autoplay"), "{rendered}");
+    }
+
+    #[test]
+    fn video_oauth_scopes_are_explicit_and_old_scopes_do_not_enable_video() {
+        for scope in [
+            "blob:video/*",
+            "rpc:app.bsky.video.getUploadLimits?aud=did:web:video.bsky.app",
+            "rpc:app.bsky.video.uploadVideo?aud=did:web:video.bsky.app",
+            "rpc:app.bsky.video.getJobStatus?aud=did:web:video.bsky.app",
+        ] {
+            assert!(
+                REQUESTED_SCOPE
+                    .split_whitespace()
+                    .any(|value| value == scope)
+            );
+        }
+        let old_scope = "atproto repo:app.bsky.feed.post?action=create blob:image/*";
+        assert!(!has_all_video_scopes(Some(old_scope)));
+        assert!(has_all_video_scopes(Some(REQUESTED_SCOPE)));
+    }
+
+    #[test]
+    fn legacy_session_cookie_defaults_to_no_video_permission() {
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        let payload = URL_SAFE_NO_PAD.encode(
+            format!(
+                "did:plc:legacy\n{}\nlegacy-session\n7\ntrue\ntrue\ntrue",
+                unix_time().saturating_add(SESSION_TTL_SECONDS)
+            )
+            .as_bytes(),
+        );
+        let mut mac = HmacSha256::new_from_slice(&public.cookie_key()).unwrap();
+        mac.update(b"session:");
+        mac.update(payload.as_bytes());
+        let token = format!(
+            "{payload}.{}",
+            URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+        );
+
+        let session = public.verify_session_cookie(&token).unwrap();
+        assert!(session.5, "legacy blob permission remains available");
+        assert!(!session.6, "legacy sessions must sign in again for video");
+    }
+
+    #[test]
+    fn video_file_constraints_reject_oversize_and_overlong_uploads() {
+        assert!(validate_video_properties(MAX_VIDEO_BYTES + 1, 30.0, "video/mp4").is_err());
+        assert!(
+            validate_video_properties(1024, MAX_VIDEO_DURATION_SECONDS + 0.1, "video/mp4").is_err()
+        );
+        assert!(validate_video_properties(1024, 30.0, "video/webm").is_ok());
+    }
+
+    #[test]
+    fn daily_upload_limits_are_checked_before_forwarding_video_bytes() {
+        assert!(
+            validate_video_upload_limits(
+                &json!({"canUpload":true,"remainingDailyVideos":1,"remainingDailyBytes":1024}),
+                1024
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_video_upload_limits(
+                &json!({"canUpload":true,"remainingDailyVideos":0,"remainingDailyBytes":2048}),
+                1024
+            )
+            .unwrap_err()
+            .contains("daily video upload limit")
+        );
+        assert!(
+            validate_video_upload_limits(
+                &json!({"canUpload":true,"remainingDailyVideos":1,"remainingDailyBytes":500}),
+                1024
+            )
+            .unwrap_err()
+            .contains("daily video upload data limit")
+        );
+    }
+
+    #[tokio::test]
+    async fn video_job_polling_stops_after_completion_and_returns_the_blob() {
+        let mut states = [
+            json!({"jobStatus":{"jobId":"job-1","state":"JOB_STATE_ENCODING"}}),
+            json!({"jobStatus":{"jobId":"job-1","state":"JOB_STATE_COMPLETED","blob":{"ref":{"$link":"bafk-video"},"mimeType":"video/mp4","size":99}}}),
+        ]
+        .into_iter();
+        let blob = poll_video_job("job-1", Duration::ZERO, 3, |_| {
+            let state = states.next().expect("poll stops when the job completes");
+            Box::pin(async move { Ok(state) })
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            blob.pointer("/ref/$link").and_then(Value::as_str),
+            Some("bafk-video")
+        );
+    }
+
+    #[tokio::test]
+    async fn video_job_polling_stops_immediately_when_processing_fails() {
+        let mut states = [
+            json!({"jobStatus":{"jobId":"job-2","state":"JOB_STATE_SCANNING"}}),
+            json!({"jobStatus":{"jobId":"job-2","state":"JOB_STATE_FAILED","message":"Video moderation rejected this upload"}}),
+        ]
+        .into_iter();
+        let result = poll_video_job("job-2", Duration::ZERO, 3, |_| {
+            let state = states.next().expect("poll stops as soon as the job fails");
+            Box::pin(async move { Ok(state) })
+        })
+        .await;
+        assert_eq!(result.unwrap_err(), "Video moderation rejected this upload");
+    }
+
+    #[test]
+    fn video_post_record_contains_video_blob_alt_ratio_reply_and_quote_shapes() {
+        let blob =
+            json!({"$type":"blob","ref":{"$link":"bafk-video"},"mimeType":"video/mp4","size":99});
+        let base = build_video_post_record(
+            "A clip",
+            blob.clone(),
+            "A river at sunset",
+            1920,
+            1080,
+            None,
+            None,
+        );
+        assert_eq!(base["embed"]["$type"], "app.bsky.embed.video");
+        assert_eq!(base["embed"]["video"], blob);
+        assert_eq!(base["embed"]["alt"], "A river at sunset");
+        assert_eq!(
+            base["embed"]["aspectRatio"],
+            json!({"width":1920,"height":1080})
+        );
+
+        let quoted = PostStrongRef {
+            uri: "at://did:plc:author/app.bsky.feed.post/abc".to_owned(),
+            cid: "cid-quoted".to_owned(),
+        };
+        let quote = build_video_post_record(
+            "Quote",
+            blob.clone(),
+            "alt",
+            1,
+            1,
+            None,
+            Some(quoted.clone()),
+        );
+        assert_eq!(quote["embed"]["$type"], "app.bsky.embed.recordWithMedia");
+        assert_eq!(quote["embed"]["media"]["$type"], "app.bsky.embed.video");
+        assert_eq!(quote["embed"]["record"]["record"]["uri"], quoted.uri);
+        let reply = json!({"root":{"uri":"root-uri","cid":"root-cid"},"parent":{"uri":"parent-uri","cid":"parent-cid"}});
+        let reply_post =
+            build_video_post_record("Reply", blob, "alt", 1, 1, Some(reply.clone()), None);
+        assert_eq!(reply_post["reply"], reply);
     }
 
     #[tokio::test]
@@ -7711,7 +8740,17 @@ mod tests {
         let did = "did:plc:av27viewer";
         let session_id = "av27-session";
         let generation = storage.rotate_web_session(did, session_id).unwrap();
-        let token = public.issue_session_cookie(did, session_id, generation, true, true, true);
+        let token = public.issue_session_cookie(
+            did,
+            session_id,
+            generation,
+            SessionPermissions {
+                write: true,
+                feed: true,
+                blob: true,
+                video: true,
+            },
+        );
         let app = public.router_with_flow(DisabledOAuthFlow, storage);
         let response = app
             .oneshot(
@@ -7772,8 +8811,8 @@ mod tests {
         assert!(css.contains(".thread-focus-actions .is-liked .icon {\n  fill: var(--accent);"));
         assert!(css.contains(".infinite-scroll-status {"));
         assert!(css.contains(".infinite-scroll-retry[hidden] {\n  display: none;"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m12"));
-        assert!(WEB_SCRIPT_URL.contains("v=js10"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m13"));
+        assert!(WEB_SCRIPT_URL.contains("v=js11"));
     }
 
     #[test]
@@ -8158,8 +9197,17 @@ mod tests {
         let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
         let session_id = "av28-timeline-session";
         let generation = storage.rotate_web_session(viewer, session_id).unwrap();
-        let token =
-            public.issue_session_cookie(viewer, session_id, generation, false, false, false);
+        let token = public.issue_session_cookie(
+            viewer,
+            session_id,
+            generation,
+            SessionPermissions {
+                write: false,
+                feed: false,
+                blob: false,
+                video: false,
+            },
+        );
         let app = public.router_with_flow(flow, storage);
         let response = app
             .oneshot(

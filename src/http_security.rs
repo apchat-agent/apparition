@@ -18,6 +18,7 @@ use tower_http::{compression::CompressionLayer, limit::RequestBodyLimitLayer};
 const MAX_URI_BYTES: usize = 8 * 1024;
 const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024;
 const MAX_PICTURE_REQUEST_BODY_BYTES: usize = 5 * 1024 * 1024;
+const MAX_VIDEO_REQUEST_BODY_BYTES: usize = 301 * 1024 * 1024;
 const WINDOW: Duration = Duration::from_secs(60);
 const MAX_BUCKETS: usize = 4096;
 
@@ -53,7 +54,9 @@ pub fn protect_with_picture_body_limit(router: Router, public_https: bool) -> Ro
 }
 
 async fn limit_picture_request_body(request: Request<Body>, next: Next) -> Response<Body> {
-    let limit = if request.method() == http::Method::POST
+    let limit = if request.method() == http::Method::POST && request.uri().path() == "/video" {
+        MAX_VIDEO_REQUEST_BODY_BYTES
+    } else if request.method() == http::Method::POST
         && matches!(request.uri().path(), "/post" | "/reply" | "/quote")
     {
         MAX_PICTURE_REQUEST_BODY_BYTES
@@ -203,7 +206,7 @@ fn with_headers(mut response: Response<Body>, public_https: bool) -> Response<Bo
     // redirect: with 'self' alone they stopped on our login page (Firefox doesn't, 2026-10-28).
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        "default-src 'none'; base-uri 'none'; form-action 'self' https:; img-src 'self' blob: https://cdn.bsky.app; style-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self'; object-src 'none'; frame-ancestors 'none'"
+        "default-src 'none'; base-uri 'none'; form-action 'self' https:; img-src 'self' blob: https://cdn.bsky.app https://video.bsky.app; media-src 'self' blob: https://video.bsky.app; style-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self' https://video.bsky.app; object-src 'none'; frame-ancestors 'none'"
             .parse()
             .unwrap(),
     );

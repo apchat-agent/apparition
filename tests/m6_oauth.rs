@@ -4,8 +4,8 @@ use appview_rs::{
     ingest::{IndexedRecord, Ingestor, MemoryStorage, ScopeMode, SqliteStorage, Storage},
     oauth::{
         FetchedAuthorProfile, OAuthAccount, OAuthCallback, OAuthFlow, OAuthPublic,
-        PdsCreatedRecord, PinnedFeedTabs, PostStrongRef, ProfileRefreshWorker, SqliteOAuthStore,
-        WebShutdown,
+        PdsCreatedRecord, PinnedFeedTabs, PostImage, PostStrongRef, ProfileRefreshWorker,
+        SqliteOAuthStore, WebShutdown,
     },
 };
 use appview_rs::{router, router_with_oauth_flow};
@@ -26,7 +26,7 @@ use tower::ServiceExt;
 use tracing::{Event, Subscriber, field::Visit};
 use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
-const EXPECTED_OAUTH_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* blob:video/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* rpc:app.bsky.video.getUploadLimits?aud=did:web:video.bsky.app rpc:app.bsky.video.uploadVideo?aud=did:web:video.bsky.app rpc:app.bsky.video.getJobStatus?aud=did:web:video.bsky.app";
+const EXPECTED_OAUTH_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=did:web:video.bsky.app rpc:app.bsky.video.uploadVideo?aud=did:web:video.bsky.app rpc:app.bsky.video.getJobStatus?aud=did:web:video.bsky.app";
 
 #[derive(Clone)]
 struct ProfileHydrationTiming(Arc<Mutex<Option<u64>>>);
@@ -192,6 +192,42 @@ impl OAuthFlow for FakeOAuthFlow {
                 "pds-post-r1",
                 "pds-post-cid",
                 serde_json::json!({"$type":"app.bsky.feed.post","text":text,"createdAt":"2026-10-28T00:00:00Z"}),
+            ))
+        })
+    }
+
+    fn create_post_with_images<'a>(
+        &'a self,
+        did: &'a str,
+        text: &'a str,
+        images: Vec<PostImage>,
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.actions
+                .lock()
+                .unwrap()
+                .push(format!("image-post:{did}:{text}:{}", images.len()));
+            let images = images
+                .into_iter()
+                .map(|image| {
+                    serde_json::json!({
+                        "image":{"$type":"blob","ref":{"$link":"bafk-test-image"},"mimeType":image.mime_type,"size":image.bytes.len()},
+                        "alt":image.alt,
+                        "aspectRatio":{"width":image.width,"height":image.height}
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(fake_pds_create_record(
+                did,
+                "app.bsky.feed.post",
+                "pds-image-r1",
+                "pds-image-cid",
+                serde_json::json!({
+                    "$type":"app.bsky.feed.post",
+                    "text":text,
+                    "createdAt":"2026-10-28T00:00:00Z",
+                    "embed":{"$type":"app.bsky.embed.images","images":images}
+                }),
             ))
         })
     }
@@ -543,6 +579,24 @@ fn multipart_post_body(
     body
 }
 
+fn multipart_video_body(boundary: &str, text: &str, duration: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    append_multipart_text_field(&mut body, boundary, "text", text);
+    append_multipart_text_field(&mut body, boundary, "video_duration", duration);
+    append_multipart_text_field(&mut body, boundary, "video_width", "1920");
+    append_multipart_text_field(&mut body, boundary, "video_height", "1080");
+    append_multipart_text_field(&mut body, boundary, "video_alt", "A short sample clip");
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"video\"; filename=\"sample.mp4\"\r\nContent-Type: video/mp4\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(b"\0\0\0\x18ftypisom\0\0\0\0");
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    body
+}
+
 fn append_multipart_text_field(body: &mut Vec<u8>, boundary: &str, name: &str, value: &str) {
     body.extend_from_slice(
         format!(
@@ -889,12 +943,13 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
             ),
             "{path}"
         );
-        assert!(html.contains("href=\"/static/app.css?v=m12\""), "{path}");
+        assert!(html.contains("href=\"/static/app.css?v=m13\""), "{path}");
         assert!(!html.contains("style="), "{path}");
-        // One external, same-origin, deferred script (like toggles in place); never inline code.
-        assert_eq!(html.matches("<script").count(), 1, "{path}");
+        // Both playback and interaction scripts are local, deferred, and never inline.
+        assert_eq!(html.matches("<script").count(), 2, "{path}");
+        assert!(html.contains("<script src=\"/static/vendor/hls.min.js?v=1.7.3\" defer></script>"));
         assert!(
-            html.contains("<script src=\"/static/app.js?v=js10\" defer></script>"),
+            html.contains("<script src=\"/static/app.js?v=js11\" defer></script>"),
             "{path}"
         );
     }
@@ -902,7 +957,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
     let stylesheet = app
         .oneshot(
             Request::builder()
-                .uri("/static/app.css?v=m12")
+                .uri("/static/app.css?v=m13")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1200,11 +1255,12 @@ async fn sign_in_error_page_uses_the_shared_mobile_document_shell() {
     assert!(
         html.contains("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">")
     );
-    assert!(html.contains("href=\"/static/app.css?v=m12\""));
+    assert!(html.contains("href=\"/static/app.css?v=m13\""));
     assert!(!html.contains("style="));
-    // The shared shell's one external script, never inline code.
-    assert_eq!(html.matches("<script").count(), 1);
-    assert!(html.contains("<script src=\"/static/app.js?v=js10\" defer></script>"));
+    // The shared shell loads both local deferred scripts, never inline code.
+    assert_eq!(html.matches("<script").count(), 2);
+    assert!(html.contains("<script src=\"/static/vendor/hls.min.js?v=1.7.3\" defer></script>"));
+    assert!(html.contains("<script src=\"/static/app.js?v=js11\" defer></script>"));
 }
 
 #[tokio::test]
@@ -1272,6 +1328,41 @@ async fn web_posts_show_avatar_relative_time_and_accessible_actions() {
     assert!(html.contains("aria-label=\"Open replies\""));
     assert!(html.contains("aria-label=\"Like post by @alice.test\""));
     assert!(html.contains("aria-label=\"Repost by @alice.test\""));
+}
+
+#[tokio::test]
+async fn hls_playback_library_is_served_from_the_same_origin() {
+    let response = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/static/vendor/hls.min.js?v=1.7.3")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-type"],
+        "text/javascript; charset=utf-8"
+    );
+    assert!(
+        response.headers()["cache-control"]
+            .to_str()
+            .unwrap()
+            .contains("immutable")
+    );
+    assert!(
+        !response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -2108,8 +2199,8 @@ async fn old_scope_session_gets_a_friendly_feed_reauthorization_page() {
 }
 
 #[tokio::test]
-async fn old_scope_session_keeps_text_composer_and_shows_picture_reauthorization_hint() {
-    let old_scope = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete";
+async fn old_scope_session_keeps_text_and_picture_composer_and_requires_video_reauthorization() {
+    let old_scope = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/*";
     let flow = FakeOAuthFlow::with_granted_scope(Some(old_scope));
     let app = OAuthPublic::new("https://appview.example")
         .unwrap()
@@ -2138,10 +2229,11 @@ async fn old_scope_session_keeps_text_composer_and_shows_picture_reauthorization
     )
     .unwrap();
     assert!(html.contains("action=\"/post\""), "{html}");
-    assert!(html.contains("Log in again to enable pictures"), "{html}");
+    assert!(!html.contains("Log in again to enable pictures"), "{html}");
     assert!(html.contains("sign in again to post videos"), "{html}");
     assert!(html.contains("href=\"/login\""), "{html}");
-    assert!(!html.contains("type=\"file\""), "{html}");
+    assert!(html.contains("data-image-input"), "{html}");
+    assert!(!html.contains("data-video-input"), "{html}");
 
     let text_post = app
         .clone()
@@ -2159,6 +2251,35 @@ async fn old_scope_session_keeps_text_composer_and_shows_picture_reauthorization
         .await
         .unwrap();
     assert_eq!(text_post.status(), StatusCode::SEE_OTHER);
+
+    let video_boundary = "av31-video";
+    let video_post = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/video")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", &cookie)
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={video_boundary}"),
+                )
+                .body(Body::from(multipart_video_body(
+                    video_boundary,
+                    "video caption",
+                    "5",
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(video_post.status(), StatusCode::FORBIDDEN);
+    let video_message: Value =
+        serde_json::from_slice(&video_post.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert_eq!(video_message["message"], "sign in again to post videos");
 
     let boundary = "av26-picture";
     let body = multipart_post_body(
@@ -2186,21 +2307,47 @@ async fn old_scope_session_keeps_text_composer_and_shows_picture_reauthorization
         )
         .await
         .unwrap();
-    assert_eq!(image_post.status(), StatusCode::FORBIDDEN);
-    let message: Value =
-        serde_json::from_slice(&image_post.into_body().collect().await.unwrap().to_bytes())
-            .unwrap();
-    assert!(
-        message["message"]
-            .as_str()
-            .unwrap()
-            .contains("Log in again")
-    );
+    assert_eq!(image_post.status(), StatusCode::SEE_OTHER);
     assert_eq!(
         *flow.actions.lock().unwrap(),
-        ["post:did:plc:alice:still works"],
-        "the text-only post succeeds and no image post is attempted"
+        [
+            "post:did:plc:alice:still works",
+            "image-post:did:plc:alice:caption:1"
+        ],
+        "old image permission still permits picture posting alongside text"
     );
+}
+
+#[tokio::test]
+async fn overlong_video_is_rejected_before_the_oauth_flow_is_called() {
+    let flow = FakeOAuthFlow::default();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow.clone(), Arc::new(MemoryStorage::default()));
+    let cookie = finish_login(&app).await;
+    let boundary = "av31-too-long";
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/video")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", cookie)
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(multipart_video_body(boundary, "caption", "601")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let message: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert!(message["message"].as_str().unwrap().contains("10 minutes"));
+    assert!(flow.actions.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
