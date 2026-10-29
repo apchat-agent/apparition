@@ -9,6 +9,27 @@ use rusqlite::Connection;
 use std::time::{Duration, Instant};
 
 #[test]
+fn snapshot_test_temp_directory_is_removed_during_unwind() {
+    let dir = std::env::temp_dir().join(format!(
+        "appview-snapshot-guard-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let result = std::panic::catch_unwind(|| {
+        let _guard = TempDirGuard::new(&dir);
+        panic!("simulate a failed assertion after creating a large fixture");
+    });
+
+    assert!(result.is_err());
+    assert!(!dir.exists(), "snapshot test temp directory leaked on unwind");
+}
+
+#[test]
 fn page_reads_do_not_wait_for_a_writer_holding_the_database() {
     let dir = std::env::temp_dir().join(format!(
         "appview-reader-isolation-{}-{}",
