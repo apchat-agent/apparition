@@ -3093,7 +3093,16 @@ async fn timeline_replies_name_the_parent_author_and_link_to_the_thread() {
             .to_vec(),
     )
     .unwrap();
-    assert!(html.contains("replying to @friend.test"), "{html}");
+    assert!(html.contains("class=\"reply-parent-card\""), "{html}");
+    assert!(html.contains("parent post"), "{html}");
+    assert!(html.contains("@friend.test"), "{html}");
+    assert!(html.contains("class=\"reply-connector\""), "{html}");
+    assert!(
+        html.contains(
+            "href=\"/app/thread?uri=at%3A%2F%2Fdid%3Aplc%3Afriend%2Fapp.bsky.feed.post%2Fparent\""
+        ),
+        "{html}"
+    );
     assert!(
         html.contains(
             "href=\"/app/thread?uri=at%3A%2F%2Fdid%3Aplc%3Aalice%2Fapp.bsky.feed.post%2Freply\""
@@ -3149,7 +3158,9 @@ async fn timeline_reply_context_uses_verified_parent_handle_when_post_is_missing
             .to_vec(),
     )
     .unwrap();
-    assert!(html.contains("replying to @friend.test"), "{html}");
+    assert!(html.contains("Reply to <a"), "{html}");
+    assert!(html.contains("@friend.test"), "{html}");
+    assert!(html.contains("class=\"reply-connector\""), "{html}");
 }
 
 #[tokio::test]

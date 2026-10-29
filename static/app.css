@@ -650,8 +650,114 @@ button:hover,
 
 .post-item,
 .notification-item {
+  position: relative;
   min-width: 0;
   border-bottom: 1px solid var(--line);
+}
+
+.reply-parent-slot,
+.notification-reply-parent {
+  position: relative;
+}
+
+.reply-parent-card {
+  position: relative;
+  z-index: 1;
+  display: block;
+  padding: 0.7rem 1.25rem 0.15rem;
+  color: var(--muted);
+  text-decoration: none;
+}
+
+.reply-parent-card:hover .reply-parent-author strong {
+  text-decoration: underline;
+}
+
+.reply-parent-header {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 0.65rem;
+  font-size: 0.86rem;
+}
+
+.reply-parent-avatar.avatar,
+.reply-parent-avatar.avatar-placeholder {
+  width: 1.7rem;
+  height: 1.7rem;
+  flex-basis: 1.7rem;
+  margin-left: 0.55rem;
+}
+
+.reply-parent-author {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 0.4rem;
+}
+
+.reply-parent-author strong {
+  overflow: hidden;
+  color: var(--text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reply-parent-author > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reply-parent-text {
+  display: -webkit-box;
+  margin: 0.35rem 0 0 3.5rem;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 0.86rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.reply-parent-text a {
+  color: inherit;
+}
+
+.reply-parent-fallback {
+  position: relative;
+  z-index: 1;
+  margin: 0;
+  padding: 0.8rem 1.25rem 0.15rem 3.75rem;
+  color: var(--muted);
+  font-size: 0.86rem;
+}
+
+.reply-parent-fallback a {
+  color: inherit;
+}
+
+.reply-connector {
+  position: absolute;
+  z-index: 0;
+  top: 2rem;
+  bottom: -2.375rem;
+  left: 2.625rem;
+  width: 1px;
+  background: var(--line);
+  pointer-events: none;
+}
+
+.reply-connector-previous {
+  top: -2.375rem;
+  bottom: auto;
+  height: 4.75rem;
+}
+
+.reply-with-parent > .post-card {
+  padding-top: 0.4rem;
 }
 
 .post-card,

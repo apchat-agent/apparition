@@ -1,5 +1,5 @@
 use futures_util::StreamExt;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -373,6 +373,11 @@ pub trait Storage: Send + Sync {
         collection: &str,
         uri: &str,
     ) -> Result<Option<IndexedRecord>, StorageError>;
+    fn records_by_uri(
+        &self,
+        collection: &str,
+        uris: &[String],
+    ) -> Result<HashMap<String, IndexedRecord>, StorageError>;
     fn replies_to(
         &self,
         parent_uri: &str,
@@ -900,6 +905,25 @@ impl Storage for MemoryStorage {
             .values()
             .find(|record| record.collection == collection && record.uri == uri)
             .cloned())
+    }
+
+    fn records_by_uri(
+        &self,
+        collection: &str,
+        uris: &[String],
+    ) -> Result<HashMap<String, IndexedRecord>, StorageError> {
+        let wanted = uris.iter().map(String::as_str).collect::<HashSet<_>>();
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .records
+            .values()
+            .filter(|record| {
+                record.collection == collection && wanted.contains(record.uri.as_str())
+            })
+            .map(|record| (record.uri.clone(), record.clone()))
+            .collect())
     }
 
     fn replies_to(
@@ -2712,6 +2736,33 @@ impl Storage for SqliteStorage {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    fn records_by_uri(
+        &self,
+        collection: &str,
+        uris: &[String],
+    ) -> Result<HashMap<String, IndexedRecord>, StorageError> {
+        if uris.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = std::iter::repeat_n("?", uris.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT did, collection, rkey, uri, cid, time_us, record_json FROM records
+             WHERE collection=? AND uri IN ({placeholders})"
+        );
+        let connection = self.read_conn()?;
+        let mut statement = connection.prepare(&sql)?;
+        let params = std::iter::once(collection).chain(uris.iter().map(String::as_str));
+        let records = statement
+            .query_map(params_from_iter(params), row_to_record)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records
+            .into_iter()
+            .map(|record| (record.uri.clone(), record))
+            .collect())
     }
 
     fn replies_to(

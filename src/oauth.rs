@@ -85,7 +85,7 @@ const PROFILE_NEGATIVE_TTL: Duration = Duration::from_secs(60 * 60);
 const PAGE_PROFILE_BUDGET: Duration = Duration::from_millis(1500);
 const PAGE_PROFILE_CONCURRENCY: usize = 8;
 const PAGE_QUOTE_CONCURRENCY: usize = 16;
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m8";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m9";
 const WEB_SCRIPT_URL: &str = "/static/app.js?v=js7";
 const ALT_MODEL_DOWNLOAD_BYTES: u64 = 264_713_119;
 const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
@@ -2552,6 +2552,8 @@ struct PageContentHydration {
     quote_hydration_ms: u64,
 }
 
+type PageParentIndex = HashMap<String, Option<IndexedRecord>>;
+
 #[derive(Default)]
 struct ThreadAncestorStats {
     from_index: usize,
@@ -2573,6 +2575,7 @@ struct WebPageTiming {
     tabs_ms: u64,
     timeline_fetch_index_ms: u64,
     timeline_fetch_live_ms: u64,
+    parent_hydration_ms: u64,
     profile_hydration_ms: u64,
     quote_hydration_ms: u64,
     render_ms: u64,
@@ -2591,6 +2594,7 @@ impl WebPageTiming {
             tabs_ms: 0,
             timeline_fetch_index_ms: 0,
             timeline_fetch_live_ms: 0,
+            parent_hydration_ms: 0,
             profile_hydration_ms: 0,
             quote_hydration_ms: 0,
             render_ms: 0,
@@ -2610,6 +2614,7 @@ impl Drop for WebPageTiming {
             tabs_ms = self.tabs_ms,
             timeline_fetch_index_ms = self.timeline_fetch_index_ms,
             timeline_fetch_live_ms = self.timeline_fetch_live_ms,
+            parent_hydration_ms = self.parent_hydration_ms,
             profile_hydration_ms = self.profile_hydration_ms,
             quote_hydration_ms = self.quote_hydration_ms,
             render_ms = self.render_ms,
@@ -2995,6 +3000,94 @@ async fn hydrate_page_content<F: OAuthFlow, S: Storage + 'static>(
         profile_hydration_ms: profile_hydration_ms?,
         quote_hydration_ms: quote_hydration.1,
     })
+}
+
+async fn hydrate_page_parents<F: OAuthFlow, S: Storage>(
+    flow: &F,
+    storage: &S,
+    page_records: &[&IndexedRecord],
+    deadline: tokio::time::Instant,
+) -> Result<PageParentIndex, StorageError> {
+    let mut parent_uris = Vec::new();
+    let mut seen = HashSet::new();
+    for record in page_records {
+        if let Some(uri) = record
+            .record
+            .pointer("/reply/parent/uri")
+            .and_then(Value::as_str)
+            .filter(|uri| post_uri_did(uri).is_some())
+            && seen.insert(uri.to_owned())
+        {
+            parent_uris.push(uri.to_owned());
+        }
+    }
+    let mut parents = parent_uris
+        .iter()
+        .cloned()
+        .map(|uri| (uri, None))
+        .collect::<PageParentIndex>();
+    let local = storage.records_by_uri("app.bsky.feed.post", &parent_uris)?;
+    for (uri, record) in local {
+        parents.insert(uri, Some(record));
+    }
+
+    let missing = parent_uris
+        .into_iter()
+        .filter(|uri| parents.get(uri).is_some_and(Option::is_none))
+        .collect::<Vec<_>>();
+    let flow = flow.clone();
+    let mut fetches = stream::iter(missing.into_iter().map(|uri| {
+        let flow = flow.clone();
+        async move {
+            let fetched = flow.fetch_post(&uri).await;
+            (uri, fetched)
+        }
+    }))
+    .buffer_unordered(PAGE_QUOTE_CONCURRENCY);
+    let _ = tokio::time::timeout_at(deadline, async {
+        while let Some((uri, fetched)) = fetches.next().await {
+            if let Ok(record) = fetched
+                && record.uri == uri
+                && record.collection == "app.bsky.feed.post"
+            {
+                parents.insert(uri, Some(record));
+            }
+        }
+    })
+    .await;
+    Ok(parents)
+}
+
+fn queue_missing_parent_authors<S: Storage>(
+    storage: &S,
+    parents: &PageParentIndex,
+) -> Result<(), StorageError> {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+    let profile_index = storage.profile_index_snapshot()?;
+    let mut queued = HashSet::new();
+    for parent in parents.values().flatten() {
+        let profile_status = profile_index.get(&parent.did);
+        let age_ms = profile_status.map_or(i64::MAX, |entry| {
+            now_ms.saturating_sub(entry.fetched_at_ms).max(0)
+        });
+        let profile_is_fresh = profile_status
+            .is_some_and(|entry| entry.has_profile && age_ms < PROFILE_MAX_AGE.as_millis() as i64);
+        let handle_is_known = storage.verified_handle(&parent.did)?.is_some();
+        let handle_is_invalid = storage.handle_is_invalid(&parent.did)?;
+        if !profile_is_fresh || (!handle_is_known && !handle_is_invalid) {
+            queued.insert(parent.did.clone());
+        }
+    }
+    if !queued.is_empty() {
+        let mut dids = queued.into_iter().collect::<Vec<_>>();
+        dids.sort();
+        storage.enqueue_profile_fetches(&dids)?;
+    }
+    Ok(())
 }
 
 fn quoted_record_ref(embed: &Value) -> Option<QuotedRecordRef> {
@@ -3524,12 +3617,26 @@ where
     page_timing.timeline_fetch_index_ms = timeline_started.elapsed().as_millis() as u64;
     let has_more = timeline_page.len() > limit;
     let timeline = timeline_page.iter().take(limit).collect::<Vec<_>>();
+    let content_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
+    let parent_started = std::time::Instant::now();
+    let parents = match hydrate_page_parents(
+        &state.flow,
+        state.storage.as_ref(),
+        &timeline,
+        content_deadline,
+    )
+    .await
+    {
+        Ok(parents) => parents,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    page_timing.parent_hydration_ms = parent_started.elapsed().as_millis() as u64;
     let quote_index = match hydrate_page_content(
         &state.flow,
         state.storage.clone(),
         &timeline,
         std::iter::empty(),
-        tokio::time::Instant::now() + PAGE_PROFILE_BUDGET,
+        content_deadline,
     )
     .await
     {
@@ -3540,6 +3647,9 @@ where
         }
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
+    if let Err(error) = queue_missing_parent_authors(state.storage.as_ref(), &parents) {
+        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+    }
     let render_started = std::time::Instant::now();
     let write_forms_enabled =
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
@@ -3547,17 +3657,18 @@ where
         .iter()
         .enumerate()
         .map(|(index, record)| {
-            format!(
-                "<li class=\"post-item\">{}</li>",
-                render_web_post(
-                    state.storage.as_ref(),
-                    record,
-                    &did,
-                    write_forms_enabled,
-                    true,
-                    index < 6,
-                    &quote_index,
-                )
+            render_timeline_post_item(
+                state.storage.as_ref(),
+                record,
+                "",
+                index
+                    .checked_sub(1)
+                    .map(|previous| timeline[previous].uri.as_str()),
+                &parents,
+                &did,
+                write_forms_enabled,
+                index < 6,
+                &quote_index,
             )
         })
         .collect::<String>();
@@ -3761,12 +3872,26 @@ where
         .iter()
         .map(|post| &post.record)
         .collect::<Vec<_>>();
+    let content_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
+    let parent_started = std::time::Instant::now();
+    let parents = match hydrate_page_parents(
+        &state.flow,
+        state.storage.as_ref(),
+        &feed_records,
+        content_deadline,
+    )
+    .await
+    {
+        Ok(parents) => parents,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    page_timing.parent_hydration_ms = parent_started.elapsed().as_millis() as u64;
     let quote_index = match hydrate_page_content(
         &state.flow,
         state.storage.clone(),
         &feed_records,
         std::iter::empty(),
-        tokio::time::Instant::now() + PAGE_PROFILE_BUDGET,
+        content_deadline,
     )
     .await
     {
@@ -3777,6 +3902,9 @@ where
         }
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
+    if let Err(error) = queue_missing_parent_authors(state.storage.as_ref(), &parents) {
+        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+    }
     let render_started = std::time::Instant::now();
     let write_forms_enabled =
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
@@ -3796,17 +3924,18 @@ where
                     )
                 })
                 .unwrap_or_default();
-            format!(
-                "<li class=\"post-item\">{repost}{}</li>",
-                render_web_post(
-                    state.storage.as_ref(),
-                    &post.record,
-                    &did,
-                    write_forms_enabled,
-                    true,
-                    index < 6,
-                    &quote_index,
-                )
+            render_timeline_post_item(
+                state.storage.as_ref(),
+                &post.record,
+                &repost,
+                index
+                    .checked_sub(1)
+                    .map(|previous| feed_records[previous].uri.as_str()),
+                &parents,
+                &did,
+                write_forms_enabled,
+                index < 6,
+                &quote_index,
             )
         })
         .collect::<String>();
@@ -4208,12 +4337,26 @@ where
             leading_authors.push(post.did);
         }
     }
+    let content_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
+    let parent_started = std::time::Instant::now();
+    let parents = match hydrate_page_parents(
+        &state.flow,
+        state.storage.as_ref(),
+        &notification_records,
+        content_deadline,
+    )
+    .await
+    {
+        Ok(parents) => parents,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    page_timing.parent_hydration_ms = parent_started.elapsed().as_millis() as u64;
     let quote_index = match hydrate_page_content(
         &state.flow,
         state.storage.clone(),
         &notification_records,
         leading_authors,
-        tokio::time::Instant::now() + PAGE_PROFILE_BUDGET,
+        content_deadline,
     )
     .await
     {
@@ -4224,10 +4367,15 @@ where
         }
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
+    if let Err(error) = queue_missing_parent_authors(state.storage.as_ref(), &parents) {
+        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+    }
     let render_started = std::time::Instant::now();
     let items = visible
         .iter()
-        .map(|group| render_web_notification_group(state.storage.as_ref(), group, &quote_index))
+        .map(|group| {
+            render_web_notification_group(state.storage.as_ref(), group, &quote_index, &parents)
+        })
         .collect::<String>();
     let items = if items.is_empty() {
         "<li class=\"empty-state\">No notifications yet.</li>".to_owned()
@@ -4268,9 +4416,10 @@ fn render_web_notification_group<S: Storage>(
     storage: &S,
     group: &WebNotificationGroup,
     quote_index: &QuoteRenderIndex,
+    parents: &PageParentIndex,
 ) -> String {
     if !matches!(group.reason.as_str(), "like" | "repost" | "follow") {
-        return render_web_notification(storage, &group.events[0], quote_index);
+        return render_web_notification(storage, &group.events[0], quote_index, parents);
     }
 
     let newest = &group.events[0];
@@ -4355,6 +4504,7 @@ fn render_web_notification<S: Storage>(
     storage: &S,
     notification: &IndexedNotification,
     quote_index: &QuoteRenderIndex,
+    parents: &PageParentIndex,
 ) -> String {
     let record = &notification.record;
     let author = profile_view_from_storage(storage, &record.did)
@@ -4383,6 +4533,7 @@ fn render_web_notification<S: Storage>(
     } else {
         format!("<p>{}</p>", html_escape(text))
     };
+    let parent = render_notification_parent(storage, record, parents);
     let embed = record
         .record
         .get("embed")
@@ -4403,7 +4554,7 @@ fn render_web_notification<S: Storage>(
         String::new()
     };
     format!(
-        "<li class=\"notification-item\"><article class=\"notification-card\"><header class=\"notification-heading\">{}<div><a class=\"author-name\" href=\"{}\">@{}</a><span class=\"notification-reason\">{reason}</span></div></header>{text}{embed}{thread_link}</article></li>",
+        "<li class=\"notification-item\"><article class=\"notification-card\"><header class=\"notification-heading\">{}<div><a class=\"author-name\" href=\"{}\">@{}</a><span class=\"notification-reason\">{reason}</span></div></header>{parent}{text}{embed}{thread_link}</article></li>",
         avatar_markup(&author, "avatar"),
         html_escape(&author_uri),
         html_escape(&handle)
@@ -4453,12 +4604,26 @@ where
     page_timing.timeline_fetch_index_ms = timeline_started.elapsed().as_millis() as u64;
     let has_more = records.len() > limit;
     let records = records.iter().take(limit).collect::<Vec<_>>();
+    let content_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
+    let parent_started = std::time::Instant::now();
+    let parents = match hydrate_page_parents(
+        &state.flow,
+        state.storage.as_ref(),
+        &records,
+        content_deadline,
+    )
+    .await
+    {
+        Ok(parents) => parents,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    page_timing.parent_hydration_ms = parent_started.elapsed().as_millis() as u64;
     let quote_index = match hydrate_page_content(
         &state.flow,
         state.storage.clone(),
         &records,
         std::iter::once(subject.to_owned()).chain(records.iter().map(|record| record.did.clone())),
-        tokio::time::Instant::now() + PAGE_PROFILE_BUDGET,
+        content_deadline,
     )
     .await
     {
@@ -4469,6 +4634,9 @@ where
         }
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
+    if let Err(error) = queue_missing_parent_authors(state.storage.as_ref(), &parents) {
+        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+    }
     let render_started = std::time::Instant::now();
     let profile = match profile_view_from_storage(state.storage.as_ref(), subject) {
         Ok(profile) => profile,
@@ -4485,17 +4653,18 @@ where
         .iter()
         .enumerate()
         .map(|(index, record)| {
-            format!(
-                "<li class=\"post-item\">{}</li>",
-                render_web_post(
-                    state.storage.as_ref(),
-                    record,
-                    &did,
-                    write_forms_enabled,
-                    true,
-                    index < 6,
-                    &quote_index,
-                )
+            render_timeline_post_item(
+                state.storage.as_ref(),
+                record,
+                "",
+                index
+                    .checked_sub(1)
+                    .map(|previous| records[previous].uri.as_str()),
+                &parents,
+                &did,
+                write_forms_enabled,
+                index < 6,
+                &quote_index,
             )
         })
         .collect::<String>();
@@ -6440,35 +6609,6 @@ fn render_web_post<S: Storage>(
         html_escape(&profile_uri),
         html_escape(&handle),
     );
-    let reply_context = record
-        .record
-        .pointer("/reply/parent/uri")
-        .and_then(Value::as_str)
-        .and_then(|parent_uri| {
-            let parent = storage
-                .record_by_uri("app.bsky.feed.post", parent_uri)
-                .ok()
-                .flatten();
-            let parent_did = parent
-                .map(|parent| parent.did)
-                .or_else(|| post_uri_did(parent_uri).map(str::to_owned))?;
-            Some(parent_did)
-        })
-        .map(|parent_did| {
-            let parent_profile = profile_view_from_storage(storage, &parent_did)
-                .unwrap_or_else(|_| json!({"did":parent_did,"handle":parent_did}));
-            let parent_handle = profile_handle(&parent_profile, &parent_did);
-            let thread_uri = format!(
-                "/app/thread?uri={}",
-                url::form_urlencoded::byte_serialize(record.uri.as_bytes()).collect::<String>()
-            );
-            format!(
-                "<p class=\"reply-context\"><a href=\"{}\">replying to @{}</a></p>",
-                html_escape(&thread_uri),
-                html_escape(&parent_handle)
-            )
-        })
-        .unwrap_or_default();
     let time = record
         .record
         .get("createdAt")
@@ -6589,7 +6729,128 @@ fn render_web_post<S: Storage>(
         .unwrap_or_default();
     let anchor = post_anchor(&record.uri);
     format!(
-        "<article class=\"post-card\" id=\"{anchor}\"><header class=\"post-header\">{author}{time}</header>{reply_context}<p class=\"post-text\">{text}</p>{embed}<div class=\"post-actions\" aria-label=\"Post actions\">{actions}</div></article>"
+        "<article class=\"post-card\" id=\"{anchor}\"><header class=\"post-header\">{author}{time}</header><p class=\"post-text\">{text}</p>{embed}<div class=\"post-actions\" aria-label=\"Post actions\">{actions}</div></article>"
+    )
+}
+
+fn short_did(did: &str) -> String {
+    let tail = did.rsplit(':').next().unwrap_or(did);
+    if tail.len() <= 12 {
+        did.to_owned()
+    } else {
+        format!("did:…{}", &tail[tail.len() - 8..])
+    }
+}
+
+fn parent_display_identity<S: Storage>(storage: &S, did: &str) -> (Value, String, String) {
+    let profile =
+        profile_view_from_storage(storage, did).unwrap_or_else(|_| json!({"did":did,"handle":did}));
+    let cached_handle = profile_handle(&profile, did);
+    let handle = if cached_handle == did {
+        short_did(did)
+    } else {
+        cached_handle
+    };
+    let display_name = profile
+        .get("displayName")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&handle)
+        .to_owned();
+    (profile, handle, display_name)
+}
+
+fn render_reply_parent_card<S: Storage>(storage: &S, parent: &IndexedRecord) -> String {
+    let (profile, handle, display_name) = parent_display_identity(storage, &parent.did);
+    let thread_uri = format!("/app/thread?uri={}", form_encoded(&parent.uri));
+    let text = parent
+        .record
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    format!(
+        "<a class=\"reply-parent-card\" href=\"{}\" aria-label=\"Open parent post by @{}\"><header class=\"reply-parent-header\">{}<span class=\"reply-parent-author\"><strong>{}</strong><span>@{}</span></span></header><p class=\"reply-parent-text\">{}</p></a>",
+        html_escape(&thread_uri),
+        html_escape(&handle),
+        avatar_markup(&profile, "reply-parent-avatar"),
+        html_escape(&display_name),
+        html_escape(&handle),
+        render_post_text(text),
+    )
+}
+
+fn render_reply_parent_fallback<S: Storage>(storage: &S, parent_uri: &str) -> String {
+    let thread_uri = format!("/app/thread?uri={}", form_encoded(parent_uri));
+    let Some(did) = post_uri_did(parent_uri) else {
+        return "<p class=\"reply-parent-fallback\">Reply to a deleted post</p>".to_owned();
+    };
+    let (_, handle, _) = parent_display_identity(storage, did);
+    format!(
+        "<p class=\"reply-parent-fallback\">Reply to <a href=\"{}\">@{}</a></p>",
+        html_escape(&thread_uri),
+        html_escape(&handle)
+    )
+}
+
+fn render_timeline_post_item<S: Storage>(
+    storage: &S,
+    record: &IndexedRecord,
+    prelude: &str,
+    previous_uri: Option<&str>,
+    parents: &PageParentIndex,
+    viewer_did: &str,
+    write_forms_enabled: bool,
+    eager_avatar: bool,
+    quote_index: &QuoteRenderIndex,
+) -> String {
+    let article = render_web_post(
+        storage,
+        record,
+        viewer_did,
+        write_forms_enabled,
+        true,
+        eager_avatar,
+        quote_index,
+    );
+    let Some(parent_uri) = record
+        .record
+        .pointer("/reply/parent/uri")
+        .and_then(Value::as_str)
+    else {
+        return format!("<li class=\"post-item\">{prelude}{article}</li>");
+    };
+    if previous_uri == Some(parent_uri) {
+        return format!(
+            "<li class=\"post-item reply-connected-to-previous\">{prelude}<span class=\"reply-connector reply-connector-previous\" aria-hidden=\"true\"></span>{article}</li>"
+        );
+    }
+    let parent = parents.get(parent_uri).and_then(Option::as_ref);
+    let parent_markup = parent
+        .map(|parent| render_reply_parent_card(storage, parent))
+        .unwrap_or_else(|| render_reply_parent_fallback(storage, parent_uri));
+    format!(
+        "<li class=\"post-item reply-with-parent\">{prelude}<div class=\"reply-parent-slot\">{parent_markup}<span class=\"reply-connector\" aria-hidden=\"true\"></span></div>{article}</li>"
+    )
+}
+
+fn render_notification_parent<S: Storage>(
+    storage: &S,
+    record: &IndexedRecord,
+    parents: &PageParentIndex,
+) -> String {
+    let Some(parent_uri) = record
+        .record
+        .pointer("/reply/parent/uri")
+        .and_then(Value::as_str)
+    else {
+        return String::new();
+    };
+    let parent = parents.get(parent_uri).and_then(Option::as_ref);
+    let markup = parent
+        .map(|parent| render_reply_parent_card(storage, parent))
+        .unwrap_or_else(|| render_reply_parent_fallback(storage, parent_uri));
+    format!(
+        "<div class=\"notification-reply-parent\">{markup}<span class=\"reply-connector\" aria-hidden=\"true\"></span></div>"
     )
 }
 
@@ -7095,7 +7356,7 @@ mod tests {
         assert!(css.contains(".icon {\n  fill: none;"));
         assert!(css.contains(".post-actions .is-liked .icon {\n  fill: var(--accent);"));
         assert!(css.contains(".thread-focus-actions .is-liked .icon {\n  fill: var(--accent);"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m8"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m9"));
         assert!(WEB_SCRIPT_URL.contains("v=js7"));
     }
 
@@ -7207,7 +7468,7 @@ mod tests {
         ];
         let groups = group_web_notifications(&notices, 0);
         let group = &groups[0];
-        let html = render_web_notification_group(&storage, group, &HashMap::new());
+        let html = render_web_notification_group(&storage, group, &HashMap::new(), &HashMap::new());
         assert!(html.contains("alice.test</a> and 1 other liked your post"));
         assert_eq!(
             html.matches("class=\"notification-avatar avatar-placeholder\"")
@@ -7273,13 +7534,7 @@ mod tests {
         let parent_did = "did:plc:original-author";
         let reply_did = "did:plc:reply-author";
         let parent = test_web_post(parent_did, "original", 1, "Original text", None);
-        let reply = test_web_post(
-            reply_did,
-            "reply",
-            2,
-            "Reply text",
-            Some(&parent.uri),
-        );
+        let reply = test_web_post(reply_did, "reply", 2, "Reply text", Some(&parent.uri));
         for record in [&parent, &reply] {
             storage.put_record(record).unwrap();
             storage.set_follow(viewer, &record.did, true).unwrap();
@@ -7320,7 +7575,7 @@ mod tests {
 
         let page = request_test_timeline(storage, viewer).await;
 
-        assert!(page.contains("Reply to @"));
+        assert!(page.contains("Reply to <a"));
         assert!(page.contains("missing-parent"));
         assert!(page.contains("class=\"reply-connector\""));
     }
@@ -7332,13 +7587,7 @@ mod tests {
         let parent_did = "did:plc:original-author";
         let reply_did = "did:plc:reply-author";
         let parent = test_web_post(parent_did, "original", 2, "Original text", None);
-        let reply = test_web_post(
-            reply_did,
-            "reply",
-            1,
-            "Reply text",
-            Some(&parent.uri),
-        );
+        let reply = test_web_post(reply_did, "reply", 1, "Reply text", Some(&parent.uri));
         for record in [&parent, &reply] {
             storage.put_record(record).unwrap();
             storage.set_follow(viewer, &record.did, true).unwrap();
@@ -7348,9 +7597,7 @@ mod tests {
 
         assert_eq!(page.matches("Original text").count(), 1);
         assert!(!page.contains("class=\"reply-parent-card\""));
-        assert!(
-            page.contains("class=\"reply-connector reply-connector-previous\"")
-        );
+        assert!(page.contains("class=\"reply-connector reply-connector-previous\""));
     }
 
     fn test_web_post(
@@ -7360,7 +7607,8 @@ mod tests {
         text: &str,
         parent_uri: Option<&str>,
     ) -> IndexedRecord {
-        let mut record = json!({"$type":"app.bsky.feed.post","text":text,"createdAt":"2026-10-29T12:00:00Z"});
+        let mut record =
+            json!({"$type":"app.bsky.feed.post","text":text,"createdAt":"2026-10-29T12:00:00Z"});
         if let Some(parent_uri) = parent_uri {
             record["reply"] = json!({
                 "root":{"uri":parent_uri,"cid":"parent-cid"},
@@ -7396,7 +7644,8 @@ mod tests {
         let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
         let session_id = "av28-timeline-session";
         let generation = storage.rotate_web_session(viewer, session_id).unwrap();
-        let token = public.issue_session_cookie(viewer, session_id, generation, false, false, false);
+        let token =
+            public.issue_session_cookie(viewer, session_id, generation, false, false, false);
         let app = public.router_with_flow(DisabledOAuthFlow, storage);
         let response = app
             .oneshot(
