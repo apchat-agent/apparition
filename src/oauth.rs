@@ -7934,6 +7934,17 @@ where
         })? {
             let name = field.name().unwrap_or_default().to_owned();
             if name == "video" {
+                // The composer always sends its file input; with no file picked it is an empty part.
+                let filename = field.file_name().unwrap_or_default().to_owned();
+                let bytes = field.bytes().await.map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "The multipart post form could not be read.".to_owned(),
+                    )
+                })?;
+                if filename.is_empty() && bytes.is_empty() {
+                    continue;
+                }
                 return Err((
                     StatusCode::BAD_REQUEST,
                     "Enable JavaScript to validate and upload videos.".to_owned(),
