@@ -2263,6 +2263,9 @@ fn icon_svg(name: &str) -> String {
         "share" => {
             "<circle cx=\"18\" cy=\"5\" r=\"3\"/><circle cx=\"6\" cy=\"12\" r=\"3\"/><circle cx=\"18\" cy=\"19\" r=\"3\"/><path d=\"m8.7 10.7 6.6-4.4M8.7 13.3l6.6 4.4\"/>"
         }
+        "more" => {
+            "<circle cx=\"5\" cy=\"12\" r=\"1\"/><circle cx=\"12\" cy=\"12\" r=\"1\"/><circle cx=\"19\" cy=\"12\" r=\"1\"/>"
+        }
         _ => return String::new(),
     };
     format!(
@@ -3517,15 +3520,13 @@ fn render_thread_focus<S: Storage>(
         .and_then(Value::as_str)
         .unwrap_or("");
     let text = if text.chars().count() > MAX_RENDERED_REMOTE_CHARS {
-        html_escape(
-            &text
-                .chars()
-                .take(MAX_RENDERED_REMOTE_CHARS)
-                .collect::<String>(),
-        )
+        text.chars()
+            .take(MAX_RENDERED_REMOTE_CHARS)
+            .collect::<String>()
     } else {
-        html_escape(text)
+        text.to_owned()
     };
+    let text = render_post_text(&text);
     let time = record
         .record
         .get("createdAt")
@@ -3563,21 +3564,25 @@ fn render_thread_focus<S: Storage>(
     let uri = html_escape(&record.uri);
     let cid = html_escape(record.cid.as_deref().unwrap_or(""));
     let reply_action = format!(
-        "<a class=\"post-action\" href=\"{}\" aria-label=\"Reply\">{}<span>{}</span></a>",
+        "<a class=\"post-action\" href=\"{}\" aria-label=\"Reply\">{}<span class=\"sr-only\">Reply</span>{}</a>",
         html_escape(&thread_uri),
         icon_svg("reply"),
-        interactions.reply_count
+        action_count_markup(interactions.reply_count)
     );
     let repost_action = if write_forms_enabled {
         format!(
-            "<details class=\"repost-menu\"><summary class=\"post-action\" aria-label=\"Repost menu\">{}<span>Repost</span><span>{}</span></summary><div class=\"repost-menu-options\"><form class=\"post-action-form\" action=\"/repost\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\"><button class=\"post-action\" type=\"submit\" aria-label=\"Repost by @{}\">Repost</button></form><a href=\"/compose?quote_uri={}\">Quote post</a></div></details>",
+            "<details class=\"repost-menu\"><summary class=\"post-action\" aria-label=\"Repost menu\">{}<span class=\"sr-only\">Repost</span>{}</summary><div class=\"repost-menu-options\"><form class=\"post-action-form\" action=\"/repost\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\"><button class=\"post-action\" type=\"submit\" aria-label=\"Repost by @{}\">Repost</button></form><a href=\"/compose?quote_uri={}\">Quote post</a></div></details>",
             icon_svg("repost"),
-            interactions.repost_count,
+            action_count_markup(interactions.repost_count),
             html_escape(&handle),
             form_encoded(&record.uri)
         )
     } else {
-        String::new()
+        format!(
+            "<span class=\"post-action action-readonly\" aria-label=\"Repost count\">{}{}</span>",
+            icon_svg("repost"),
+            action_count_markup(interactions.repost_count)
+        )
     };
     let like_action = if write_forms_enabled {
         let liked = interactions.viewer_like.is_some();
@@ -3591,16 +3596,28 @@ fn render_thread_focus<S: Storage>(
                 )
             })
             .unwrap_or_default();
+        let like_aria = if liked {
+            format!("Unlike post by @{}", html_escape(&handle))
+        } else {
+            format!("Like post by @{}", html_escape(&handle))
+        };
         format!(
-            "<form class=\"post-action-form\" action=\"/like\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\">{intent}<button class=\"post-action{}\" type=\"submit\" aria-label=\"Like post by @{}\" aria-pressed=\"{}\">{}<span>{}</span></button></form>",
+            "<form class=\"post-action-form\" action=\"/like\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\">{intent}<button class=\"post-action{}\" type=\"submit\" aria-label=\"{like_aria}\" aria-pressed=\"{liked}\">{}<span class=\"sr-only\">Like</span>{}</button></form>",
             if liked { " is-liked" } else { "" },
-            html_escape(&handle),
-            liked,
             icon_svg("like"),
-            interactions.like_count
+            action_count_markup(interactions.like_count)
         )
     } else {
-        String::new()
+        format!(
+            "<span class=\"post-action action-readonly{}\" aria-label=\"Like count\">{}{}</span>",
+            if interactions.viewer_like.is_some() {
+                " is-liked"
+            } else {
+                ""
+            },
+            icon_svg("like"),
+            action_count_markup(interactions.like_count)
+        )
     };
     let share_action = format!(
         "<a class=\"post-action\" href=\"{}\" aria-label=\"Share or copy link\">{}<span>Share</span></a>",
@@ -3608,7 +3625,8 @@ fn render_thread_focus<S: Storage>(
         icon_svg("share")
     );
     let more_action = format!(
-        "<details class=\"thread-more-menu\"><summary class=\"post-action\" aria-label=\"More post actions\">…</summary><div class=\"repost-menu-options\"><a href=\"{}\">Copy link</a><a href=\"{}\">View profile</a></div></details>",
+        "<details class=\"thread-more-menu\"><summary class=\"post-action\" aria-label=\"More post actions\">{}</summary><div class=\"repost-menu-options\"><a href=\"{}\">Copy link</a><a href=\"{}\">View profile</a></div></details>",
+        icon_svg("more"),
         html_escape(&thread_uri),
         html_escape(&profile_uri)
     );
@@ -4379,6 +4397,50 @@ fn relative_time(created_at: &str) -> String {
     }
 }
 
+fn render_post_text(text: &str) -> String {
+    let Some((separator_start, separator)) = text
+        .char_indices()
+        .rev()
+        .find(|(_, character)| character.is_whitespace())
+    else {
+        return if is_thread_number(text) {
+            format!(
+                "<span class=\"thread-number-pill\">{}</span>",
+                html_escape(text)
+            )
+        } else {
+            html_escape(text)
+        };
+    };
+    let number_start = separator_start + separator.len_utf8();
+    let number = &text[number_start..];
+    if !is_thread_number(number) {
+        return html_escape(text);
+    }
+    format!(
+        "{}<span class=\"thread-number-pill\">{}</span>",
+        html_escape(&text[..number_start]),
+        html_escape(number)
+    )
+}
+
+fn is_thread_number(value: &str) -> bool {
+    value.split_once('/').is_some_and(|(part, total)| {
+        !part.is_empty()
+            && !total.is_empty()
+            && part.bytes().all(|byte| byte.is_ascii_digit())
+            && total.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn action_count_markup(count: usize) -> String {
+    if count == 0 {
+        String::new()
+    } else {
+        format!("<span class=\"action-count\">{count}</span>")
+    }
+}
+
 fn render_web_post<S: Storage>(
     storage: &S,
     record: &IndexedRecord,
@@ -4453,6 +4515,7 @@ fn render_web_post<S: Storage>(
         .get("text")
         .and_then(Value::as_str)
         .unwrap_or("");
+    let text = render_post_text(text);
     let text = if link_text_to_thread {
         let thread_uri = format!(
             "/app/thread?uri={}",
@@ -4461,10 +4524,10 @@ fn render_web_post<S: Storage>(
         format!(
             "<a class=\"post-text-link\" href=\"{}\">{}</a>",
             html_escape(&thread_uri),
-            html_escape(text)
+            text
         )
     } else {
-        html_escape(text)
+        text
     };
     let interactions = storage
         .post_interaction_summary(&record.uri, Some(viewer_did))
@@ -4474,14 +4537,14 @@ fn render_web_post<S: Storage>(
         url::form_urlencoded::byte_serialize(record.uri.as_bytes()).collect::<String>()
     );
     let reply_action = format!(
-        "<a class=\"post-action\" href=\"{}\" aria-label=\"Open replies\">{}<span>Reply</span><span class=\"action-count\">{}</span></a>",
+        "<a class=\"post-action\" href=\"{}\" aria-label=\"Open replies\">{}<span class=\"sr-only\">Reply</span>{}</a>",
         html_escape(&thread_uri),
         icon_svg("reply"),
-        interactions.reply_count
+        action_count_markup(interactions.reply_count)
     );
-    let actions = if write_forms_enabled {
-        let uri = html_escape(&record.uri);
-        let cid = html_escape(record.cid.as_deref().unwrap_or(""));
+    let uri = html_escape(&record.uri);
+    let cid = html_escape(record.cid.as_deref().unwrap_or(""));
+    let (repost_action, like_action) = if write_forms_enabled {
         let (like_intent, like_label) = if interactions.viewer_like.is_some() {
             (
                 "<input type=\"hidden\" name=\"intent\" value=\"delete\">",
@@ -4501,23 +4564,52 @@ fn render_web_post<S: Storage>(
             format!("Like post by @{}", html_escape(&handle))
         };
         let quote_href = format!("/compose?quote_uri={}", form_encoded(&record.uri));
-        format!(
-            "{reply_action}<form class=\"post-action-form\" action=\"/like\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\">{like_intent}<button class=\"post-action\" type=\"submit\" aria-label=\"{like_aria}\" aria-pressed=\"{}\">{}{like_label}<span class=\"action-count\">{}</span></button></form><details class=\"repost-menu\"><summary class=\"post-action\" aria-label=\"Repost menu\">{}{repost_label}<span class=\"action-count\">{}</span></summary><div class=\"repost-menu-options\"><form class=\"post-action-form\" action=\"/repost\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\"><button class=\"post-action\" type=\"submit\" aria-label=\"Repost by @{}\">Repost</button></form><a href=\"{}\">Quote post</a></div></details>",
-            if interactions.viewer_like.is_some() {
-                "true"
-            } else {
-                "false"
-            },
-            icon_svg("like"),
-            interactions.like_count,
+        let repost = format!(
+            "<details class=\"repost-menu\"><summary class=\"post-action\" aria-label=\"Repost menu\">{}<span class=\"sr-only\">{repost_label}</span>{}</summary><div class=\"repost-menu-options\"><form class=\"post-action-form\" action=\"/repost\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\"><button class=\"post-action\" type=\"submit\" aria-label=\"Repost by @{}\">Repost</button></form><a href=\"{}\">Quote post</a></div></details>",
             icon_svg("repost"),
-            interactions.repost_count,
+            action_count_markup(interactions.repost_count),
             html_escape(&handle),
             html_escape(&quote_href)
-        )
+        );
+        let liked = interactions.viewer_like.is_some();
+        let like = format!(
+            "<form class=\"post-action-form\" action=\"/like\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\">{like_intent}<button class=\"post-action{}\" type=\"submit\" aria-label=\"{like_aria}\" aria-pressed=\"{liked}\">{}<span class=\"sr-only\">{like_label}</span>{}</button></form>",
+            if liked { " is-liked" } else { "" },
+            icon_svg("like"),
+            action_count_markup(interactions.like_count)
+        );
+        (repost, like)
     } else {
-        reply_action
+        (
+            format!(
+                "<span class=\"post-action action-readonly\" aria-label=\"Repost count\">{}{}</span>",
+                icon_svg("repost"),
+                action_count_markup(interactions.repost_count)
+            ),
+            format!(
+                "<span class=\"post-action action-readonly{}\" aria-label=\"Like count\">{}{}</span>",
+                if interactions.viewer_like.is_some() {
+                    " is-liked"
+                } else {
+                    ""
+                },
+                icon_svg("like"),
+                action_count_markup(interactions.like_count)
+            ),
+        )
     };
+    let share_action = format!(
+        "<a class=\"post-action\" href=\"{}\" aria-label=\"Share or copy link\">{}<span class=\"sr-only\">Share</span></a>",
+        html_escape(&thread_uri),
+        icon_svg("share")
+    );
+    let more_action = format!(
+        "<details class=\"post-more-menu\"><summary class=\"post-action\" aria-label=\"More post actions\">{}</summary><div class=\"repost-menu-options\"><a href=\"{}\">Copy link</a><a href=\"{}\">View profile</a></div></details>",
+        icon_svg("more"),
+        html_escape(&thread_uri),
+        html_escape(&profile_uri)
+    );
+    let actions = format!("{reply_action}{repost_action}{like_action}{share_action}{more_action}");
     let embed = record
         .record
         .get("embed")
@@ -4746,7 +4838,7 @@ fn render_web_quote<S: Storage>(
         avatar_markup(&profile, "small-avatar"),
         html_escape(display_name),
         html_escape(&handle),
-        html_escape(text)
+        render_post_text(text)
     )
 }
 
