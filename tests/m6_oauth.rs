@@ -4,7 +4,7 @@ use appview_rs::{
     ingest::{IndexedRecord, Ingestor, MemoryStorage, ScopeMode, SqliteStorage, Storage},
     oauth::{
         FetchedAuthorProfile, OAuthAccount, OAuthCallback, OAuthFlow, OAuthPublic,
-        PdsCreatedRecord, PinnedFeedTabs, PostStrongRef, SqliteOAuthStore,
+        PdsCreatedRecord, PinnedFeedTabs, PostStrongRef, ProfileRefreshWorker, SqliteOAuthStore,
     },
 };
 use appview_rs::{router, router_with_oauth_flow};
@@ -22,8 +22,31 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tower::ServiceExt;
+use tracing::{Event, Subscriber, field::Visit};
+use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
 const EXPECTED_OAUTH_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=*";
+
+#[derive(Clone)]
+struct ProfileHydrationTiming(Arc<Mutex<Option<u64>>>);
+
+struct ProfileHydrationVisitor<'a>(&'a mut Option<u64>);
+
+impl Visit for ProfileHydrationVisitor<'_> {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        if field.name() == "profile_hydration_ms" {
+            *self.0 = Some(value);
+        }
+    }
+
+    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+}
+
+impl<S: Subscriber> Layer<S> for ProfileHydrationTiming {
+    fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+        event.record(&mut ProfileHydrationVisitor(&mut self.0.lock().unwrap()));
+    }
+}
 
 #[derive(Clone)]
 struct FakeOAuthFlow {
@@ -3313,78 +3336,122 @@ async fn page_fetches_missing_author_profile_stores_it_and_keeps_avatar_url_safe
 }
 
 #[tokio::test]
-async fn app_timeline_does_not_wait_for_slow_profile_hydration() {
+async fn app_timeline_waits_for_new_author_profiles_before_rendering() {
     let storage = Arc::new(MemoryStorage::default());
-    let author = "did:plc:slow-author";
-    storage.set_follow("did:plc:alice", author, true).unwrap();
-    storage
-        .put_record(&fake_feed_post(author, "post", 2, "visible immediately"))
-        .unwrap();
     let flow = FakeOAuthFlow::default();
-    flow.profile_delays_ms
-        .lock()
-        .unwrap()
-        .insert(author.into(), 1_000);
-    flow.author_profiles.lock().unwrap().insert(
-        author.into(),
-        FetchedAuthorProfile {
-            profile: Some(IndexedRecord {
-                did: author.into(),
-                collection: "app.bsky.actor.profile".into(),
-                rkey: "self".into(),
-                uri: format!("at://{author}/app.bsky.actor.profile/self"),
-                cid: Some("profile-cid".into()),
-                time_us: 1_800_000_000_000_000,
-                record: serde_json::json!({
-                    "$type":"app.bsky.actor.profile",
-                    "displayName":"Slowly hydrated"
+    let authors = (0..10)
+        .map(|index| format!("did:plc:slow-author-{index}"))
+        .collect::<Vec<_>>();
+    for (index, author) in authors.iter().enumerate() {
+        storage.set_follow("did:plc:alice", author, true).unwrap();
+        storage
+            .put_record(&fake_feed_post(
+                author,
+                &format!("post-{index}"),
+                20 - index as u64,
+                &format!("visible post {index}"),
+            ))
+            .unwrap();
+        flow.profile_delays_ms
+            .lock()
+            .unwrap()
+            .insert(author.clone(), 60);
+        flow.author_profiles.lock().unwrap().insert(
+            author.clone(),
+            FetchedAuthorProfile {
+                profile: Some(IndexedRecord {
+                    did: author.clone(),
+                    collection: "app.bsky.actor.profile".into(),
+                    rkey: "self".into(),
+                    uri: format!("at://{author}/app.bsky.actor.profile/self"),
+                    cid: Some(format!("profile-cid-{index}")),
+                    time_us: 1_800_000_000_000_000,
+                    record: serde_json::json!({
+                        "$type":"app.bsky.actor.profile",
+                        "displayName":format!("Hydrated author {index}")
+                    }),
                 }),
-            }),
-            verified_handle: Some("slow-author.test".into()),
-        },
-    );
+                verified_handle: Some(format!("author-{index}.test")),
+            },
+        );
+    }
     let app = OAuthPublic::new("https://appview.example")
         .unwrap()
-        .router_with_flow(flow, storage.clone());
+        .router_with_flow(flow.clone(), storage.clone());
     let cookie = finish_login(&app).await;
+    let timing = Arc::new(Mutex::new(None));
+    let subscriber = tracing_subscriber::registry().with(ProfileHydrationTiming(timing.clone()));
+    let _guard = tracing::subscriber::set_default(subscriber);
     let started = Instant::now();
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/app")
-                .header("cookie", cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let html = get_html(&app, "/app", &cookie).await;
     let elapsed = started.elapsed();
-    let html = String::from_utf8(
-        response
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes()
-            .to_vec(),
-    )
-    .unwrap();
-    assert!(elapsed < Duration::from_millis(200), "took {elapsed:?}");
-    assert!(html.contains("visible immediately"), "{html}");
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if storage
-                .get_record(author, "app.bsky.actor.profile", "self")
-                .unwrap()
-                .is_some()
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("background hydration should store the profile");
+    assert!(elapsed < Duration::from_millis(500), "took {elapsed:?}");
+    for (index, _) in authors.iter().enumerate() {
+        assert!(html.contains(&format!("Hydrated author {index}")), "{html}");
+        assert!(html.contains(&format!("visible post {index}")), "{html}");
+    }
+    assert_eq!(flow.profile_requests.lock().unwrap().len(), authors.len());
+    let profile_hydration_ms = timing
+        .lock()
+        .unwrap()
+        .expect("page timing should record the profile wait");
+    assert!(
+        profile_hydration_ms >= 60,
+        "wait reported {profile_hydration_ms} ms"
+    );
+    assert!(
+        profile_hydration_ms < 500,
+        "wait reported {profile_hydration_ms} ms"
+    );
+}
+
+#[tokio::test]
+async fn app_timeline_skips_fresh_indexed_profiles_without_fetching() {
+    let storage = Arc::new(MemoryStorage::default());
+    let author = "did:plc:fresh-author";
+    storage.set_follow("did:plc:alice", author, true).unwrap();
+    storage
+        .put_record(&fake_feed_post(author, "post", 2, "fresh indexed post"))
+        .unwrap();
+    storage
+        .put_record(&IndexedRecord {
+            did: author.into(),
+            collection: "app.bsky.actor.profile".into(),
+            rkey: "self".into(),
+            uri: format!("at://{author}/app.bsky.actor.profile/self"),
+            cid: Some("fresh-profile-cid".into()),
+            time_us: 1_800_000_000_000_000,
+            record: serde_json::json!({
+                "$type":"app.bsky.actor.profile",
+                "displayName":"Freshly indexed"
+            }),
+        })
+        .unwrap();
+    storage
+        .set_verified_handle(author, "fresh-author.test")
+        .unwrap();
+    let flow = FakeOAuthFlow::default();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow.clone(), storage);
+    let cookie = finish_login(&app).await;
+    let timing = Arc::new(Mutex::new(None));
+    let subscriber = tracing_subscriber::registry().with(ProfileHydrationTiming(timing.clone()));
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let started = Instant::now();
+    let html = get_html(&app, "/app", &cookie).await;
+
+    assert!(html.contains("Freshly indexed"), "{html}");
+    assert!(flow.profile_requests.lock().unwrap().is_empty());
+    assert!(started.elapsed() < Duration::from_millis(200));
+    let profile_hydration_ms = timing
+        .lock()
+        .unwrap()
+        .expect("page timing should record profile hydration");
+    assert!(
+        profile_hydration_ms < 50,
+        "wait reported {profile_hydration_ms} ms"
+    );
 }
 
 #[tokio::test]
@@ -3458,15 +3525,43 @@ async fn profile_budget_keeps_page_rendering_and_queues_timed_out_authors_in_ord
             .lock()
             .unwrap()
             .insert((*author).to_owned(), 2_000);
+        flow.author_profiles.lock().unwrap().insert(
+            (*author).to_owned(),
+            FetchedAuthorProfile {
+                profile: Some(IndexedRecord {
+                    did: (*author).to_owned(),
+                    collection: "app.bsky.actor.profile".into(),
+                    rkey: "self".into(),
+                    uri: format!("at://{author}/app.bsky.actor.profile/self"),
+                    cid: Some(format!("profile-cid-{index}")),
+                    time_us: 1_800_000_000_000_000,
+                    record: serde_json::json!({
+                        "$type":"app.bsky.actor.profile",
+                        "displayName":format!("Background hydrated {index}")
+                    }),
+                }),
+                verified_handle: Some(format!("slow-author-{index}.test")),
+            },
+        );
     }
     let app = OAuthPublic::new("https://appview.example")
         .unwrap()
         .router_with_flow(flow.clone(), storage.clone());
     let cookie = finish_login(&app).await;
 
+    let started = Instant::now();
     let html = get_html(&app, "/app", &cookie).await;
+    let elapsed = started.elapsed();
+    assert!(elapsed <= Duration::from_millis(1700), "took {elapsed:?}");
     assert!(html.contains("visible slow post 0"));
     assert!(html.contains("visible slow post 2"));
+    for author in authors {
+        assert!(
+            html.contains(author),
+            "fallback author {author} missing from {html}"
+        );
+        assert!(!html.contains("Background hydrated"), "{html}");
+    }
     assert_eq!(flow.profile_requests.lock().unwrap().as_slice(), authors);
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -3486,6 +3581,24 @@ async fn profile_budget_keeps_page_rendering_and_queues_timed_out_authors_in_ord
         storage.pending_handle_refreshes(10).unwrap(),
         authors.map(str::to_owned)
     );
+    for author in authors {
+        flow.profile_delays_ms
+            .lock()
+            .unwrap()
+            .insert(author.to_owned(), 0);
+    }
+    let refresh = ProfileRefreshWorker::new(flow, storage.clone(), Duration::from_millis(1));
+    assert_eq!(refresh.refresh_once().await.unwrap(), authors.len());
+    for (index, author) in authors.iter().enumerate() {
+        assert!(
+            storage
+                .get_record(author, "app.bsky.actor.profile", "self")
+                .unwrap()
+                .is_some_and(|profile| {
+                    profile.record["displayName"] == format!("Background hydrated {index}")
+                })
+        );
+    }
 }
 
 #[tokio::test]
