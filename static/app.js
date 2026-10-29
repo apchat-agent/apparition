@@ -16,6 +16,7 @@ document.addEventListener("submit", async (event) => {
     });
     if (!response.ok) throw new Error(String(response.status));
     const state = await response.json();
+    button.classList.toggle("is-liked", state.liked);
     button.setAttribute("aria-pressed", state.liked ? "true" : "false");
     const label = button.getAttribute("aria-label") || "";
     button.setAttribute("aria-label", label.replace(/^(Unlike|Like)/, state.liked ? "Unlike" : "Like"));

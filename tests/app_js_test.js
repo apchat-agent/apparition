@@ -17,8 +17,14 @@ Deno.test("like handler fills the heart and clears it when unliked", async () =>
     querySelector() {
       return null;
     },
-    createElement() {
-      return { className: "", textContent: "" };
+    createElement(tag) {
+      return {
+        className: "",
+        textContent: "",
+        remove() {
+          if (tag === "input") form.intent = null;
+        },
+      };
     },
   };
   const button = {
