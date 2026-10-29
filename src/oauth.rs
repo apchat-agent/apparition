@@ -3546,32 +3546,67 @@ async fn hydrate_page_parents<F: OAuthFlow, S: Storage>(
     page_records: &[&IndexedRecord],
     deadline: tokio::time::Instant,
 ) -> Result<PageParentIndex, StorageError> {
-    let mut parent_uris = Vec::new();
-    let mut seen = HashSet::new();
-    for record in page_records {
-        if let Some(uri) = record
-            .record
-            .pointer("/reply/parent/uri")
-            .and_then(Value::as_str)
-            .filter(|uri| post_uri_did(uri).is_some())
-            && seen.insert(uri.to_owned())
-        {
-            parent_uris.push(uri.to_owned());
-        }
-    }
-    let mut parents = parent_uris
+    let mut parents = PageParentIndex::new();
+    let mut parent_uris = page_records
         .iter()
-        .cloned()
-        .map(|uri| (uri, None))
-        .collect::<PageParentIndex>();
-    let local = storage.records_by_uri("app.bsky.feed.post", &parent_uris)?;
+        .filter_map(|record| {
+            record
+                .record
+                .pointer("/reply/parent/uri")
+                .and_then(Value::as_str)
+                .filter(|uri| post_uri_did(uri).is_some())
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    parent_uris.sort_unstable();
+    parent_uris.dedup();
+
+    for depth in 0..=2 {
+        if parent_uris.is_empty() || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        hydrate_parent_uri_batch(flow, storage, &parent_uris, &mut parents, deadline).await?;
+        if depth == 2 {
+            break;
+        }
+        parent_uris = parent_uris
+            .iter()
+            .filter_map(|uri| parents.get(uri).and_then(Option::as_ref))
+            .filter_map(|record| {
+                record
+                    .record
+                    .pointer("/reply/parent/uri")
+                    .and_then(Value::as_str)
+                    .filter(|uri| post_uri_did(uri).is_some())
+                    .filter(|uri| !parents.contains_key(*uri))
+                    .map(str::to_owned)
+            })
+            .collect();
+        parent_uris.sort_unstable();
+        parent_uris.dedup();
+    }
+    Ok(parents)
+}
+
+async fn hydrate_parent_uri_batch<F: OAuthFlow, S: Storage>(
+    flow: &F,
+    storage: &S,
+    parent_uris: &[String],
+    parents: &mut PageParentIndex,
+    deadline: tokio::time::Instant,
+) -> Result<(), StorageError> {
+    for uri in parent_uris {
+        parents.entry(uri.clone()).or_insert(None);
+    }
+    let local = storage.records_by_uri("app.bsky.feed.post", parent_uris)?;
     for (uri, record) in local {
         parents.insert(uri, Some(record));
     }
 
     let missing = parent_uris
-        .into_iter()
-        .filter(|uri| parents.get(uri).is_some_and(Option::is_none))
+        .iter()
+        .filter(|uri| parents.get(*uri).is_some_and(Option::is_none))
+        .cloned()
         .collect::<Vec<_>>();
     let flow = flow.clone();
     let mut fetches = stream::iter(missing.into_iter().map(|uri| {
@@ -3593,7 +3628,7 @@ async fn hydrate_page_parents<F: OAuthFlow, S: Storage>(
         }
     })
     .await;
-    Ok(parents)
+    Ok(())
 }
 
 fn queue_missing_parent_authors<S: Storage>(
@@ -7896,7 +7931,10 @@ struct TimelinePostGrouping {
     grouped_indices: HashSet<usize>,
 }
 
-fn timeline_post_grouping(records: &[&IndexedRecord]) -> TimelinePostGrouping {
+fn timeline_post_grouping(
+    records: &[&IndexedRecord],
+    parents: &PageParentIndex,
+) -> TimelinePostGrouping {
     const MAX_THREAD_SPAN_US: u64 = 24 * 60 * 60 * 1_000_000;
 
     let indices = records
@@ -7943,6 +7981,37 @@ fn timeline_post_grouping(records: &[&IndexedRecord]) -> TimelinePostGrouping {
             .map(|index| records[*index].time_us)
             .min()
             .unwrap_or_default();
+        let mut oldest = oldest;
+        let mut parent_uri = records[root]
+            .record
+            .pointer("/reply/parent/uri")
+            .and_then(Value::as_str)
+            .filter(|uri| post_uri_did(uri).is_some());
+        let mut visited_parents = HashSet::new();
+        let mut complete_ancestry = true;
+        while let Some(uri) = parent_uri {
+            if !visited_parents.insert(uri) {
+                break;
+            }
+            match parents.get(uri) {
+                Some(Some(parent)) => {
+                    oldest = oldest.min(parent.time_us);
+                    parent_uri = parent
+                        .record
+                        .pointer("/reply/parent/uri")
+                        .and_then(Value::as_str)
+                        .filter(|uri| post_uri_did(uri).is_some());
+                }
+                Some(None) => break,
+                None => {
+                    complete_ancestry = false;
+                    break;
+                }
+            }
+        }
+        if !complete_ancestry {
+            continue;
+        }
         let newest = chain
             .iter()
             .map(|index| records[*index].time_us)
@@ -7975,7 +8044,7 @@ fn render_timeline_post_items<S: Storage>(
     write_forms_enabled: bool,
     quote_index: &QuoteRenderIndex,
 ) -> String {
-    let grouping = timeline_post_grouping(records);
+    let grouping = timeline_post_grouping(records, parents);
     let mut html = String::new();
     for (index, record) in records.iter().enumerate() {
         if let Some(group) = grouping.groups_by_newest.get(&index) {
