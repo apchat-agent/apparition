@@ -943,13 +943,13 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
             ),
             "{path}"
         );
-        assert!(html.contains("href=\"/static/app.css?v=m15\""), "{path}");
+        assert!(html.contains("href=\"/static/app.css?v=m16\""), "{path}");
         assert!(!html.contains("style="), "{path}");
         // Both playback and interaction scripts are local, deferred, and never inline.
         assert_eq!(html.matches("<script").count(), 2, "{path}");
         assert!(html.contains("<script src=\"/static/vendor/hls.min.js?v=1.7.3\" defer></script>"));
         assert!(
-            html.contains("<script src=\"/static/app.js?v=js13\" defer></script>"),
+            html.contains("<script src=\"/static/app.js?v=js14\" defer></script>"),
             "{path}"
         );
     }
@@ -957,7 +957,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
     let stylesheet = app
         .oneshot(
             Request::builder()
-                .uri("/static/app.css?v=m15")
+                .uri("/static/app.css?v=m16")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1257,12 +1257,12 @@ async fn sign_in_error_page_uses_the_shared_mobile_document_shell() {
     );
     assert!(html.contains("Login failed, try again"));
     assert!(html.contains("href=\"/login\""));
-    assert!(html.contains("href=\"/static/app.css?v=m15\""));
+    assert!(html.contains("href=\"/static/app.css?v=m16\""));
     assert!(!html.contains("style="));
     // The shared shell loads both local deferred scripts, never inline code.
     assert_eq!(html.matches("<script").count(), 2);
     assert!(html.contains("<script src=\"/static/vendor/hls.min.js?v=1.7.3\" defer></script>"));
-    assert!(html.contains("<script src=\"/static/app.js?v=js13\" defer></script>"));
+    assert!(html.contains("<script src=\"/static/app.js?v=js14\" defer></script>"));
 }
 
 #[tokio::test]
@@ -5711,4 +5711,49 @@ async fn old_scope_profile_shows_per_action_reauthorization_messages() {
     assert!(html.contains("Sign in again to block"), "{html}");
     assert!(html.contains("Sign in again to mute"), "{html}");
     assert!(html.contains("Sign in again to add to lists"), "{html}");
+}
+
+#[tokio::test]
+async fn profile_follow_form_creates_the_follow_record_in_the_viewers_repo() {
+    let storage = Arc::new(MemoryStorage::default());
+    let flow = FakeOAuthFlow::default();
+    let actions = flow.actions.clone();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage.clone());
+    let cookie = finish_login(&app).await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/profile/action")
+                .header("origin", "https://appview.example")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("cookie", &cookie)
+                .body(Body::from("subject=did%3Aplc%3Afriend&action=follow"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert!(
+        storage
+            .is_following("did:plc:alice", "did:plc:friend")
+            .unwrap()
+    );
+    let created = storage
+        .records_for_actor_collection("did:plc:alice", "app.bsky.graph.follow", 10)
+        .unwrap();
+    assert_eq!(created.len(), 1);
+    assert_eq!(created[0].record["$type"], "app.bsky.graph.follow");
+    assert_eq!(created[0].record["subject"], "did:plc:friend");
+    assert!(
+        actions
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|action| action.starts_with("create:app.bsky.graph.follow:"))
+    );
 }
