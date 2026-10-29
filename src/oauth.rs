@@ -6411,7 +6411,6 @@ where
             Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
         }
     };
-    let banner = profile_banner_markup(&profile);
     let description = profile
         .get("description")
         .and_then(Value::as_str)
@@ -6468,14 +6467,21 @@ where
     } else {
         String::new()
     };
+    let content = render_profile_page_content(
+        &profile,
+        display_name,
+        &handle,
+        &follows_you,
+        &label_chips,
+        &action_html,
+        &description,
+        &stats,
+        &posts,
+        &older,
+    );
     let response = Html(page_shell_with_feeds_and_badge(
         display_name,
-        &format!(
-            "<section class=\"profile-header\">{banner}<div class=\"profile-card\"><div class=\"profile-heading-row\"><div class=\"profile-identity\">{}<div class=\"profile-identity-copy\"><h1>{}</h1><p class=\"profile-handle\">@{}</p>{follows_you}<div class=\"profile-labels\">{label_chips}</div></div></div>{action_html}</div><div class=\"profile-description-stats\">{description}<div class=\"profile-stats\">{stats}</div></div></div></section><header class=\"section-heading\"><h2>Posts</h2></header><ol class=\"post-list\">{posts}</ol>{older}",
-            avatar_markup(&profile, "profile-avatar"),
-            html_escape(display_name),
-            html_escape(&handle)
-        ),
+        &content,
         true,
         &tabs.feeds,
         None,
@@ -6485,6 +6491,27 @@ where
     .into_response();
     page_timing.render_ms = render_started.elapsed().as_millis() as u64;
     response
+}
+
+fn render_profile_page_content(
+    profile: &Value,
+    display_name: &str,
+    handle: &str,
+    follows_you: &str,
+    label_chips: &str,
+    action_html: &str,
+    description: &str,
+    stats: &str,
+    posts: &str,
+    older: &str,
+) -> String {
+    let banner = profile_banner_markup(profile);
+    format!(
+        "<section class=\"profile-header\">{banner}<div class=\"profile-card\"><div class=\"profile-heading-row\"><div class=\"profile-identity\">{}<div class=\"profile-identity-copy\"><h1>{}</h1><p class=\"profile-handle\">@{}</p>{follows_you}<div class=\"profile-labels\">{label_chips}</div></div></div>{action_html}</div><div class=\"profile-description-stats\">{description}<div class=\"profile-stats\">{stats}</div></div></div></section><header class=\"section-heading\"><h2>Posts</h2></header><ol class=\"post-list\">{posts}</ol>{older}",
+        avatar_markup(profile, "profile-avatar"),
+        html_escape(display_name),
+        html_escape(handle),
+    )
 }
 
 fn profile_banner_markup(profile: &Value) -> String {
@@ -6593,12 +6620,7 @@ where
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
     let content = if verified_cookie_block_access(&state.public, &headers, state.storage.as_ref()) {
-        format!(
-            "<section class=\"block-confirm-card\" aria-labelledby=\"block-confirm-title\"><h1 id=\"block-confirm-title\">Block @{}?</h1><p>They won't be able to see your posts, follow you, or message you.</p><form class=\"block-confirm-actions\" action=\"/profile/action\" method=\"post\" data-profile-action><input type=\"hidden\" name=\"subject\" value=\"{}\"><input type=\"hidden\" name=\"action\" value=\"block\"><input type=\"hidden\" name=\"confirm\" value=\"yes\"><a class=\"secondary-button\" href=\"/profile?did={}\">Cancel</a><button type=\"submit\">Block</button></form></section>",
-            html_escape(&handle),
-            html_escape(subject_did),
-            form_encoded(subject_did),
-        )
+        render_profile_block_confirm_content(&handle, subject_did)
     } else {
         format!(
             "<section class=\"block-confirm-card\"><h1>Block @{}</h1>{}</section>",
@@ -6607,6 +6629,15 @@ where
         )
     };
     Html(page_shell("Confirm block", &content, true)).into_response()
+}
+
+fn render_profile_block_confirm_content(handle: &str, subject_did: &str) -> String {
+    format!(
+        "<section class=\"block-confirm-card\" aria-labelledby=\"block-confirm-title\"><h1 id=\"block-confirm-title\">Block @{}?</h1><p>They won't be able to see your posts, follow you, or message you.</p><form class=\"block-confirm-actions\" action=\"/profile/action\" method=\"post\" data-profile-action><input type=\"hidden\" name=\"subject\" value=\"{}\"><input type=\"hidden\" name=\"action\" value=\"block\"><input type=\"hidden\" name=\"confirm\" value=\"yes\"><a class=\"secondary-button\" href=\"/profile?did={}\">Cancel</a><button type=\"submit\">Block</button></form></section>",
+        html_escape(handle),
+        html_escape(subject_did),
+        form_encoded(subject_did),
+    )
 }
 
 async fn profile_action<F, S>(
@@ -10667,6 +10698,121 @@ mod tests {
     use tower::ServiceExt;
     use tracing::instrument::WithSubscriber;
     use tracing_subscriber::fmt::MakeWriter;
+
+    #[test]
+    fn write_profile_capture_fixture_when_requested() {
+        let Some(output_dir) = std::env::var_os("AV36B_CAPTURE_DIR") else {
+            return;
+        };
+        let output_dir = PathBuf::from(output_dir);
+        fs::create_dir_all(&output_dir).unwrap();
+
+        let subject_did = "did:plc:riley";
+        let mut labels_by_actor = HashMap::new();
+        labels_by_actor.insert(
+            subject_did.to_owned(),
+            vec![AccountLabel {
+                subject_did: subject_did.to_owned(),
+                labeler_did: "did:plc:careful-labeler".to_owned(),
+                labeler_name: "Careful Labeler".to_owned(),
+                value: "spider".to_owned(),
+                display_name: "Spider Warning".to_owned(),
+                severity: "alert".to_owned(),
+                blurs: "media".to_owned(),
+            }],
+        );
+        let labels = render_account_label_chips(&labels_by_actor, subject_did);
+        let lists = [
+            ProfileListChoice {
+                uri: "at://did:plc:alice/app.bsky.graph.list/friends".to_owned(),
+                name: "Friends".to_owned(),
+                purpose: "app.bsky.graph.defs#curatelist".to_owned(),
+                item_uri: Some("at://did:plc:alice/app.bsky.graph.listitem/riley".to_owned()),
+            },
+            ProfileListChoice {
+                uri: "at://did:plc:alice/app.bsky.graph.list/reading".to_owned(),
+                name: "Reading circle".to_owned(),
+                purpose: "app.bsky.graph.defs#curatelist".to_owned(),
+                item_uri: None,
+            },
+        ];
+        let actions = render_profile_actions(ProfileActionState {
+            subject_did,
+            following: true,
+            blocked: false,
+            muted: false,
+            follow_access: true,
+            block_access: true,
+            mute_access: true,
+            list_access: true,
+            lists: &lists,
+        });
+        let display_name = "Riley Morgan";
+        let banner_url = "https://cdn.bsky.app/img/banner/plain/fixture@jpeg";
+        let variants = [
+            ("following", display_name, true),
+            ("no-banner", display_name, false),
+            (
+                "long-name",
+                "Riley Morgan writes about gardens, books, careful experiments, and small discoveries throughout the changing seasons",
+                true,
+            ),
+        ];
+        for (name, display_name, has_banner) in variants {
+            let mut profile = json!({
+                "displayName": display_name,
+                "handle": "riley.example",
+                "avatar": null,
+                "banner": banner_url,
+                "description": "Field notes, art, and quiet mornings. More at https://example.test/about",
+                "followersCount": 128,
+                "followsCount": 214,
+                "postsCount": 1042
+            });
+            if !has_banner {
+                profile.as_object_mut().unwrap().remove("banner");
+            }
+            let handle = "riley.example";
+            let description = profile["description"]
+                .as_str()
+                .map(|description| {
+                    format!(
+                        "<p class=\"profile-description\">{}</p>",
+                        render_profile_description(description)
+                    )
+                })
+                .unwrap_or_default();
+            let stats = [
+                profile_stat(&profile, "followersCount", "Followers"),
+                profile_stat(&profile, "followsCount", "Following"),
+                profile_stat(&profile, "postsCount", "Posts"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<String>();
+            let content = render_profile_page_content(
+                &profile,
+                display_name,
+                handle,
+                "<span class=\"follows-you-pill\">Follows you</span>",
+                &labels,
+                &actions,
+                &description,
+                &stats,
+                "<li class=\"empty-state\">No indexed posts yet.</li>",
+                "",
+            );
+            let html =
+                page_shell_with_feeds_and_badge(display_name, &content, true, &[], None, false, 0)
+                    // Keep all browser-fixture traffic local while exercising production markup.
+                    .replace(banner_url, "/fixture-banner.svg");
+            fs::write(output_dir.join(format!("{name}.html")), html).unwrap();
+        }
+
+        let block_confirmation = render_profile_block_confirm_content("riley.example", subject_did);
+        let block_confirmation = page_shell("Confirm block", &block_confirmation, true);
+        fs::write(output_dir.join("block-confirm.html"), block_confirmation).unwrap();
+    }
 
     #[tokio::test]
     async fn production_account_label_lookup_batches_all_page_authors_and_sends_labeler_header() {
