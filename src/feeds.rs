@@ -62,6 +62,7 @@ pub struct FeedTimelineTiming {
     pub timeline_fetch_live_ms: u64,
     pub skeleton_hydration_ms: u64,
     pub cache_hit: bool,
+    pub skeleton_cache_hit: bool,
 }
 
 const LIVE_POST_CACHE_ENTRIES: usize = 20_000;

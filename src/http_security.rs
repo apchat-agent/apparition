@@ -12,7 +12,7 @@ use std::{
     sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
-use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::{compression::CompressionLayer, limit::RequestBodyLimitLayer};
 
 const MAX_URI_BYTES: usize = 8 * 1024;
 const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024;
@@ -31,6 +31,7 @@ static RATE_STATE: OnceLock<Mutex<RateState>> = OnceLock::new();
 pub fn protect(router: Router, public_https: bool) -> Router {
     router
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
+        .layer(CompressionLayer::new().gzip(true).br(true))
         .layer(from_fn_with_state(public_https, apply))
 }
 

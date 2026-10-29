@@ -2,8 +2,8 @@ use crate::identity::{HttpIdentityBackend, IdentityResolver};
 use crate::{
     api::profile_view_from_storage,
     feeds::{
-        FeedClient, FeedTimeline, FeedTimelineTiming, ResolvedFeed, SavedFeedPreference,
-        parse_saved_feed_preferences,
+        FeedClient, FeedSkeletonPage, FeedTimeline, FeedTimelineTiming, ResolvedFeed,
+        SavedFeedPreference, parse_saved_feed_preferences,
     },
     ingest::{
         IndexedNotification, IndexedRecord, MemoryStorage, NotificationCursor, ProfileIndexEntry,
@@ -334,6 +334,7 @@ pub struct OAuthWebState<F, S> {
     pub public: OAuthPublic,
     pub flow: F,
     pub storage: Arc<S>,
+    feed_page_cache: FeedPageCache,
 }
 
 impl OAuthPublic {
@@ -454,6 +455,7 @@ impl OAuthPublic {
                 public: self.clone(),
                 flow,
                 storage,
+                feed_page_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             }))
     }
 
@@ -641,6 +643,9 @@ type ServiceAuthCache =
 type FeedPageCache = Arc<
     tokio::sync::Mutex<HashMap<(String, String, String), (tokio::time::Instant, FeedTimeline)>>,
 >;
+type FeedSkeletonCache = Arc<
+    tokio::sync::Mutex<HashMap<(String, String, String), (tokio::time::Instant, FeedSkeletonPage)>>,
+>;
 const SERVICE_AUTH_LIFETIME_SECS: u64 = 30 * 60;
 const FEED_PAGE_CACHE_SECS: u64 = 60;
 
@@ -654,6 +659,7 @@ pub struct AtriumOAuthFlow<B: crate::identity::IdentityBackend = HttpIdentityBac
     saved_feed_refreshes: SavedFeedRefreshes,
     service_auth_cache: ServiceAuthCache,
     feed_page_cache: FeedPageCache,
+    feed_skeleton_cache: FeedSkeletonCache,
 }
 
 impl<B: crate::identity::IdentityBackend> Clone for AtriumOAuthFlow<B> {
@@ -668,6 +674,7 @@ impl<B: crate::identity::IdentityBackend> Clone for AtriumOAuthFlow<B> {
             saved_feed_refreshes: self.saved_feed_refreshes.clone(),
             service_auth_cache: self.service_auth_cache.clone(),
             feed_page_cache: self.feed_page_cache.clone(),
+            feed_skeleton_cache: self.feed_skeleton_cache.clone(),
         }
     }
 }
@@ -958,6 +965,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             saved_feed_refreshes: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             service_auth_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             feed_page_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            feed_skeleton_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -1654,17 +1662,61 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
             let resolve_started = std::time::Instant::now();
             let generator = self.feed_client.resolve_feed(uri).await?;
             let resolve_ms = resolve_started.elapsed().as_millis() as u64;
-            let auth_started = std::time::Instant::now();
-            let service_jwt = self
-                .service_auth_token(did, &generator.service_did)
-                .await
-                .ok();
-            let auth_ms = auth_started.elapsed().as_millis() as u64;
             let skeleton_started = std::time::Instant::now();
-            let skeleton = self
-                .feed_client
-                .get_skeleton(&generator, cursor, service_jwt.as_deref())
-                .await?;
+            let mut skeleton_cache_hit = false;
+            let mut auth_ms = 0;
+            let skeleton = if let Some((expires, skeleton)) =
+                self.feed_skeleton_cache.lock().await.get(&key).cloned()
+                && expires > tokio::time::Instant::now()
+            {
+                skeleton_cache_hit = true;
+                skeleton
+            } else {
+                let auth_started = std::time::Instant::now();
+                let auth_flow = self.clone();
+                let viewer_did = did.to_owned();
+                let service_did = generator.service_did.clone();
+                let auth_task = tokio::spawn(async move {
+                    auth_flow
+                        .service_auth_token(&viewer_did, &service_did)
+                        .await
+                });
+                let anonymous_skeleton = self
+                    .feed_client
+                    .get_skeleton(&generator, cursor, None)
+                    .await;
+                let skeleton = match anonymous_skeleton {
+                    Ok(skeleton) => {
+                        // Public generators can return immediately; let session token refresh
+                        // warm the cache for later requests without holding up this page.
+                        drop(auth_task);
+                        skeleton
+                    }
+                    Err(anonymous_error) => {
+                        let service_jwt = auth_task
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .ok_or(anonymous_error)?;
+                        auth_ms = auth_started.elapsed().as_millis() as u64;
+                        self.feed_client
+                            .get_skeleton(&generator, cursor, Some(&service_jwt))
+                            .await?
+                    }
+                };
+                let mut cache = self.feed_skeleton_cache.lock().await;
+                cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
+                if cache.len() < 1024 {
+                    cache.insert(
+                        key.clone(),
+                        (
+                            tokio::time::Instant::now() + Duration::from_secs(FEED_PAGE_CACHE_SECS),
+                            skeleton.clone(),
+                        ),
+                    );
+                }
+                skeleton
+            };
             let skeleton_ms = skeleton_started.elapsed().as_millis() as u64;
             let hydration_started = std::time::Instant::now();
             let timeline = self.feed_client.hydrate_skeleton(skeleton, storage).await?;
@@ -1686,6 +1738,7 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
                     timeline_fetch_live_ms: resolve_ms.saturating_add(skeleton_ms),
                     skeleton_hydration_ms: hydration_started.elapsed().as_millis() as u64,
                     cache_hit: false,
+                    skeleton_cache_hit,
                 },
             };
             let mut cache = self.feed_page_cache.lock().await;
@@ -2508,7 +2561,7 @@ async fn hydrate_page_quotes<F: OAuthFlow, S: Storage>(
     })
     .await;
     if fetch_result.is_err() {
-        tracing::info!(
+        tracing::debug!(
             pending = result
                 .values()
                 .filter(|state| matches!(state, QuoteRenderState::Pending))
@@ -3083,20 +3136,50 @@ where
     let Some(uri) = query.get("uri").filter(|uri| !uri.is_empty()) else {
         return oauth_error(StatusCode::BAD_REQUEST, "feed uri is required");
     };
+    let page_key = (
+        did.clone(),
+        uri.to_owned(),
+        query.get("cursor").cloned().unwrap_or_default(),
+    );
     let timeline_started = std::time::Instant::now();
-    let page = match state
-        .flow
-        .feed_timeline(
-            &did,
-            uri,
-            query.get("cursor").map(String::as_str),
-            state.storage.as_ref(),
-        )
-        .await
+    let page = if let Some((expires, page)) =
+        state.feed_page_cache.lock().await.get(&page_key).cloned()
+        && expires > tokio::time::Instant::now()
     {
-        Ok(page) => page,
-        Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
+        let mut page = page;
+        page.timing = FeedTimelineTiming {
+            cache_hit: true,
+            ..FeedTimelineTiming::default()
+        };
+        page
+    } else {
+        match state
+            .flow
+            .feed_timeline(
+                &did,
+                uri,
+                query.get("cursor").map(String::as_str),
+                state.storage.as_ref(),
+            )
+            .await
+        {
+            Ok(page) => page,
+            Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
+        }
     };
+    if !page.timing.cache_hit {
+        let mut cache = state.feed_page_cache.lock().await;
+        cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
+        if cache.len() < 1024 {
+            cache.insert(
+                page_key,
+                (
+                    tokio::time::Instant::now() + Duration::from_secs(FEED_PAGE_CACHE_SECS),
+                    page.clone(),
+                ),
+            );
+        }
+    }
     page_timing.session_token_refresh_ms = page
         .timing
         .session_token_refresh_ms
