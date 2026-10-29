@@ -5885,6 +5885,46 @@ async fn profile_labels_are_fetched_once_and_render_as_chips_with_labeler_detail
 }
 
 #[tokio::test]
+async fn own_timeline_hides_posts_by_muted_and_blocked_accounts() {
+    let storage = Arc::new(MemoryStorage::default());
+    for (did, rkey, text) in [
+        ("did:plc:muted", "muted-post", "muted content"),
+        ("did:plc:blocked", "blocked-post", "blocked content"),
+        ("did:plc:visible", "visible-post", "visible content"),
+    ] {
+        storage
+            .put_record(&fake_feed_post(did, rkey, 10, text))
+            .unwrap();
+        storage.set_follow("did:plc:alice", did, true).unwrap();
+    }
+    storage
+        .put_record(&IndexedRecord {
+            did: "did:plc:alice".to_owned(),
+            collection: "app.bsky.graph.block".to_owned(),
+            rkey: "blocked".to_owned(),
+            uri: "at://did:plc:alice/app.bsky.graph.block/blocked".to_owned(),
+            cid: Some("block-cid".to_owned()),
+            time_us: 20,
+            record: serde_json::json!({"subject":"did:plc:blocked"}),
+        })
+        .unwrap();
+    let flow = FakeOAuthFlow::default();
+    flow.muted_actors
+        .lock()
+        .unwrap()
+        .insert("did:plc:muted".to_owned());
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage);
+    let cookie = finish_login(&app).await;
+
+    let html = get_html(&app, "/app", &cookie).await;
+    assert!(html.contains("visible content"), "{html}");
+    assert!(!html.contains("muted content"), "{html}");
+    assert!(!html.contains("blocked content"), "{html}");
+}
+
+#[tokio::test]
 async fn profile_follow_form_creates_the_follow_record_in_the_viewers_repo() {
     let storage = Arc::new(MemoryStorage::default());
     let flow = FakeOAuthFlow::default();
