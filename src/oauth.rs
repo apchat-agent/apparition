@@ -7679,6 +7679,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn video_embed_renders_playlist_alt_text_and_aspect_ratio() {
+        let storage = MemoryStorage::default();
+        let rendered = render_web_embed(
+            &storage,
+            "did:plc:av31author",
+            &json!({
+                "$type":"app.bsky.embed.video#view",
+                "playlist":"https://video.bsky.app/watch/did%3Aplc%3Aav31author/bafk-video/playlist.m3u8",
+                "thumbnail":"https://video.bsky.app/watch/did%3Aplc%3Aav31author/bafk-video/thumbnail.jpg",
+                "alt":"A red bicycle rides past a park",
+                "aspectRatio":{"width":1920,"height":1080}
+            }),
+        );
+        assert!(rendered.contains("<video"), "{rendered}");
+        assert!(rendered.contains("playlist.m3u8"), "{rendered}");
+        assert!(rendered.contains("A red bicycle rides past a park"), "{rendered}");
+        assert!(rendered.contains("width=\"1920\""), "{rendered}");
+        assert!(rendered.contains("height=\"1080\""), "{rendered}");
+        assert!(rendered.contains("thumbnail.jpg"), "{rendered}");
+        assert!(rendered.contains("controls"), "{rendered}");
+        assert!(rendered.contains("muted"), "{rendered}");
+        assert!(!rendered.contains("autoplay"), "{rendered}");
+    }
+
     #[tokio::test]
     async fn alt_test_page_requires_and_accepts_a_verified_session_cookie() {
         let public = OAuthPublic::new("https://appview.example").unwrap();

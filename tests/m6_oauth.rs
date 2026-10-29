@@ -26,7 +26,7 @@ use tower::ServiceExt;
 use tracing::{Event, Subscriber, field::Visit};
 use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
-const EXPECTED_OAUTH_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=*";
+const EXPECTED_OAUTH_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* blob:video/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* rpc:app.bsky.video.getUploadLimits?aud=did:web:video.bsky.app rpc:app.bsky.video.uploadVideo?aud=did:web:video.bsky.app rpc:app.bsky.video.getJobStatus?aud=did:web:video.bsky.app";
 
 #[derive(Clone)]
 struct ProfileHydrationTiming(Arc<Mutex<Option<u64>>>);
@@ -2139,6 +2139,7 @@ async fn old_scope_session_keeps_text_composer_and_shows_picture_reauthorization
     .unwrap();
     assert!(html.contains("action=\"/post\""), "{html}");
     assert!(html.contains("Log in again to enable pictures"), "{html}");
+    assert!(html.contains("sign in again to post videos"), "{html}");
     assert!(html.contains("href=\"/login\""), "{html}");
     assert!(!html.contains("type=\"file\""), "{html}");
 
