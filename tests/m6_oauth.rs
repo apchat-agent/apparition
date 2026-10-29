@@ -5839,6 +5839,52 @@ async fn old_scope_profile_shows_per_action_reauthorization_messages() {
 }
 
 #[tokio::test]
+async fn profile_labels_are_fetched_once_and_render_as_chips_with_labeler_details() {
+    let storage = Arc::new(MemoryStorage::default());
+    storage
+        .put_record(&fake_feed_post(
+            "did:plc:friend",
+            "post-one",
+            5,
+            "labelled account post",
+        ))
+        .unwrap();
+    let flow = FakeOAuthFlow::default();
+    flow.account_labels.lock().unwrap().push(AccountLabel {
+        subject_did: "did:plc:friend".to_owned(),
+        labeler_did: "did:plc:labeler".to_owned(),
+        labeler_name: "Careful Labeler".to_owned(),
+        value: "spider".to_owned(),
+        display_name: "Spider Warning".to_owned(),
+        severity: "alert".to_owned(),
+        blurs: "media".to_owned(),
+    });
+    let label_requests = flow.label_requests.clone();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage);
+    let cookie = finish_login(&app).await;
+
+    let html = get_html(&app, "/profile?did=did%3Aplc%3Afriend", &cookie).await;
+    assert!(html.contains("profile-actions"), "{html}");
+    assert!(html.contains("Spider Warning"), "{html}");
+    assert!(html.contains("Careful Labeler"), "{html}");
+    assert!(html.contains("severity: alert"), "{html}");
+    assert!(html.contains("blurs: media"), "{html}");
+    assert!(html.matches("account-label-chip").count() >= 2, "{html}");
+    let requests = label_requests.lock().unwrap();
+    assert_eq!(requests.len(), 1, "label lookup should be batched per page");
+    assert_eq!(
+        requests[0]
+            .iter()
+            .filter(|did| did.as_str() == "did:plc:friend")
+            .count(),
+        1,
+        "duplicate profile/post authors should only be sent once"
+    );
+}
+
+#[tokio::test]
 async fn profile_follow_form_creates_the_follow_record_in_the_viewers_repo() {
     let storage = Arc::new(MemoryStorage::default());
     let flow = FakeOAuthFlow::default();
