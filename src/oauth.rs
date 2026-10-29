@@ -88,7 +88,7 @@ const PAGE_PROFILE_BUDGET: Duration = Duration::from_millis(1500);
 const PAGE_PROFILE_CONCURRENCY: usize = 8;
 const PAGE_QUOTE_CONCURRENCY: usize = 16;
 const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m14";
-const WEB_SCRIPT_URL: &str = "/static/app.js?v=js12";
+const WEB_SCRIPT_URL: &str = "/static/app.js?v=js13";
 const HLS_SCRIPT_URL: &str = "/static/vendor/hls.min.js?v=1.7.3";
 const ALT_MODEL_DOWNLOAD_BYTES: u64 = 264_713_119;
 const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
@@ -899,6 +899,7 @@ impl OAuthPublic {
             .route("/feeds", get(feeds_page::<F, S>))
             .route("/app/feed", get(feed_timeline_page::<F, S>))
             .route("/app/thread", get(thread_page::<F, S>))
+            .route("/quote-fragment", get(quote_fragment::<F, S>))
             .route("/notifications", get(notifications_page::<F, S>))
             .route(
                 "/notifications/unread-count",
@@ -3517,12 +3518,13 @@ async fn hydrate_page_content<F: OAuthFlow, S: Storage + 'static>(
     flow: &F,
     storage: Arc<S>,
     page_records: &[&IndexedRecord],
+    quote_records: &[&IndexedRecord],
     leading_authors: impl IntoIterator<Item = String>,
     deadline: tokio::time::Instant,
 ) -> Result<PageContentHydration, StorageError> {
     let mut refs = Vec::new();
     let mut seen_refs = HashSet::new();
-    for record in page_records {
+    for record in quote_records {
         if let Some(embed) = record.record.get("embed")
             && let Some(reference) = quoted_record_ref(embed)
             && seen_refs.insert(reference.uri.clone())
@@ -3577,6 +3579,23 @@ async fn hydrate_page_content<F: OAuthFlow, S: Storage + 'static>(
         profile_hydration_ms: profile_hydration_ms?,
         quote_hydration_ms: quote_hydration.1,
     })
+}
+
+fn page_records_with_parents<'a>(
+    page_records: &[&'a IndexedRecord],
+    parents: &'a PageParentIndex,
+) -> Vec<&'a IndexedRecord> {
+    let mut result = page_records.to_vec();
+    let mut seen = page_records
+        .iter()
+        .map(|record| record.uri.as_str())
+        .collect::<HashSet<_>>();
+    for parent in parents.values().flatten() {
+        if seen.insert(parent.uri.as_str()) {
+            result.push(parent);
+        }
+    }
+    result
 }
 
 async fn hydrate_page_parents<F: OAuthFlow, S: Storage>(
@@ -4244,10 +4263,12 @@ where
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
     page_timing.parent_hydration_ms = parent_started.elapsed().as_millis() as u64;
+    let quote_records = page_records_with_parents(&timeline, &parents);
     let quote_index = match hydrate_page_content(
         &state.flow,
         state.storage.clone(),
         &timeline,
+        &quote_records,
         std::iter::empty(),
         content_deadline,
     )
@@ -4494,10 +4515,12 @@ where
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
     page_timing.parent_hydration_ms = parent_started.elapsed().as_millis() as u64;
+    let quote_records = page_records_with_parents(&feed_records, &parents);
     let quote_index = match hydrate_page_content(
         &state.flow,
         state.storage.clone(),
         &feed_records,
+        &quote_records,
         std::iter::empty(),
         content_deadline,
     )
@@ -4953,10 +4976,12 @@ where
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
     page_timing.parent_hydration_ms = parent_started.elapsed().as_millis() as u64;
+    let quote_records = page_records_with_parents(&notification_records, &parents);
     let quote_index = match hydrate_page_content(
         &state.flow,
         state.storage.clone(),
         &notification_records,
+        &quote_records,
         leading_authors,
         content_deadline,
     )
@@ -5221,10 +5246,12 @@ where
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
     page_timing.parent_hydration_ms = parent_started.elapsed().as_millis() as u64;
+    let quote_records = page_records_with_parents(&records, &parents);
     let quote_index = match hydrate_page_content(
         &state.flow,
         state.storage.clone(),
         &records,
+        &quote_records,
         std::iter::once(subject.to_owned()).chain(records.iter().map(|record| record.did.clone())),
         content_deadline,
     )
@@ -5406,6 +5433,7 @@ where
         &state.flow,
         state.storage.clone(),
         &page_records,
+        &page_records,
         std::iter::empty(),
         page_deadline,
     )
@@ -5586,6 +5614,34 @@ where
         unread_badge_count(state.storage.as_ref(), &viewer_did),
     ))
     .into_response()
+}
+
+async fn quote_fragment<F, S>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response
+where
+    F: OAuthFlow,
+    S: Storage + 'static,
+{
+    if verified_cookie_did(&state.public, &headers, state.storage.as_ref()).is_none() {
+        return (StatusCode::UNAUTHORIZED, "sign in to load this quoted post").into_response();
+    }
+    let Some(uri) = query.get("uri").filter(|uri| post_uri_did(uri).is_some()) else {
+        return oauth_error(StatusCode::BAD_REQUEST, "uri must identify a post");
+    };
+    let record = match load_post_record(&state.flow, state.storage.as_ref(), uri).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return (StatusCode::NOT_FOUND, "quoted post not found").into_response(),
+        Err(error) => {
+            tracing::debug!(%error, uri, "quoted post fragment fetch failed");
+            return (StatusCode::BAD_GATEWAY, "quoted post could not be loaded").into_response();
+        }
+    };
+    let index = HashMap::from([(uri.clone(), QuoteRenderState::Found(record))]);
+    let embed = json!({"$type":"app.bsky.embed.record","record":{"record":{"uri":uri}}});
+    Html(render_web_quote(state.storage.as_ref(), &embed, &index, 0)).into_response()
 }
 
 fn render_quote_preview<S: Storage>(storage: &S, quoted: &IndexedRecord) -> String {
@@ -8463,8 +8519,16 @@ fn render_web_quote<S: Storage>(
     };
     let encoded_uri = form_encoded(uri);
     if quote_depth > 0 {
+        let handle = post_uri_did(uri)
+            .and_then(|did| {
+                let profile = profile_view_from_storage(storage, did).ok()?;
+                let handle = profile_handle(&profile, did);
+                (handle != did).then_some(handle)
+            })
+            .map(|handle| format!(" · @{}", html_escape(&handle)))
+            .unwrap_or_default();
         return format!(
-            "<a class=\"quoted-nested-link\" href=\"/app/thread?uri={encoded_uri}\">Quoted post</a>"
+            "<a class=\"quoted-nested-link\" href=\"/app/thread?uri={encoded_uri}\">Quoted post{handle}</a>"
         );
     }
     if reference.unavailable {
@@ -8515,7 +8579,7 @@ fn render_web_quote<S: Storage>(
         }
         QuoteRenderState::Pending | QuoteRenderState::Other(_) => {
             return format!(
-                "<a class=\"quoted-post-card quoted-post-status\" href=\"/app/thread?uri={encoded_uri}\">Quoted post</a>"
+                "<div class=\"quoted-post-card quoted-post-deferred\" data-quote-fragment=\"/quote-fragment?uri={encoded_uri}\" data-quote-thread=\"/app/thread?uri={encoded_uri}\"><span>Loading quoted post…</span><a href=\"/app/thread?uri={encoded_uri}\">Open thread</a></div>"
             );
         }
     };
@@ -8855,7 +8919,10 @@ mod tests {
 
         let rendered = render_web_quote(&storage, &embed, &index, 0);
 
-        assert!(rendered.contains("data-quote-fragment=\"/quote-fragment?uri="), "{rendered}");
+        assert!(
+            rendered.contains("data-quote-fragment=\"/quote-fragment?uri="),
+            "{rendered}"
+        );
         assert!(rendered.contains("Loading quoted post"), "{rendered}");
         assert!(!rendered.contains(">Quoted post</a>"), "{rendered}");
     }
@@ -8864,7 +8931,9 @@ mod tests {
     fn av33_nested_quote_link_keeps_its_label_and_adds_the_known_author_handle() {
         let storage = MemoryStorage::default();
         let did = "did:plc:nested-author";
-        storage.set_verified_handle(did, "nested.author.test").unwrap();
+        storage
+            .set_verified_handle(did, "nested.author.test")
+            .unwrap();
         let embed = quote_embed(&format!("at://{did}/app.bsky.feed.post/nested"));
 
         let rendered = render_web_quote(&storage, &embed, &QuoteRenderIndex::new(), 1);
@@ -8896,13 +8965,8 @@ mod tests {
         storage.set_follow(viewer, author, true).unwrap();
         let flow = QuoteHydrationTestFlow::new([root_with_quote, quote.clone()]);
 
-        let page = request_test_timeline_at_with_flow(
-            storage,
-            viewer,
-            "/app?limit=2",
-            flow.clone(),
-        )
-        .await;
+        let page =
+            request_test_timeline_at_with_flow(storage, viewer, "/app?limit=2", flow.clone()).await;
 
         assert!(page.contains("class=\"post-item thread-group\""), "{page}");
         assert!(page.contains("Thread group ancestor"), "{page}");
@@ -8911,7 +8975,10 @@ mod tests {
         fetched.sort();
         let mut expected = vec![root.uri, quote.uri];
         expected.sort();
-        assert_eq!(fetched, expected, "one parent fetch and one batched quote fetch");
+        assert_eq!(
+            fetched, expected,
+            "one parent fetch and one batched quote fetch"
+        );
     }
 
     #[tokio::test]
@@ -8955,8 +9022,14 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let fragment = String::from_utf8(body.to_vec()).unwrap();
-        assert!(fragment.contains("class=\"quoted-post-card\""), "{fragment}");
-        assert!(fragment.contains("Fetched quote fragment body"), "{fragment}");
+        assert!(
+            fragment.contains("class=\"quoted-post-card\""),
+            "{fragment}"
+        );
+        assert!(
+            fragment.contains("Fetched quote fragment body"),
+            "{fragment}"
+        );
     }
 
     #[test]
@@ -9209,7 +9282,7 @@ mod tests {
         assert!(css.contains(".infinite-scroll-status {"));
         assert!(css.contains(".infinite-scroll-retry[hidden] {\n  display: none;"));
         assert!(WEB_STYLESHEET_URL.contains("v=m14"));
-        assert!(WEB_SCRIPT_URL.contains("v=js12"));
+        assert!(WEB_SCRIPT_URL.contains("v=js13"));
     }
 
     #[test]

@@ -825,6 +825,7 @@ function installInfiniteScroll({
             } else {
               existingGroup.append(connector, post);
             }
+            initializeVideoPlayers(post);
             existingPostNodes.set(post.getAttribute("data-post-uri"), post);
           }
           if (threadMore) {
@@ -864,6 +865,7 @@ function installInfiniteScroll({
         existingPostNodes.set(uri, post);
       }
       list.append(card);
+      initializeVideoPlayers(card);
       appended.push(card);
     }
     return appended;
@@ -933,7 +935,36 @@ function installInfiniteScroll({
   checkPosition();
 }
 
+function initializeVideoPlayers(root = document) {
+  const videos = [];
+  if (root.matches?.("video[data-video-playlist]")) videos.push(root);
+  videos.push(...(root.querySelectorAll?.("video[data-video-playlist]") || []));
+  for (const video of videos) {
+    if (video.dataset?.videoInitialized === "true") continue;
+    const playlist = video.getAttribute("data-video-playlist");
+    if (!playlist) continue;
+    if (video.canPlayType?.("application/vnd.apple.mpegurl")) {
+      video.src = playlist;
+      if (video.dataset) {
+        video.dataset.videoReady = "true";
+        video.dataset.videoInitialized = "true";
+      }
+      continue;
+    }
+    const HlsClient = window.Hls || globalThis.Hls;
+    if (!HlsClient?.isSupported?.()) continue;
+    const player = new HlsClient({ enableWorker: false });
+    player.loadSource(playlist);
+    player.attachMedia(video);
+    if (video.dataset) {
+      video.dataset.videoReady = "true";
+      video.dataset.videoInitialized = "true";
+    }
+  }
+}
+
 installInfiniteScroll();
+initializeVideoPlayers();
 
 // Phones: the app frame is pinned to the screen (app.css), so the document itself should never be scrolled. iOS can
 // still leave it scrolled after the keyboard closes; put it back.
@@ -996,19 +1027,35 @@ window.visualViewport?.addEventListener("resize", resetDocumentScroll);
   });
 })();
 
-// HLS.js is bundled locally under the same-origin script policy. Safari uses its
-// native HLS implementation; Firefox and other MediaSource browsers use HLS.js.
-(document.querySelectorAll?.("video[data-video-playlist]") || []).forEach((video) => {
-  const playlist = video.getAttribute("data-video-playlist");
-  if (!playlist) return;
-  if (video.canPlayType?.("application/vnd.apple.mpegurl")) {
-    video.src = playlist;
-    return;
+// A quote can remain unresolved when page hydration reaches its shared budget. Load
+// its same-origin fragment after the page is visible, keeping a useful link if it fails.
+function fillDeferredQuotes(root = document) {
+  const placeholders = [];
+  if (root.matches?.("[data-quote-fragment]")) placeholders.push(root);
+  placeholders.push(...(root.querySelectorAll?.("[data-quote-fragment]") || []));
+  for (const placeholder of placeholders) {
+    if (placeholder.dataset?.quoteLoading === "true") continue;
+    const fragmentUrl = placeholder.getAttribute("data-quote-fragment");
+    if (!fragmentUrl) continue;
+    if (placeholder.dataset) placeholder.dataset.quoteLoading = "true";
+    fetch(fragmentUrl, {
+      credentials: "same-origin",
+      headers: { Accept: "text/html" },
+    }).then(async (response) => {
+      if (!response.ok) throw new Error(`Quote fragment request failed (${response.status}).`);
+      const fragmentDocument = new DOMParser().parseFromString(await response.text(), "text/html");
+      const card = fragmentDocument.querySelector(".quoted-post-card");
+      if (!card) throw new Error("The quote fragment did not contain a post card.");
+      fillDeferredQuotes(card);
+      placeholder.replaceWith(card);
+    }).catch(() => {
+      const fallback = document.createElement("a");
+      fallback.className = "quoted-post-card quoted-post-status";
+      fallback.href = placeholder.getAttribute("data-quote-thread") || "/app";
+      fallback.textContent = "Quoted post unavailable · Open thread";
+      placeholder.replaceWith(fallback);
+    });
   }
-  const HlsClient = window.Hls || globalThis.Hls;
-  if (!HlsClient?.isSupported?.()) return;
-  const player = new HlsClient({ enableWorker: false });
-  player.loadSource(playlist);
-  player.attachMedia(video);
-  video.dataset.videoReady = "true";
-});
+}
+
+fillDeferredQuotes();

@@ -949,7 +949,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
         assert_eq!(html.matches("<script").count(), 2, "{path}");
         assert!(html.contains("<script src=\"/static/vendor/hls.min.js?v=1.7.3\" defer></script>"));
         assert!(
-            html.contains("<script src=\"/static/app.js?v=js12\" defer></script>"),
+            html.contains("<script src=\"/static/app.js?v=js13\" defer></script>"),
             "{path}"
         );
     }
@@ -1262,7 +1262,7 @@ async fn sign_in_error_page_uses_the_shared_mobile_document_shell() {
     // The shared shell loads both local deferred scripts, never inline code.
     assert_eq!(html.matches("<script").count(), 2);
     assert!(html.contains("<script src=\"/static/vendor/hls.min.js?v=1.7.3\" defer></script>"));
-    assert!(html.contains("<script src=\"/static/app.js?v=js12\" defer></script>"));
+    assert!(html.contains("<script src=\"/static/app.js?v=js13\" defer></script>"));
 }
 
 #[tokio::test]
@@ -5028,7 +5028,12 @@ async fn quote_failures_distinguish_missing_unavailable_and_budget_placeholder()
 
     assert!(html.contains("Post not found"), "{html}");
     assert!(html.contains("Post unavailable"), "{html}");
-    assert!(html.contains("Quoted post"), "{html}");
+    assert!(
+        html.contains("data-quote-fragment=\"/quote-fragment?uri="),
+        "{html}"
+    );
+    assert!(html.contains("Loading quoted post"), "{html}");
+    assert!(!html.contains(">Quoted post</a>"), "{html}");
     assert!(!html.contains(deleted_uri), "{html}");
     assert!(!html.contains(unavailable_uri), "{html}");
     assert!(!html.contains(delayed_uri), "{html}");
