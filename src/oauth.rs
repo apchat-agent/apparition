@@ -95,14 +95,13 @@ const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
 const SAVED_FEED_CACHE_PREFIX: &str = "saved-feed-preferences:";
 const VIDEO_SERVICE_DID: &str = "did:web:video.bsky.app";
 const VIDEO_SERVICE_URL: &str = "https://video.bsky.app";
-const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=did:web:video.bsky.app rpc:app.bsky.video.uploadVideo?aud=did:web:video.bsky.app rpc:app.bsky.video.getJobStatus?aud=did:web:video.bsky.app";
+const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=*";
 const BLOB_SCOPE: &str = "blob:image/*";
 const VIDEO_BLOB_SCOPE: &str = "blob:video/*";
-const VIDEO_SCOPES: [&str; 4] = [
+const VIDEO_SCOPES: [&str; 3] = [
     VIDEO_BLOB_SCOPE,
-    "rpc:app.bsky.video.getUploadLimits?aud=did:web:video.bsky.app",
-    "rpc:app.bsky.video.uploadVideo?aud=did:web:video.bsky.app",
-    "rpc:app.bsky.video.getJobStatus?aud=did:web:video.bsky.app",
+    "rpc:app.bsky.video.getUploadLimits?aud=*",
+    "rpc:com.atproto.repo.uploadBlob?aud=*",
 ];
 const WRITE_SCOPES: [&str; 3] = [
     "repo:app.bsky.feed.post?action=create",
@@ -313,6 +312,19 @@ fn build_video_post_record(
 
 fn job_status_value(response: &Value) -> &Value {
     response.get("jobStatus").unwrap_or(response)
+}
+
+fn service_auth_audience_from_url(value: &str) -> Result<String, String> {
+    let url = reqwest::Url::parse(value)
+        .map_err(|_| "PDS URL could not be parsed for service authorization".to_owned())?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("PDS URL has an unsupported scheme for service authorization".to_owned());
+    }
+    let hostname = url
+        .host_str()
+        .filter(|hostname| !hostname.is_empty())
+        .ok_or_else(|| "PDS URL has no host for service authorization".to_owned())?;
+    Ok(format!("did:web:{hostname}"))
 }
 
 async fn poll_video_job<F>(
@@ -1530,6 +1542,18 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         cached_preferences.unwrap_or_default()
     }
 
+    async fn pds_service_did(&self, viewer_did: &str) -> Result<String, String> {
+        let did = viewer_did
+            .parse::<Did>()
+            .map_err(|_| "viewer DID is invalid".to_owned())?;
+        let session = self
+            .client
+            .restore(&did)
+            .await
+            .map_err(|_| "OAuth session could not be restored".to_owned())?;
+        service_auth_audience_from_url(&session.base_uri())
+    }
+
     async fn service_auth_token(
         &self,
         viewer_did: &str,
@@ -1620,6 +1644,16 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         let token = self
             .service_auth_token(viewer_did, VIDEO_SERVICE_DID, lexicon)
             .await?;
+        self.video_service_json_with_token(&token, lexicon, parameters)
+            .await
+    }
+
+    async fn video_service_json_with_token(
+        &self,
+        token: &str,
+        lexicon: &str,
+        parameters: &[(&str, &str)],
+    ) -> Result<Value, String> {
         let mut url = reqwest::Url::parse(&self.video_service_url)
             .map_err(|error| format!("video service URL is invalid: {error}"))?;
         url.set_path(&format!("/xrpc/{lexicon}"));
@@ -1641,8 +1675,9 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             .await?;
         validate_video_upload_limits(&limits, video.size_bytes)?;
 
+        let pds_service_did = self.pds_service_did(did).await?;
         let token = self
-            .service_auth_token(did, VIDEO_SERVICE_DID, "app.bsky.video.uploadVideo")
+            .service_auth_token(did, &pds_service_did, "com.atproto.repo.uploadBlob")
             .await?;
         let mut url = reqwest::Url::parse(&self.video_service_url)
             .map_err(|error| format!("video service URL is invalid: {error}"))?;
@@ -1657,7 +1692,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         let response = self
             .video_http_client
             .post(url)
-            .bearer_auth(token)
+            .bearer_auth(&token)
             .header(header::CONTENT_TYPE, &video.mime_type)
             .header(header::CONTENT_LENGTH, video.size_bytes)
             .body(body)
@@ -1680,17 +1715,18 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                 .cloned()
                 .ok_or_else(|| "video service completed without returning a blob".to_owned());
         }
+        let poll_token = token.clone();
         poll_video_job(
             job_id,
             VIDEO_JOB_POLL_INTERVAL,
             VIDEO_JOB_MAX_POLLS,
             |job_id| {
                 let service = self.clone();
-                let did = did.to_owned();
+                let token = poll_token.clone();
                 Box::pin(async move {
                     service
-                        .video_service_json(
-                            &did,
+                        .video_service_json_with_token(
+                            &token,
                             "app.bsky.video.getJobStatus",
                             &[("jobId", job_id.as_str())],
                         )
@@ -3979,10 +4015,7 @@ where
         }
         Err(_) => {
             tracing::warn!("oauth callback panicked");
-            return oauth_error_page(
-                StatusCode::BAD_GATEWAY,
-                "Sign-in could not be completed. Please start again.",
-            );
+            return login_retry_page();
         }
     };
     if !has_atproto_scope(account.granted_scope.as_deref()) {
@@ -7450,6 +7483,15 @@ fn oauth_error_page(status: StatusCode, message: &str) -> Response {
         .into_response()
 }
 
+fn login_retry_page() -> Response {
+    Html(page_shell(
+        "Login failed",
+        "<section class=\"error-card\"><p class=\"eyebrow\">Sign-in error</p><h1>Login failed, try again</h1><p>Your sign-in could not be completed.</p><a class=\"primary-link\" href=\"/login\">Try again</a></section>",
+        false,
+    ))
+    .into_response()
+}
+
 fn feed_reauthorization_page() -> Response {
     Html(page_shell(
         "Allow feeds",
@@ -9363,6 +9405,7 @@ mod tests {
         auth_calls: usize,
         auth_requests: Vec<(String, String)>,
         skeleton_authorizations: Vec<Option<String>>,
+        video_requests: Vec<(String, String)>,
         pds_url: String,
         fail_auth: bool,
     }
@@ -9416,6 +9459,9 @@ mod tests {
         });
         let auth_state = state.clone();
         let skeleton_state = state.clone();
+        let video_limits_state = state.clone();
+        let video_upload_state = state.clone();
+        let video_status_state = state.clone();
         let app = Router::new()
             .route(
                 "/.well-known/oauth-authorization-server",
@@ -9446,27 +9492,72 @@ mod tests {
                                 Json(json!({"error":"Unavailable"})),
                             )
                         } else {
-                            (StatusCode::OK, Json(json!({"token":SERVICE_JWT})))
+                            let token = match parameters.get("lxm").map(String::as_str) {
+                                Some("app.bsky.video.getUploadLimits") => "limits-service-jwt",
+                                Some("com.atproto.repo.uploadBlob") => "upload-blob-service-jwt",
+                                Some("app.bsky.video.getJobStatus") => "job-status-service-jwt",
+                                _ => SERVICE_JWT,
+                            };
+                            (StatusCode::OK, Json(json!({"token":token})))
                         }
                     }
                 }),
             )
             .route(
                 "/xrpc/app.bsky.video.getUploadLimits",
-                get(|| async {
-                    Json(json!({"canUpload":true,"remainingDailyVideos":5,"remainingDailyBytes":1000}))
+                get(move |headers: HeaderMap| {
+                    let state = video_limits_state.clone();
+                    async move {
+                        state.lock().unwrap().video_requests.push((
+                            "/xrpc/app.bsky.video.getUploadLimits".to_owned(),
+                            headers
+                                .get(header::AUTHORIZATION)
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default()
+                                .to_owned(),
+                        ));
+                        Json(json!({"canUpload":true,"remainingDailyVideos":5,"remainingDailyBytes":1000}))
+                    }
                 }),
             )
             .route(
                 "/xrpc/app.bsky.video.uploadVideo",
-                post(|_: Bytes| async {
-                    Json(json!({
-                        "jobStatus":{
-                            "jobId":"job-1",
-                            "state":"JOB_STATE_COMPLETED",
-                            "blob":{"ref":{"$link":"bafk-video"},"mimeType":"video/mp4","size":99}
-                        }
-                    }))
+                post(move |headers: HeaderMap, _: Bytes| {
+                    let state = video_upload_state.clone();
+                    async move {
+                        state.lock().unwrap().video_requests.push((
+                            "/xrpc/app.bsky.video.uploadVideo".to_owned(),
+                            headers
+                                .get(header::AUTHORIZATION)
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default()
+                                .to_owned(),
+                        ));
+                        Json(json!({"jobStatus":{"jobId":"job-1","state":"JOB_STATE_ENCODING"}}))
+                    }
+                }),
+            )
+            .route(
+                "/xrpc/app.bsky.video.getJobStatus",
+                get(move |headers: HeaderMap| {
+                    let state = video_status_state.clone();
+                    async move {
+                        state.lock().unwrap().video_requests.push((
+                            "/xrpc/app.bsky.video.getJobStatus".to_owned(),
+                            headers
+                                .get(header::AUTHORIZATION)
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default()
+                                .to_owned(),
+                        ));
+                        Json(json!({
+                            "jobStatus":{
+                                "jobId":"job-1",
+                                "state":"JOB_STATE_COMPLETED",
+                                "blob":{"ref":{"$link":"bafk-video"},"mimeType":"video/mp4","size":99}
+                            }
+                        }))
+                    }
                 }),
             )
             .route(
@@ -9734,8 +9825,14 @@ mod tests {
             filename: "clip.mp4".to_owned(),
         };
 
-        let blob = flow.upload_video_blob(FEED_VIEWER_DID, &video).await.unwrap();
-        assert_eq!(blob.pointer("/ref/$link").and_then(Value::as_str), Some("bafk-video"));
+        let blob = flow
+            .upload_video_blob(FEED_VIEWER_DID, &video)
+            .await
+            .unwrap();
+        assert_eq!(
+            blob.pointer("/ref/$link").and_then(Value::as_str),
+            Some("bafk-video")
+        );
         assert_eq!(
             state.lock().unwrap().auth_requests.as_slice(),
             &[
@@ -9746,6 +9843,23 @@ mod tests {
                 (
                     "did:web:127.0.0.1".to_owned(),
                     "com.atproto.repo.uploadBlob".to_owned()
+                ),
+            ]
+        );
+        assert_eq!(
+            state.lock().unwrap().video_requests.as_slice(),
+            &[
+                (
+                    "/xrpc/app.bsky.video.getUploadLimits".to_owned(),
+                    "Bearer limits-service-jwt".to_owned()
+                ),
+                (
+                    "/xrpc/app.bsky.video.uploadVideo".to_owned(),
+                    "Bearer upload-blob-service-jwt".to_owned()
+                ),
+                (
+                    "/xrpc/app.bsky.video.getJobStatus".to_owned(),
+                    "Bearer upload-blob-service-jwt".to_owned()
                 ),
             ]
         );
