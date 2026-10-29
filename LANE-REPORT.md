@@ -293,3 +293,12 @@ Implemented saved custom feed preferences, guarded generator resolution, service
 - `cargo fmt --all -- --check`: passed.
 - `cargo clippy --offline -- -D warnings`: passed.
 - No live server was accessed and nothing was pushed.
+
+## av26 attach pictures to posts (2026-10-29)
+
+Added bounded client-side JPEG preparation, EXIF stripping, image alt text, multipart upload through OAuth/DPoP, image and quote-with-image embeds, old-scope handling, and a 5 MiB protected web body limit. Full red/green commit evidence, verification results, and the required post-deploy re-login steps are in [LANE-REPORT-av26.md](LANE-REPORT-av26.md).
+
+- `cargo test --offline -- --test-threads=1`: passed, 227 tests; 2 ignored manual benchmarks.
+- `deno test --allow-read=static/app.js tests/app_js_test.js`: passed, 3 tests.
+- `cargo clippy --offline --all-targets -- -D warnings`, `cargo fmt --check`, and `cargo deny check licenses`: passed.
+- No live server was contacted and nothing was pushed.
