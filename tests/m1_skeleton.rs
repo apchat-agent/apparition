@@ -94,7 +94,7 @@ async fn oversized_login_form_body_returns_413() {
         DisabledOAuthFlow,
         std::sync::Arc::new(MemoryStorage::default()),
     );
-    let body = format!("handle={}", "a".repeat(5 * 1024 * 1024));
+    let body = format!("handle={}", "a".repeat(40_000));
     let response = app
         .oneshot(
             Request::builder()

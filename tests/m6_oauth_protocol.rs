@@ -93,6 +93,7 @@ struct FakeServerState {
     create_count: usize,
     upload_count: usize,
     upload_fail_on: Option<usize>,
+    upload_missing_ref_on: Option<usize>,
     create_bodies: Vec<Value>,
 }
 
@@ -117,6 +118,7 @@ impl IdentityBackend for ProductionFlowIdentity {
 
 #[derive(Clone, Debug)]
 struct CapturedRequest {
+    method: String,
     path: String,
     headers: HashMap<String, String>,
     body: String,
@@ -406,6 +408,10 @@ async fn production_post_with_two_images_uploads_blobs_before_creating_record() 
         })
         .collect::<Vec<_>>();
     assert_eq!(upload_requests.len(), 2);
+    assert_eq!(upload_requests[0].method, "POST");
+    assert!(upload_requests[0]
+        .path
+        .starts_with("/xrpc/com.atproto.repo.uploadBlob"));
     assert_eq!(
         upload_requests[0]
             .headers
@@ -449,10 +455,28 @@ async fn production_post_with_two_images_uploads_blobs_before_creating_record() 
     assert_eq!(record["embed"]["images"].as_array().unwrap().len(), 2);
     assert_eq!(record["embed"]["images"][0]["alt"], "first alt");
     assert_eq!(
+        record["embed"]["images"][0]["image"],
+        json!({
+            "$type":"blob",
+            "ref":{"$link":"bafyreiedv4rjxnzxvlvlgqbi4vpqi3s4iuz4buywtkgfjpfjn2gix5cocu"},
+            "mimeType":"image/jpeg",
+            "size":first.len()
+        })
+    );
+    assert_eq!(
         record["embed"]["images"][0]["aspectRatio"],
         json!({"width":1200,"height":800})
     );
     assert_eq!(record["embed"]["images"][1]["alt"], "second alt");
+    assert_eq!(
+        record["embed"]["images"][1]["image"],
+        json!({
+            "$type":"blob",
+            "ref":{"$link":"bafyreiedv4rjxnzxvlvlgqbi4vpqi3s4iuz4buywtkgfjpfjn2gix5cocu"},
+            "mimeType":"image/jpeg",
+            "size":second.len()
+        })
+    );
     assert_eq!(
         record["embed"]["images"][1]["aspectRatio"],
         json!({"width":2000,"height":1000})
@@ -500,6 +524,47 @@ async fn second_image_upload_failure_does_not_create_a_post() {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let state = shared.lock().unwrap();
     assert_eq!(state.upload_count, 2);
+    assert_eq!(state.create_count, 0);
+    drop(state);
+    server.abort();
+}
+
+#[tokio::test]
+async fn upload_blob_response_without_ref_does_not_create_a_post() {
+    let public = OAuthPublic::new("https://appview.example").unwrap();
+    let (flow, _, shared, server) =
+        production_flow_with_public(public.clone(), None, Some(EXPECTED_OAUTH_SCOPE)).await;
+    shared.lock().unwrap().upload_missing_ref_on = Some(1);
+    let app = public.router_with_flow(flow, Arc::new(MemoryStorage::default()));
+    let cookie = finish_production_login(&app, &shared).await;
+    let boundary = "protocol-missing-blob-ref";
+    let body = picture_multipart(
+        boundary,
+        "no dangling image post",
+        None,
+        None,
+        &[("missing-ref.jpg", b"\xff\xd8\xffimage", "image alt", 10, 10)],
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/post")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", cookie)
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let state = shared.lock().unwrap();
+    assert_eq!(state.upload_count, 1);
     assert_eq!(state.create_count, 0);
     drop(state);
     server.abort();
@@ -1271,6 +1336,19 @@ async fn serve_one(mut stream: TcpStream, origin: &str, state: Arc<Mutex<FakeSer
                 state.upload_count += 1;
                 if state.upload_fail_on == Some(state.upload_count) {
                     (500, vec![], json!({"error":"UploadFailed","message":"fake upload failure"}).to_string())
+                } else if state.upload_missing_ref_on == Some(state.upload_count) {
+                    (
+                        200,
+                        vec![],
+                        json!({
+                            "blob": {
+                                "$type":"blob",
+                                "mimeType":request.headers.get("content-type").map(String::as_str).unwrap_or("application/octet-stream"),
+                                "size":request.body_bytes.len()
+                            }
+                        })
+                        .to_string(),
+                    )
                 } else {
                     let mime = request.headers.get("content-type").map(String::as_str).unwrap_or("application/octet-stream");
                     (
@@ -1330,6 +1408,7 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<CapturedRequest
     let head = String::from_utf8_lossy(&bytes[..header_end]);
     let mut lines = head.split("\r\n");
     let first = lines.next().unwrap_or_default();
+    let method = first.split_whitespace().next().unwrap_or_default().to_owned();
     let path = first.split_whitespace().nth(1).unwrap_or("/").to_owned();
     let mut headers = HashMap::new();
     let content_length = lines
@@ -1357,6 +1436,7 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<CapturedRequest
         bytes.extend_from_slice(&chunk[..read]);
     }
     Ok(CapturedRequest {
+        method,
         path,
         headers,
         body: String::from_utf8_lossy(&bytes[header_end..header_end + content_length]).into_owned(),
