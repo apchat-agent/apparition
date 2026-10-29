@@ -540,7 +540,16 @@ Deno.test("infinite scroll loads once past the newest page midpoint in the pinne
   let releaseFetch;
   const pendingResponse = new Promise((resolve) => { releaseFetch = resolve; });
   const requests = [];
-  const nextCards = [new Element("li", "post-5"), new Element("li", "post-6")];
+  const duplicatePost = new Element("li", "post-2");
+  duplicatePost.setAttribute("data-post-kind", "post");
+  const fifthPost = new Element("li", "post-5");
+  fifthPost.setAttribute("data-post-kind", "post");
+  const replyPost = new Element("li", "post-6");
+  replyPost.setAttribute("data-post-kind", "post");
+  const duplicateParent = new Element("a", "post-1");
+  duplicateParent.setAttribute("data-post-kind", "parent");
+  replyPost.append(duplicateParent);
+  const nextCards = [duplicatePost, fifthPost, replyPost];
   const nextList = new Element("ol");
   nextList.className = "post-list";
   nextList.append(...nextCards);
@@ -576,6 +585,8 @@ Deno.test("infinite scroll loads once past the newest page midpoint in the pinne
   releaseFetch({ ok: true, text: async () => "page-two" });
   await new Promise((resolve) => setTimeout(resolve, 0));
   assertEquals(list.children.map((card) => card.getAttribute("data-post-uri")).join(","), "post-1,post-2,post-3,post-4,post-5,post-6");
+  assert(duplicatePost.removed, "a repeated post URI must be skipped across pages");
+  assert(duplicateParent.removed, "a reply parent already on the page must not be repeated");
   Observer.latest.fire();
   layout.listeners.get("scroll")();
   assertEquals(requests.length, 1, "the end of the list must stop future requests");
