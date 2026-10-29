@@ -5754,6 +5754,370 @@ fn create_key_file(path: &Path) -> Result<fs::File, std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::{DidDocument, DidService, IdentityBackend, ResolutionError};
+    use crate::ingest::IndexedRecord;
+    use atrium_oauth::store::session::Session;
+    use axum::http::Uri;
+    use std::collections::HashMap;
+    use tokio::net::TcpListener;
+    use tracing::instrument::WithSubscriber;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    const FEED_VIEWER_DID: &str = "did:plc:av23viewer";
+    const FEED_CREATOR_DID: &str = "did:plc:av23creator";
+    const FEED_SERVICE_DID: &str = "did:plc:av23service";
+    const FEED_URI: &str = "at://did:plc:av23creator/app.bsky.feed.generator/av23-authenticated";
+    const FAILURE_FEED_URI: &str =
+        "at://did:plc:av23creator/app.bsky.feed.generator/av23-auth-failure";
+    const PLACEHOLDER_URI: &str = "at://did:plc:av23author/app.bsky.feed.post/placeholder";
+    const REAL_POST_URIS: [&str; 3] = [
+        "at://did:plc:av23author/app.bsky.feed.post/real-one",
+        "at://did:plc:av23author/app.bsky.feed.post/real-two",
+        "at://did:plc:av23author/app.bsky.feed.post/real-three",
+    ];
+    const SERVICE_JWT: &str = "av23-service-jwt";
+
+    #[derive(Clone)]
+    struct FeedTestIdentity(HashMap<String, DidDocument>);
+
+    impl IdentityBackend for FeedTestIdentity {
+        async fn did_document(&self, did: &str) -> Result<Option<DidDocument>, ResolutionError> {
+            Ok(self.0.get(did).cloned())
+        }
+
+        async fn dns_txt_did(&self, _: &str) -> Result<Option<String>, ResolutionError> {
+            Ok(None)
+        }
+
+        async fn well_known_did(&self, _: &str) -> Result<Option<String>, ResolutionError> {
+            Ok(None)
+        }
+    }
+
+    #[derive(Default)]
+    struct FeedTestState {
+        auth_calls: usize,
+        skeleton_authorizations: Vec<Option<String>>,
+        fail_auth: bool,
+    }
+
+    #[derive(Clone, Default)]
+    struct FeedTestLogs(Arc<Mutex<Vec<u8>>>);
+
+    struct FeedTestLogWriter(FeedTestLogs);
+
+    impl Write for FeedTestLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for FeedTestLogs {
+        type Writer = FeedTestLogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            FeedTestLogWriter(self.clone())
+        }
+    }
+
+    async fn feed_test_flow(
+        fail_auth: bool,
+    ) -> (
+        AtriumOAuthFlow<FeedTestIdentity>,
+        Arc<Mutex<FeedTestState>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let pds = format!("http://127.0.0.1:{}", address.port());
+        let service_endpoint = format!("{pds}/fg");
+        let state = Arc::new(Mutex::new(FeedTestState {
+            fail_auth,
+            ..FeedTestState::default()
+        }));
+        let oauth_metadata = json!({
+            "issuer":pds,
+            "authorization_endpoint":format!("{pds}/authorize"),
+            "token_endpoint":format!("{pds}/token"),
+            "scopes_supported":["atproto"],
+            "response_types_supported":["code"]
+        });
+        let auth_state = state.clone();
+        let skeleton_state = state.clone();
+        let app = Router::new()
+            .route(
+                "/.well-known/oauth-authorization-server",
+                get(move || {
+                    let metadata = oauth_metadata.clone();
+                    async move { Json(metadata) }
+                }),
+            )
+            .route(
+                "/xrpc/com.atproto.server.getServiceAuth",
+                get(move || {
+                    let state = auth_state.clone();
+                    async move {
+                        let mut state = state.lock().unwrap();
+                        state.auth_calls += 1;
+                        if state.fail_auth {
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(json!({"error":"Unavailable"})),
+                            )
+                        } else {
+                            (StatusCode::OK, Json(json!({"token":SERVICE_JWT})))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/xrpc/com.atproto.repo.getRecord",
+                get(|uri: Uri| async move {
+                    let query = uri.query().unwrap_or_default();
+                    if query.contains("collection=app.bsky.feed.generator") {
+                        Json(json!({
+                            "uri": FEED_URI,
+                            "cid": "bafyreav23generator",
+                            "value": {"did": FEED_SERVICE_DID, "displayName": "For you"}
+                        }))
+                        .into_response()
+                    } else {
+                        StatusCode::NOT_FOUND.into_response()
+                    }
+                }),
+            )
+            .route(
+                "/fg/xrpc/app.bsky.feed.getFeedSkeleton",
+                get(move |uri: Uri, headers: HeaderMap| {
+                    let state = skeleton_state.clone();
+                    async move {
+                        let authorization = headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned);
+                        state
+                            .lock()
+                            .unwrap()
+                            .skeleton_authorizations
+                            .push(authorization.clone());
+                        let feed = if authorization.as_deref() == Some("Bearer av23-service-jwt") {
+                            REAL_POST_URIS
+                                .iter()
+                                .map(|post| json!({"post":post}))
+                                .collect::<Vec<_>>()
+                        } else {
+                            vec![json!({
+                                "post": PLACEHOLDER_URI,
+                                "reason": {"$type":"app.bsky.feed.defs#skeletonReasonPin"}
+                            })]
+                        };
+                        let _ = uri;
+                        Json(json!({"feed":feed,"cursor":"next"}))
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let docs = HashMap::from([
+            (
+                FEED_CREATOR_DID.to_owned(),
+                DidDocument {
+                    id: FEED_CREATOR_DID.to_owned(),
+                    also_known_as: vec![],
+                    verification_method: vec![],
+                    service: vec![DidService {
+                        id: "#atproto_pds".into(),
+                        type_name: "AtprotoPersonalDataServer".into(),
+                        service_endpoint: pds.clone(),
+                    }],
+                },
+            ),
+            (
+                FEED_SERVICE_DID.to_owned(),
+                DidDocument {
+                    id: FEED_SERVICE_DID.to_owned(),
+                    also_known_as: vec![],
+                    verification_method: vec![],
+                    service: vec![DidService {
+                        id: "#bsky_fg".into(),
+                        type_name: "BskyFeedGenerator".into(),
+                        service_endpoint,
+                    }],
+                },
+            ),
+        ]);
+        let identity_resolver = Arc::new(IdentityResolver::new(
+            FeedTestIdentity(docs),
+            Duration::from_secs(30),
+        ));
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let store = SqliteOAuthStore::open(":memory:").unwrap();
+        let viewer_did: Did = FEED_VIEWER_DID.parse().unwrap();
+        store
+            .set(
+                viewer_did.clone(),
+                Session {
+                    dpop_key: create_key().key,
+                    token_set: serde_json::from_value(json!({
+                        "iss":pds,
+                        "sub":viewer_did,
+                        "aud":pds,
+                        "scope":"atproto",
+                        "refresh_token":null,
+                        "access_token":"viewer-access-token",
+                        "token_type":"DPoP",
+                        "expires_at":null
+                    }))
+                    .unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        let flow = AtriumOAuthFlow::new(
+            &public,
+            identity_resolver,
+            store,
+            &pds,
+            SafeHttpClient::new().with_http_test_hosts(["127.0.0.1".to_owned()]),
+        )
+        .unwrap();
+        (flow, state, server)
+    }
+
+    fn feed_test_storage() -> MemoryStorage {
+        let storage = MemoryStorage::default();
+        for (uri, text) in std::iter::once((PLACEHOLDER_URI, "This feed requires authentication"))
+            .chain(REAL_POST_URIS.iter().copied().zip([
+                "personal post one",
+                "personal post two",
+                "personal post three",
+            ]))
+        {
+            let rkey = uri.rsplit('/').next().unwrap();
+            let did = uri
+                .strip_prefix("at://")
+                .and_then(|rest| rest.split('/').next())
+                .unwrap();
+            storage
+                .put_record(&IndexedRecord {
+                    did: did.to_owned(),
+                    collection: "app.bsky.feed.post".into(),
+                    rkey: rkey.to_owned(),
+                    uri: uri.to_owned(),
+                    cid: None,
+                    time_us: 1,
+                    record: json!({"$type":"app.bsky.feed.post","text":text,"createdAt":"2026-10-28T12:00:00Z"}),
+                })
+                .unwrap();
+        }
+        storage
+    }
+
+    #[tokio::test]
+    async fn authenticated_feed_uses_service_jwt_for_single_skeleton_request() {
+        let (flow, state, server) = feed_test_flow(false).await;
+        let storage = feed_test_storage();
+        let page = flow
+            .feed_timeline(FEED_VIEWER_DID, FEED_URI, None, &storage)
+            .await
+            .unwrap();
+        let texts = page
+            .timeline
+            .feed
+            .iter()
+            .map(|post| post.record.record["text"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            [
+                "personal post one",
+                "personal post two",
+                "personal post three"
+            ]
+        );
+        let state = state.lock().unwrap();
+        assert_eq!(state.skeleton_authorizations.len(), 1);
+        assert_eq!(
+            state.skeleton_authorizations[0].as_deref(),
+            Some("Bearer av23-service-jwt")
+        );
+        assert_eq!(state.auth_calls, 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn service_auth_token_is_reused_on_next_feed_page() {
+        let (flow, state, server) = feed_test_flow(false).await;
+        let storage = feed_test_storage();
+        flow.feed_timeline(FEED_VIEWER_DID, FEED_URI, None, &storage)
+            .await
+            .unwrap();
+        flow.feed_timeline(FEED_VIEWER_DID, FEED_URI, Some("next"), &storage)
+            .await
+            .unwrap();
+        let state = state.lock().unwrap();
+        assert_eq!(state.auth_calls, 1);
+        assert_eq!(state.skeleton_authorizations.len(), 2);
+        assert!(
+            state
+                .skeleton_authorizations
+                .iter()
+                .all(|authorization| authorization.as_deref() == Some("Bearer av23-service-jwt"))
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_service_auth_falls_back_anonymously_and_warns_once_per_feed() {
+        let (flow, state, server) = feed_test_flow(true).await;
+        let storage = feed_test_storage();
+        let logs = FeedTestLogs::default();
+        for cursor in [None, Some("next")] {
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(logs.clone())
+                .finish();
+            flow.feed_timeline(FEED_VIEWER_DID, FAILURE_FEED_URI, cursor, &storage)
+                .with_subscriber(subscriber)
+                .await
+                .unwrap();
+        }
+        let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            output
+                .matches("feed service auth unavailable; requesting skeleton anonymously")
+                .count(),
+            1
+        );
+        let state = state.lock().unwrap();
+        assert_eq!(state.auth_calls, 2);
+        assert_eq!(state.skeleton_authorizations.len(), 2);
+        assert!(state.skeleton_authorizations.iter().all(Option::is_none));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn logged_out_feed_uses_anonymous_skeleton_without_service_auth() {
+        let (flow, state, server) = feed_test_flow(false).await;
+        let storage = feed_test_storage();
+        let page = flow
+            .feed_timeline("", FEED_URI, None, &storage)
+            .await
+            .unwrap();
+        assert_eq!(page.timeline.feed.len(), 1);
+        let state = state.lock().unwrap();
+        assert_eq!(state.auth_calls, 0);
+        assert_eq!(state.skeleton_authorizations.as_slice(), [None]);
+        server.abort();
+    }
 
     // HTTP/2 browsers may send each cookie as its own `cookie` header; the
     // sign-in cookie was missed when another cookie came first (2026-10-28).
