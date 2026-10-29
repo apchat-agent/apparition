@@ -1,10 +1,61 @@
-// Like toggles in place instead of reloading the page. Without this script the form posts as before.
+document.addEventListener("change", (event) => {
+  const select = event.target;
+  if (!(select instanceof HTMLSelectElement) || !select.matches("[data-profile-list-select]")) return;
+  const option = select.selectedOptions[0];
+  const button = select.form?.querySelector(".profile-list-action");
+  if (button && option) button.textContent = option.dataset.member === "true" ? "Remove" : "Add";
+});
+
+document.addEventListener("click", async (event) => {
+  const target = event.target;
+  const cancel = target.closest?.(".block-confirm-dialog .secondary-button");
+  if (cancel) {
+    event.preventDefault();
+    const dialog = cancel.closest("dialog");
+    dialog?.close();
+    dialog?.remove();
+    return;
+  }
+
+  const listLink = target.closest?.("a[data-focus-list]");
+  if (listLink) {
+    event.preventDefault();
+    listLink.closest("details")?.removeAttribute("open");
+    const select = document.querySelector("[data-profile-list-select]");
+    select?.scrollIntoView({ block: "center" });
+    select?.focus();
+    return;
+  }
+
+  const link = target.closest?.("a[data-block-confirm]");
+  if (!link) return;
+  event.preventDefault();
+  link.closest("details")?.removeAttribute("open");
+  try {
+    const response = await fetch(link.href, {
+      credentials: "same-origin",
+      headers: { Accept: "text/html" },
+    });
+    if (!response.ok) throw new Error(String(response.status));
+    const page = new DOMParser().parseFromString(await response.text(), "text/html");
+    const card = page.querySelector(".block-confirm-card");
+    if (!card) throw new Error("the block confirmation page is unavailable");
+    const dialog = document.createElement("dialog");
+    dialog.className = "block-confirm-dialog";
+    dialog.append(card.cloneNode(true));
+    dialog.addEventListener("close", () => dialog.remove(), { once: true });
+    document.body.append(dialog);
+    dialog.showModal();
+  } catch {
+    window.location.assign(link.href);
+  }
+});
+
+// Like and profile actions update in place when this script is enabled. Their forms still work without it.
 document.addEventListener("submit", async (event) => {
   const profileForm = event.target;
   if (profileForm instanceof HTMLFormElement && profileForm.getAttribute("action") === "/profile/action") {
     event.preventDefault();
-    const prompt = profileForm.dataset.confirm;
-    if (prompt && !window.confirm(prompt)) return;
     const button = profileForm.querySelector("button[type=submit]");
     if (button) button.disabled = true;
     try {
@@ -21,6 +72,11 @@ document.addEventListener("submit", async (event) => {
       const replacement = document.createElement("template");
       replacement.innerHTML = result.actions_html;
       current.replaceWith(replacement.content);
+      const dialog = profileForm.closest("dialog");
+      if (dialog) {
+        dialog.close();
+        dialog.remove();
+      }
     } catch {
       profileForm.submit();
     }

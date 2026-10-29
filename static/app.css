@@ -14,6 +14,9 @@
   --accent-contrast: #ffffff;
   --focus: #b544d5;
   --shadow: 0 12px 36px rgb(22 40 55 / 7%);
+  --label-alert-ink: #80591c;
+  --label-alert-surface: #f5f0e5;
+  --label-alert-line: #e5d8bd;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -29,6 +32,9 @@
     --accent-contrast: #0e141a;
     --focus: #e19bf2;
     --shadow: 0 12px 36px rgb(0 0 0 / 22%);
+    --label-alert-ink: #dbc48e;
+    --label-alert-surface: #28251f;
+    --label-alert-line: #574a30;
   }
 }
 
@@ -1426,86 +1432,313 @@ a.quoted-post-card:hover,
   overflow-wrap: anywhere;
 }
 
-.profile-card {
-  display: flex;
-  align-items: center;
-  gap: 1rem;
+.profile-header {
   margin-bottom: 1rem;
-  padding: 1rem 1.25rem;
   border-bottom: 1px solid var(--line);
+}
+
+.profile-banner {
+  height: 9rem;
+  overflow: hidden;
+  background: var(--surface-raised);
+}
+
+.profile-banner img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.profile-card {
+  display: grid;
+  gap: 0.8rem;
+  margin-top: -2.6rem;
+  padding: 0.5rem 0.9rem 1rem;
+}
+
+.profile-heading-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.6rem;
+  align-items: start;
+}
+
+.profile-identity {
+  display: flex;
+  min-width: 0;
+  align-items: flex-end;
+  gap: 0.65rem;
 }
 
 .profile-avatar,
 .profile-card .avatar-placeholder {
+  position: relative;
   display: block;
   width: 5rem;
   height: 5rem;
   flex: 0 0 5rem;
+  border: 4px solid var(--page);
   border-radius: 50%;
   background: linear-gradient(135deg, var(--accent), #98c9ae);
   object-fit: cover;
 }
 
+.profile-identity-copy {
+  min-width: 0;
+  padding-bottom: 0.15rem;
+}
+
 .profile-card h1 {
+  margin: 0;
   overflow-wrap: anywhere;
+  font-size: 1.35rem;
+  line-height: 1.2;
 }
 
 .profile-handle {
-  margin: 0.3rem 0 0;
+  margin: 0.25rem 0 0;
+  color: var(--muted);
+}
+
+.follows-you-pill {
+  display: inline-flex;
+  margin-top: 0.3rem;
+  padding: 0.08rem 0.45rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.7rem;
+  line-height: 1.45;
 }
 
 .profile-actions {
-  display: grid;
-  gap: 0.75rem;
-  margin-bottom: 1.25rem;
-  padding: 0.9rem 1.25rem 1.1rem;
-  border-bottom: 1px solid var(--line);
+  display: contents;
 }
 
-.profile-actions h2,
-.profile-actions h3 {
-  margin: 0;
-  font-size: 1rem;
-}
-
-.profile-relationships,
-.profile-action-buttons,
-.profile-list-actions {
+.profile-control-row {
+  position: relative;
   display: flex;
-  flex-wrap: wrap;
+  grid-column: 2;
+  grid-row: 1;
   align-items: center;
-  gap: 0.5rem;
-}
-
-.profile-relationships span,
-.list-purpose {
-  color: var(--muted);
-  font-size: 0.85rem;
+  justify-content: flex-end;
+  gap: 0.4rem;
+  padding-top: 0.2rem;
 }
 
 .profile-action-form {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
   gap: 0.4rem;
   margin: 0;
 }
 
-.profile-action-form button {
-  min-height: 2.35rem;
-  padding: 0.4rem 0.8rem;
+.profile-primary-action button {
+  min-height: 2.45rem;
+  padding: 0.4rem 1rem;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-contrast);
+  font-size: 0.88rem;
+  font-weight: 750;
+  white-space: nowrap;
+}
+
+.profile-primary-action.following button {
+  background: transparent;
+  color: var(--text);
+}
+
+.profile-overflow {
+  position: relative;
+}
+
+.profile-overflow-trigger {
+  display: grid;
+  width: 2.45rem;
+  height: 2.45rem;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  color: var(--text);
+  cursor: pointer;
+  list-style: none;
+}
+
+.profile-overflow-trigger::-webkit-details-marker {
+  display: none;
+}
+
+.profile-overflow-trigger .icon {
+  width: 1.25rem;
+  height: 1.25rem;
+}
+
+.profile-menu {
+  position: absolute;
+  z-index: 8;
+  top: calc(100% + 0.3rem);
+  right: 0;
+  display: grid;
+  min-width: 12rem;
+  padding: 0.35rem;
+  border: 1px solid var(--line);
+  border-radius: 0.8rem;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.profile-menu-item,
+.profile-menu .profile-action-form button {
+  display: flex;
+  width: 100%;
+  min-height: 2.5rem;
+  align-items: center;
+  justify-content: flex-start;
+  padding: 0.5rem 0.65rem;
+  border: 0;
+  border-radius: 0.55rem;
+  background: transparent;
+  color: var(--text);
+  font-size: 0.9rem;
+  text-align: left;
+  text-decoration: none;
+}
+
+.profile-menu-item:hover,
+.profile-menu .profile-action-form button:hover {
+  background: var(--surface-raised);
+  color: var(--accent);
+}
+
+.profile-menu .profile-action-form {
+  display: block;
+}
+
+@media (max-width: 799px) {
+  .profile-overflow[open] .profile-menu {
+    position: fixed;
+    top: auto;
+    right: auto;
+    bottom: calc(var(--mobile-nav-height, 4rem) + 0.55rem);
+    left: 50%;
+    width: min(24rem, calc(100vw - 1.25rem));
+    max-height: calc(100dvh - 2rem);
+    overflow-y: auto;
+    transform: translateX(-50%);
+    border-radius: 1rem;
+    padding: 0.5rem;
+  }
 }
 
 .profile-list-actions {
-  align-items: flex-start;
+  grid-column: 1 / -1;
+  grid-row: 2;
+  min-width: 0;
 }
 
-.profile-list-choice {
+.profile-list-row {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0;
+}
+
+.profile-list-row select {
+  width: auto;
+  min-width: 0;
+  min-height: 2.45rem;
+  flex: 1 1 auto;
+  padding: 0.35rem 0.55rem;
+  border: 1px solid var(--line);
+  border-radius: 0.65rem;
+  background: var(--surface-raised);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.84rem;
+}
+
+.profile-list-action {
+  min-height: 2.45rem;
+  flex: 0 0 auto;
+  padding: 0.35rem 0.8rem;
+  border-radius: 999px;
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
+.profile-description-stats {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.profile-description {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.profile-description-link {
+  overflow-wrap: anywhere;
+}
+
+.profile-stats {
   display: flex;
   flex-wrap: wrap;
+  gap: 0.9rem;
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+.profile-stats strong {
+  color: var(--text);
+}
+
+.list-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.block-confirm-card {
+  max-width: 28rem;
+  margin: 1.5rem auto;
+  padding: 1.25rem;
+  border: 1px solid var(--line);
+  border-radius: 1rem;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.block-confirm-card h1 {
+  margin: 0;
+  font-size: 1.25rem;
+}
+
+.block-confirm-card p {
+  color: var(--muted);
+}
+
+.block-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.6rem;
+  margin-top: 1.25rem;
+}
+
+.secondary-button {
+  display: inline-flex;
+  min-height: 44px;
   align-items: center;
-  gap: 0.25rem 0.6rem;
-  width: 100%;
+  padding: 0.5rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 0.7rem;
+  color: var(--text);
+  text-decoration: none;
 }
 
 .action-confirm {
@@ -2013,6 +2246,17 @@ a.quoted-post-card:hover,
 }
 
 @media (max-width: 440px) {
+  .profile-avatar,
+  .profile-card .avatar-placeholder {
+    width: 4.25rem;
+    height: 4.25rem;
+    flex-basis: 4.25rem;
+  }
+
+  .profile-card h1 {
+    font-size: 1.2rem;
+  }
+
   .post-card,
   .notification-card,
   .composer {
@@ -2112,7 +2356,7 @@ a.quoted-post-card:hover,
   }
 
   body:has(.mobile-nav) {
-    --mobile-nav-height: calc(2.1rem + 0.2rem + 1px + env(safe-area-inset-bottom) * 0.55);
+    --mobile-nav-height: calc(2rem + 0.2rem + 1px + max(4px, calc(env(safe-area-inset-bottom) * 0.25)));
     --mobile-compose-clearance: calc(var(--mobile-nav-height) + 0.75rem);
   }
 
@@ -2120,13 +2364,12 @@ a.quoted-post-card:hover,
   body:has(.mobile-nav) .mobile-nav {
     min-height: 0;
     padding-top: 0.1rem;
-    /* 55% of the 34px inset leaves about 19px below the row; icons retain roughly 15px above the 5px home indicator, 8px from the edge. */
-    padding-bottom: calc(0.1rem + env(safe-area-inset-bottom) * 0.55);
+    padding-bottom: calc(0.1rem + max(4px, calc(env(safe-area-inset-bottom) * 0.25)));
   }
 
   body:has(.mobile-nav) .mobile-nav a,
   body:has(.mobile-nav) .mobile-nav button {
-    min-height: 2.1rem;
+    min-height: 2rem;
     min-width: 44px;
   }
 
@@ -2271,8 +2514,8 @@ body {
   position: relative;
   display: inline-flex;
   flex: 0 0 auto;
-  color: var(--accent);
-  font-size: 0.68rem;
+  color: var(--muted);
+  font-size: 0.65rem;
   line-height: 1.3;
   vertical-align: middle;
 }
@@ -2281,13 +2524,25 @@ body {
   max-width: 10rem;
   padding: 0.08rem 0.35rem;
   overflow: hidden;
-  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  border: 1px solid var(--line);
   border-radius: 999px;
-  background: color-mix(in srgb, var(--accent) 10%, var(--surface));
+  background: var(--surface-raised);
+  color: var(--muted);
   cursor: pointer;
   list-style: none;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.account-label-chip.severity-alert summary {
+  border-color: var(--label-alert-line);
+  background: var(--label-alert-surface);
+  color: var(--label-alert-ink);
+}
+
+.account-label-chip.severity-inform summary {
+  border-color: color-mix(in srgb, var(--accent) 24%, var(--line));
+  background: color-mix(in srgb, var(--accent) 5%, var(--surface));
 }
 
 .account-label-chip summary::-webkit-details-marker {
@@ -2301,14 +2556,33 @@ body {
   left: 0;
   width: max-content;
   max-width: min(18rem, 80vw);
-  padding: 0.45rem 0.6rem;
+  padding: 0.55rem 0.7rem;
   border: 1px solid var(--border);
-  border-radius: 0.45rem;
+  border-radius: 0.65rem;
   background: var(--surface);
   box-shadow: 0 4px 14px rgb(0 0 0 / 18%);
   color: var(--text);
   font-size: 0.75rem;
   white-space: normal;
+}
+
+.block-confirm-dialog {
+  width: min(28rem, calc(100% - 2rem));
+  max-width: none;
+  padding: 0;
+  border: 0;
+  border-radius: 1rem;
+  background: transparent;
+  color: var(--text);
+}
+
+.block-confirm-dialog::backdrop {
+  background: rgb(0 0 0 / 42%);
+}
+
+.block-confirm-dialog .block-confirm-card {
+  margin: 0;
+  box-shadow: var(--shadow);
 }
 
 .account-label-chip[open] {

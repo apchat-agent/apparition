@@ -1068,13 +1068,13 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
             ),
             "{path}"
         );
-        assert!(html.contains("href=\"/static/app.css?v=m18\""), "{path}");
+        assert!(html.contains("href=\"/static/app.css?v=m19\""), "{path}");
         assert!(!html.contains("style="), "{path}");
         // Both playback and interaction scripts are local, deferred, and never inline.
         assert_eq!(html.matches("<script").count(), 2, "{path}");
         assert!(html.contains("<script src=\"/static/vendor/hls.min.js?v=1.7.3\" defer></script>"));
         assert!(
-            html.contains("<script src=\"/static/app.js?v=js14\" defer></script>"),
+            html.contains("<script src=\"/static/app.js?v=js15\" defer></script>"),
             "{path}"
         );
     }
@@ -1082,7 +1082,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
     let stylesheet = app
         .oneshot(
             Request::builder()
-                .uri("/static/app.css?v=m18")
+                .uri("/static/app.css?v=m19")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1383,12 +1383,12 @@ async fn sign_in_error_page_uses_the_shared_mobile_document_shell() {
     );
     assert!(html.contains("Login failed, try again"));
     assert!(html.contains("href=\"/login\""));
-    assert!(html.contains("href=\"/static/app.css?v=m18\""));
+    assert!(html.contains("href=\"/static/app.css?v=m19\""));
     assert!(!html.contains("style="));
     // The shared shell loads both local deferred scripts, never inline code.
     assert_eq!(html.matches("<script").count(), 2);
     assert!(html.contains("<script src=\"/static/vendor/hls.min.js?v=1.7.3\" defer></script>"));
-    assert!(html.contains("<script src=\"/static/app.js?v=js14\" defer></script>"));
+    assert!(html.contains("<script src=\"/static/app.js?v=js15\" defer></script>"));
 }
 
 #[tokio::test]
@@ -5814,9 +5814,11 @@ async fn profile_page_shows_relationship_and_actions_for_other_accounts_only() {
 
     let other = get_html(&app, "/profile?did=did%3Aplc%3Afriend", &cookie).await;
     assert!(other.contains("class=\"profile-actions\""), "{other}");
-    assert!(other.contains("You follow this account"), "{other}");
-    assert!(other.contains("Follows you"), "{other}");
-    assert!(other.contains("Unfollow"), "{other}");
+    assert!(other.contains(">Following</button>"), "{other}");
+    assert!(
+        other.contains("follows-you-pill\">Follows you</span>"),
+        "{other}"
+    );
 
     let own = get_html(&app, "/profile?did=did%3Aplc%3Aalice", &cookie).await;
     assert!(!own.contains("class=\"profile-actions\""), "{own}");
@@ -5919,7 +5921,7 @@ async fn profile_actions_use_one_follow_button_overflow_menu_and_membership_sele
     assert!(actions.contains("Mute account"), "{html}");
     assert!(actions.contains("Block account"), "{html}");
     assert!(!actions.contains("Confirm block"), "{html}");
-    assert!(!actions.contains("Unfollow"), "{html}");
+    assert!(!actions.contains(">Unfollow</button>"), "{html}");
     assert!(actions.contains("class=\"profile-list-row\""), "{html}");
     assert!(actions.contains("Friends ✓"), "{html}");
     assert!(actions.contains("Reading circle"), "{html}");
@@ -5934,6 +5936,9 @@ async fn profile_actions_use_one_follow_button_overflow_menu_and_membership_sele
 #[tokio::test]
 async fn block_confirmation_is_a_named_review_page_with_cancel_and_block_actions() {
     let storage = Arc::new(MemoryStorage::default());
+    storage
+        .set_verified_handle("did:plc:friend", "friend")
+        .unwrap();
     let app = OAuthPublic::new("https://appview.example")
         .unwrap()
         .router_with_flow(FakeOAuthFlow::default(), storage);
@@ -5970,6 +5975,66 @@ async fn block_confirmation_is_a_named_review_page_with_cancel_and_block_actions
     assert!(html.contains("name=\"confirm\" value=\"yes\""), "{html}");
     assert!(html.contains(">Cancel</a>"), "{html}");
     assert!(html.contains(">Block</button>"), "{html}");
+}
+
+#[tokio::test]
+async fn profile_list_toggle_uses_current_membership_to_choose_add_or_remove() {
+    let storage = Arc::new(MemoryStorage::default());
+    let list_uri = "at://did:plc:alice/app.bsky.graph.list/friends";
+    let item_uri = "at://did:plc:alice/app.bsky.graph.listitem/friend-item";
+    let flow = FakeOAuthFlow::default();
+    *flow.profile_lists.lock().unwrap() = vec![ProfileListChoice {
+        uri: list_uri.to_owned(),
+        item_uri: Some(item_uri.to_owned()),
+        name: "Friends".into(),
+        purpose: "app.bsky.graph.defs#curatelist".into(),
+    }];
+    let actions = flow.actions.clone();
+    let profile_lists = flow.profile_lists.clone();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage.clone());
+    let cookie = finish_login(&app).await;
+
+    for expected_action in [
+        "delete:app.bsky.graph.listitem",
+        "create:app.bsky.graph.listitem",
+    ] {
+        let body = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("subject", "did:plc:friend")
+            .append_pair("action", "list_toggle")
+            .append_pair("list_uri", list_uri)
+            .finish();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/profile/action")
+                    .header("origin", "https://appview.example")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("cookie", &cookie)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(
+            actions
+                .lock()
+                .unwrap()
+                .last()
+                .is_some_and(|action| action.starts_with(expected_action)),
+            "{:?}",
+            actions.lock().unwrap()
+        );
+        if expected_action.starts_with("delete") {
+            assert_eq!(profile_lists.lock().unwrap()[0].item_uri.as_deref(), None);
+        } else {
+            assert!(profile_lists.lock().unwrap()[0].item_uri.is_some());
+        }
+    }
 }
 
 #[tokio::test]

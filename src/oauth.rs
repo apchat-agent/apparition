@@ -87,8 +87,8 @@ const PROFILE_NEGATIVE_TTL: Duration = Duration::from_secs(60 * 60);
 const PAGE_PROFILE_BUDGET: Duration = Duration::from_millis(1500);
 const PAGE_PROFILE_CONCURRENCY: usize = 8;
 const PAGE_QUOTE_CONCURRENCY: usize = 16;
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m18";
-const WEB_SCRIPT_URL: &str = "/static/app.js?v=js14";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m19";
+const WEB_SCRIPT_URL: &str = "/static/app.js?v=js15";
 const HLS_SCRIPT_URL: &str = "/static/vendor/hls.min.js?v=1.7.3";
 const ALT_MODEL_DOWNLOAD_BYTES: u64 = 264_713_119;
 const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
@@ -988,6 +988,7 @@ impl OAuthPublic {
             )
             .route("/notifications/stream", get(notification_stream::<F, S>))
             .route("/profile", get(profile_page::<F, S>))
+            .route("/profile/block-confirm", get(profile_block_confirm::<F, S>))
             .route("/profile/action", post(profile_action::<F, S>))
             .route("/thread", get(thread_page::<F, S>))
             .route("/compose", get(quote_composer::<F, S>))
@@ -2050,7 +2051,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         let labeler_dids = self.labeler_dids_for_viewer(viewer_did).await?;
         let accepted_labelers = labeler_dids.join(",");
         let mut account_raw_labels = Vec::new();
-        for batch in actors.chunks(1) {
+        for batch in actors.chunks(ACCOUNT_LABEL_PROFILE_BATCH_SIZE) {
             let mut url = url::Url::parse(&format!(
                 "{}app.bsky.actor.getProfiles",
                 self.public_appview_base
@@ -6087,8 +6088,13 @@ fn render_account_label_chips(
         .into_iter()
         .flatten()
         .map(|label| {
+            let severity_class = match label.severity.as_str() {
+                "alert" => "severity-alert",
+                "inform" => "severity-inform",
+                _ => "severity-neutral",
+            };
             format!(
-                "<details class=\"account-label-chip\"><summary aria-label=\"Account label: {}\">{}</summary><span class=\"account-label-details\">{} · severity: {} · blurs: {}</span></details>",
+                "<details class=\"account-label-chip {severity_class}\"><summary aria-label=\"Account label: {}\">{}</summary><span class=\"account-label-details\">{} · severity: {} · blurs: {}</span></details>",
                 html_escape(&label.display_name),
                 html_escape(&label.display_name),
                 html_escape(&label.labeler_name),
@@ -6109,9 +6115,6 @@ async fn profile_action_panel<F: OAuthFlow, S: Storage>(
 ) -> Result<String, String> {
     let following = storage
         .is_following(viewer_did, subject_did)
-        .map_err(|error| error.to_string())?;
-    let follows_you = storage
-        .is_following(subject_did, viewer_did)
         .map_err(|error| error.to_string())?;
     let blocked = storage
         .records_for_actor_collection(viewer_did, "app.bsky.graph.block", 10_000)
@@ -6147,7 +6150,6 @@ async fn profile_action_panel<F: OAuthFlow, S: Storage>(
     Ok(render_profile_actions(ProfileActionState {
         subject_did,
         following,
-        follows_you,
         blocked,
         muted,
         follow_access,
@@ -6161,7 +6163,6 @@ async fn profile_action_panel<F: OAuthFlow, S: Storage>(
 struct ProfileActionState<'a> {
     subject_did: &'a str,
     following: bool,
-    follows_you: bool,
     blocked: bool,
     muted: bool,
     follow_access: bool,
@@ -6175,7 +6176,6 @@ fn render_profile_actions(state: ProfileActionState<'_>) -> String {
     let ProfileActionState {
         subject_did,
         following,
-        follows_you,
         blocked,
         muted,
         follow_access,
@@ -6184,98 +6184,77 @@ fn render_profile_actions(state: ProfileActionState<'_>) -> String {
         list_access,
         lists,
     } = state;
-    let mut relationships = Vec::new();
-    if following {
-        relationships.push("You follow this account".to_owned());
-    }
-    if follows_you {
-        relationships.push("Follows you".to_owned());
-    }
-    if blocked {
-        relationships.push("Blocked".to_owned());
-    }
-    if muted {
-        relationships.push("Muted".to_owned());
-    }
-    relationships.extend(
-        lists
-            .iter()
-            .filter(|list| list.item_uri.is_some())
-            .map(|list| format!("In {}", html_escape(&list.name))),
-    );
-    let relationships = if relationships.is_empty() {
-        "<span>No relationship</span>".to_owned()
-    } else {
-        relationships
-            .into_iter()
-            .map(|relationship| format!("<span>{relationship}</span>"))
-            .collect::<String>()
-    };
     let follow = if follow_access {
-        if following {
-            profile_action_form(subject_did, "unfollow", "Unfollow", None, false)
-        } else {
-            profile_action_form(subject_did, "follow", "Follow", None, false)
-        }
+        profile_follow_control(subject_did, following)
     } else {
         permission_reauthorization_link(if following { "unfollow" } else { "follow" })
     };
-    let block = if block_access {
-        if blocked {
-            profile_action_form(subject_did, "unblock", "Unblock", None, false)
-        } else {
-            profile_action_form(subject_did, "block", "Block", None, true)
-        }
-    } else {
+    let block = if !block_access {
         permission_reauthorization_link(if blocked { "unblock" } else { "block" })
+    } else if blocked {
+        profile_action_form(subject_did, "unblock", "Unblock account", None)
+    } else {
+        let did = form_encoded(subject_did);
+        format!(
+            "<a class=\"profile-menu-item\" href=\"/profile/block-confirm?did={did}\" data-block-confirm aria-haspopup=\"dialog\">Block account</a>"
+        )
     };
     let mute = if mute_access {
         if muted {
-            profile_action_form(subject_did, "unmute", "Unmute", None, false)
+            profile_action_form(subject_did, "unmute", "Unmute account", None)
         } else {
-            profile_action_form(subject_did, "mute", "Mute", None, false)
+            profile_action_form(subject_did, "mute", "Mute account", None)
         }
     } else {
         permission_reauthorization_link(if muted { "unmute" } else { "mute" })
     };
-    let list_controls = if !list_access {
+    let lists_link = if list_access {
+        "<a class=\"profile-menu-item\" href=\"#profile-lists\" data-focus-list>Add to lists...</a>"
+            .to_owned()
+    } else {
+        permission_reauthorization_link("lists")
+    };
+    let list_control = if !list_access {
         permission_reauthorization_link("lists")
     } else if lists.is_empty() {
         "<p class=\"list-empty\">No lists found in your account.</p>".to_owned()
     } else {
-        lists
+        let selected = &lists[0];
+        let selected_member = selected.item_uri.is_some();
+        let options = lists
             .iter()
-            .map(|list| {
-                let purpose = if list.purpose.ends_with("#modlist") {
-                    "Moderation list"
-                } else {
-                    "Curate list"
-                };
-                let form = if let Some(item_uri) = list.item_uri.as_deref() {
-                    profile_action_form(
-                        subject_did,
-                        "list_remove",
-                        &format!("Remove from {}", html_escape(&list.name)),
-                        Some(("item_uri", item_uri)),
-                        true,
-                    )
-                } else {
-                    profile_action_form(
-                        subject_did,
-                        "list_add",
-                        &format!("Add to {}", html_escape(&list.name)),
-                        Some(("list_uri", &list.uri)),
-                        false,
-                    )
-                };
+            .enumerate()
+            .map(|(index, list)| {
+                let check = if list.item_uri.is_some() { " ✓" } else { "" };
+                let selected = if index == 0 { " selected" } else { "" };
                 format!(
-                    "<div class=\"profile-list-choice\">{form}<span class=\"list-purpose\">{purpose}</span></div>"
+                    "<option value=\"{}\" data-member=\"{}\"{selected}>{}{check}</option>",
+                    html_escape(&list.uri),
+                    list.item_uri.is_some(),
+                    html_escape(&list.name),
                 )
             })
-            .collect::<String>()
+            .collect::<String>();
+        let action_label = if selected_member { "Remove" } else { "Add" };
+        format!(
+            "<form class=\"profile-list-row\" id=\"profile-lists\" action=\"/profile/action\" method=\"post\" data-profile-action data-profile-list-form><input type=\"hidden\" name=\"subject\" value=\"{}\"><input type=\"hidden\" name=\"action\" value=\"list_toggle\"><label class=\"sr-only\" for=\"profile-list-select\">Choose a list</label><select id=\"profile-list-select\" name=\"list_uri\" data-profile-list-select>{options}</select><button class=\"profile-list-action\" type=\"submit\">{action_label}</button></form>",
+            html_escape(subject_did)
+        )
     };
     format!(
-        "<section class=\"profile-actions\" aria-label=\"Profile actions\"><h2>Relationship</h2><div class=\"profile-relationships\">{relationships}</div><div class=\"profile-action-buttons\">{follow}{block}{mute}</div><div class=\"profile-list-actions\"><h3>Your lists</h3>{list_controls}</div></section>"
+        "<section class=\"profile-actions\" aria-label=\"Profile actions\"><div class=\"profile-control-row\">{follow}<details class=\"profile-overflow\"><summary class=\"profile-overflow-trigger\" aria-label=\"More profile actions\"><svg class=\"icon\" aria-hidden=\"true\" focusable=\"false\"><use href=\"#i-more\"></use></svg></summary><div class=\"profile-menu\" role=\"menu\">{lists_link}{mute}{block}</div></details></div><div class=\"profile-list-actions\">{list_control}</div></section>"
+    )
+}
+
+fn profile_follow_control(subject_did: &str, following: bool) -> String {
+    let (action, label, class, aria_label) = if following {
+        ("unfollow", "Following", "following", "Unfollow")
+    } else {
+        ("follow", "Follow", "follow", "Follow")
+    };
+    format!(
+        "<form class=\"profile-primary-action {class}\" action=\"/profile/action\" method=\"post\" data-profile-action><input type=\"hidden\" name=\"subject\" value=\"{}\"><input type=\"hidden\" name=\"action\" value=\"{action}\"><button type=\"submit\" aria-label=\"{aria_label}\">{label}</button></form>",
+        html_escape(subject_did)
     )
 }
 
@@ -6297,29 +6276,7 @@ fn profile_action_form(
     action: &str,
     label: &str,
     extra: Option<(&str, &str)>,
-    confirmation: bool,
 ) -> String {
-    let confirm = if confirmation {
-        let label = if action == "block" {
-            "Confirm block"
-        } else {
-            "Confirm removal"
-        };
-        format!(
-            "<label class=\"action-confirm\"><input type=\"checkbox\" name=\"confirm\" value=\"yes\" required>{label}</label>"
-        )
-    } else {
-        String::new()
-    };
-    let data_confirm = if confirmation {
-        if action == "block" {
-            " data-confirm=\"Block this account?\""
-        } else {
-            " data-confirm=\"Remove this account from the list?\""
-        }
-    } else {
-        ""
-    };
     let extra = extra
         .map(|(name, value)| {
             format!(
@@ -6330,7 +6287,7 @@ fn profile_action_form(
         })
         .unwrap_or_default();
     format!(
-        "<form class=\"profile-action-form\" action=\"/profile/action\" method=\"post\" data-profile-action{data_confirm}><input type=\"hidden\" name=\"subject\" value=\"{}\"><input type=\"hidden\" name=\"action\" value=\"{}\">{extra}{confirm}<button type=\"submit\">{}</button></form>",
+        "<form class=\"profile-action-form\" action=\"/profile/action\" method=\"post\" data-profile-action><input type=\"hidden\" name=\"subject\" value=\"{}\"><input type=\"hidden\" name=\"action\" value=\"{}\">{extra}<button type=\"submit\">{}</button></form>",
         html_escape(subject_did),
         html_escape(action),
         html_escape(label)
@@ -6427,6 +6384,19 @@ where
         .and_then(Value::as_str)
         .unwrap_or(&handle);
     let label_chips = render_account_label_chips(&quote_index.account_labels, subject);
+    let follows_you = if subject != did {
+        state
+            .storage
+            .is_following(subject, &did)
+            .map_err(|error| error.to_string())
+    } else {
+        Ok(false)
+    };
+    let follows_you = match follows_you {
+        Ok(true) => "<span class=\"follows-you-pill\">Follows you</span>",
+        Ok(false) => "",
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+    };
     let action_html = if subject == did {
         String::new()
     } else {
@@ -6444,6 +6414,26 @@ where
             Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
         }
     };
+    let banner = profile_banner_markup(&profile);
+    let description = profile
+        .get("description")
+        .and_then(Value::as_str)
+        .filter(|description| !description.trim().is_empty())
+        .map(|description| {
+            format!(
+                "<p class=\"profile-description\">{}</p>",
+                render_profile_description(description)
+            )
+        })
+        .unwrap_or_default();
+    let stats = [
+        profile_stat(&profile, "followersCount", "Followers"),
+        profile_stat(&profile, "followsCount", "Following"),
+        profile_stat(&profile, "postsCount", "Posts"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<String>();
     let write_forms_enabled =
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
     let posts = render_timeline_post_items(
@@ -6484,7 +6474,7 @@ where
     let response = Html(page_shell_with_feeds_and_badge(
         display_name,
         &format!(
-            "<section class=\"profile-card\">{}<div><h1>{}</h1><div class=\"profile-labels\">{label_chips}</div><p class=\"profile-handle\">@{}</p></div></section>{action_html}<header class=\"section-heading\"><h2>Posts</h2></header><ol class=\"post-list\">{posts}</ol>{older}",
+            "<section class=\"profile-header\">{banner}<div class=\"profile-card\"><div class=\"profile-heading-row\"><div class=\"profile-identity\">{}<div class=\"profile-identity-copy\"><h1>{}</h1><p class=\"profile-handle\">@{}</p>{follows_you}<div class=\"profile-labels\">{label_chips}</div></div></div>{action_html}</div><div class=\"profile-description-stats\">{description}<div class=\"profile-stats\">{stats}</div></div></div></section><header class=\"section-heading\"><h2>Posts</h2></header><ol class=\"post-list\">{posts}</ol>{older}",
             avatar_markup(&profile, "profile-avatar"),
             html_escape(display_name),
             html_escape(&handle)
@@ -6498,6 +6488,128 @@ where
     .into_response();
     page_timing.render_ms = render_started.elapsed().as_millis() as u64;
     response
+}
+
+fn profile_banner_markup(profile: &Value) -> String {
+    let banner = profile
+        .get("banner")
+        .and_then(Value::as_str)
+        .and_then(|value| url::Url::parse(value).ok())
+        .filter(|url| {
+            url.scheme() == "https"
+                && url.host_str() == Some("cdn.bsky.app")
+                && url.username().is_empty()
+                && url.password().is_none()
+        });
+    if let Some(banner) = banner {
+        format!(
+            "<div class=\"profile-banner\"><img src=\"{}\" alt=\"\" decoding=\"async\"></div>",
+            html_escape(banner.as_str())
+        )
+    } else {
+        "<div class=\"profile-banner\" aria-hidden=\"true\"></div>".to_owned()
+    }
+}
+
+fn profile_stat(profile: &Value, field: &str, label: &str) -> Option<String> {
+    let count = profile.get(field)?.as_u64()?;
+    Some(format!("<span><strong>{count}</strong> {label}</span>"))
+}
+
+fn render_profile_description(description: &str) -> String {
+    let mut remaining = description;
+    let mut rendered = String::new();
+    while let Some(start) = [remaining.find("https://"), remaining.find("http://")]
+        .into_iter()
+        .flatten()
+        .min()
+    {
+        rendered.push_str(&html_escape(&remaining[..start]));
+        let candidate = &remaining[start..];
+        let end = candidate
+            .find(char::is_whitespace)
+            .unwrap_or(candidate.len());
+        let mut link_end = end;
+        while candidate[..link_end]
+            .chars()
+            .last()
+            .is_some_and(|character| {
+                matches!(character, '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']')
+            })
+        {
+            link_end -= candidate[..link_end]
+                .chars()
+                .last()
+                .unwrap_or_default()
+                .len_utf8();
+        }
+        let link = &candidate[..link_end];
+        let parsed = url::Url::parse(link).ok().filter(|url| {
+            matches!(url.scheme(), "http" | "https")
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+        });
+        if let Some(parsed) = parsed {
+            rendered.push_str(&format!(
+                "<a class=\"profile-description-link\" href=\"{}\" rel=\"nofollow noopener noreferrer\">{}</a>",
+                html_escape(parsed.as_str()),
+                html_escape(link)
+            ));
+            rendered.push_str(&html_escape(&candidate[link_end..end]));
+        } else {
+            rendered.push_str(&html_escape(&candidate[..end]));
+        }
+        remaining = &candidate[end..];
+    }
+    rendered.push_str(&html_escape(remaining));
+    rendered
+}
+
+async fn profile_block_confirm<F, S>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response
+where
+    F: OAuthFlow,
+    S: Storage + 'static,
+{
+    let Some(viewer_did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref())
+    else {
+        return Redirect::to("/login").into_response();
+    };
+    let Some(subject_did) = query.get("did").map(String::as_str) else {
+        return oauth_error(StatusCode::BAD_REQUEST, "profile subject is required");
+    };
+    if subject_did.parse::<Did>().is_err() {
+        return oauth_error(StatusCode::BAD_REQUEST, "profile subject DID is invalid");
+    }
+    if subject_did == viewer_did {
+        return oauth_error(
+            StatusCode::FORBIDDEN,
+            "profile actions are unavailable on your own profile",
+        );
+    }
+    let handle = match profile_view_from_storage(state.storage.as_ref(), subject_did) {
+        Ok(profile) => profile_handle(&profile, subject_did),
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    let content = if verified_cookie_block_access(&state.public, &headers, state.storage.as_ref()) {
+        format!(
+            "<section class=\"block-confirm-card\" aria-labelledby=\"block-confirm-title\"><h1 id=\"block-confirm-title\">Block @{}?</h1><p>They won't be able to see your posts, follow you, or message you.</p><form class=\"block-confirm-actions\" action=\"/profile/action\" method=\"post\" data-profile-action><input type=\"hidden\" name=\"subject\" value=\"{}\"><input type=\"hidden\" name=\"action\" value=\"block\"><input type=\"hidden\" name=\"confirm\" value=\"yes\"><a class=\"secondary-button\" href=\"/profile?did={}\">Cancel</a><button type=\"submit\">Block</button></form></section>",
+            html_escape(&handle),
+            html_escape(subject_did),
+            form_encoded(subject_did),
+        )
+    } else {
+        format!(
+            "<section class=\"block-confirm-card\"><h1>Block @{}</h1>{}</section>",
+            html_escape(&handle),
+            permission_reauthorization_link("block")
+        )
+    };
+    Html(page_shell("Confirm block", &content, true)).into_response()
 }
 
 async fn profile_action<F, S>(
@@ -6545,7 +6657,7 @@ where
             verified_cookie_mute_access(&state.public, &headers, state.storage.as_ref()),
             action,
         ),
-        "list_add" | "list_remove" => (
+        "list_add" | "list_remove" | "list_toggle" => (
             verified_cookie_list_access(&state.public, &headers, state.storage.as_ref()),
             "lists",
         ),
@@ -6772,6 +6884,87 @@ where
                     .await
                 }
                 Err(error) => Err(error),
+            }
+        }
+        "list_toggle" => {
+            let Some(list_uri) = form.get("list_uri").map(String::as_str) else {
+                return oauth_error(StatusCode::BAD_REQUEST, "list URI is required");
+            };
+            let list_prefix = format!("at://{viewer_did}/app.bsky.graph.list/");
+            if !list_uri.starts_with(&list_prefix)
+                || list_uri
+                    .strip_prefix(&list_prefix)
+                    .is_none_or(str::is_empty)
+                || list_uri[list_prefix.len()..].contains('/')
+            {
+                return oauth_error(StatusCode::FORBIDDEN, "list must belong to your account");
+            }
+            let lists = match state
+                .flow
+                .profile_list_choices(&viewer_did, subject_did)
+                .await
+            {
+                Ok(lists) => lists,
+                Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
+            };
+            let Some(list) = lists.iter().find(|list| list.uri == list_uri) else {
+                return oauth_error(
+                    StatusCode::FORBIDDEN,
+                    "list does not belong to your account",
+                );
+            };
+            if let Some(item_uri) = list.item_uri.as_deref() {
+                let item_prefix = format!("at://{viewer_did}/app.bsky.graph.listitem/");
+                if !item_uri.starts_with(&item_prefix)
+                    || item_uri
+                        .strip_prefix(&item_prefix)
+                        .is_none_or(str::is_empty)
+                    || item_uri[item_prefix.len()..].contains('/')
+                {
+                    return oauth_error(
+                        StatusCode::FORBIDDEN,
+                        "list item must belong to your account",
+                    );
+                }
+                match state
+                    .flow
+                    .delete_profile_graph_record(&viewer_did, "app.bsky.graph.listitem", item_uri)
+                    .await
+                {
+                    Ok(()) => {
+                        remove_deleted_record(
+                            state.storage.clone(),
+                            &viewer_did,
+                            "app.bsky.graph.listitem",
+                            item_uri,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                }
+            } else {
+                let record = json!({
+                    "$type":"app.bsky.graph.listitem",
+                    "subject":subject_did,
+                    "list":list_uri,
+                    "createdAt":Datetime::now()
+                });
+                match state
+                    .flow
+                    .create_profile_graph_record(&viewer_did, "app.bsky.graph.listitem", record)
+                    .await
+                {
+                    Ok(created) => {
+                        persist_created_record(
+                            state.storage.clone(),
+                            &viewer_did,
+                            "app.bsky.graph.listitem",
+                            created,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                }
             }
         }
         _ => unreachable!("profile action was validated above"),
@@ -10420,7 +10613,11 @@ mod tests {
                                 .and_then(|value| value.to_str().ok())
                                 .map(str::to_owned),
                         ));
-                        Json(json!({"profiles":[]}))
+                        Json(json!({"profiles":[
+                            {"did":"did:plc:authora","labels":[{"src":"did:plc:customlabeler","uri":"did:plc:authora","val":"spider"}]},
+                            {"did":"did:plc:authorb","labels":[{"src":"did:plc:customlabeler","uri":"did:plc:authorb","val":"spider"}]},
+                            {"did":"did:plc:authorc","labels":[{"src":"did:plc:customlabeler","uri":"did:plc:authorc","val":"spider"}]}
+                        ]}))
                     }
                 }),
             )
@@ -10430,7 +10627,15 @@ mod tests {
                     let requests = service_requests.clone();
                     async move {
                         requests.lock().unwrap().push((uri.to_string(), None));
-                        Json(json!({"views":[]}))
+                        Json(json!({"views":[{
+                            "creator":{"did":"did:plc:customlabeler","displayName":"Careful Labeler"},
+                            "policies":{"labelValueDefinitions":[{
+                                "identifier":"spider",
+                                "severity":"alert",
+                                "blurs":"media",
+                                "locales":[{"lang":"en","name":"Spider Warning"}]
+                            }]}
+                        }]}))
                     }
                 }),
             );
@@ -10465,16 +10670,24 @@ mod tests {
             ),
         );
 
-        flow.fetch_account_labels_for_page(
-            viewer,
-            vec![
-                "did:plc:authora".to_owned(),
-                "did:plc:authorb".to_owned(),
-                "did:plc:authorc".to_owned(),
-            ],
-        )
-        .await
-        .unwrap();
+        let labels = flow
+            .fetch_account_labels_for_page(
+                viewer,
+                vec![
+                    "did:plc:authora".to_owned(),
+                    "did:plc:authorb".to_owned(),
+                    "did:plc:authorc".to_owned(),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(labels.len(), 3, "all fake page authors carry labels");
+        assert!(labels.iter().all(|label| {
+            label.display_name == "Spider Warning"
+                && label.labeler_name == "Careful Labeler"
+                && label.severity == "alert"
+                && label.blurs == "media"
+        }));
 
         let requests = requests.lock().unwrap();
         let profile_calls = requests
@@ -10990,8 +11203,8 @@ mod tests {
         assert!(css.contains(".thread-focus-actions .is-liked .icon {\n  fill: var(--accent);"));
         assert!(css.contains(".infinite-scroll-status {"));
         assert!(css.contains(".infinite-scroll-retry[hidden] {\n  display: none;"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m18"));
-        assert!(WEB_SCRIPT_URL.contains("v=js14"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m19"));
+        assert!(WEB_SCRIPT_URL.contains("v=js15"));
     }
 
     #[test]
@@ -11000,15 +11213,16 @@ mod tests {
 
         assert!(css.contains(".mobile-profile-avatar {\n    width: 1.4rem;\n    height: 1.4rem;"));
         assert!(css.contains(".mobile-nav .icon {\n    width: 1.2rem;\n    height: 1.2rem;"));
-        assert!(css.contains("padding-bottom: calc(0.1rem + env(safe-area-inset-bottom) * 0.55);"));
-        assert!(css.contains("55% of the 34px inset"));
-        assert!(css.contains("min-height: 2.1rem;\n    min-width: 44px;"));
         assert!(css.contains(
-            "--mobile-nav-height: calc(2.1rem + 0.2rem + 1px + env(safe-area-inset-bottom) * 0.55);"
+            "padding-bottom: calc(0.1rem + max(4px, calc(env(safe-area-inset-bottom) * 0.25)));"
+        ));
+        assert!(css.contains("min-height: 2rem;\n    min-width: 44px;"));
+        assert!(css.contains(
+            "--mobile-nav-height: calc(2rem + 0.2rem + 1px + max(4px, calc(env(safe-area-inset-bottom) * 0.25)));"
         ));
         assert!(css.contains("bottom: var(--mobile-compose-clearance);"));
         assert!(css.contains("padding-bottom: max(4.25rem, var(--mobile-compose-clearance));"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m18"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m19"));
     }
 
     #[test]
