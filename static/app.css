@@ -1308,6 +1308,36 @@ button:hover,
     bottom: 0;
   }
 
+  /* Icon-only bottom bar at about half the old height (owner, 2026-10-29); labels stay for screen readers. */
+  body:has(.mobile-nav) .mobile-nav {
+    min-height: 0;
+    padding-top: 0.1rem;
+    padding-bottom: calc(0.1rem + env(safe-area-inset-bottom));
+  }
+
+  body:has(.mobile-nav) .mobile-nav a,
+  body:has(.mobile-nav) .mobile-nav button {
+    min-height: 2.6rem;
+  }
+
+  body:has(.mobile-nav) .mobile-nav a > span,
+  body:has(.mobile-nav) .mobile-nav button > span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  body:has(.mobile-nav) .mobile-compose {
+    bottom: calc(3.6rem + env(safe-area-inset-bottom));
+  }
+
+  body:has(.mobile-nav) .center-column {
+    padding-bottom: 4.5rem;
+  }
+
   .feed-tab {
     max-width: 9rem;
     padding: 0 0.7rem;

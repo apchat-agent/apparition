@@ -40,7 +40,9 @@ async fn health_endpoint_returns_json_ok() {
         let csp = response.headers()["content-security-policy"]
             .to_str()
             .unwrap();
-        assert!(csp.contains("script-src 'none'"));
+        // Scripts only from our own origin (static/app.js), never inline or eval.
+        assert!(csp.contains("script-src 'self';"), "{csp}");
+        assert!(!csp.contains("unsafe-inline") && !csp.contains("unsafe-eval"), "{csp}");
         assert!(csp.contains("frame-ancestors 'none'"));
         // Sign-in is a form POST answered by a redirect to the user's authorization
         // server; Safari and Chrome apply form-action to that redirect (2026-10-28).
