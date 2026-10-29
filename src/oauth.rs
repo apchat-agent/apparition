@@ -7266,6 +7266,152 @@ mod tests {
         assert!(ten.contains("10 unread notifications"));
     }
 
+    #[tokio::test]
+    async fn timeline_reply_shows_parent_card_and_connector_with_parent_identity() {
+        let storage = Arc::new(MemoryStorage::default());
+        let viewer = "did:plc:reply-viewer";
+        let parent_did = "did:plc:original-author";
+        let reply_did = "did:plc:reply-author";
+        let parent = test_web_post(parent_did, "original", 1, "Original text", None);
+        let reply = test_web_post(
+            reply_did,
+            "reply",
+            2,
+            "Reply text",
+            Some(&parent.uri),
+        );
+        for record in [&parent, &reply] {
+            storage.put_record(record).unwrap();
+            storage.set_follow(viewer, &record.did, true).unwrap();
+        }
+        storage
+            .set_verified_handle(parent_did, "original.test")
+            .unwrap();
+        storage
+            .set_verified_handle(reply_did, "reply.test")
+            .unwrap();
+        put_test_profile(&storage, parent_did, "Original Author");
+
+        let page = request_test_timeline(storage, viewer).await;
+
+        assert!(page.contains("class=\"reply-parent-card\""));
+        assert!(page.contains("class=\"reply-connector\""));
+        assert!(page.contains("Original text"));
+        assert!(page.contains("Original Author"));
+        assert!(page.contains("@original.test"));
+        assert!(page.contains("Reply text"));
+        assert!(page.contains("/app/thread?uri=at%3A%2F%2Fdid%3Aplc%3Aoriginal-author"));
+    }
+
+    #[tokio::test]
+    async fn timeline_reply_to_unavailable_parent_shows_a_fallback_line() {
+        let storage = Arc::new(MemoryStorage::default());
+        let viewer = "did:plc:reply-viewer";
+        let reply_did = "did:plc:reply-author";
+        let reply = test_web_post(
+            reply_did,
+            "reply-missing-parent",
+            2,
+            "Reply text",
+            Some("at://did:plc:missing-parent/app.bsky.feed.post/gone"),
+        );
+        storage.put_record(&reply).unwrap();
+        storage.set_follow(viewer, reply_did, true).unwrap();
+
+        let page = request_test_timeline(storage, viewer).await;
+
+        assert!(page.contains("Reply to @"));
+        assert!(page.contains("missing-parent"));
+        assert!(page.contains("class=\"reply-connector\""));
+    }
+
+    #[tokio::test]
+    async fn timeline_does_not_duplicate_a_parent_already_in_the_previous_card() {
+        let storage = Arc::new(MemoryStorage::default());
+        let viewer = "did:plc:reply-viewer";
+        let parent_did = "did:plc:original-author";
+        let reply_did = "did:plc:reply-author";
+        let parent = test_web_post(parent_did, "original", 2, "Original text", None);
+        let reply = test_web_post(
+            reply_did,
+            "reply",
+            1,
+            "Reply text",
+            Some(&parent.uri),
+        );
+        for record in [&parent, &reply] {
+            storage.put_record(record).unwrap();
+            storage.set_follow(viewer, &record.did, true).unwrap();
+        }
+
+        let page = request_test_timeline(storage, viewer).await;
+
+        assert_eq!(page.matches("Original text").count(), 1);
+        assert!(!page.contains("class=\"reply-parent-card\""));
+        assert!(
+            page.contains("class=\"reply-connector reply-connector-previous\"")
+        );
+    }
+
+    fn test_web_post(
+        did: &str,
+        rkey: &str,
+        time_us: u64,
+        text: &str,
+        parent_uri: Option<&str>,
+    ) -> IndexedRecord {
+        let mut record = json!({"$type":"app.bsky.feed.post","text":text,"createdAt":"2026-10-29T12:00:00Z"});
+        if let Some(parent_uri) = parent_uri {
+            record["reply"] = json!({
+                "root":{"uri":parent_uri,"cid":"parent-cid"},
+                "parent":{"uri":parent_uri,"cid":"parent-cid"}
+            });
+        }
+        IndexedRecord {
+            did: did.to_owned(),
+            collection: "app.bsky.feed.post".to_owned(),
+            rkey: rkey.to_owned(),
+            uri: format!("at://{did}/app.bsky.feed.post/{rkey}"),
+            cid: Some(format!("cid-{rkey}")),
+            time_us,
+            record,
+        }
+    }
+
+    fn put_test_profile(storage: &MemoryStorage, did: &str, display_name: &str) {
+        storage
+            .put_record(&IndexedRecord {
+                did: did.to_owned(),
+                collection: "app.bsky.actor.profile".to_owned(),
+                rkey: "self".to_owned(),
+                uri: format!("at://{did}/app.bsky.actor.profile/self"),
+                cid: None,
+                time_us: 1,
+                record: json!({"displayName":display_name}),
+            })
+            .unwrap();
+    }
+
+    async fn request_test_timeline(storage: Arc<MemoryStorage>, viewer: &str) -> String {
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let session_id = "av28-timeline-session";
+        let generation = storage.rotate_web_session(viewer, session_id).unwrap();
+        let token = public.issue_session_cookie(viewer, session_id, generation, false, false, false);
+        let app = public.router_with_flow(DisabledOAuthFlow, storage);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/app")
+                    .header("cookie", format!("{SESSION_COOKIE}={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
     const HOUR_US: u64 = 60 * 60 * 1_000_000;
 
     fn web_notice(
