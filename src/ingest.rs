@@ -2,6 +2,8 @@ use futures_util::StreamExt;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::{
     cmp::Reverse,
     collections::{HashMap, HashSet, VecDeque},
@@ -593,6 +595,20 @@ pub(crate) fn ensure_private_database_file(path: &Path) -> Result<(), std::io::E
 pub struct MemoryStorage {
     inner: Mutex<MemoryState>,
     notification_hub: NotificationHub,
+    #[cfg(test)]
+    record_uri_single_lookups: AtomicUsize,
+    #[cfg(test)]
+    record_uri_batch_lookups: AtomicUsize,
+}
+
+#[cfg(test)]
+impl MemoryStorage {
+    pub(crate) fn record_uri_lookup_counts(&self) -> (usize, usize) {
+        (
+            self.record_uri_single_lookups.load(Ordering::Relaxed),
+            self.record_uri_batch_lookups.load(Ordering::Relaxed),
+        )
+    }
 }
 
 #[derive(Default)]
@@ -897,6 +913,9 @@ impl Storage for MemoryStorage {
         collection: &str,
         uri: &str,
     ) -> Result<Option<IndexedRecord>, StorageError> {
+        #[cfg(test)]
+        self.record_uri_single_lookups
+            .fetch_add(1, Ordering::Relaxed);
         Ok(self
             .inner
             .lock()
@@ -912,6 +931,9 @@ impl Storage for MemoryStorage {
         collection: &str,
         uris: &[String],
     ) -> Result<HashMap<String, IndexedRecord>, StorageError> {
+        #[cfg(test)]
+        self.record_uri_batch_lookups
+            .fetch_add(1, Ordering::Relaxed);
         let wanted = uris.iter().map(String::as_str).collect::<HashSet<_>>();
         Ok(self
             .inner

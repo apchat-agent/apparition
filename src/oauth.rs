@@ -3026,9 +3026,10 @@ async fn hydrate_page_parents<F: OAuthFlow, S: Storage>(
         .cloned()
         .map(|uri| (uri, None))
         .collect::<PageParentIndex>();
-    let local = storage.records_by_uri("app.bsky.feed.post", &parent_uris)?;
-    for (uri, record) in local {
-        parents.insert(uri, Some(record));
+    for uri in &parent_uris {
+        if let Some(record) = storage.record_by_uri("app.bsky.feed.post", uri)? {
+            parents.insert(uri.clone(), Some(record));
+        }
     }
 
     let missing = parent_uris
@@ -7598,6 +7599,39 @@ mod tests {
         assert_eq!(page.matches("Original text").count(), 1);
         assert!(!page.contains("class=\"reply-parent-card\""));
         assert!(page.contains("class=\"reply-connector reply-connector-previous\""));
+    }
+
+    #[tokio::test]
+    async fn timeline_parent_hydration_uses_one_batch_lookup_for_the_page() {
+        let storage = Arc::new(MemoryStorage::default());
+        let viewer = "did:plc:reply-viewer";
+        for index in 0..25_u64 {
+            let parent_did = format!("did:plc:parent-{index}");
+            let parent = test_web_post(&parent_did, "parent", 50 - index, "Parent text", None);
+            let reply = test_web_post(
+                "did:plc:reply-author",
+                &format!("reply-{index}"),
+                100 + index,
+                "Reply text",
+                Some(&parent.uri),
+            );
+            storage.put_record(&parent).unwrap();
+            storage.put_record(&reply).unwrap();
+            storage.set_follow(viewer, &parent_did, true).unwrap();
+            storage
+                .set_follow(viewer, "did:plc:reply-author", true)
+                .unwrap();
+        }
+
+        let page = request_test_timeline(storage.clone(), viewer).await;
+        let (single_lookups, batch_lookups) = storage.record_uri_lookup_counts();
+
+        assert_eq!(page.matches("class=\"reply-parent-card\"").count(), 25);
+        assert_eq!(
+            single_lookups, 0,
+            "parent hydration used per-record lookups"
+        );
+        assert_eq!(batch_lookups, 1, "parents should load in one page lookup");
     }
 
     fn test_web_post(
