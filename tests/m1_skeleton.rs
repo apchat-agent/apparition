@@ -40,10 +40,13 @@ async fn health_endpoint_returns_json_ok() {
         let csp = response.headers()["content-security-policy"]
             .to_str()
             .unwrap();
-        // Scripts only from our own origin (static/app.js), never inline or eval.
-        assert!(csp.contains("script-src 'self';"), "{csp}");
+        // Scripts only from our own origin; wasm-unsafe-eval is the narrow token needed by ORT.
         assert!(
-            !csp.contains("unsafe-inline") && !csp.contains("unsafe-eval"),
+            csp.contains("script-src 'self' 'wasm-unsafe-eval';"),
+            "{csp}"
+        );
+        assert!(
+            !csp.contains("'unsafe-inline'") && !csp.contains("'unsafe-eval'"),
             "{csp}"
         );
         assert!(csp.contains("frame-ancestors 'none'"));
