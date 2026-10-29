@@ -701,4 +701,14 @@ mod tests {
         assert_eq!(accepts.load(Ordering::Relaxed), 1);
         server.abort();
     }
+
+    #[test]
+    fn client_pool_keeps_reqwest_dns_override_names_separate() {
+        let client = SafeHttpClient::with_resolver(FakeResolver::new([]));
+        let address = [SocketAddr::from(([127, 0, 0, 1], 443))];
+        client.client_for("safe.example.", &address).unwrap();
+        client.client_for("safe.example", &address).unwrap();
+
+        assert_eq!(client.clients.lock().unwrap().clients.len(), 2);
+    }
 }
