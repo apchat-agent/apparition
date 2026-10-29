@@ -2077,16 +2077,15 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                 }
             }
         }
-        let labeler_dids = labeler_dids;
         let presentations = self.labeler_presentations(&labeler_dids).await?;
         let labels = account_raw_labels
             .into_iter()
-            .filter_map(|(subject_did, labeler_did, value)| {
+            .map(|(subject_did, labeler_did, value)| {
                 let presentation = presentations.get(&labeler_did);
                 let global = label_value_default(&value);
                 let definition =
                     presentation.and_then(|presentation| presentation.definitions.get(&value));
-                Some(AccountLabel {
+                AccountLabel {
                     subject_did,
                     labeler_did: labeler_did.clone(),
                     labeler_name: presentation
@@ -2102,7 +2101,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                     blurs: definition
                         .map(|definition| definition.blurs.clone())
                         .unwrap_or(global.blurs),
-                })
+                }
             })
             .collect::<Vec<_>>();
         let mut cache = self.account_label_page_cache.lock().await;
@@ -3150,7 +3149,7 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
                     })
                 })
                 .collect::<Vec<_>>();
-            choices.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+            choices.sort_by_key(|choice| choice.name.to_lowercase());
             Ok(choices)
         })
     }
@@ -6121,7 +6120,7 @@ async fn profile_action_panel<F: OAuthFlow, S: Storage>(
     } else {
         Vec::new()
     };
-    Ok(render_profile_actions(
+    Ok(render_profile_actions(ProfileActionState {
         subject_did,
         following,
         follows_you,
@@ -6131,12 +6130,12 @@ async fn profile_action_panel<F: OAuthFlow, S: Storage>(
         block_access,
         mute_access,
         list_access,
-        &lists,
-    ))
+        lists: &lists,
+    }))
 }
 
-fn render_profile_actions(
-    subject_did: &str,
+struct ProfileActionState<'a> {
+    subject_did: &'a str,
     following: bool,
     follows_you: bool,
     blocked: bool,
@@ -6145,8 +6144,22 @@ fn render_profile_actions(
     block_access: bool,
     mute_access: bool,
     list_access: bool,
-    lists: &[ProfileListChoice],
-) -> String {
+    lists: &'a [ProfileListChoice],
+}
+
+fn render_profile_actions(state: ProfileActionState<'_>) -> String {
+    let ProfileActionState {
+        subject_did,
+        following,
+        follows_you,
+        blocked,
+        muted,
+        follow_access,
+        block_access,
+        mute_access,
+        list_access,
+        lists,
+    } = state;
     let mut relationships = Vec::new();
     if following {
         relationships.push("You follow this account".to_owned());
@@ -10420,7 +10433,8 @@ mod tests {
         let storage = MemoryStorage::default();
         let uri = "at://did:plc:quoted-author/app.bsky.feed.post/quoted";
         let embed = quote_embed(uri);
-        let index = HashMap::from([(uri.to_owned(), QuoteRenderState::Pending)]);
+        let mut index = QuoteRenderIndex::default();
+        index.insert(uri.to_owned(), QuoteRenderState::Pending);
 
         let rendered = render_web_quote(&storage, &embed, &index, 0);
 
@@ -10839,8 +10853,8 @@ mod tests {
         assert!(css.contains(".thread-focus-actions .is-liked .icon {\n  fill: var(--accent);"));
         assert!(css.contains(".infinite-scroll-status {"));
         assert!(css.contains(".infinite-scroll-retry[hidden] {\n  display: none;"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m15"));
-        assert!(WEB_SCRIPT_URL.contains("v=js13"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m18"));
+        assert!(WEB_SCRIPT_URL.contains("v=js14"));
     }
 
     #[test]
@@ -10857,7 +10871,7 @@ mod tests {
         ));
         assert!(css.contains("bottom: var(--mobile-compose-clearance);"));
         assert!(css.contains("padding-bottom: max(4.25rem, var(--mobile-compose-clearance));"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m15"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m18"));
     }
 
     #[test]
@@ -10968,7 +10982,12 @@ mod tests {
         ];
         let groups = group_web_notifications(&notices, 0);
         let group = &groups[0];
-        let html = render_web_notification_group(&storage, group, &HashMap::new(), &HashMap::new());
+        let html = render_web_notification_group(
+            &storage,
+            group,
+            &QuoteRenderIndex::default(),
+            &HashMap::new(),
+        );
         assert!(html.contains("alice.test</a> and 1 other liked your post"));
         assert_eq!(
             html.matches("class=\"notification-avatar avatar-placeholder\"")

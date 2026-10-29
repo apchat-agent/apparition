@@ -1383,7 +1383,7 @@ async fn sign_in_error_page_uses_the_shared_mobile_document_shell() {
     );
     assert!(html.contains("Login failed, try again"));
     assert!(html.contains("href=\"/login\""));
-    assert!(html.contains("href=\"/static/app.css?v=m17\""));
+    assert!(html.contains("href=\"/static/app.css?v=m18\""));
     assert!(!html.contains("style="));
     // The shared shell loads both local deferred scripts, never inline code.
     assert_eq!(html.matches("<script").count(), 2);
