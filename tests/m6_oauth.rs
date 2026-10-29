@@ -3186,6 +3186,129 @@ async fn notifications_page_is_linked_and_shows_all_local_notification_reasons()
 }
 
 #[tokio::test]
+async fn notifications_stream_requires_a_session() {
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), Arc::new(MemoryStorage::default()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/notifications/stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn opening_notifications_marks_prior_events_seen() {
+    let storage = Arc::new(MemoryStorage::default());
+    let viewer = "did:plc:alice";
+    let now_us = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64;
+    storage
+        .put_record(&IndexedRecord {
+            did: "did:plc:friend".into(),
+            collection: "app.bsky.feed.like".into(),
+            rkey: "unread-like".into(),
+            uri: "at://did:plc:friend/app.bsky.feed.like/unread-like".into(),
+            cid: None,
+            time_us: now_us,
+            record: serde_json::json!({"subject":{"uri":"at://did:plc:alice/app.bsky.feed.post/own"}}),
+        })
+        .unwrap();
+    assert_eq!(storage.unread_notification_count(viewer).unwrap(), 1);
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage.clone());
+    let cookie = finish_login(&app).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/notifications")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(storage.unread_notification_count(viewer).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn ingest_like_updates_a_connected_notification_stream_within_one_second() {
+    let storage = Arc::new(MemoryStorage::default());
+    let viewer = "did:plc:alice";
+    let now_us = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64;
+    storage.mark_notifications_seen(viewer, now_us).unwrap();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage.clone());
+    let cookie = finish_login(&app).await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/notifications/stream")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream")
+    );
+    let mut body = response.into_body();
+    let first = tokio::time::timeout(Duration::from_secs(1), body.frame())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&first).contains("data: 0"));
+
+    Ingestor::new(storage, ScopeMode::Full)
+        .process_json(
+            &serde_json::json!({
+                "did":"did:plc:friend",
+                "time_us":now_us + 1_000_000,
+                "kind":"commit",
+                "commit":{
+                    "operation":"create",
+                    "collection":"app.bsky.feed.like",
+                    "rkey":"live-like",
+                    "cid":"live-like-cid",
+                    "record":{"subject":{"uri":"at://did:plc:alice/app.bsky.feed.post/own","cid":"own-cid"}}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    let update = tokio::time::timeout(Duration::from_secs(1), body.frame())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&update).contains("data: 1"));
+}
+
+#[tokio::test]
 async fn timeline_profile_and_notification_pages_offer_older_cursor_links() {
     let storage = Arc::new(MemoryStorage::default());
     let post_a = "at://did:plc:alice/app.bsky.feed.post/a";
