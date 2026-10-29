@@ -9019,6 +9019,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timeline_groups_three_post_self_thread_without_standalone_duplicates() {
+        let storage = Arc::new(MemoryStorage::default());
+        let viewer = "did:plc:reply-viewer";
+        let author = "did:plc:self-thread-author";
+        let first = test_web_post(author, "self-1", 1, "Self thread first", None);
+        let second = test_web_post(author, "self-2", 2, "Self thread second", Some(&first.uri));
+        let third = test_web_post(author, "self-3", 3, "Self thread third", Some(&second.uri));
+        for record in [&first, &second, &third] {
+            storage.put_record(record).unwrap();
+            storage.set_follow(viewer, author, true).unwrap();
+        }
+
+        let page = request_test_timeline(storage, viewer).await;
+
+        assert_eq!(page.matches("class=\"thread-group\"").count(), 1, "{page}");
+        assert_eq!(page.matches("class=\"post-card\"").count(), 3, "{page}");
+        assert_eq!(page.matches("class=\"reply-parent-card\"").count(), 0, "{page}");
+        for text in ["Self thread first", "Self thread second", "Self thread third"] {
+            assert_eq!(page.matches(text).count(), 1, "{page}");
+        }
+        let first_position = page.find("Self thread first").unwrap();
+        let second_position = page.find("Self thread second").unwrap();
+        let third_position = page.find("Self thread third").unwrap();
+        assert!(first_position < second_position && second_position < third_position);
+    }
+
+    #[tokio::test]
     async fn timeline_reply_to_unavailable_parent_shows_a_fallback_line() {
         let storage = Arc::new(MemoryStorage::default());
         let viewer = "did:plc:reply-viewer";
