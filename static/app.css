@@ -195,11 +195,14 @@ textarea:focus-visible {
 
 .feed-tab {
   position: relative;
-  display: inline-flex;
+  display: block;
   min-height: 3.25rem;
+  max-width: 11rem;
   flex: 0 0 auto;
-  align-items: center;
-  padding: 0 1rem;
+  overflow: hidden;
+  padding: 0 0.85rem;
+  line-height: 3.25rem;
+  text-overflow: ellipsis;
   color: var(--muted);
   font-weight: 700;
   text-decoration: none;
@@ -1263,4 +1266,51 @@ button:hover,
 /* A like or repost returns to #post-...; keep the card clear of the sticky header. */
 .post-card {
   scroll-margin-top: 5rem;
+}
+
+/* Phones: the page is exactly the visible screen and the posts scroll inside it, so the bottom bar is part of the
+   layout instead of position: fixed. A fixed bar lags behind Safari's collapsing URL bar while scrolling and
+   detaches from it (the owner's report, also a bsky.app bug). Guest pages have no bottom bar and keep normal scrolling. */
+@media (max-width: 799px) {
+  body:has(.mobile-nav) {
+    position: relative;
+    display: flex;
+    height: 100vh;
+    height: 100dvh;
+    min-height: 0;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  body:has(.mobile-nav) .app-layout {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+  }
+
+  body:has(.mobile-nav) .center-column {
+    min-height: 100%;
+    padding-bottom: 5.5rem;
+  }
+
+  body:has(.mobile-nav) .mobile-nav {
+    position: static;
+    flex: 0 0 auto;
+  }
+
+  body:has(.mobile-nav) .mobile-compose {
+    position: absolute;
+    bottom: calc(5rem + env(safe-area-inset-bottom));
+  }
+
+  body:has(.mobile-nav) .thread-reply-bar {
+    position: sticky;
+    bottom: 0;
+  }
+
+  .feed-tab {
+    max-width: 9rem;
+    padding: 0 0.7rem;
+    font-size: 0.92rem;
+  }
 }
