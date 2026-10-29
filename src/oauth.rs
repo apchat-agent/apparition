@@ -95,13 +95,21 @@ const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
 const SAVED_FEED_CACHE_PREFIX: &str = "saved-feed-preferences:";
 const VIDEO_SERVICE_DID: &str = "did:web:video.bsky.app";
 const VIDEO_SERVICE_URL: &str = "https://video.bsky.app";
-const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=*";
+const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.graph.getMutes?aud=*";
 const BLOB_SCOPE: &str = "blob:image/*";
 const VIDEO_BLOB_SCOPE: &str = "blob:video/*";
 const VIDEO_SCOPES: [&str; 3] = [
     VIDEO_BLOB_SCOPE,
     "rpc:app.bsky.video.getUploadLimits?aud=*",
     "rpc:com.atproto.repo.uploadBlob?aud=*",
+];
+const FOLLOW_SCOPES: [&str; 1] = ["repo:app.bsky.graph.follow?action=create&action=delete"];
+const BLOCK_SCOPES: [&str; 1] = ["repo:app.bsky.graph.block?action=create&action=delete"];
+const LIST_SCOPES: [&str; 1] = ["repo:app.bsky.graph.listitem?action=create&action=delete"];
+const MUTE_SCOPES: [&str; 3] = [
+    "rpc:app.bsky.graph.muteActor?aud=*",
+    "rpc:app.bsky.graph.unmuteActor?aud=*",
+    "rpc:app.bsky.graph.getMutes?aud=*",
 ];
 const WRITE_SCOPES: [&str; 3] = [
     "repo:app.bsky.feed.post?action=create",
@@ -165,6 +173,10 @@ struct SessionPermissions {
     feed: bool,
     blob: bool,
     video: bool,
+    follow: bool,
+    block: bool,
+    mute: bool,
+    list: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -997,8 +1009,15 @@ impl OAuthPublic {
     ) -> String {
         let expires = unix_time().saturating_add(SESSION_TTL_SECONDS);
         let payload = format!(
-            "{did}\n{expires}\n{session_id}\n{generation}\n{}\n{}\n{}\n{}",
-            permissions.write, permissions.feed, permissions.blob, permissions.video
+            "{did}\n{expires}\n{session_id}\n{generation}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            permissions.write,
+            permissions.feed,
+            permissions.blob,
+            permissions.video,
+            permissions.follow,
+            permissions.block,
+            permissions.mute,
+            permissions.list
         );
         let encoded = URL_SAFE_NO_PAD.encode(payload.as_bytes());
         let mut mac = HmacSha256::new_from_slice(&self.cookie_key())
@@ -1043,7 +1062,7 @@ impl OAuthPublic {
     fn verify_session_cookie(
         &self,
         token: &str,
-    ) -> Option<(String, String, u64, bool, bool, bool, bool)> {
+    ) -> Option<(String, String, u64, SessionPermissions)> {
         let (payload, signature) = token.split_once('.')?;
         let signature = URL_SAFE_NO_PAD.decode(signature).ok()?;
         let mut mac = HmacSha256::new_from_slice(&self.cookie_key()).ok()?;
@@ -1055,16 +1074,14 @@ impl OAuthPublic {
         let (did, session) = value.split_once('\n')?;
         let (expires, session) = session.split_once('\n')?;
         let (session_id, generation) = session.split_once('\n')?;
-        let (generation, permissions) = generation.split_once('\n')?;
-        let (write_access, permissions) = permissions
-            .split_once('\n')
-            .unwrap_or((permissions, "false\nfalse"));
-        let (feed_access, permissions) = permissions
-            .split_once('\n')
-            .unwrap_or((permissions, "false\nfalse"));
-        let (blob_access, video_access) = permissions
-            .split_once('\n')
-            .unwrap_or((permissions, "false"));
+        let (generation, permission_values) = generation.split_once('\n')?;
+        let permission_values = permission_values.split('\n').collect::<Vec<_>>();
+        let permission = |index: usize| {
+            permission_values
+                .get(index)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(false)
+        };
         if expires.parse::<u64>().ok()? <= unix_time()
             || session_id.is_empty()
             || !(did.starts_with("did:plc:") || did.starts_with("did:web:"))
@@ -1075,10 +1092,16 @@ impl OAuthPublic {
             did.to_owned(),
             session_id.to_owned(),
             generation.parse().ok()?,
-            write_access.parse().ok()?,
-            feed_access.parse().ok()?,
-            blob_access.parse().ok()?,
-            video_access.parse().ok()?,
+            SessionPermissions {
+                write: permission(0),
+                feed: permission(1),
+                blob: permission(2),
+                video: permission(3),
+                follow: permission(4),
+                block: permission(5),
+                mute: permission(6),
+                list: permission(7),
+            },
         ))
     }
 
@@ -4124,6 +4147,10 @@ where
                 feed: feed_access,
                 blob: blob_access,
                 video: video_access,
+                follow: has_all_follow_scopes(account.granted_scope.as_deref()),
+                block: has_all_block_scopes(account.granted_scope.as_deref()),
+                mute: has_all_mute_scopes(account.granted_scope.as_deref()),
+                list: has_all_list_scopes(account.granted_scope.as_deref()),
             },
         ),
         if state.public.secure_cookies() {
@@ -4152,7 +4179,7 @@ where
     if !same_origin_request(&headers, &state.public.public_url) {
         return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
     }
-    let Some((did, session_id, _, _, _, _, _)) =
+    let Some((did, session_id, _, _)) =
         verified_cookie_session(&state.public, &headers, state.storage.as_ref())
     else {
         return clear_session_cookie(
@@ -7333,7 +7360,7 @@ fn verified_cookie_did<S: Storage>(
     headers: &HeaderMap,
     storage: &S,
 ) -> Option<String> {
-    verified_cookie_session(public, headers, storage).map(|(did, _, _, _, _, _, _)| did)
+    verified_cookie_session(public, headers, storage).map(|(did, _, _, _)| did)
 }
 
 fn verified_cookie_write_access<S: Storage>(
@@ -7342,7 +7369,7 @@ fn verified_cookie_write_access<S: Storage>(
     storage: &S,
 ) -> bool {
     verified_cookie_session(public, headers, storage)
-        .is_some_and(|(_, _, _, write_access, _, _, _)| write_access)
+        .is_some_and(|(_, _, _, permissions)| permissions.write)
 }
 
 fn verified_cookie_blob_access<S: Storage>(
@@ -7351,7 +7378,7 @@ fn verified_cookie_blob_access<S: Storage>(
     storage: &S,
 ) -> bool {
     verified_cookie_session(public, headers, storage)
-        .is_some_and(|(_, _, _, _, _, blob_access, _)| blob_access)
+        .is_some_and(|(_, _, _, permissions)| permissions.blob)
 }
 
 fn verified_cookie_video_access<S: Storage>(
@@ -7360,7 +7387,7 @@ fn verified_cookie_video_access<S: Storage>(
     storage: &S,
 ) -> bool {
     verified_cookie_session(public, headers, storage)
-        .is_some_and(|(_, _, _, _, _, _, video_access)| video_access)
+        .is_some_and(|(_, _, _, permissions)| permissions.video)
 }
 
 fn verified_cookie_feed_access<S: Storage>(
@@ -7369,30 +7396,58 @@ fn verified_cookie_feed_access<S: Storage>(
     storage: &S,
 ) -> bool {
     verified_cookie_session(public, headers, storage)
-        .is_some_and(|(_, _, _, _, feed_access, _, _)| feed_access)
+        .is_some_and(|(_, _, _, permissions)| permissions.feed)
+}
+
+fn verified_cookie_follow_access<S: Storage>(
+    public: &OAuthPublic,
+    headers: &HeaderMap,
+    storage: &S,
+) -> bool {
+    verified_cookie_session(public, headers, storage)
+        .is_some_and(|(_, _, _, permissions)| permissions.follow)
+}
+
+fn verified_cookie_block_access<S: Storage>(
+    public: &OAuthPublic,
+    headers: &HeaderMap,
+    storage: &S,
+) -> bool {
+    verified_cookie_session(public, headers, storage)
+        .is_some_and(|(_, _, _, permissions)| permissions.block)
+}
+
+fn verified_cookie_mute_access<S: Storage>(
+    public: &OAuthPublic,
+    headers: &HeaderMap,
+    storage: &S,
+) -> bool {
+    verified_cookie_session(public, headers, storage)
+        .is_some_and(|(_, _, _, permissions)| permissions.mute)
+}
+
+fn verified_cookie_list_access<S: Storage>(
+    public: &OAuthPublic,
+    headers: &HeaderMap,
+    storage: &S,
+) -> bool {
+    verified_cookie_session(public, headers, storage)
+        .is_some_and(|(_, _, _, permissions)| permissions.list)
 }
 
 fn verified_cookie_session<S: Storage>(
     public: &OAuthPublic,
     headers: &HeaderMap,
     storage: &S,
-) -> Option<(String, String, u64, bool, bool, bool, bool)> {
-    let (did, session_id, generation, write_access, feed_access, blob_access, video_access) =
+) -> Option<(String, String, u64, SessionPermissions)> {
+    let (did, session_id, generation, permissions) =
         cookie_value(headers).and_then(|value| public.verify_session_cookie(value))?;
     (storage
         .web_session_generation(&did, &session_id)
         .ok()
         .flatten()
         == Some(generation))
-    .then_some((
-        did,
-        session_id,
-        generation,
-        write_access,
-        feed_access,
-        blob_access,
-        video_access,
-    ))
+    .then_some((did, session_id, generation, permissions))
 }
 
 /// The like script asks with `x-appview-fetch: 1` and gets the new state as JSON instead of a page.
@@ -8716,6 +8771,30 @@ fn has_all_video_scopes(scope: Option<&str>) -> bool {
         .all(|required| granted.contains(required))
 }
 
+fn has_all_scopes(scope: Option<&str>, required: &[&str]) -> bool {
+    let Some(scope) = scope else {
+        return false;
+    };
+    let granted = scope.split_whitespace().collect::<HashSet<_>>();
+    required.iter().all(|required| granted.contains(required))
+}
+
+fn has_all_follow_scopes(scope: Option<&str>) -> bool {
+    has_all_scopes(scope, &FOLLOW_SCOPES)
+}
+
+fn has_all_block_scopes(scope: Option<&str>) -> bool {
+    has_all_scopes(scope, &BLOCK_SCOPES)
+}
+
+fn has_all_mute_scopes(scope: Option<&str>) -> bool {
+    has_all_scopes(scope, &MUTE_SCOPES)
+}
+
+fn has_all_list_scopes(scope: Option<&str>) -> bool {
+    has_all_scopes(scope, &LIST_SCOPES)
+}
+
 fn requested_scopes() -> Vec<Scope> {
     std::iter::once(Scope::Known(KnownScope::Atproto))
         .chain(
@@ -8731,6 +8810,26 @@ fn requested_scopes() -> Vec<Scope> {
         )
         .chain(
             VIDEO_SCOPES
+                .iter()
+                .map(|scope| Scope::Unknown((*scope).to_owned())),
+        )
+        .chain(
+            FOLLOW_SCOPES
+                .iter()
+                .map(|scope| Scope::Unknown((*scope).to_owned())),
+        )
+        .chain(
+            BLOCK_SCOPES
+                .iter()
+                .map(|scope| Scope::Unknown((*scope).to_owned())),
+        )
+        .chain(
+            LIST_SCOPES
+                .iter()
+                .map(|scope| Scope::Unknown((*scope).to_owned())),
+        )
+        .chain(
+            MUTE_SCOPES
                 .iter()
                 .map(|scope| Scope::Unknown((*scope).to_owned())),
         )
@@ -9005,6 +9104,10 @@ mod tests {
                 feed: false,
                 blob: false,
                 video: false,
+                follow: false,
+                block: false,
+                mute: false,
+                list: false,
             },
         );
         let app = public.router_with_flow(flow, storage);
@@ -9053,7 +9156,14 @@ mod tests {
 
     #[test]
     fn every_requested_rpc_scope_has_a_spec_valid_audience() {
-        for scope in FEED_SCOPES.iter().chain(VIDEO_SCOPES.iter()) {
+        for scope in FEED_SCOPES
+            .iter()
+            .chain(VIDEO_SCOPES.iter())
+            .chain(FOLLOW_SCOPES.iter())
+            .chain(BLOCK_SCOPES.iter())
+            .chain(LIST_SCOPES.iter())
+            .chain(MUTE_SCOPES.iter())
+        {
             if !scope.starts_with("rpc:") {
                 continue;
             }
@@ -9078,7 +9188,9 @@ mod tests {
             "rpc:app.bsky.graph.getMutes?aud=*",
         ] {
             assert!(
-                REQUESTED_SCOPE.split_whitespace().any(|requested| requested == scope),
+                REQUESTED_SCOPE
+                    .split_whitespace()
+                    .any(|requested| requested == scope),
                 "missing profile action OAuth scope: {scope}"
             );
         }
@@ -9103,8 +9215,27 @@ mod tests {
         );
 
         let session = public.verify_session_cookie(&token).unwrap();
-        assert!(session.5, "legacy blob permission remains available");
-        assert!(!session.6, "legacy sessions must sign in again for video");
+        assert!(session.3.blob, "legacy blob permission remains available");
+        assert!(
+            !session.3.video,
+            "legacy sessions must sign in again for video"
+        );
+        assert!(
+            !session.3.follow,
+            "legacy sessions must sign in again to follow"
+        );
+        assert!(
+            !session.3.block,
+            "legacy sessions must sign in again to block"
+        );
+        assert!(
+            !session.3.mute,
+            "legacy sessions must sign in again to mute"
+        );
+        assert!(
+            !session.3.list,
+            "legacy sessions must sign in again to manage lists"
+        );
     }
 
     #[test]
@@ -9236,6 +9367,10 @@ mod tests {
                 feed: true,
                 blob: true,
                 video: true,
+                follow: false,
+                block: false,
+                mute: false,
+                list: false,
             },
         );
         let app = public.router_with_flow(DisabledOAuthFlow, storage);
@@ -10053,6 +10188,10 @@ mod tests {
                 feed: false,
                 blob: false,
                 video: false,
+                follow: false,
+                block: false,
+                mute: false,
+                list: false,
             },
         );
         let app = public.router_with_flow(flow, storage);
