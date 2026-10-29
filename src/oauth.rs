@@ -5756,6 +5756,19 @@ mod tests {
     ];
     const SERVICE_JWT: &str = "av23-service-jwt";
 
+    #[test]
+    fn icon_symbols_leave_fill_to_css_so_liked_hearts_can_be_filled() {
+        let sprite = icon_sprite();
+        let css = include_str!("../static/app.css");
+
+        assert!(!sprite.contains("fill=\"none\""));
+        assert!(sprite.contains("<symbol id=\"i-like\""));
+        assert!(css.contains(".icon {\n  fill: none;"));
+        assert!(css.contains(".post-actions .is-liked .icon {\n  fill: var(--accent);"));
+        assert!(css.contains(".thread-focus-actions .is-liked .icon {\n  fill: var(--accent);"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m6"));
+    }
+
     #[derive(Clone)]
     struct FeedTestIdentity(HashMap<String, DidDocument>);
 
