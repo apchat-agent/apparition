@@ -2434,10 +2434,8 @@ async fn web_posts_show_local_counts_and_liked_state_and_submit_unlike() {
     )
     .unwrap();
     assert_eq!(html.matches("class=\"action-count\">1</span>").count(), 3);
-    assert!(
-        html.contains("Liked<span class=\"action-count\">1</span>"),
-        "{html}"
-    );
+    assert!(html.contains("class=\"post-action is-liked\""), "{html}");
+    assert!(html.contains("aria-pressed=\"true\""), "{html}");
 
     let response = app.oneshot(
         Request::builder()
@@ -3732,6 +3730,88 @@ async fn post_action_rows_are_ordered_hide_zero_counts_and_style_thread_numbers(
     )
     .unwrap();
     assert!(thread_html.contains("One useful point <span class=\"thread-number-pill\">1/2</span>"));
+}
+
+#[tokio::test]
+async fn thread_page_fetches_parent_and_root_concurrently() {
+    let storage = Arc::new(MemoryStorage::default());
+    let root_uri = "at://did:plc:thread/app.bsky.feed.post/root";
+    let parent_uri = "at://did:plc:thread/app.bsky.feed.post/parent";
+    let middle_uri = "at://did:plc:thread/app.bsky.feed.post/middle";
+    let mut middle = fake_feed_post("did:plc:thread", "middle", 2, "Middle");
+    middle.record["reply"] = serde_json::json!({
+        "root":{"uri":root_uri,"cid":"root-cid"},
+        "parent":{"uri":root_uri,"cid":"root-cid"}
+    });
+    let mut parent = fake_feed_post("did:plc:thread", "parent", 3, "Parent");
+    parent.record["reply"] = serde_json::json!({
+        "root":{"uri":root_uri,"cid":"root-cid"},
+        "parent":{"uri":middle_uri,"cid":"middle-cid"}
+    });
+    let mut target = fake_feed_post("did:plc:thread", "target", 4, "Target");
+    target.record["reply"] = serde_json::json!({
+        "root":{"uri":root_uri,"cid":"root-cid"},
+        "parent":{"uri":parent_uri,"cid":"parent-cid"}
+    });
+    storage.put_record(&target).unwrap();
+    for did in ["did:plc:thread", "did:plc:alice"] {
+        storage
+            .set_verified_handle(did, &format!("{}.test", did.replace(':', "-")))
+            .unwrap();
+    }
+    let root = fake_feed_post("did:plc:thread", "root", 1, "Root");
+    let flow = FakeOAuthFlow {
+        live_posts: Arc::new(Mutex::new(
+            [
+                (root_uri.to_owned(), root),
+                (parent_uri.to_owned(), parent),
+                (middle_uri.to_owned(), middle),
+            ]
+            .into_iter()
+            .collect(),
+        )),
+        post_delays_ms: Arc::new(Mutex::new(
+            [root_uri, parent_uri, middle_uri]
+                .into_iter()
+                .map(|uri| (uri.to_owned(), 200))
+                .collect(),
+        )),
+        ..FakeOAuthFlow::default()
+    };
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage);
+    let cookie = finish_login(&app).await;
+    let started = Instant::now();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/app/thread?uri=at%3A%2F%2Fdid%3Aplc%3Athread%2Fapp.bsky.feed.post%2Ftarget")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(600),
+        "thread rendered in {elapsed:?}"
+    );
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("Root"), "{html}");
+    assert!(html.contains("Middle"), "{html}");
+    assert!(html.contains("Parent"), "{html}");
 }
 
 #[tokio::test]
