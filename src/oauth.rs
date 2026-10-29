@@ -7567,6 +7567,12 @@ mod tests {
         assert!(page.contains("@original.test"));
         assert!(page.contains("Reply text"));
         assert!(page.contains("/app/thread?uri=at%3A%2F%2Fdid%3Aplc%3Aoriginal-author"));
+        assert!(page.contains(
+            "data-post-kind=\"post\" data-post-uri=\"at://did:plc:reply-author/app.bsky.feed.post/reply\""
+        ));
+        assert!(page.contains(
+            "data-post-kind=\"parent\" data-post-uri=\"at://did:plc:original-author/app.bsky.feed.post/original\""
+        ));
     }
 
     #[tokio::test]
