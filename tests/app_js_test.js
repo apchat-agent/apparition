@@ -451,3 +451,128 @@ Deno.test("posting completes while an alt suggestion is still running", async ()
   releaseModel({ caption: async () => "A photo." });
   await suggestion;
 });
+
+Deno.test("infinite scroll loads once past the newest page midpoint in the pinned phone frame", async () => {
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  const installInfiniteScroll = new Function(`${source}; return installInfiniteScroll;`)();
+  assertEquals(typeof installInfiniteScroll, "function", "app.js should expose its infinite-scroll installer");
+
+  class Element {
+    constructor(tag = "div", uri = "") {
+      this.tag = tag;
+      this.children = [];
+      this.attributes = new Map(uri ? [["data-post-uri", uri]] : []);
+      this.listeners = new Map();
+      this.className = "";
+      this.textContent = "";
+      this.top = 100;
+      this.parentElement = null;
+      this.removed = false;
+    }
+    append(...nodes) {
+      for (const node of nodes) {
+        node.parentElement = this;
+        this.children.push(node);
+      }
+    }
+    after(...nodes) { this.afterNodes = [...(this.afterNodes || []), ...nodes]; }
+    addEventListener(name, listener) { this.listeners.set(name, listener); }
+    setAttribute(name, value) { this.attributes.set(name, String(value)); }
+    getAttribute(name) { return this.attributes.get(name) ?? null; }
+    remove() {
+      this.removed = true;
+      if (this.parentElement) this.parentElement.children = this.parentElement.children.filter((child) => child !== this);
+    }
+    getBoundingClientRect() { return { top: this.top }; }
+  }
+  class Link extends Element {
+    constructor(href) { super("a"); this.href = href; }
+  }
+  class Observer {
+    constructor(callback, options) {
+      this.callback = callback;
+      this.options = options;
+      Observer.latest = this;
+    }
+    observe(target) { this.target = target; }
+    unobserve(target) { if (this.target === target) this.target = null; }
+    fire(isIntersecting = true) {
+      this.callback([{ target: this.target, isIntersecting }]);
+    }
+  }
+
+  const initialCards = ["post-1", "post-2", "post-3", "post-4"].map((uri) => new Element("li", uri));
+  const list = new Element("ol");
+  list.className = "post-list";
+  list.append(...initialCards);
+  const layout = new Element("div");
+  const link = new Link("/older-a");
+  const documentMock = {
+    addEventListener() {},
+    querySelector(selector) {
+      if (selector === ".pagination-link[rel=\"next\"]") return link;
+      if (selector === ".post-list, .notification-list") return list;
+      if (selector === ".app-layout") return layout;
+      if (selector === ".mobile-nav") return {};
+      return null;
+    },
+    querySelectorAll() { return []; },
+    createElement(tag) { return new Element(tag); },
+  };
+  const windowMock = {
+    visualViewport: { addEventListener() {} },
+    matchMedia() { return { matches: true }; },
+    addEventListener(name, listener) { this.listeners.set(name, listener); },
+    listeners: new Map(),
+    EventSource: class {
+      addEventListener() {}
+    },
+  };
+  globalThis.document = documentMock;
+  globalThis.window = windowMock;
+  globalThis.EventSource = windowMock.EventSource;
+  globalThis.HTMLFormElement = class {};
+  globalThis.Node = { TEXT_NODE: 3 };
+
+  let releaseFetch;
+  const pendingResponse = new Promise((resolve) => { releaseFetch = resolve; });
+  const requests = [];
+  const nextCards = [new Element("li", "post-5"), new Element("li", "post-6")];
+  const nextList = new Element("ol");
+  nextList.className = "post-list";
+  nextList.append(...nextCards);
+  let parsedPage;
+  installInfiniteScroll({
+    fetch: (url) => {
+      requests.push(url);
+      return pendingResponse;
+    },
+    parsePage: () => parsedPage,
+    IntersectionObserver: Observer,
+  });
+
+  assertEquals(Observer.latest.options.root, layout, "the narrow pinned app should observe its real scroll container");
+  Observer.latest.fire();
+  assertEquals(requests.length, 0, "the sentinel must not fetch before the middle of the page");
+  Observer.latest.target.top = 1; // 49%: the middle card has not crossed the container's top edge.
+  layout.listeners.get("scroll")();
+  assertEquals(requests.length, 0, "49% of the newest page must not fetch");
+
+  Observer.latest.target.top = -1; // 51%: the middle card has crossed the container's top edge.
+  layout.listeners.get("scroll")();
+  await Promise.resolve();
+  assertEquals(requests.length, 1, "51% of the newest page should start one request");
+  assertEquals(requests[0], "/older-a");
+  Observer.latest.fire();
+  Observer.latest.fire();
+  assertEquals(requests.length, 1, "repeated observer notifications during a request must not duplicate it");
+
+  parsedPage = { list: nextList, link: null };
+  releaseFetch({ ok: true, text: async () => "page-two" });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assertEquals(list.children.map((card) => card.getAttribute("data-post-uri")).join(","), "post-1,post-2,post-3,post-4,post-5,post-6");
+  Observer.latest.fire();
+  layout.listeners.get("scroll")();
+  assertEquals(requests.length, 1, "the end of the list must stop future requests");
+  assert((link.afterNodes || []).some((node) => node.textContent.includes("caught up")), "the end should have a readable status");
+});
