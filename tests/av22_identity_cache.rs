@@ -111,6 +111,7 @@ async fn identity_and_pds_are_warm_after_a_resolver_restart() {
             Some("https://alice-pds.test")
         );
     }
+    assert!(cache.flush(), "identity cache writer did not flush");
     drop(cache);
 
     let restarted_cache = Arc::new(SqliteIdentityCache::open(&path).unwrap());
@@ -140,6 +141,7 @@ async fn not_found_identity_is_negative_cached_across_a_resolver_restart() {
         IdentityResolver::new(backend.clone(), Duration::ZERO).with_persistent_cache(cache.clone());
     assert!(resolver.resolve_did_document(BOB).await.is_err());
     drop(resolver);
+    assert!(cache.flush(), "identity cache writer did not flush");
     drop(cache);
 
     let restarted_backend = FakeIdentityBackend::default();
