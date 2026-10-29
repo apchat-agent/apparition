@@ -936,6 +936,58 @@ Deno.test("an incoming full post keeps an earlier reply parent card on screen", 
   );
 });
 
+Deno.test("infinite scroll merges a new reply into an on-screen thread without removing cards", async () => {
+  const pages = {};
+  const harness = await createInfiniteScrollHarness({
+    cards: ["seed"],
+    responses: [{ ok: true, text: async () => "page-two" }],
+    pages,
+  });
+  harness.list.children[0].remove();
+  const existingGroup = new harness.Element("li");
+  existingGroup.className = "post-item thread-group";
+  const postA = new harness.Element("article");
+  postA.setAttribute("data-post-kind", "post");
+  postA.setAttribute("data-post-uri", "thread-A");
+  const postB = new harness.Element("article");
+  postB.setAttribute("data-post-kind", "post");
+  postB.setAttribute("data-post-uri", "thread-B");
+  existingGroup.append(postA, postB);
+  harness.list.append(existingGroup);
+
+  const nextList = new harness.Element("ol");
+  nextList.className = "post-list";
+  const incomingGroup = new harness.Element("li");
+  incomingGroup.className = "post-item thread-group";
+  const duplicateB = new harness.Element("article");
+  duplicateB.setAttribute("data-post-kind", "post");
+  duplicateB.setAttribute("data-post-uri", "thread-B");
+  const postC = new harness.Element("article");
+  postC.setAttribute("data-post-kind", "post");
+  postC.setAttribute("data-post-uri", "thread-C");
+  incomingGroup.append(duplicateB, postC);
+  nextList.append(incomingGroup);
+  pages["page-two"] = { list: nextList, link: null };
+
+  harness.Observer.latest.target.top = -1;
+  harness.scroll();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert(!existingGroup.removed, "the on-screen group must remain attached");
+  assert(harness.list.children.includes(existingGroup));
+  assert(existingGroup.children.includes(postC), "the new reply should join the on-screen group");
+  const uriCounts = new Map();
+  const collect = (node) => {
+    const uri = node.getAttribute?.("data-post-uri");
+    if (uri) uriCounts.set(uri, (uriCounts.get(uri) || 0) + 1);
+    for (const child of node.children || []) collect(child);
+  };
+  collect(harness.list);
+  assertEquals(uriCounts.get("thread-A"), 1);
+  assertEquals(uriCounts.get("thread-B"), 1);
+  assertEquals(uriCounts.get("thread-C"), 1);
+});
+
 Deno.test("infinite scroll stops before retaining more than 500 cards", async () => {
   const harness = await createInfiniteScrollHarness({
     cards: Array.from({ length: 500 }, (_, index) => `post-${index}`),
