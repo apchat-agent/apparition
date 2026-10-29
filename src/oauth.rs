@@ -3660,15 +3660,17 @@ where
             render_timeline_post_item(
                 state.storage.as_ref(),
                 record,
-                "",
-                index
-                    .checked_sub(1)
-                    .map(|previous| timeline[previous].uri.as_str()),
-                &parents,
-                &did,
-                write_forms_enabled,
-                index < 6,
-                &quote_index,
+                TimelinePostItemOptions {
+                    prelude: "",
+                    previous_uri: index
+                        .checked_sub(1)
+                        .map(|previous| timeline[previous].uri.as_str()),
+                    parents: &parents,
+                    viewer_did: &did,
+                    write_forms_enabled,
+                    eager_avatar: index < 6,
+                    quote_index: &quote_index,
+                },
             )
         })
         .collect::<String>();
@@ -3927,15 +3929,17 @@ where
             render_timeline_post_item(
                 state.storage.as_ref(),
                 &post.record,
-                &repost,
-                index
-                    .checked_sub(1)
-                    .map(|previous| feed_records[previous].uri.as_str()),
-                &parents,
-                &did,
-                write_forms_enabled,
-                index < 6,
-                &quote_index,
+                TimelinePostItemOptions {
+                    prelude: &repost,
+                    previous_uri: index
+                        .checked_sub(1)
+                        .map(|previous| feed_records[previous].uri.as_str()),
+                    parents: &parents,
+                    viewer_did: &did,
+                    write_forms_enabled,
+                    eager_avatar: index < 6,
+                    quote_index: &quote_index,
+                },
             )
         })
         .collect::<String>();
@@ -4656,15 +4660,17 @@ where
             render_timeline_post_item(
                 state.storage.as_ref(),
                 record,
-                "",
-                index
-                    .checked_sub(1)
-                    .map(|previous| records[previous].uri.as_str()),
-                &parents,
-                &did,
-                write_forms_enabled,
-                index < 6,
-                &quote_index,
+                TimelinePostItemOptions {
+                    prelude: "",
+                    previous_uri: index
+                        .checked_sub(1)
+                        .map(|previous| records[previous].uri.as_str()),
+                    parents: &parents,
+                    viewer_did: &did,
+                    write_forms_enabled,
+                    eager_avatar: index < 6,
+                    quote_index: &quote_index,
+                },
             )
         })
         .collect::<String>();
@@ -6792,44 +6798,50 @@ fn render_reply_parent_fallback<S: Storage>(storage: &S, parent_uri: &str) -> St
     )
 }
 
+struct TimelinePostItemOptions<'a> {
+    prelude: &'a str,
+    previous_uri: Option<&'a str>,
+    parents: &'a PageParentIndex,
+    viewer_did: &'a str,
+    write_forms_enabled: bool,
+    eager_avatar: bool,
+    quote_index: &'a QuoteRenderIndex,
+}
+
 fn render_timeline_post_item<S: Storage>(
     storage: &S,
     record: &IndexedRecord,
-    prelude: &str,
-    previous_uri: Option<&str>,
-    parents: &PageParentIndex,
-    viewer_did: &str,
-    write_forms_enabled: bool,
-    eager_avatar: bool,
-    quote_index: &QuoteRenderIndex,
+    options: TimelinePostItemOptions<'_>,
 ) -> String {
     let article = render_web_post(
         storage,
         record,
-        viewer_did,
-        write_forms_enabled,
+        options.viewer_did,
+        options.write_forms_enabled,
         true,
-        eager_avatar,
-        quote_index,
+        options.eager_avatar,
+        options.quote_index,
     );
     let Some(parent_uri) = record
         .record
         .pointer("/reply/parent/uri")
         .and_then(Value::as_str)
     else {
-        return format!("<li class=\"post-item\">{prelude}{article}</li>");
+        return format!("<li class=\"post-item\">{}{article}</li>", options.prelude);
     };
-    if previous_uri == Some(parent_uri) {
+    if options.previous_uri == Some(parent_uri) {
         return format!(
-            "<li class=\"post-item reply-connected-to-previous\">{prelude}<span class=\"reply-connector reply-connector-previous\" aria-hidden=\"true\"></span>{article}</li>"
+            "<li class=\"post-item reply-connected-to-previous\">{}<span class=\"reply-connector reply-connector-previous\" aria-hidden=\"true\"></span>{article}</li>",
+            options.prelude
         );
     }
-    let parent = parents.get(parent_uri).and_then(Option::as_ref);
+    let parent = options.parents.get(parent_uri).and_then(Option::as_ref);
     let parent_markup = parent
         .map(|parent| render_reply_parent_card(storage, parent))
         .unwrap_or_else(|| render_reply_parent_fallback(storage, parent_uri));
     format!(
-        "<li class=\"post-item reply-with-parent\">{prelude}<div class=\"reply-parent-slot\">{parent_markup}<span class=\"reply-connector\" aria-hidden=\"true\"></span></div>{article}</li>"
+        "<li class=\"post-item reply-with-parent\">{}<div class=\"reply-parent-slot\">{parent_markup}<span class=\"reply-connector\" aria-hidden=\"true\"></span></div>{article}</li>",
+        options.prelude
     )
 }
 
