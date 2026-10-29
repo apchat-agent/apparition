@@ -73,7 +73,7 @@ const PROFILE_NEGATIVE_TTL: Duration = Duration::from_secs(60 * 60);
 const PAGE_PROFILE_BUDGET: Duration = Duration::from_millis(1500);
 const PAGE_PROFILE_CONCURRENCY: usize = 8;
 const PAGE_QUOTE_CONCURRENCY: usize = 16;
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m2";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m3";
 const WEB_SCRIPT_URL: &str = "/static/app.js?v=js2";
 const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=*";
 const WRITE_SCOPES: [&str; 3] = [
@@ -4478,10 +4478,9 @@ fn render_feed_card(feed: &ResolvedFeed) -> String {
     let href = feed_link_href(feed);
     let avatar = feed_avatar_markup(feed);
     format!(
-        "<li class=\"feed-item\"><a class=\"feed-card\" href=\"{href}\">{avatar}<h2>{}</h2><p>{}</p><code>{}</code></a></li>",
+        "<li class=\"feed-item\"><a class=\"feed-card\" href=\"{href}\">{avatar}<h2>{}</h2><p>{}</p></a></li>",
         html_escape(&feed.display_name),
         html_escape(feed.description.as_deref().unwrap_or("")),
-        html_escape(&feed.uri),
     )
 }
 
@@ -4489,10 +4488,9 @@ fn render_feed_heading(feed: &ResolvedFeed) -> String {
     let href = feed_link_href(feed);
     let avatar = feed_avatar_markup(feed);
     format!(
-        "<header class=\"page-heading feed-heading\">{avatar}<p class=\"eyebrow\"><a href=\"/feeds\">Feeds</a></p><h1>{}</h1><p class=\"page-subtitle\">{}</p><code>{}</code><a class=\"pagination-link\" href=\"{href}\">Feed address</a></header>",
+        "<header class=\"page-heading feed-heading\">{avatar}<p class=\"eyebrow\"><a href=\"/feeds\">Feeds</a></p><h1>{}</h1><p class=\"page-subtitle\">{}</p><a class=\"feed-address-link\" href=\"{href}\">Feed address</a></header>",
         html_escape(&feed.display_name),
         html_escape(feed.description.as_deref().unwrap_or("")),
-        html_escape(&feed.uri),
     )
 }
 

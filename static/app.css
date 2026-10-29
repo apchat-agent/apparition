@@ -1544,3 +1544,49 @@ body {
 .reply-context {
   margin: 0.15rem 0 0;
 }
+
+/* No horizontal scrolling on phones (owner, 2026-10-29: the feed header's raw at:// address and a full-width
+   "Feed address" button pushed the page wider than the screen). Long words wrap; grid text columns may shrink. */
+.center-column,
+.page-content {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.feed-heading {
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0 0.65rem;
+  margin-bottom: 0.4rem;
+  padding: 0 0.75rem;
+}
+
+.feed-heading > .feed-avatar {
+  width: 2.75rem;
+  height: 2.75rem;
+  grid-row: 1 / span 3;
+  border-radius: 0.6rem;
+}
+
+.feed-heading .eyebrow {
+  display: none;
+}
+
+.feed-heading h1 {
+  font-size: 1.25rem;
+}
+
+.feed-heading .page-subtitle {
+  display: -webkit-box;
+  margin-top: 0.1rem;
+  overflow: hidden;
+  font-size: 0.88rem;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.feed-address-link {
+  color: var(--accent);
+  font-size: 0.82rem;
+  font-weight: 700;
+  text-decoration: none;
+}
