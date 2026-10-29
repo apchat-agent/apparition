@@ -9162,6 +9162,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timeline_caps_mixed_author_thread_and_links_to_skipped_replies() {
+        let storage = Arc::new(MemoryStorage::default());
+        let viewer = "did:plc:reply-viewer";
+        let mut records = Vec::new();
+        for index in 0..5_u64 {
+            let author = format!("did:plc:mixed-author-{index}");
+            let parent_uri = records
+                .last()
+                .map(|record: &IndexedRecord| record.uri.clone());
+            let record = test_web_post(
+                &author,
+                &format!("mixed-{index}"),
+                index + 1,
+                &format!("Mixed post {index}"),
+                parent_uri.as_deref(),
+            );
+            storage.put_record(&record).unwrap();
+            storage.set_follow(viewer, &author, true).unwrap();
+            records.push(record);
+        }
+
+        let page = request_test_timeline(storage, viewer).await;
+
+        assert_eq!(
+            page.matches("class=\"post-item thread-group\"").count(),
+            1,
+            "{page}"
+        );
+        assert_eq!(page.matches("class=\"post-card\"").count(), 3, "{page}");
+        for shown in ["Mixed post 0", "Mixed post 3", "Mixed post 4"] {
+            assert!(page.contains(shown), "missing {shown}: {page}");
+        }
+        for skipped in ["Mixed post 1", "Mixed post 2"] {
+            assert!(!page.contains(skipped), "unexpected {skipped}: {page}");
+        }
+        assert!(page.contains("2 more replies"), "{page}");
+        assert!(page.contains("class=\"thread-more\""), "{page}");
+        assert!(page.contains("/app/thread?uri=at%3A%2F%2Fdid%3Aplc%3Amixed-author-0"));
+    }
+
+    #[tokio::test]
     async fn timeline_reply_to_unavailable_parent_shows_a_fallback_line() {
         let storage = Arc::new(MemoryStorage::default());
         let viewer = "did:plc:reply-viewer";
