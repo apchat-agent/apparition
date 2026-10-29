@@ -19,6 +19,7 @@ use std::{
 
 const ALICE: &str = "did:plc:alice";
 const BOB: &str = "did:plc:bob";
+static NEXT_DATABASE_PATH: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Default)]
 struct FakeIdentityBackend {
@@ -74,10 +75,14 @@ impl IdentityBackend for FakeIdentityBackend {
 }
 
 fn database_path() -> PathBuf {
-    let unique = 0;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let sequence = NEXT_DATABASE_PATH.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "appview-rs-av22-identity-{}-{unique}.sqlite",
-        std::process::id()
+        "appview-rs-av22-identity-{}-{timestamp}-{sequence}.sqlite",
+        std::process::id(),
     ))
 }
 
