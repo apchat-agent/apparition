@@ -592,7 +592,7 @@ async fn get_unread_count<S: Storage, B: IdentityBackend>(
     let actor = claims.iss;
     let count = state
         .storage
-        .notification_count(&actor)
+        .unread_notification_count(&actor)
         .map_err(|_| ApiError::internal())?;
     Ok(Json(json!({"count":count})))
 }

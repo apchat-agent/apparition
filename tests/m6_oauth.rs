@@ -832,12 +832,12 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
             ),
             "{path}"
         );
-        assert!(html.contains("href=\"/static/app.css?v=m5\""), "{path}");
+        assert!(html.contains("href=\"/static/app.css?v=m6\""), "{path}");
         assert!(!html.contains("style="), "{path}");
         // One external, same-origin, deferred script (like toggles in place); never inline code.
         assert_eq!(html.matches("<script").count(), 1, "{path}");
         assert!(
-            html.contains("<script src=\"/static/app.js?v=js4\" defer></script>"),
+            html.contains("<script src=\"/static/app.js?v=js5\" defer></script>"),
             "{path}"
         );
     }
@@ -845,7 +845,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
     let stylesheet = app
         .oneshot(
             Request::builder()
-                .uri("/static/app.css?v=m5")
+                .uri("/static/app.css?v=m6")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1127,11 +1127,11 @@ async fn sign_in_error_page_uses_the_shared_mobile_document_shell() {
     assert!(
         html.contains("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">")
     );
-    assert!(html.contains("href=\"/static/app.css?v=m5\""));
+    assert!(html.contains("href=\"/static/app.css?v=m6\""));
     assert!(!html.contains("style="));
     // The shared shell's one external script, never inline code.
     assert_eq!(html.matches("<script").count(), 1);
-    assert!(html.contains("<script src=\"/static/app.js?v=js4\" defer></script>"));
+    assert!(html.contains("<script src=\"/static/app.js?v=js5\" defer></script>"));
 }
 
 #[tokio::test]
@@ -3306,6 +3306,150 @@ async fn ingest_like_updates_a_connected_notification_stream_within_one_second()
         .into_data()
         .unwrap();
     assert!(String::from_utf8_lossy(&update).contains("data: 1"));
+}
+
+#[tokio::test]
+async fn notification_streams_are_same_origin_and_capped_per_viewer() {
+    let storage = Arc::new(MemoryStorage::default());
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage);
+    let cookie = finish_login(&app).await;
+    let cross_origin = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/notifications/stream")
+                .header("cookie", &cookie)
+                .header("origin", "https://attacker.example")
+                .header("sec-fetch-site", "cross-site")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cross_origin.status(), StatusCode::FORBIDDEN);
+
+    let mut streams = Vec::new();
+    for _ in 0..4 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/notifications/stream")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        streams.push(response.into_body());
+    }
+    let capped = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/notifications/stream")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(capped.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    drop(streams.pop());
+    let after_close = app
+        .oneshot(
+            Request::builder()
+                .uri("/notifications/stream")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(after_close.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn authenticated_pages_render_unread_count_in_both_navigation_bells() {
+    let storage = Arc::new(MemoryStorage::default());
+    let now_us = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64;
+    for index in 0..10 {
+        storage
+            .put_record(&IndexedRecord {
+                did: format!("did:plc:actor{index}"),
+                collection: "app.bsky.feed.like".into(),
+                rkey: format!("like{index}"),
+                uri: format!("at://did:plc:actor{index}/app.bsky.feed.like/like{index}"),
+                cid: None,
+                time_us: now_us + index,
+                record: serde_json::json!({"subject":{"uri":"at://did:plc:alice/app.bsky.feed.post/own"}}),
+            })
+            .unwrap();
+    }
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage);
+    let cookie = finish_login(&app).await;
+    let html = get_html(&app, "/app", &cookie).await;
+    assert!(html.contains("class=\"primary-nav\""));
+    assert!(html.contains("class=\"mobile-nav\""));
+    assert_eq!(html.matches(">9+</span>").count(), 2);
+    assert_eq!(html.matches("10 unread notifications").count(), 2);
+}
+
+#[test]
+fn sqlite_notification_last_seen_persists_and_filters_unread_events() {
+    let path = std::path::PathBuf::from(format!(
+        "target/av25-notification-seen-{}.sqlite3",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let viewer = "did:plc:av25viewer";
+    let last_seen = 2_000_000_000_000_000;
+    {
+        let storage = SqliteStorage::open(&path).unwrap();
+        storage.mark_notifications_seen(viewer, last_seen).unwrap();
+        storage
+            .put_record(&IndexedRecord {
+                did: "did:plc:av25actor".into(),
+                collection: "app.bsky.feed.like".into(),
+                rkey: "old".into(),
+                uri: "at://did:plc:av25actor/app.bsky.feed.like/old".into(),
+                cid: None,
+                time_us: last_seen - 1,
+                record: serde_json::json!({"subject":{"uri":"at://did:plc:av25viewer/app.bsky.feed.post/p"}}),
+            })
+            .unwrap();
+        assert_eq!(storage.unread_notification_count(viewer).unwrap(), 0);
+        storage
+            .put_record(&IndexedRecord {
+                did: "did:plc:av25actor".into(),
+                collection: "app.bsky.feed.like".into(),
+                rkey: "new".into(),
+                uri: "at://did:plc:av25actor/app.bsky.feed.like/new".into(),
+                cid: None,
+                time_us: last_seen + 1,
+                record: serde_json::json!({"subject":{"uri":"at://did:plc:av25viewer/app.bsky.feed.post/p"}}),
+            })
+            .unwrap();
+        assert_eq!(storage.unread_notification_count(viewer).unwrap(), 1);
+    }
+    let reopened = SqliteStorage::open(&path).unwrap();
+    assert_eq!(reopened.notification_last_seen(viewer).unwrap(), last_seen);
+    assert_eq!(reopened.unread_notification_count(viewer).unwrap(), 1);
+    drop(reopened);
+    for suffix in ["", "-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        let _ = std::fs::remove_file(sidecar);
+    }
 }
 
 #[tokio::test]

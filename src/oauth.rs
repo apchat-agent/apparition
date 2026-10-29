@@ -34,7 +34,10 @@ use axum::{
     Json, Router,
     extract::{Form, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::{Html, IntoResponse, Redirect, Response},
+    response::{
+        Html, IntoResponse, Redirect, Response,
+        sse::{Event, Sse},
+    },
     routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -75,7 +78,7 @@ const PAGE_PROFILE_BUDGET: Duration = Duration::from_millis(1500);
 const PAGE_PROFILE_CONCURRENCY: usize = 8;
 const PAGE_QUOTE_CONCURRENCY: usize = 16;
 const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m6";
-const WEB_SCRIPT_URL: &str = "/static/app.js?v=js4";
+const WEB_SCRIPT_URL: &str = "/static/app.js?v=js5";
 const SAVED_FEED_CACHE_PREFIX: &str = "saved-feed-preferences:";
 const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=*";
 const WRITE_SCOPES: [&str; 3] = [
@@ -335,6 +338,42 @@ pub struct OAuthWebState<F, S> {
     pub flow: F,
     pub storage: Arc<S>,
     feed_page_cache: FeedPageCache,
+    notification_streams: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+const MAX_NOTIFICATION_STREAMS_PER_VIEWER: usize = 4;
+
+struct NotificationStreamGuard {
+    registry: Arc<Mutex<HashMap<String, usize>>>,
+    did: String,
+}
+
+impl NotificationStreamGuard {
+    fn acquire(registry: Arc<Mutex<HashMap<String, usize>>>, did: &str) -> Option<Self> {
+        let mut streams = registry.lock().ok()?;
+        let count = streams.entry(did.to_owned()).or_default();
+        if *count >= MAX_NOTIFICATION_STREAMS_PER_VIEWER {
+            return None;
+        }
+        *count += 1;
+        Some(Self {
+            registry: registry.clone(),
+            did: did.to_owned(),
+        })
+    }
+}
+
+impl Drop for NotificationStreamGuard {
+    fn drop(&mut self) {
+        if let Ok(mut streams) = self.registry.lock()
+            && let Some(count) = streams.get_mut(&self.did)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                streams.remove(&self.did);
+            }
+        }
+    }
 }
 
 impl OAuthPublic {
@@ -443,6 +482,11 @@ impl OAuthPublic {
             .route("/app/feed", get(feed_timeline_page::<F, S>))
             .route("/app/thread", get(thread_page::<F, S>))
             .route("/notifications", get(notifications_page::<F, S>))
+            .route(
+                "/notifications/unread-count",
+                get(notification_unread_count::<F, S>),
+            )
+            .route("/notifications/stream", get(notification_stream::<F, S>))
             .route("/profile", get(profile_page::<F, S>))
             .route("/thread", get(thread_page::<F, S>))
             .route("/compose", get(quote_composer::<F, S>))
@@ -456,6 +500,7 @@ impl OAuthPublic {
                 flow,
                 storage,
                 feed_page_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+                notification_streams: Arc::new(Mutex::new(HashMap::new())),
             }))
     }
 
@@ -1832,6 +1877,26 @@ fn page_shell_with_feeds(
     active_feed: Option<&str>,
     following_active: bool,
 ) -> String {
+    page_shell_with_feeds_and_badge(
+        title,
+        content,
+        authenticated,
+        feeds,
+        active_feed,
+        following_active,
+        0,
+    )
+}
+
+fn page_shell_with_feeds_and_badge(
+    title: &str,
+    content: &str,
+    authenticated: bool,
+    feeds: &[ResolvedFeed],
+    active_feed: Option<&str>,
+    following_active: bool,
+    unread_count: usize,
+) -> String {
     page_shell_with_options(
         title,
         content,
@@ -1842,6 +1907,7 @@ fn page_shell_with_feeds(
             following_active,
             show_feed_tabs: true,
             mobile_navigation_override: None,
+            unread_count,
         },
     )
 }
@@ -1852,6 +1918,7 @@ struct PageShellOptions<'a> {
     following_active: bool,
     show_feed_tabs: bool,
     mobile_navigation_override: Option<&'a str>,
+    unread_count: usize,
 }
 
 fn page_shell_with_options(
@@ -1866,13 +1933,15 @@ fn page_shell_with_options(
         following_active,
         show_feed_tabs,
         mobile_navigation_override,
+        unread_count,
     } = options;
     let navigation = if authenticated {
         format!(
-            "<nav class=\"primary-nav\" aria-label=\"Main navigation\"><a href=\"/app\">{}<span>Home</span></a><a href=\"/feeds\">{}<span>Feeds</span></a><a href=\"/notifications\">{}<span>Notifications</span></a><a href=\"/profile\">{}<span>Profile</span></a><a class=\"compose-link\" href=\"/app#new-post\">{}<span>New post</span></a><form action=\"/logout\" method=\"post\"><button type=\"submit\">Sign out</button></form></nav>",
+            "<nav class=\"primary-nav\" aria-label=\"Main navigation\"><a href=\"/app\">{}<span>Home</span></a><a href=\"/feeds\">{}<span>Feeds</span></a><a class=\"notification-nav-link\" href=\"/notifications\">{}<span>Notifications</span>{}</a><a href=\"/profile\">{}<span>Profile</span></a><a class=\"compose-link\" href=\"/app#new-post\">{}<span>New post</span></a><form action=\"/logout\" method=\"post\"><button type=\"submit\">Sign out</button></form></nav>",
             icon_svg("home"),
             icon_svg("feeds"),
             icon_svg("notifications"),
+            notification_badge_markup(unread_count),
             icon_svg("profile"),
             icon_svg("compose")
         )
@@ -1894,10 +1963,11 @@ fn page_shell_with_options(
             .map(str::to_owned)
             .unwrap_or_else(|| {
                 format!(
-                    "<nav class=\"mobile-nav\" aria-label=\"Mobile navigation\"><a href=\"/app\">{}<span>Home</span></a><a href=\"/feeds\">{}<span>Feeds</span></a><a href=\"/notifications\">{}<span>Alerts</span></a><a href=\"/profile\">{}<span>Profile</span></a></nav><a class=\"mobile-compose\" href=\"/app#new-post\" aria-label=\"New post\">{}</a>",
+                    "<nav class=\"mobile-nav\" aria-label=\"Mobile navigation\"><a href=\"/app\">{}<span>Home</span></a><a href=\"/feeds\">{}<span>Feeds</span></a><a class=\"notification-nav-link\" href=\"/notifications\">{}<span>Alerts</span>{}</a><a href=\"/profile\">{}<span>Profile</span></a></nav><a class=\"mobile-compose\" href=\"/app#new-post\" aria-label=\"New post\">{}</a>",
                     icon_svg("home"),
                     icon_svg("feeds"),
                     icon_svg("notifications"),
+                    notification_badge_markup(unread_count),
                     icon_svg("profile"),
                     icon_svg("compose")
                 )
@@ -1917,6 +1987,27 @@ fn page_shell_with_options(
         WEB_SCRIPT_URL,
         icon_sprite()
     )
+}
+
+fn notification_badge_markup(unread_count: usize) -> String {
+    let hidden = if unread_count == 0 { " hidden" } else { "" };
+    let display = if unread_count > 9 {
+        "9+".to_owned()
+    } else {
+        unread_count.to_string()
+    };
+    format!(
+        "<span class=\"notification-badge\" data-notification-badge aria-label=\"{unread_count} unread notifications\" aria-live=\"polite\"{hidden}>{display}</span>"
+    )
+}
+
+fn unread_badge_count<S: Storage>(storage: &S, did: &str) -> usize {
+    storage
+        .unread_notification_count(did)
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, %did, "could not read notification badge count");
+            0
+        })
 }
 
 fn render_feed_tabs(
@@ -3084,7 +3175,7 @@ where
     } else {
         String::new()
     };
-    let response = Html(page_shell_with_feeds(
+    let response = Html(page_shell_with_feeds_and_badge(
         "Timeline",
         &format!(
             "<header class=\"page-heading\"><p class=\"eyebrow\">Your feed</p><h1>Timeline</h1><p class=\"page-subtitle\">Posts from accounts in your local view.</p></header>{read_only_message}{indexing_status}{post_form}<ol class=\"post-list\">{posts}</ol>{older}",
@@ -3093,6 +3184,7 @@ where
         &pinned_feeds,
         None,
         true,
+        unread_badge_count(state.storage.as_ref(), &did),
     ))
     .into_response();
     page_timing.render_ms = render_started.elapsed().as_millis() as u64;
@@ -3123,7 +3215,7 @@ where
     } else {
         entries
     };
-    Html(page_shell_with_feeds(
+    Html(page_shell_with_feeds_and_badge(
         "Feeds",
         &format!(
             "<header class=\"page-heading\"><p class=\"eyebrow\">Your saved algorithms</p><h1>Feeds</h1><p class=\"page-subtitle\">Pinned custom feeds from your account.</p></header><ol class=\"feed-list\">{entries}</ol>"
@@ -3132,6 +3224,7 @@ where
         &feeds,
         None,
         false,
+        unread_badge_count(state.storage.as_ref(), &did),
     ))
     .into_response()
 }
@@ -3292,7 +3385,7 @@ where
     let tabs = pinned_feeds_for_layout(&state.flow, &did, true).await;
     page_timing.preferences_ms = tabs.preferences_ms;
     page_timing.tabs_ms = tabs.tabs_ms;
-    let response = Html(page_shell_with_feeds(
+    let response = Html(page_shell_with_feeds_and_badge(
         &page.generator.display_name,
         &format!(
             "{}{}<ol class=\"post-list\">{posts}</ol>{older}",
@@ -3303,6 +3396,7 @@ where
         &tabs.feeds,
         Some(&page.generator.uri),
         false,
+        unread_badge_count(state.storage.as_ref(), &did),
     ))
     .into_response();
     page_timing.render_ms = render_started.elapsed().as_millis() as u64;
@@ -3420,6 +3514,156 @@ fn notification_group_cursor(group: &WebNotificationGroup) -> NotificationCursor
     }
 }
 
+fn unread_count_event(count: usize) -> Event {
+    Event::default().event("unread").data(count.to_string())
+}
+
+fn notification_count_stream<S: Storage + 'static>(
+    receiver: crate::ingest::NotificationSubscription,
+    initial_count: usize,
+    storage: Arc<S>,
+    did: String,
+    heartbeat_interval: Duration,
+    guard: NotificationStreamGuard,
+) -> impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>> + Send + 'static {
+    let heartbeat_interval = heartbeat_interval.max(Duration::from_millis(1));
+    let heartbeat = tokio::time::interval_at(
+        tokio::time::Instant::now() + heartbeat_interval,
+        heartbeat_interval,
+    );
+    stream::unfold(
+        (
+            Some(initial_count),
+            receiver,
+            heartbeat,
+            storage,
+            did,
+            guard,
+        ),
+        |(initial, mut receiver, mut heartbeat, storage, did, _guard)| async move {
+            if let Some(count) = initial {
+                return Some((
+                    Ok(unread_count_event(count)),
+                    (None, receiver, heartbeat, storage, did, _guard),
+                ));
+            }
+            tokio::select! {
+                _ = heartbeat.tick() => Some((
+                    Ok(Event::default().comment("heartbeat")),
+                    (None, receiver, heartbeat, storage, did, _guard),
+                )),
+                result = receiver.recv() => match result {
+                    Ok(count) => Some((
+                        Ok(unread_count_event(count)),
+                        (None, receiver, heartbeat, storage, did, _guard),
+                    )),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let count = storage.unread_notification_count(&did).unwrap_or_default();
+                        Some((
+                            Ok(unread_count_event(count)),
+                            (None, receiver, heartbeat, storage, did, _guard),
+                        ))
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+                }
+            }
+        },
+    )
+}
+
+async fn notification_unread_count<F, S>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    headers: HeaderMap,
+) -> Response
+where
+    F: OAuthFlow,
+    S: Storage + 'static,
+{
+    if !same_origin_event_request(&headers, &state.public.public_url) {
+        return oauth_error(StatusCode::FORBIDDEN, "request must be same-origin");
+    }
+    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    match state.storage.unread_notification_count(&did) {
+        Ok(count) => Json(json!({"count":count})).into_response(),
+        Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
+}
+
+async fn notification_stream<F, S>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    headers: HeaderMap,
+) -> Response
+where
+    F: OAuthFlow,
+    S: Storage + 'static,
+{
+    if !same_origin_event_request(&headers, &state.public.public_url) {
+        return oauth_error(StatusCode::FORBIDDEN, "request must be same-origin");
+    }
+    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(guard) = NotificationStreamGuard::acquire(state.notification_streams.clone(), &did)
+    else {
+        return oauth_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many notification streams for this viewer",
+        );
+    };
+    let receiver = state.storage.subscribe_notification_counts(&did);
+    let initial_count = match state.storage.unread_notification_count(&did) {
+        Ok(count) => count,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    let events = notification_count_stream(
+        receiver,
+        initial_count,
+        state.storage.clone(),
+        did,
+        Duration::from_secs(25),
+        guard,
+    );
+    let mut response = Sse::new(events).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-transform"),
+    );
+    response.headers_mut().insert(
+        header::HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    response
+}
+
+fn same_origin_event_request(headers: &HeaderMap, public_url: &str) -> bool {
+    if headers
+        .get("sec-fetch-site")
+        .is_some_and(|site| site.to_str().ok() != Some("same-origin"))
+    {
+        return false;
+    }
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return true;
+    };
+    let Ok(origin_value) = origin.to_str() else {
+        return false;
+    };
+    let Ok(origin) = reqwest::Url::parse(origin_value) else {
+        return false;
+    };
+    let Ok(expected) = reqwest::Url::parse(public_url) else {
+        return false;
+    };
+    origin.username().is_empty()
+        && origin.password().is_none()
+        && origin.path() == "/"
+        && origin.query().is_none()
+        && origin.fragment().is_none()
+        && origin.origin() == expected.origin()
+}
+
 async fn notifications_page<F, S>(
     State(state): State<Arc<OAuthWebState<F, S>>>,
     headers: HeaderMap,
@@ -3451,13 +3695,25 @@ where
     let before = query
         .get("cursor")
         .and_then(|cursor| NotificationCursor::parse(cursor));
+    let last_seen_us = match state.storage.notification_last_seen(&did) {
+        Ok(time_us) => time_us,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    let now_us = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
+        .min(u64::MAX as u128) as u64;
+    if let Err(error) = state.storage.mark_notifications_seen(&did, now_us) {
+        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+    }
     let timeline_started = std::time::Instant::now();
     let notices = match state.storage.notifications_for(&did, None, usize::MAX) {
         Ok(notices) => notices,
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
     page_timing.timeline_fetch_index_ms = timeline_started.elapsed().as_millis() as u64;
-    let groups = group_web_notifications(&notices, 0);
+    let groups = group_web_notifications(&notices, last_seen_us);
     let (visible, has_more) = notification_group_page(&groups, before.as_ref(), limit);
     let notification_records = visible
         .iter()
@@ -3520,7 +3776,7 @@ where
     } else {
         String::new()
     };
-    let response = Html(page_shell_with_feeds(
+    let response = Html(page_shell_with_feeds_and_badge(
         "Notifications",
         &format!(
             "<header class=\"page-heading\"><p class=\"eyebrow\">What’s happening</p><h1>Notifications</h1><p class=\"page-subtitle\">Recent activity around your posts and profile.</p></header><ol class=\"notification-list\">{items}</ol>{older}"
@@ -3529,6 +3785,7 @@ where
         &tabs.feeds,
         None,
         false,
+        unread_badge_count(state.storage.as_ref(), &did),
     ))
     .into_response();
     page_timing.render_ms = render_started.elapsed().as_millis() as u64;
@@ -3796,7 +4053,7 @@ where
     } else {
         String::new()
     };
-    let response = Html(page_shell_with_feeds(
+    let response = Html(page_shell_with_feeds_and_badge(
         display_name,
         &format!(
             "<section class=\"profile-card\">{}<div><h1>{}</h1><p class=\"profile-handle\">@{}</p></div></section><header class=\"section-heading\"><h2>Posts</h2></header><ol class=\"post-list\">{posts}</ol>{older}",
@@ -3808,6 +4065,7 @@ where
         &tabs.feeds,
         None,
         false,
+        unread_badge_count(state.storage.as_ref(), &did),
     ))
     .into_response();
     page_timing.render_ms = render_started.elapsed().as_millis() as u64;
@@ -3982,7 +4240,9 @@ where
     } else {
         String::new()
     };
-    let mobile_navigation = render_thread_mobile_navigation(state.storage.as_ref(), &viewer_did);
+    let badge_count = unread_badge_count(state.storage.as_ref(), &viewer_did);
+    let mobile_navigation =
+        render_thread_mobile_navigation(state.storage.as_ref(), &viewer_did, badge_count);
     let response = Html(page_shell_with_options(
         "Thread",
         &format!(
@@ -4003,6 +4263,7 @@ where
             following_active: false,
             show_feed_tabs: false,
             mobile_navigation_override: Some(&mobile_navigation),
+            unread_count: badge_count,
         },
     ))
     .into_response();
@@ -4067,13 +4328,14 @@ where
         verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()),
     )
     .await;
-    Html(page_shell_with_feeds(
+    Html(page_shell_with_feeds_and_badge(
         "Quote post",
         &format!("<header class=\"page-heading\"><h1>Quote post</h1></header>{composer}"),
         true,
         &tabs.feeds,
         None,
         false,
+        unread_badge_count(state.storage.as_ref(), &viewer_did),
     ))
     .into_response()
 }
@@ -4312,15 +4574,20 @@ fn render_thread_reply_bar<S: Storage>(storage: &S, viewer_did: &str) -> String 
     )
 }
 
-fn render_thread_mobile_navigation<S: Storage>(storage: &S, viewer_did: &str) -> String {
+fn render_thread_mobile_navigation<S: Storage>(
+    storage: &S,
+    viewer_did: &str,
+    unread_count: usize,
+) -> String {
     let profile = profile_view_from_storage(storage, viewer_did)
         .unwrap_or_else(|_| json!({"did":viewer_did,"handle":viewer_did}));
     format!(
-        "<nav class=\"mobile-nav\" aria-label=\"Mobile navigation\"><a href=\"/app\">{}<span>Home</span></a><button class=\"mobile-search\" type=\"button\" aria-label=\"Mobile search\" disabled>{}<span>Search</span></button><a href=\"/feeds\">{}<span>Feeds</span></a><a href=\"/notifications\">{}<span>Notifications</span></a><a href=\"/profile\" aria-label=\"Profile\">{}</a></nav><a class=\"mobile-compose\" href=\"/app#new-post\" aria-label=\"New post\">{}</a>",
+        "<nav class=\"mobile-nav\" aria-label=\"Mobile navigation\"><a href=\"/app\">{}<span>Home</span></a><button class=\"mobile-search\" type=\"button\" aria-label=\"Mobile search\" disabled>{}<span>Search</span></button><a href=\"/feeds\">{}<span>Feeds</span></a><a class=\"notification-nav-link\" href=\"/notifications\">{}<span>Notifications</span>{}</a><a href=\"/profile\" aria-label=\"Profile\">{}</a></nav><a class=\"mobile-compose\" href=\"/app#new-post\" aria-label=\"New post\">{}</a>",
         icon_svg("home"),
         icon_svg("search"),
         icon_svg("feeds"),
         icon_svg("notifications"),
+        notification_badge_markup(unread_count),
         avatar_markup(&profile, "mobile-profile-avatar"),
         icon_svg("compose")
     )
@@ -5945,6 +6212,7 @@ mod tests {
     use crate::ingest::IndexedRecord;
     use atrium_oauth::store::session::Session;
     use axum::http::Uri;
+    use http_body_util::BodyExt;
     use std::collections::HashMap;
     use tokio::net::TcpListener;
     use tracing::instrument::WithSubscriber;
@@ -5969,7 +6237,13 @@ mod tests {
         let sprite = icon_sprite();
         let css = include_str!("../static/app.css");
 
-        assert!(!sprite.contains("fill=\"none\""));
+        assert!(sprite.split("<symbol ").skip(1).all(|symbol| {
+            !symbol
+                .split('>')
+                .next()
+                .unwrap_or_default()
+                .contains(" fill=")
+        }));
         assert!(sprite.contains("<symbol id=\"i-like\""));
         assert!(css.contains(".icon {\n  fill: none;"));
         assert!(css.contains(".post-actions .is-liked .icon {\n  fill: var(--accent);"));
@@ -6045,6 +6319,93 @@ mod tests {
             first[0].events[0].record.uri,
             second[0].events[0].record.uri
         );
+        let cursor = notification_group_cursor(second.last().unwrap());
+        let (third, has_more) = notification_group_page(&groups, Some(&cursor), 1);
+        assert!(!has_more);
+        assert_eq!(third[0].events.len(), 1);
+        let all_uris = first
+            .iter()
+            .chain(&second)
+            .chain(&third)
+            .flat_map(|group| group.events.iter().map(|event| event.record.uri.clone()))
+            .collect::<HashSet<_>>();
+        assert_eq!(all_uris.len(), 4);
+    }
+
+    #[test]
+    fn grouped_like_row_shows_other_count_avatars_and_subject_snippet() {
+        let storage = MemoryStorage::default();
+        storage
+            .set_verified_handle("did:plc:alice", "alice.test")
+            .unwrap();
+        storage
+            .set_verified_handle("did:plc:bob", "bob.test")
+            .unwrap();
+        let post_uri = "at://did:plc:viewer/app.bsky.feed.post/post-a";
+        storage
+            .put_record(&IndexedRecord {
+                did: "did:plc:viewer".into(),
+                collection: "app.bsky.feed.post".into(),
+                rkey: "post-a".into(),
+                uri: post_uri.into(),
+                cid: None,
+                time_us: 1,
+                record: json!({"text":"subject <preview> text"}),
+            })
+            .unwrap();
+        let notices = vec![
+            web_notice("alice", "like", 10 * HOUR_US, Some("post-a")),
+            web_notice("bob", "like", 9 * HOUR_US, Some("post-a")),
+        ];
+        let groups = group_web_notifications(&notices, 0);
+        let group = &groups[0];
+        let html = render_web_notification_group(&storage, group, &HashMap::new());
+        assert!(html.contains("alice.test</a> and 1 other liked your post"));
+        assert_eq!(
+            html.matches("class=\"notification-avatar avatar-placeholder\"")
+                .count(),
+            2
+        );
+        assert!(html.contains("subject &lt;preview&gt; text"));
+    }
+
+    #[tokio::test]
+    async fn notification_stream_sends_initial_count_and_heartbeat() {
+        let storage = Arc::new(MemoryStorage::default());
+        let did = "did:plc:stream-test".to_owned();
+        let receiver = storage.subscribe_notification_counts(&did);
+        let registry = Arc::new(Mutex::new(HashMap::new()));
+        let guard = NotificationStreamGuard::acquire(registry, &did).unwrap();
+        let events =
+            notification_count_stream(receiver, 3, storage, did, Duration::from_millis(10), guard);
+        let mut body = Sse::new(events).into_response().into_body();
+        let initial = tokio::time::timeout(Duration::from_secs(1), body.frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&initial).contains("data: 3"));
+        let heartbeat = tokio::time::timeout(Duration::from_secs(1), body.frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&heartbeat).contains(": heartbeat"));
+    }
+
+    #[test]
+    fn notification_badge_hides_zero_and_caps_counts_above_nine() {
+        let zero = notification_badge_markup(0);
+        assert!(zero.contains("hidden"));
+        assert!(zero.contains(">0</span>"));
+        let ten = notification_badge_markup(10);
+        assert!(!ten.contains(" hidden"));
+        assert!(ten.contains(">9+</span>"));
+        assert!(ten.contains("10 unread notifications"));
     }
 
     const HOUR_US: u64 = 60 * 60 * 1_000_000;

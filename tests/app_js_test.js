@@ -17,6 +17,9 @@ Deno.test("like handler fills the heart and clears it when unliked", async () =>
     querySelector() {
       return null;
     },
+    querySelectorAll() {
+      return [];
+    },
     createElement(tag) {
       return {
         className: "",
@@ -116,4 +119,86 @@ Deno.test("like handler fills the heart and clears it when unliked", async () =>
   assert(!button.classList.contains("is-liked"), "unlike should clear the heart");
   assertEquals(button.getAttribute("aria-pressed"), "false");
   assert(!form.submitted, "successful requests should keep using the in-place handler");
+});
+
+Deno.test("notification badges update from SSE and fall back to 30-second polling", async () => {
+  const listeners = new Map();
+  const visibilityListeners = new Map();
+  const badges = [0, 1].map(() => ({
+    hidden: true,
+    textContent: "0",
+    attributes: new Map(),
+    setAttribute(name, value) {
+      this.attributes.set(name, value);
+    },
+  }));
+  const documentMock = {
+    addEventListener(name, listener) {
+      listeners.set(name, listener);
+      if (name === "visibilitychange") visibilityListeners.set(name, listener);
+    },
+    querySelector() {
+      return null;
+    },
+    querySelectorAll(selector) {
+      return selector === "[data-notification-badge]" ? badges : [];
+    },
+  };
+  const intervals = [];
+  const requests = [];
+  class FakeEventSource {
+    constructor(url) {
+      this.url = url;
+      this.listeners = new Map();
+      FakeEventSource.latest = this;
+    }
+    addEventListener(name, listener) {
+      this.listeners.set(name, listener);
+    }
+    close() {
+      this.closed = true;
+    }
+  }
+
+  globalThis.document = documentMock;
+  globalThis.HTMLFormElement = class {};
+  globalThis.Node = { TEXT_NODE: 3 };
+  globalThis.EventSource = FakeEventSource;
+  globalThis.window = {
+    scrollY: 0,
+    scrollX: 0,
+    EventSource: FakeEventSource,
+    visualViewport: { addEventListener() {} },
+    setInterval(callback, delay) {
+      intervals.push({ callback, delay });
+      return intervals.length;
+    },
+  };
+  globalThis.fetch = async (url) => {
+    requests.push(url);
+    return { ok: true, json: async () => ({ count: 2 }) };
+  };
+
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  new Function(source)();
+  const eventSource = FakeEventSource.latest;
+  assertEquals(eventSource.url, "/notifications/stream");
+  eventSource.listeners.get("unread")({ data: "10" });
+  for (const badge of badges) {
+    assertEquals(badge.textContent, "9+");
+    assert(!badge.hidden);
+    assertEquals(badge.attributes.get("aria-label"), "10 unread notifications");
+  }
+  eventSource.listeners.get("unread")({ data: "0" });
+  assert(badges.every((badge) => badge.hidden));
+
+  eventSource.onerror();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert(eventSource.closed);
+  assertEquals(intervals[0].delay, 30_000);
+  assertEquals(requests[0], "/notifications/unread-count");
+  visibilityListeners.get("visibilitychange")();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assertEquals(requests.length, 2);
+  assertEquals(badges[0].textContent, "2");
 });

@@ -153,6 +153,34 @@ textarea:focus-visible {
   color: var(--text);
 }
 
+.notification-nav-link {
+  position: relative;
+}
+
+.notification-badge {
+  position: absolute;
+  z-index: 1;
+  top: -0.2rem;
+  right: 0.15rem;
+  display: grid;
+  min-width: 1.2rem;
+  height: 1.2rem;
+  place-items: center;
+  padding: 0 0.25rem;
+  border: 2px solid var(--page);
+  border-radius: 999px;
+  background: #e11d48;
+  color: #fff;
+  font-size: 0.65rem;
+  font-weight: 750;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.notification-badge[hidden] {
+  display: none;
+}
+
 .primary-nav .icon {
   width: 1.35rem;
   height: 1.35rem;

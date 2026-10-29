@@ -61,3 +61,56 @@ const resetDocumentScroll = () => {
 };
 document.addEventListener("focusout", () => setTimeout(resetDocumentScroll, 100));
 window.visualViewport?.addEventListener("resize", resetDocumentScroll);
+
+// Keep the notification badge live while the page is open. SSE is the normal path;
+// the JSON count endpoint provides a low-frequency fallback for proxies that close streams.
+(() => {
+  const badges = [...document.querySelectorAll("[data-notification-badge]")];
+  if (!badges.length) return;
+
+  const updateBadges = (value) => {
+    const count = Number(value);
+    if (!Number.isSafeInteger(count) || count < 0) return;
+    for (const badge of badges) {
+      badge.hidden = count === 0;
+      badge.textContent = count > 9 ? "9+" : String(count);
+      badge.setAttribute("aria-label", `${count} unread notifications`);
+    }
+  };
+
+  const refreshCount = async () => {
+    try {
+      const response = await fetch("/notifications/unread-count", {
+        credentials: "same-origin",
+        headers: { Accept: "application/json" },
+      });
+      if (!response.ok) return;
+      const result = await response.json();
+      updateBadges(result.count);
+    } catch {
+      // The next visibility change or polling tick retries the small count request.
+    }
+  };
+
+  let pollTimer;
+  const startPolling = () => {
+    if (pollTimer) return;
+    refreshCount();
+    pollTimer = window.setInterval(refreshCount, 30_000);
+  };
+
+  if ("EventSource" in window) {
+    const source = new EventSource("/notifications/stream");
+    source.addEventListener("unread", (event) => updateBadges(event.data));
+    source.onerror = () => {
+      source.close();
+      startPolling();
+    };
+  } else {
+    startPolling();
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) refreshCount();
+  });
+})();

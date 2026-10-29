@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const SUPPORTED_COLLECTIONS: &[&str] = &[
@@ -411,6 +411,10 @@ pub trait Storage: Send + Sync {
         limit: usize,
     ) -> Result<Vec<IndexedNotification>, StorageError>;
     fn notification_count(&self, did: &str) -> Result<usize, StorageError>;
+    fn notification_last_seen(&self, did: &str) -> Result<u64, StorageError>;
+    fn mark_notifications_seen(&self, did: &str, time_us: u64) -> Result<(), StorageError>;
+    fn unread_notification_count(&self, did: &str) -> Result<usize, StorageError>;
+    fn subscribe_notification_counts(&self, did: &str) -> NotificationSubscription;
     fn author_posts(
         &self,
         did: &str,
@@ -468,6 +472,81 @@ pub trait Storage: Send + Sync {
     fn bytes_on_disk(&self) -> u64;
 }
 
+#[derive(Clone, Default)]
+pub struct NotificationHub {
+    channels: Arc<Mutex<HashMap<String, broadcast::Sender<usize>>>>,
+}
+
+impl NotificationHub {
+    const CHANNEL_CAPACITY: usize = 16;
+
+    pub fn subscribe(&self, did: &str) -> NotificationSubscription {
+        let receiver = if let Ok(mut channels) = self.channels.lock() {
+            channels.retain(|_, sender| sender.receiver_count() > 0);
+            channels
+                .entry(did.to_owned())
+                .or_insert_with(|| broadcast::channel(Self::CHANNEL_CAPACITY).0)
+                .subscribe()
+        } else {
+            let (sender, receiver) = broadcast::channel(1);
+            drop(sender);
+            receiver
+        };
+        NotificationSubscription {
+            did: did.to_owned(),
+            hub: self.clone(),
+            receiver,
+        }
+    }
+
+    pub fn publish(&self, did: &str, unread_count: usize) {
+        if let Ok(mut channels) = self.channels.lock()
+            && let Some(sender) = channels.get(did)
+        {
+            let _ = sender.send(unread_count);
+            if sender.receiver_count() == 0 {
+                channels.remove(did);
+            }
+        }
+    }
+}
+
+pub struct NotificationSubscription {
+    did: String,
+    hub: NotificationHub,
+    receiver: broadcast::Receiver<usize>,
+}
+
+impl NotificationSubscription {
+    pub async fn recv(&mut self) -> Result<usize, broadcast::error::RecvError> {
+        self.receiver.recv().await
+    }
+}
+
+impl Drop for NotificationSubscription {
+    fn drop(&mut self) {
+        if let Ok(mut channels) = self.hub.channels.lock()
+            && channels
+                .get(&self.did)
+                .is_some_and(|sender| sender.receiver_count() <= 1)
+        {
+            channels.remove(&self.did);
+        }
+    }
+}
+
+fn publish_notification_counts<S: Storage>(
+    storage: &S,
+    hub: &NotificationHub,
+    dids: impl IntoIterator<Item = String>,
+) {
+    for did in dids.into_iter().collect::<HashSet<_>>() {
+        if let Ok(count) = storage.unread_notification_count(&did) {
+            hub.publish(&did, count);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BatchApplyTiming {
     pub apply: Duration,
@@ -508,6 +587,7 @@ pub(crate) fn ensure_private_database_file(path: &Path) -> Result<(), std::io::E
 #[derive(Default)]
 pub struct MemoryStorage {
     inner: Mutex<MemoryState>,
+    notification_hub: NotificationHub,
 }
 
 #[derive(Default)]
@@ -528,6 +608,7 @@ struct MemoryState {
     handle_refresh_order: VecDeque<String>,
     profile_index: HashMap<String, ProfileIndexEntry>,
     profile_fetch_queue: VecDeque<String>,
+    notification_last_seen: HashMap<String, u64>,
 }
 
 struct BackfillRetry {
@@ -537,6 +618,10 @@ struct BackfillRetry {
 
 impl Storage for MemoryStorage {
     fn put_record(&self, record: &IndexedRecord) -> Result<(), StorageError> {
+        let affected = notification_edges(record)
+            .into_iter()
+            .map(|(_, subject_did, _, _)| subject_did)
+            .collect::<Vec<_>>();
         let key = (
             record.did.clone(),
             record.collection.clone(),
@@ -553,6 +638,8 @@ impl Storage for MemoryStorage {
                 },
             );
         }
+        drop(inner);
+        publish_notification_counts(self, &self.notification_hub, affected);
         Ok(())
     }
 
@@ -565,8 +652,14 @@ impl Storage for MemoryStorage {
             return Ok(BatchApplyTiming::default());
         }
         let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut affected = Vec::new();
         for update in updates {
             if let Some(record) = &update.upsert {
+                affected.extend(
+                    notification_edges(record)
+                        .into_iter()
+                        .map(|(_, subject_did, _, _)| subject_did),
+                );
                 let key = (
                     record.did.clone(),
                     record.collection.clone(),
@@ -584,6 +677,17 @@ impl Storage for MemoryStorage {
                 }
             }
             if let Some((did, collection, rkey)) = &update.delete {
+                if let Some(record) =
+                    inner
+                        .records
+                        .get(&(did.clone(), collection.clone(), rkey.clone()))
+                {
+                    affected.extend(
+                        notification_edges(record)
+                            .into_iter()
+                            .map(|(_, subject_did, _, _)| subject_did),
+                    );
+                }
                 inner
                     .records
                     .remove(&(did.clone(), collection.clone(), rkey.clone()));
@@ -638,6 +742,8 @@ impl Storage for MemoryStorage {
             }
             inner.cursor = Some(update.time_us);
         }
+        drop(inner);
+        publish_notification_counts(self, &self.notification_hub, affected);
         Ok(BatchApplyTiming {
             apply: started.elapsed(),
             commit: Duration::ZERO,
@@ -667,6 +773,19 @@ impl Storage for MemoryStorage {
         following: &[String],
     ) -> Result<(), StorageError> {
         let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut affected = inner
+            .records
+            .values()
+            .filter(|record| record.did == did)
+            .flat_map(notification_edges)
+            .map(|(_, subject_did, _, _)| subject_did)
+            .collect::<Vec<_>>();
+        affected.extend(
+            records
+                .iter()
+                .flat_map(notification_edges)
+                .map(|(_, subject_did, _, _)| subject_did),
+        );
         inner
             .records
             .retain(|(record_did, _, _), _| record_did != did);
@@ -722,14 +841,17 @@ impl Storage for MemoryStorage {
                 inner.backfill_completed.remove(subject);
             }
         }
+        drop(inner);
+        publish_notification_counts(self, &self.notification_hub, affected);
         Ok(())
     }
 
     fn delete_record(&self, did: &str, collection: &str, rkey: &str) -> Result<(), StorageError> {
         let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
-        inner
-            .records
-            .remove(&(did.to_owned(), collection.to_owned(), rkey.to_owned()));
+        let removed =
+            inner
+                .records
+                .remove(&(did.to_owned(), collection.to_owned(), rkey.to_owned()));
         if collection == "app.bsky.actor.profile" {
             inner.profile_index.insert(
                 did.to_owned(),
@@ -738,6 +860,14 @@ impl Storage for MemoryStorage {
                     fetched_at_ms: epoch_millis(),
                 },
             );
+        }
+        drop(inner);
+        if let Some(record) = removed {
+            let affected = notification_edges(&record)
+                .into_iter()
+                .map(|(_, subject_did, _, _)| subject_did)
+                .collect::<Vec<_>>();
+            publish_notification_counts(self, &self.notification_hub, affected);
         }
         Ok(())
     }
@@ -980,6 +1110,48 @@ impl Storage for MemoryStorage {
             .flat_map(notification_edges)
             .filter(|(_, subject_did, _, _)| subject_did == did)
             .count())
+    }
+
+    fn notification_last_seen(&self, did: &str) -> Result<u64, StorageError> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .notification_last_seen
+            .get(did)
+            .copied()
+            .unwrap_or_default())
+    }
+
+    fn mark_notifications_seen(&self, did: &str, time_us: u64) -> Result<(), StorageError> {
+        self.inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .notification_last_seen
+            .entry(did.to_owned())
+            .and_modify(|last_seen| *last_seen = (*last_seen).max(time_us))
+            .or_insert(time_us);
+        publish_notification_counts(self, &self.notification_hub, [did.to_owned()]);
+        Ok(())
+    }
+
+    fn unread_notification_count(&self, did: &str) -> Result<usize, StorageError> {
+        let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        let last_seen = inner
+            .notification_last_seen
+            .get(did)
+            .copied()
+            .unwrap_or_default();
+        Ok(inner
+            .records
+            .values()
+            .flat_map(notification_edges)
+            .filter(|(record, subject_did, _, _)| subject_did == did && record.time_us > last_seen)
+            .count())
+    }
+
+    fn subscribe_notification_counts(&self, did: &str) -> NotificationSubscription {
+        self.notification_hub.subscribe(did)
     }
 
     fn author_posts(
@@ -1511,6 +1683,7 @@ pub struct SqliteStorage {
     checkpoint_backlog: Arc<AtomicU64>,
     tracked: Arc<RwLock<TrackedSet>>,
     profile_index: Arc<RwLock<HashMap<String, ProfileIndexEntry>>>,
+    notification_hub: NotificationHub,
 }
 
 impl Drop for SqliteStorage {
@@ -1656,6 +1829,10 @@ impl SqliteStorage {
              );
              CREATE INDEX IF NOT EXISTS notification_events_subject_time
                  ON notification_events(subject_did, time_us DESC, source_uri DESC, reason);
+             CREATE TABLE IF NOT EXISTS notification_last_seen (
+                 viewer_did TEXT PRIMARY KEY,
+                 time_us INTEGER NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS registered_users (did TEXT PRIMARY KEY);
              CREATE TABLE IF NOT EXISTS web_session_generations (
                  did TEXT PRIMARY KEY,
@@ -1782,6 +1959,7 @@ impl SqliteStorage {
             checkpoint_backlog: backlog,
             tracked: Arc::new(RwLock::new(tracked_set)),
             profile_index: Arc::new(RwLock::new(profile_index)),
+            notification_hub: NotificationHub::default(),
         })
     }
 
@@ -2170,6 +2348,10 @@ impl Storage for SqliteStorage {
     }
 
     fn put_record(&self, record: &IndexedRecord) -> Result<(), StorageError> {
+        let affected = notification_edges(record)
+            .into_iter()
+            .map(|(_, subject_did, _, _)| subject_did)
+            .collect::<Vec<_>>();
         let record_json = serde_json::to_string(&record.record)?;
         let connection = self.conn()?;
         connection.execute(
@@ -2190,6 +2372,7 @@ impl Storage for SqliteStorage {
                 },
             )?;
         }
+        publish_notification_counts(self, &self.notification_hub, affected);
         Ok(())
     }
 
@@ -2204,6 +2387,7 @@ impl Storage for SqliteStorage {
         let mut connection = self.conn()?;
         let transaction = connection.transaction()?;
         let mut tracked_follow_deltas = HashMap::<String, i64>::new();
+        let mut affected = Vec::new();
         for update in updates {
             if let Some(did) = &update.handle_refresh {
                 transaction.execute(
@@ -2212,6 +2396,11 @@ impl Storage for SqliteStorage {
                 )?;
             }
             if let Some(record) = &update.upsert {
+                affected.extend(
+                    notification_edges(record)
+                        .into_iter()
+                        .map(|(_, subject_did, _, _)| subject_did),
+                );
                 let record_json = serde_json::to_string(&record.record)?;
                 transaction.execute(
                     "INSERT INTO records (did, collection, rkey, uri, cid, time_us, record_json)
@@ -2232,6 +2421,17 @@ impl Storage for SqliteStorage {
                 write_notification_events(&transaction, record)?;
             }
             if let Some((did, collection, rkey)) = &update.delete {
+                let mut statement = transaction.prepare(
+                    "SELECT DISTINCT subject_did FROM notification_events
+                     WHERE source_did=?1 AND source_collection=?2 AND source_rkey=?3",
+                )?;
+                affected.extend(
+                    statement
+                        .query_map(params![did, collection, rkey], |row| {
+                            row.get::<_, String>(0)
+                        })?
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
                 transaction.execute(
                     "DELETE FROM records WHERE did=?1 AND collection=?2 AND rkey=?3",
                     params![did, collection, rkey],
@@ -2334,6 +2534,7 @@ impl Storage for SqliteStorage {
             }
         }
         self.apply_tracked_follow_deltas(&tracked_follow_deltas)?;
+        publish_notification_counts(self, &self.notification_hub, affected);
         Ok(BatchApplyTiming {
             apply,
             commit: commit_started.elapsed(),
@@ -2396,8 +2597,25 @@ impl Storage for SqliteStorage {
         records: &[IndexedRecord],
         following: &[String],
     ) -> Result<(), StorageError> {
+        let mut affected = {
+            let connection = self.read_conn()?;
+            let mut statement = connection.prepare(
+                "SELECT DISTINCT subject_did FROM notification_events WHERE source_did=?1",
+            )?;
+            statement
+                .query_map([did], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        affected.extend(
+            records
+                .iter()
+                .flat_map(notification_edges)
+                .map(|(_, subject_did, _, _)| subject_did),
+        );
         self.replace_repo_snapshot_inner(did, records, following, None)?;
-        self.refresh_profile_index_for_did(did)
+        self.refresh_profile_index_for_did(did)?;
+        publish_notification_counts(self, &self.notification_hub, affected);
+        Ok(())
     }
 
     fn replace_repo_snapshot_throttled(
@@ -2407,11 +2625,40 @@ impl Storage for SqliteStorage {
         following: &[String],
         records_per_second: u64,
     ) -> Result<(), StorageError> {
+        let mut affected = {
+            let connection = self.read_conn()?;
+            let mut statement = connection.prepare(
+                "SELECT DISTINCT subject_did FROM notification_events WHERE source_did=?1",
+            )?;
+            statement
+                .query_map([did], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        affected.extend(
+            records
+                .iter()
+                .flat_map(notification_edges)
+                .map(|(_, subject_did, _, _)| subject_did),
+        );
         self.replace_repo_snapshot_inner(did, records, following, Some(records_per_second))?;
-        self.refresh_profile_index_for_did(did)
+        self.refresh_profile_index_for_did(did)?;
+        publish_notification_counts(self, &self.notification_hub, affected);
+        Ok(())
     }
 
     fn delete_record(&self, did: &str, collection: &str, rkey: &str) -> Result<(), StorageError> {
+        let affected = {
+            let connection = self.read_conn()?;
+            let mut statement = connection.prepare(
+                "SELECT DISTINCT subject_did FROM notification_events
+                 WHERE source_did=?1 AND source_collection=?2 AND source_rkey=?3",
+            )?;
+            statement
+                .query_map(params![did, collection, rkey], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
         let connection = self.conn()?;
         connection.execute(
             "DELETE FROM records WHERE did=?1 AND collection=?2 AND rkey=?3",
@@ -2431,6 +2678,7 @@ impl Storage for SqliteStorage {
                 },
             )?;
         }
+        publish_notification_counts(self, &self.notification_hub, affected);
         Ok(())
     }
 
@@ -2646,6 +2894,43 @@ impl Storage for SqliteStorage {
             [did],
             |row| row.get(0),
         )?)
+    }
+
+    fn notification_last_seen(&self, did: &str) -> Result<u64, StorageError> {
+        let stored: Option<i64> = self
+            .read_conn()?
+            .query_row(
+                "SELECT time_us FROM notification_last_seen WHERE viewer_did=?1",
+                [did],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(stored.unwrap_or_default().max(0) as u64)
+    }
+
+    fn mark_notifications_seen(&self, did: &str, time_us: u64) -> Result<(), StorageError> {
+        self.conn()?.execute(
+            "INSERT INTO notification_last_seen(viewer_did,time_us) VALUES(?1,?2)
+             ON CONFLICT(viewer_did) DO UPDATE SET time_us=MAX(time_us,excluded.time_us)",
+            params![did, time_us.min(i64::MAX as u64) as i64],
+        )?;
+        publish_notification_counts(self, &self.notification_hub, [did.to_owned()]);
+        Ok(())
+    }
+
+    fn unread_notification_count(&self, did: &str) -> Result<usize, StorageError> {
+        Ok(self.read_conn()?.query_row(
+            "SELECT COUNT(*) FROM notification_events
+             WHERE subject_did=?1 AND time_us > COALESCE(
+                 (SELECT time_us FROM notification_last_seen WHERE viewer_did=?1), 0
+             )",
+            [did],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn subscribe_notification_counts(&self, did: &str) -> NotificationSubscription {
+        self.notification_hub.subscribe(did)
     }
 
     fn author_posts(
