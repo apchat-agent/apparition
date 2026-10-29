@@ -5824,6 +5824,155 @@ async fn profile_page_shows_relationship_and_actions_for_other_accounts_only() {
 }
 
 #[tokio::test]
+async fn profile_header_renders_banner_avatar_counts_follows_you_and_linked_description() {
+    let storage = Arc::new(MemoryStorage::default());
+    let friend = "did:plc:friend";
+    storage
+        .put_record(&IndexedRecord {
+            did: friend.into(),
+            collection: "app.bsky.actor.profile".into(),
+            rkey: "self".into(),
+            uri: format!("at://{friend}/app.bsky.actor.profile/self"),
+            cid: Some("friend-profile-cid".into()),
+            time_us: 1,
+            record: serde_json::json!({
+                "displayName":"Riley Morgan",
+                "description":"More at https://example.test/about",
+                "avatar":{"$type":"blob","ref":{"$link":"avatar-cid"}},
+                "banner":{"$type":"blob","ref":{"$link":"banner-cid"}}
+            }),
+        })
+        .unwrap();
+    storage.set_follow("did:plc:alice", friend, true).unwrap();
+    storage.set_follow(friend, "did:plc:alice", true).unwrap();
+    storage
+        .set_verified_handle(friend, "riley.example")
+        .unwrap();
+    storage
+        .put_record(&fake_feed_post(friend, "profile-post", 5, "hello"))
+        .unwrap();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage);
+    let cookie = finish_login(&app).await;
+
+    let html = get_html(&app, "/profile?did=did%3Aplc%3Afriend", &cookie).await;
+    assert!(html.contains("class=\"profile-banner\""), "{html}");
+    assert!(html.contains("banner-cid"), "{html}");
+    assert!(html.contains("class=\"profile-avatar\""), "{html}");
+    assert!(html.contains("avatar-cid"), "{html}");
+    assert!(html.contains("<h1>Riley Morgan</h1>"), "{html}");
+    assert!(html.contains("@riley.example"), "{html}");
+    assert!(
+        html.contains("class=\"follows-you-pill\">Follows you</span>"),
+        "{html}"
+    );
+    assert!(html.contains("Followers"), "{html}");
+    assert!(html.contains("Following"), "{html}");
+    assert!(html.contains("Posts"), "{html}");
+    assert!(html.contains("class=\"profile-description\""), "{html}");
+    assert!(
+        html.contains("href=\"https://example.test/about\" rel=\"nofollow noopener noreferrer\""),
+        "{html}"
+    );
+}
+
+#[tokio::test]
+async fn profile_actions_use_one_follow_button_overflow_menu_and_membership_selector() {
+    let storage = Arc::new(MemoryStorage::default());
+    storage
+        .set_follow("did:plc:alice", "did:plc:friend", true)
+        .unwrap();
+    let flow = FakeOAuthFlow::default();
+    *flow.profile_lists.lock().unwrap() = vec![
+        ProfileListChoice {
+            uri: "at://did:plc:alice/app.bsky.graph.list/friends".into(),
+            item_uri: Some("at://did:plc:alice/app.bsky.graph.listitem/friend-item".into()),
+            name: "Friends".into(),
+            purpose: "app.bsky.graph.defs#curatelist".into(),
+        },
+        ProfileListChoice {
+            uri: "at://did:plc:alice/app.bsky.graph.list/reading".into(),
+            item_uri: None,
+            name: "Reading circle".into(),
+            purpose: "app.bsky.graph.defs#curatelist".into(),
+        },
+    ];
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage);
+    let cookie = finish_login(&app).await;
+
+    let html = get_html(&app, "/profile?did=did%3Aplc%3Afriend", &cookie).await;
+    let actions = html.split("class=\"profile-actions\"").nth(1).unwrap_or("");
+    assert!(
+        actions.contains("class=\"profile-primary-action following\""),
+        "{html}"
+    );
+    assert!(actions.contains(">Following</button>"), "{html}");
+    assert!(actions.contains("class=\"profile-overflow\""), "{html}");
+    assert!(
+        actions.contains("aria-label=\"More profile actions\""),
+        "{html}"
+    );
+    assert!(actions.contains("Add to lists"), "{html}");
+    assert!(actions.contains("Mute account"), "{html}");
+    assert!(actions.contains("Block account"), "{html}");
+    assert!(!actions.contains("Confirm block"), "{html}");
+    assert!(!actions.contains("Unfollow"), "{html}");
+    assert!(actions.contains("class=\"profile-list-row\""), "{html}");
+    assert!(actions.contains("Friends ✓"), "{html}");
+    assert!(actions.contains("Reading circle"), "{html}");
+    assert_eq!(
+        actions.matches("class=\"profile-list-action\"").count(),
+        1,
+        "{html}"
+    );
+    assert!(actions.contains(">Remove</button>"), "{html}");
+}
+
+#[tokio::test]
+async fn block_confirmation_is_a_named_review_page_with_cancel_and_block_actions() {
+    let storage = Arc::new(MemoryStorage::default());
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage);
+    let cookie = finish_login(&app).await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/profile/block-confirm?did=did%3Aplc%3Afriend")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("Block @friend?"), "{html}");
+    assert!(
+        html.contains("They won't be able to see your posts"),
+        "{html}"
+    );
+    assert!(html.contains("name=\"action\" value=\"block\""), "{html}");
+    assert!(html.contains("name=\"confirm\" value=\"yes\""), "{html}");
+    assert!(html.contains(">Cancel</a>"), "{html}");
+    assert!(html.contains(">Block</button>"), "{html}");
+}
+
+#[tokio::test]
 async fn old_scope_profile_shows_per_action_reauthorization_messages() {
     let storage = Arc::new(MemoryStorage::default());
     let old_scope = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=*";
@@ -5872,6 +6021,7 @@ async fn profile_labels_are_fetched_once_and_render_as_chips_with_labeler_detail
     assert!(html.contains("Careful Labeler"), "{html}");
     assert!(html.contains("severity: alert"), "{html}");
     assert!(html.contains("blurs: media"), "{html}");
+    assert!(html.contains("account-label-chip severity-alert"), "{html}");
     assert!(html.matches("account-label-chip").count() >= 2, "{html}");
     let requests = label_requests.lock().unwrap();
     assert_eq!(requests.len(), 1, "label lookup should be batched per page");
@@ -5883,6 +6033,22 @@ async fn profile_labels_are_fetched_once_and_render_as_chips_with_labeler_detail
         1,
         "duplicate profile/post authors should only be sent once"
     );
+}
+
+#[test]
+fn mobile_bottom_bar_cuts_safe_area_padding_and_shrinks_the_icon_row() {
+    let css = include_str!("../static/app.css");
+    assert!(
+        css.contains(
+            "padding-bottom: calc(0.1rem + max(4px, calc(env(safe-area-inset-bottom) * 0.25)));"
+        ),
+        "bottom nav should reserve only a quarter of the iOS inset"
+    );
+    assert!(
+        css.contains("min-height: 2rem;\n    min-width: 44px;"),
+        "icon row should retain its tap width while using less vertical slack"
+    );
+    assert!(css.contains("env(safe-area-inset-bottom) * 0.25"));
 }
 
 #[tokio::test]
