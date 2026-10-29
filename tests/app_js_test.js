@@ -744,6 +744,26 @@ Deno.test("infinite scroll stops before retaining more than 500 cards", async ()
   assertEquals(harness.list.children.length, 500);
   assert(!harness.link.removed, "the Older link should remain available to continue with a full navigation");
   assert(harness.status.textContent.includes("500"), "the status should explain why automatic loading stopped");
+
+  const pages = {};
+  const nearLimit = await createInfiniteScrollHarness({
+    cards: Array.from({ length: 499 }, (_, index) => `near-limit-${index}`),
+    responses: [{ ok: true, text: async () => "oversized-page" }],
+    pages,
+  });
+  const nextList = new nearLimit.Element("ol");
+  nextList.className = "post-list";
+  nextList.append(new nearLimit.Element("li", "post-501"), new nearLimit.Element("li", "post-502"));
+  pages["oversized-page"] = {
+    list: nextList,
+    link: new nearLimit.Link("/older-b"),
+  };
+  nearLimit.Observer.latest.target.top = -1;
+  nearLimit.scroll();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assertEquals(nearLimit.list.children.length, 499, "a fetched page must not push retained cards over the cap");
+  assert(nearLimit.status.textContent.includes("499"), "the status should report how many cards remain in memory");
+  assertEquals(nearLimit.link.getAttribute("href"), "/older-a", "the fallback link should still point to this page");
 });
 
 Deno.test("a like form on an appended card uses the existing delegated handler", async () => {
