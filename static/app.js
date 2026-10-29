@@ -443,10 +443,11 @@ function installInfiniteScroll({
   };
 
   const stopAtMemoryLimit = () => {
+    const retainedCards = pageCards().length;
     stopped = true;
     observer?.disconnect();
     retry.hidden = true;
-    updateStatus(`Showing ${maximumCards} items. Use Older to continue.`);
+    updateStatus(`Showing ${retainedCards} items. Use Older to continue.`);
   };
 
   const postNodesIn = (root) => {

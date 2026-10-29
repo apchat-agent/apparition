@@ -86,7 +86,7 @@ const PAGE_PROFILE_BUDGET: Duration = Duration::from_millis(1500);
 const PAGE_PROFILE_CONCURRENCY: usize = 8;
 const PAGE_QUOTE_CONCURRENCY: usize = 16;
 const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m11";
-const WEB_SCRIPT_URL: &str = "/static/app.js?v=js8";
+const WEB_SCRIPT_URL: &str = "/static/app.js?v=js9";
 const ALT_MODEL_DOWNLOAD_BYTES: u64 = 264_713_119;
 const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
 const SAVED_FEED_CACHE_PREFIX: &str = "saved-feed-preferences:";
