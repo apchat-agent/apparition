@@ -490,11 +490,6 @@ function installInfiniteScroll({
       }
       for (const post of posts) {
         const uri = post.getAttribute("data-post-uri");
-        const previousParent = existingParentNodes.get(uri);
-        if (previousParent) {
-          previousParent.remove();
-          existingParentNodes.delete(uri);
-        }
         existingPostNodes.set(uri, post);
       }
       list.append(card);

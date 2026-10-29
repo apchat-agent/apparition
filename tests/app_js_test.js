@@ -758,7 +758,7 @@ Deno.test("an incoming full post keeps an earlier reply parent card on screen", 
   await new Promise((resolve) => setTimeout(resolve, 0));
 
   assert(!parent.removed, "the earlier reply parent card must remain on screen");
-  assertEquals(parent.parentElement, reply, "the parent card must stay attached to its original reply");
+  assert(reply.children.includes(parent), "the parent card must stay attached to its original reply");
   assertEquals(
     harness.list.children.filter((card) =>
       card.getAttribute("data-post-uri") === "post-P" && card.getAttribute("data-post-kind") !== "parent"
