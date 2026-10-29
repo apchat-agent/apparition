@@ -151,6 +151,6 @@ async fn content_security_policy_allows_only_same_origin_scripts_and_wasm_compil
 
     assert_eq!(
         response.headers()["content-security-policy"],
-        "default-src 'none'; base-uri 'none'; form-action 'self' https:; img-src 'self' https://cdn.bsky.app; style-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self'; object-src 'none'; frame-ancestors 'none'"
+        "default-src 'none'; base-uri 'none'; form-action 'self' https:; img-src 'self' blob: https://cdn.bsky.app; style-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self'; object-src 'none'; frame-ancestors 'none'"
     );
 }
