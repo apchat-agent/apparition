@@ -203,7 +203,7 @@ fn with_headers(mut response: Response<Body>, public_https: bool) -> Response<Bo
     // redirect: with 'self' alone they stopped on our login page (Firefox doesn't, 2026-10-28).
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        "default-src 'none'; base-uri 'none'; form-action 'self' https:; img-src 'self' https://cdn.bsky.app; style-src 'self'; script-src 'self'; connect-src 'self'; object-src 'none'; frame-ancestors 'none'"
+        "default-src 'none'; base-uri 'none'; form-action 'self' https:; img-src 'self' https://cdn.bsky.app; style-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self'; object-src 'none'; frame-ancestors 'none'"
             .parse()
             .unwrap(),
     );

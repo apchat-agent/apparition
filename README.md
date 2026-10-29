@@ -75,6 +75,7 @@ Open [http://127.0.0.1:3000/login](http://127.0.0.1:3000/login), enter an AT Pro
 | `appview_did` | `APPVIEW_DID` | `did:web:localhost` | AppView service identity |
 | `public_url` | `APPVIEW_PUBLIC_URL` | `https://appview.example` | HTTPS origin and OAuth client ID origin in confidential mode; ignored in loopback mode |
 | `oauth_mode` | `APPVIEW_OAUTH_MODE` | `confidential` | `confidential` for the public HTTPS client, or `loopback` for local development OAuth |
+| `alt_model_dir` | `APPVIEW_ALT_MODEL_DIR` | unset | Parent directory containing `alt-caption-v1/` model files for on-device alt-text suggestions; fetch them with `scripts/fetch-alt-model.sh` |
 
 Use `scoped` for a small self-hosted instance. It indexes registered users, their follows, and interactions on their posts. `full` indexes every supported account and will use substantially more disk as the firehose continues. Neither mode currently has a retention or compaction policy.
 

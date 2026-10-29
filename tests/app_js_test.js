@@ -271,6 +271,9 @@ Deno.test("alt suggestion loads only after its button is clicked and protects ed
   const suggestions = ["A dog on a beach.", "A brown dog on a beach.", "A dog beside the sea."];
   const loader = async () => {
     modelLoads++;
+    assert(!progress.hidden, "the first click should reveal download progress");
+    assertEquals(progress.max, 264_713_119, "progress should show the exact model payload size");
+    assert(status.textContent.includes("264,713,119 bytes"), "the download size should be visible before loading");
     return { caption: async () => suggestions.shift() };
   };
 
@@ -321,6 +324,50 @@ Deno.test("alt suggestion failure leaves the alt text alone and reports a short 
   assertEquals(altInput.value, "Carefully written alt text");
   assert(status.textContent.length > 0, "a useful failure message should be visible");
   assert(!button.disabled, "the button should be usable after a failure");
+});
+
+Deno.test("each selected image renders an opt-in alt suggestion button", async () => {
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  const makeElement = (tag) => ({
+    tag,
+    children: [],
+    attributes: {},
+    listeners: new Map(),
+    addEventListener(name, listener) { this.listeners.set(name, listener); },
+    append(...nodes) { this.children.push(...nodes); },
+    replaceChildren() { this.children = []; },
+    setAttribute(name, value) { this.attributes[name] = value; },
+  });
+  const input = makeElement("input");
+  input.files = [Object.assign(new Blob(["picture"]), { name: "cat.png" })];
+  const previews = makeElement("previews");
+  const status = makeElement("status");
+  const form = {
+    querySelector(selector) {
+      if (selector === "[data-image-input]") return input;
+      if (selector === "[data-image-previews]") return previews;
+      if (selector === "[data-image-status]") return status;
+      return null;
+    },
+    addEventListener() {},
+  };
+  globalThis.document = {
+    addEventListener() {},
+    createElement: makeElement,
+    querySelector(selector) { return selector === "form[data-alt-test]" ? null : null; },
+    querySelectorAll(selector) { return selector === "form[data-image-composer]" ? [form] : []; },
+  };
+  globalThis.window = { visualViewport: { addEventListener() {} } };
+  new Function(source)();
+  input.listeners.get("change")();
+
+  const preview = previews.children[0];
+  assert(preview, "choosing a picture should create its preview");
+  const details = preview.children[1];
+  const suggestion = details.children.find((child) => child.tag === "button" && child.textContent === "Suggest alt text");
+  assert(suggestion, "the alt field should have its own suggestion button");
+  assertEquals(suggestion.type, "button", "suggesting must not submit the post form");
+  assertEquals(typeof suggestion.listeners.get("click"), "function");
 });
 
 Deno.test("posting completes while an alt suggestion is still running", async () => {

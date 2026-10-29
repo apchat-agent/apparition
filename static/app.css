@@ -518,6 +518,52 @@ textarea:focus-visible {
   border: 1px solid var(--line);
 }
 
+.image-preview .alt-suggestion-button {
+  width: 100%;
+  border-color: var(--accent, #315efb);
+  color: var(--accent, #315efb);
+  font-weight: 700;
+}
+
+.alt-suggestion-status,
+.alt-test-page [data-alt-test-status] {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+.alt-suggestion-progress,
+.alt-test-page progress {
+  width: 100%;
+  min-height: 0.7rem;
+  accent-color: var(--accent, #315efb);
+}
+
+.alt-test-page form {
+  display: grid;
+  gap: 0.7rem;
+  max-width: 32rem;
+  margin-block: 1rem;
+}
+
+.alt-test-page dl {
+  display: grid;
+  grid-template-columns: minmax(8rem, 1fr) minmax(0, 2fr);
+  gap: 0.65rem 1rem;
+  max-width: 40rem;
+}
+
+.alt-test-page dt {
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.alt-test-page dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
 .quote-composer .quoted-post-preview {
   margin: 0.25rem 0 0.35rem;
 }

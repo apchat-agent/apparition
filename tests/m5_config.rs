@@ -96,9 +96,11 @@ fn alt_model_directory_is_optional_and_can_be_configured_in_toml_or_environment(
     let default = Config::from_toml_and_env("", std::iter::empty::<(&str, &str)>()).unwrap();
     assert!(format!("{default:?}").contains("alt_model_dir: None"));
 
-    let from_toml =
-        Config::from_toml_and_env("alt_model_dir = \"./data/models\"", std::iter::empty::<(&str, &str)>())
-            .unwrap();
+    let from_toml = Config::from_toml_and_env(
+        "alt_model_dir = \"./data/models\"",
+        std::iter::empty::<(&str, &str)>(),
+    )
+    .unwrap();
     assert!(format!("{from_toml:?}").contains("alt_model_dir: Some(\"./data/models\")"));
 
     let from_env =

@@ -17,7 +17,10 @@ fn temporary_model_directory() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!("appview-av27-models-{}-{nonce}", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "appview-av27-models-{}-{nonce}",
+        std::process::id()
+    ))
 }
 
 #[tokio::test]
@@ -86,9 +89,20 @@ async fn model_route_serves_files_with_length_type_and_immutable_cache_headers()
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["content-type"], "application/json");
-    assert_eq!(response.headers()["content-length"], content.len().to_string());
-    assert!(response.headers()["cache-control"].to_str().unwrap().contains("immutable"));
-    assert_eq!(response.into_body().collect().await.unwrap().to_bytes(), &content[..]);
+    assert_eq!(
+        response.headers()["content-length"],
+        content.len().to_string()
+    );
+    assert!(
+        response.headers()["cache-control"]
+            .to_str()
+            .unwrap()
+            .contains("immutable")
+    );
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        &content[..]
+    );
     fs::remove_dir_all(root).unwrap();
 }
 
