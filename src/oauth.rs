@@ -87,12 +87,18 @@ const PROFILE_NEGATIVE_TTL: Duration = Duration::from_secs(60 * 60);
 const PAGE_PROFILE_BUDGET: Duration = Duration::from_millis(1500);
 const PAGE_PROFILE_CONCURRENCY: usize = 8;
 const PAGE_QUOTE_CONCURRENCY: usize = 16;
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m16";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m17";
 const WEB_SCRIPT_URL: &str = "/static/app.js?v=js14";
 const HLS_SCRIPT_URL: &str = "/static/vendor/hls.min.js?v=1.7.3";
 const ALT_MODEL_DOWNLOAD_BYTES: u64 = 264_713_119;
 const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
 const SAVED_FEED_CACHE_PREFIX: &str = "saved-feed-preferences:";
+const BSKY_MODERATION_LABELER_DID: &str = "did:plc:ar7c4by46qjdydhdevvrndac";
+const PUBLIC_APPVIEW_BASE: &str = "https://public.api.bsky.app/xrpc/";
+const ACCOUNT_LABEL_PROFILE_BATCH_SIZE: usize = 25;
+const ACCOUNT_LABEL_CACHE_TTL: Duration = Duration::from_secs(60);
+const LABELER_PREFERENCE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const LABELER_PRESENTATION_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const VIDEO_SERVICE_DID: &str = "did:web:video.bsky.app";
 const VIDEO_SERVICE_URL: &str = "https://video.bsky.app";
 const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.graph.getMutes?aud=*";
@@ -1212,6 +1218,25 @@ type FeedSkeletonCache = Arc<
 >;
 type MutedActorCache =
     Arc<tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, HashSet<String>)>>>;
+type LabelerPreferenceCache =
+    Arc<tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, Vec<String>)>>>;
+type AccountLabelPageCache =
+    Arc<tokio::sync::Mutex<HashMap<(String, String), (tokio::time::Instant, Vec<AccountLabel>)>>>;
+type LabelerPresentationCache =
+    Arc<tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, LabelerPresentation)>>>;
+
+#[derive(Clone, Debug, Default)]
+struct LabelerPresentation {
+    name: String,
+    definitions: HashMap<String, LabelValuePresentation>,
+}
+
+#[derive(Clone, Debug)]
+struct LabelValuePresentation {
+    name: String,
+    severity: String,
+    blurs: String,
+}
 const SERVICE_AUTH_LIFETIME_SECS: u64 = 30 * 60;
 const FEED_PAGE_CACHE_SECS: u64 = 60;
 const BSKY_APPVIEW_DID: &str = "did:web:api.bsky.app";
@@ -1232,6 +1257,9 @@ pub struct AtriumOAuthFlow<B: crate::identity::IdentityBackend = HttpIdentityBac
     feed_page_cache: FeedPageCache,
     feed_skeleton_cache: FeedSkeletonCache,
     muted_actor_cache: MutedActorCache,
+    labeler_preference_cache: LabelerPreferenceCache,
+    account_label_page_cache: AccountLabelPageCache,
+    labeler_presentation_cache: LabelerPresentationCache,
 }
 
 impl<B: crate::identity::IdentityBackend> Clone for AtriumOAuthFlow<B> {
@@ -1250,6 +1278,9 @@ impl<B: crate::identity::IdentityBackend> Clone for AtriumOAuthFlow<B> {
             feed_page_cache: self.feed_page_cache.clone(),
             feed_skeleton_cache: self.feed_skeleton_cache.clone(),
             muted_actor_cache: self.muted_actor_cache.clone(),
+            labeler_preference_cache: self.labeler_preference_cache.clone(),
+            account_label_page_cache: self.account_label_page_cache.clone(),
+            labeler_presentation_cache: self.labeler_presentation_cache.clone(),
         }
     }
 }
@@ -1547,6 +1578,9 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             feed_page_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             feed_skeleton_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             muted_actor_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            labeler_preference_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            account_label_page_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            labeler_presentation_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -1750,6 +1784,342 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             }
         }
         Err("Bluesky getMutes pagination exceeded its safety limit".to_owned())
+    }
+
+    async fn labeler_dids_for_viewer(&self, did: &str) -> Result<Vec<String>, String> {
+        if let Some((expires, dids)) = self.labeler_preference_cache.lock().await.get(did).cloned()
+            && expires > tokio::time::Instant::now()
+        {
+            return Ok(dids);
+        }
+        let parsed_did = did
+            .parse::<Did>()
+            .map_err(|_| "viewer DID is invalid".to_owned())?;
+        let session = self
+            .client
+            .restore(&parsed_did)
+            .await
+            .map_err(|_| "OAuth session could not be restored".to_owned())?;
+        let request = XrpcRequest {
+            method: http::Method::GET,
+            nsid: "app.bsky.actor.getPreferences".to_owned(),
+            parameters: Some(json!({})),
+            input: None,
+            encoding: None,
+        };
+        let response: OutputDataOrBytes<Value> = session
+            .send_xrpc::<Value, Value, Value, Value>(&request)
+            .await
+            .map_err(|error| {
+                log_pds_xrpc_failure("app.bsky.actor.getPreferences", &error);
+                "PDS getPreferences request failed".to_owned()
+            })?;
+        let response = match response {
+            OutputDataOrBytes::Data(value) => value,
+            OutputDataOrBytes::Bytes(_) => {
+                return Err("PDS getPreferences returned a non-JSON response".to_owned());
+            }
+        };
+        let mut labelers = vec![BSKY_MODERATION_LABELER_DID.to_owned()];
+        if let Some(preferences) = response.get("preferences").and_then(Value::as_array) {
+            for preference in preferences {
+                let is_labelers_pref = preference
+                    .get("$type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind.ends_with("#labelersPref"));
+                if !is_labelers_pref {
+                    continue;
+                }
+                if let Some(user_labelers) = preference.get("labelers").and_then(Value::as_array) {
+                    labelers.extend(user_labelers.iter().filter_map(|labeler| {
+                        let did = labeler.get("did")?.as_str()?;
+                        did.parse::<Did>().ok().map(|_| did.to_owned())
+                    }));
+                }
+            }
+        }
+        let mut seen = HashSet::new();
+        labelers.retain(|labeler| seen.insert(labeler.clone()));
+        labelers.truncate(20);
+        let mut cache = self.labeler_preference_cache.lock().await;
+        cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
+        if cache.len() >= 4096
+            && let Some(oldest) = cache.keys().next().cloned()
+        {
+            cache.remove(&oldest);
+        }
+        cache.insert(
+            did.to_owned(),
+            (
+                tokio::time::Instant::now() + LABELER_PREFERENCE_CACHE_TTL,
+                labelers.clone(),
+            ),
+        );
+        Ok(labelers)
+    }
+
+    async fn public_appview_json(
+        &self,
+        url: url::Url,
+        headers: HeaderMap,
+    ) -> Result<Value, String> {
+        let response = self.http_client.get(&url, headers, 2 * 1024 * 1024).await?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "Bluesky AppView request failed with status {}",
+                response.status()
+            ));
+        }
+        serde_json::from_slice(response.body())
+            .map_err(|_| "Bluesky AppView returned invalid JSON".to_owned())
+    }
+
+    async fn labeler_presentations(
+        &self,
+        labeler_dids: &[String],
+    ) -> Result<HashMap<String, LabelerPresentation>, String> {
+        let now = tokio::time::Instant::now();
+        let cached = self.labeler_presentation_cache.lock().await;
+        let mut presentations = HashMap::new();
+        let missing = labeler_dids
+            .iter()
+            .filter(|did| {
+                if let Some((expires, presentation)) = cached.get(*did)
+                    && *expires > now
+                {
+                    presentations.insert((*did).clone(), presentation.clone());
+                    false
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        drop(cached);
+        if !missing.is_empty() {
+            let mut url = url::Url::parse(&format!(
+                "{PUBLIC_APPVIEW_BASE}app.bsky.labeler.getServices"
+            ))
+            .map_err(|_| "Bluesky AppView URL is invalid".to_owned())?;
+            {
+                let mut query = url.query_pairs_mut();
+                for did in &missing {
+                    query.append_pair("dids", did);
+                }
+                query.append_pair("detailed", "true");
+            }
+            let response = self.public_appview_json(url, HeaderMap::new()).await?;
+            let views = response
+                .get("views")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let mut fetched = HashMap::new();
+            for view in views {
+                let creator = view.get("creator").unwrap_or(&Value::Null);
+                let Some(did) = creator.get("did").and_then(Value::as_str) else {
+                    continue;
+                };
+                let name = creator
+                    .get("displayName")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.trim().is_empty())
+                    .or_else(|| creator.get("handle").and_then(Value::as_str))
+                    .unwrap_or(did)
+                    .to_owned();
+                let mut definitions = HashMap::new();
+                if let Some(values) = view
+                    .get("policies")
+                    .and_then(|policies| policies.get("labelValueDefinitions"))
+                    .and_then(Value::as_array)
+                {
+                    for definition in values {
+                        let Some(identifier) = definition.get("identifier").and_then(Value::as_str)
+                        else {
+                            continue;
+                        };
+                        let locales = definition
+                            .get("locales")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        let locale = locales
+                            .iter()
+                            .find(|locale| locale.get("lang").and_then(Value::as_str) == Some("en"))
+                            .or_else(|| locales.first());
+                        let default_name = label_value_default(identifier).name;
+                        definitions.insert(
+                            identifier.to_owned(),
+                            LabelValuePresentation {
+                                name: locale
+                                    .and_then(|locale| locale.get("name"))
+                                    .and_then(Value::as_str)
+                                    .filter(|name| !name.trim().is_empty())
+                                    .unwrap_or(&default_name)
+                                    .to_owned(),
+                                severity: definition
+                                    .get("severity")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("none")
+                                    .to_owned(),
+                                blurs: definition
+                                    .get("blurs")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("none")
+                                    .to_owned(),
+                            },
+                        );
+                    }
+                }
+                fetched.insert(did.to_owned(), LabelerPresentation { name, definitions });
+            }
+            for did in &missing {
+                fetched
+                    .entry(did.clone())
+                    .or_insert_with(|| LabelerPresentation {
+                        name: did.clone(),
+                        definitions: HashMap::new(),
+                    });
+            }
+            let mut cache = self.labeler_presentation_cache.lock().await;
+            cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
+            for (did, presentation) in fetched {
+                presentations.insert(did.clone(), presentation.clone());
+                if cache.len() < 4096 {
+                    cache.insert(
+                        did,
+                        (
+                            tokio::time::Instant::now() + LABELER_PRESENTATION_CACHE_TTL,
+                            presentation,
+                        ),
+                    );
+                }
+            }
+        }
+        Ok(presentations)
+    }
+
+    async fn fetch_account_labels_for_page(
+        &self,
+        viewer_did: &str,
+        actor_dids: Vec<String>,
+    ) -> Result<Vec<AccountLabel>, String> {
+        let mut actors = actor_dids
+            .into_iter()
+            .filter(|did| did.parse::<Did>().is_ok())
+            .collect::<Vec<_>>();
+        actors.sort();
+        actors.dedup();
+        actors.truncate(100);
+        if actors.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cache_key = (viewer_did.to_owned(), actors.join(","));
+        if let Some((expires, labels)) = self
+            .account_label_page_cache
+            .lock()
+            .await
+            .get(&cache_key)
+            .cloned()
+            && expires > tokio::time::Instant::now()
+        {
+            return Ok(labels);
+        }
+        let labeler_dids = self.labeler_dids_for_viewer(viewer_did).await?;
+        let accepted_labelers = labeler_dids.join(",");
+        let mut account_raw_labels = Vec::new();
+        for batch in actors.chunks(ACCOUNT_LABEL_PROFILE_BATCH_SIZE) {
+            let mut url =
+                url::Url::parse(&format!("{PUBLIC_APPVIEW_BASE}app.bsky.actor.getProfiles"))
+                    .map_err(|_| "Bluesky AppView URL is invalid".to_owned())?;
+            {
+                let mut query = url.query_pairs_mut();
+                for did in batch {
+                    query.append_pair("actors", did);
+                }
+            }
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "atproto-accept-labelers",
+                HeaderValue::from_str(&accepted_labelers)
+                    .map_err(|_| "labeler preference header is invalid".to_owned())?,
+            );
+            let response = self.public_appview_json(url, headers).await?;
+            if let Some(profiles) = response.get("profiles").and_then(Value::as_array) {
+                for profile in profiles {
+                    let Some(subject_did) = profile.get("did").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    for label in profile
+                        .get("labels")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        let (Some(labeler_did), Some(uri), Some(value)) = (
+                            label.get("src").and_then(Value::as_str),
+                            label.get("uri").and_then(Value::as_str),
+                            label.get("val").and_then(Value::as_str),
+                        ) else {
+                            continue;
+                        };
+                        if uri == subject_did
+                            && label.get("neg").and_then(Value::as_bool) != Some(true)
+                            && labeler_dids.iter().any(|accepted| accepted == labeler_did)
+                        {
+                            account_raw_labels.push((
+                                subject_did.to_owned(),
+                                labeler_did.to_owned(),
+                                value.to_owned(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        let labeler_dids = labeler_dids;
+        let presentations = self.labeler_presentations(&labeler_dids).await?;
+        let labels = account_raw_labels
+            .into_iter()
+            .filter_map(|(subject_did, labeler_did, value)| {
+                let presentation = presentations.get(&labeler_did);
+                let global = label_value_default(&value);
+                let definition =
+                    presentation.and_then(|presentation| presentation.definitions.get(&value));
+                Some(AccountLabel {
+                    subject_did,
+                    labeler_did: labeler_did.clone(),
+                    labeler_name: presentation
+                        .map(|presentation| presentation.name.clone())
+                        .unwrap_or_else(|| labeler_did.clone()),
+                    value,
+                    display_name: definition
+                        .map(|definition| definition.name.clone())
+                        .unwrap_or(global.name),
+                    severity: definition
+                        .map(|definition| definition.severity.clone())
+                        .unwrap_or(global.severity),
+                    blurs: definition
+                        .map(|definition| definition.blurs.clone())
+                        .unwrap_or(global.blurs),
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut cache = self.account_label_page_cache.lock().await;
+        cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
+        if cache.len() >= 4096
+            && let Some(oldest) = cache.keys().next().cloned()
+        {
+            cache.remove(&oldest);
+        }
+        cache.insert(
+            cache_key,
+            (
+                tokio::time::Instant::now() + ACCOUNT_LABEL_CACHE_TTL,
+                labels.clone(),
+            ),
+        );
+        Ok(labels)
     }
 
     async fn set_muted_actor(&self, did: &str, subject: &str, muted: bool) -> Result<(), String> {
@@ -2785,6 +3155,17 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
         })
     }
 
+    fn account_labels_for_page<'a>(
+        &'a self,
+        viewer_did: &'a str,
+        actor_dids: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<AccountLabel>, String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.fetch_account_labels_for_page(viewer_did, actor_dids)
+                .await
+        })
+    }
+
     fn timeline<'a>(
         &'a self,
         did: &'a str,
@@ -3469,7 +3850,31 @@ struct QuotedRecordRef {
     unavailable: bool,
 }
 
-type QuoteRenderIndex = HashMap<String, QuoteRenderState>;
+#[derive(Clone, Debug, Default)]
+struct QuoteRenderIndex {
+    quotes: HashMap<String, QuoteRenderState>,
+    account_labels: HashMap<String, Vec<AccountLabel>>,
+}
+
+impl QuoteRenderIndex {
+    fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl std::ops::Deref for QuoteRenderIndex {
+    type Target = HashMap<String, QuoteRenderState>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.quotes
+    }
+}
+
+impl std::ops::DerefMut for QuoteRenderIndex {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.quotes
+    }
+}
 
 struct PageContentHydration {
     quote_index: QuoteRenderIndex,
@@ -3863,6 +4268,7 @@ fn candidates_profile_fetches(
 
 async fn hydrate_page_content<F: OAuthFlow, S: Storage + 'static>(
     flow: &F,
+    viewer_did: &str,
     storage: Arc<S>,
     page_records: &[&IndexedRecord],
     quote_records: &[&IndexedRecord],
@@ -3895,6 +4301,30 @@ async fn hydrate_page_content<F: OAuthFlow, S: Storage + 'static>(
         }
     }
 
+    let label_actor_dids = {
+        let mut actors = authors.clone();
+        actors.sort();
+        actors.dedup();
+        actors.truncate(100);
+        actors
+    };
+    let label_flow = flow.clone();
+    let viewer_did = viewer_did.to_owned();
+    let label_hydration = async move {
+        match tokio::time::timeout_at(
+            deadline,
+            label_flow.account_labels_for_page(&viewer_did, label_actor_dids),
+        )
+        .await
+        {
+            Ok(Ok(labels)) => labels,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "page account labels could not be fetched");
+                Vec::new()
+            }
+            Err(_) => Vec::new(),
+        }
+    };
     let quote_storage = storage.clone();
     let profile_flow = flow.clone();
     let profile_task = tokio::spawn(async move {
@@ -3920,9 +4350,18 @@ async fn hydrate_page_content<F: OAuthFlow, S: Storage + 'static>(
         let quotes = hydrate_page_quotes(flow, quote_storage.as_ref(), refs, deadline).await;
         (quotes, started.elapsed().as_millis() as u64)
     };
-    let (quote_hydration, profile_hydration_ms) = tokio::join!(quote_hydration, profile_fast_path);
+    let (quote_hydration, profile_hydration_ms, labels) =
+        tokio::join!(quote_hydration, profile_fast_path, label_hydration);
+    let mut quote_index = quote_hydration.0?;
+    for label in labels {
+        quote_index
+            .account_labels
+            .entry(label.subject_did.clone())
+            .or_default()
+            .push(label);
+    }
     Ok(PageContentHydration {
-        quote_index: quote_hydration.0?,
+        quote_index,
         profile_hydration_ms: profile_hydration_ms?,
         quote_hydration_ms: quote_hydration.1,
     })
@@ -4104,7 +4543,7 @@ async fn hydrate_page_quotes<F: OAuthFlow, S: Storage>(
     refs: Vec<QuotedRecordRef>,
     deadline: tokio::time::Instant,
 ) -> Result<QuoteRenderIndex, StorageError> {
-    let mut result = HashMap::new();
+    let mut result = QuoteRenderIndex::default();
     let mut missing_posts = Vec::new();
     for reference in refs {
         let state = if reference.unavailable {
@@ -4557,6 +4996,30 @@ where
     response
 }
 
+async fn timeline_hidden_actor_dids<F: OAuthFlow, S: Storage>(
+    flow: &F,
+    storage: &S,
+    viewer_did: &str,
+) -> Result<HashSet<String>, String> {
+    let mut hidden = storage
+        .records_for_actor_collection(viewer_did, "app.bsky.graph.block", 10_000)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter_map(|record| {
+            record
+                .record
+                .get("subject")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<HashSet<_>>();
+    match flow.muted_actor_dids(viewer_did).await {
+        Ok(muted) => hidden.extend(muted),
+        Err(error) => tracing::warn!(%error, "could not load muted accounts for the timeline"),
+    }
+    Ok(hidden)
+}
+
 async fn app_home<F, S>(
     State(state): State<Arc<OAuthWebState<F, S>>>,
     headers: HeaderMap,
@@ -4599,7 +5062,15 @@ where
     };
     page_timing.timeline_fetch_index_ms = timeline_started.elapsed().as_millis() as u64;
     let has_more = timeline_page.len() > limit;
-    let timeline = timeline_page.iter().take(limit).collect::<Vec<_>>();
+    let next_cursor_record = timeline_page.get(limit.saturating_sub(1)).cloned();
+    let hidden_actors =
+        match timeline_hidden_actor_dids(&state.flow, state.storage.as_ref(), &did).await {
+            Ok(hidden) => hidden,
+            Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+        };
+    let mut page_records = timeline_page.into_iter().take(limit).collect::<Vec<_>>();
+    page_records.retain(|record| !hidden_actors.contains(&record.did));
+    let timeline = page_records.iter().collect::<Vec<_>>();
     let content_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
     let parent_started = std::time::Instant::now();
     let parents = match hydrate_page_parents(
@@ -4617,6 +5088,7 @@ where
     let quote_records = page_records_with_parents(&timeline, &parents);
     let quote_index = match hydrate_page_content(
         &state.flow,
+        &did,
         state.storage.clone(),
         &timeline,
         &quote_records,
@@ -4652,7 +5124,7 @@ where
     } else {
         posts
     };
-    let indexing_status = if timeline.is_empty() {
+    let indexing_status = if page_records.is_empty() && next_cursor_record.is_none() {
         let (total, done) = match state.storage.backfill_progress(&did) {
             Ok(progress) => progress,
             Err(error) => {
@@ -4701,8 +5173,8 @@ where
         String::new()
     };
     let older = if has_more {
-        timeline
-            .last()
+        next_cursor_record
+            .as_ref()
             .map(|last| {
                 let cursor = RecordCursor {
                     time_us: last.time_us,
@@ -4846,9 +5318,18 @@ where
     if page.timing.cache_hit {
         page_timing.timeline_fetch_index_ms = timeline_started.elapsed().as_millis() as u64;
     }
-    let feed_records = page
+    let hidden_actors =
+        match timeline_hidden_actor_dids(&state.flow, state.storage.as_ref(), &did).await {
+            Ok(hidden) => hidden,
+            Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+        };
+    let feed_items = page
         .timeline
         .feed
+        .iter()
+        .filter(|post| !hidden_actors.contains(&post.record.did))
+        .collect::<Vec<_>>();
+    let feed_records = feed_items
         .iter()
         .map(|post| &post.record)
         .collect::<Vec<_>>();
@@ -4869,6 +5350,7 @@ where
     let quote_records = page_records_with_parents(&feed_records, &parents);
     let quote_index = match hydrate_page_content(
         &state.flow,
+        &did,
         state.storage.clone(),
         &feed_records,
         &quote_records,
@@ -4890,9 +5372,7 @@ where
     let render_started = std::time::Instant::now();
     let write_forms_enabled =
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
-    let feed_preludes = page
-        .timeline
-        .feed
+    let feed_preludes = feed_items
         .iter()
         .map(|post| {
             post.reposted_by
@@ -5330,6 +5810,7 @@ where
     let quote_records = page_records_with_parents(&notification_records, &parents);
     let quote_index = match hydrate_page_content(
         &state.flow,
+        &did,
         state.storage.clone(),
         &notification_records,
         &quote_records,
@@ -5538,6 +6019,61 @@ fn render_web_notification<S: Storage>(
         html_escape(&author_uri),
         html_escape(&handle)
     )
+}
+
+fn label_value_default(value: &str) -> LabelValuePresentation {
+    let (name, severity, blurs) = match value {
+        "!hide" => ("Hidden", "alert", "content"),
+        "!warn" => ("Warning", "inform", "content"),
+        "porn" => ("Adult Content", "alert", "media"),
+        "sexual" => ("Sexually Suggestive", "inform", "media"),
+        "nudity" => ("Nudity", "inform", "media"),
+        "graphic-media" => ("Graphic Media", "alert", "media"),
+        other => {
+            let name = other
+                .split('-')
+                .map(|part| {
+                    let mut chars = part.chars();
+                    chars
+                        .next()
+                        .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            return LabelValuePresentation {
+                name,
+                severity: "none".to_owned(),
+                blurs: "none".to_owned(),
+            };
+        }
+    };
+    LabelValuePresentation {
+        name: name.to_owned(),
+        severity: severity.to_owned(),
+        blurs: blurs.to_owned(),
+    }
+}
+
+fn render_account_label_chips(
+    labels_by_actor: &HashMap<String, Vec<AccountLabel>>,
+    actor_did: &str,
+) -> String {
+    labels_by_actor
+        .get(actor_did)
+        .into_iter()
+        .flatten()
+        .map(|label| {
+            format!(
+                "<details class=\"account-label-chip\"><summary aria-label=\"Account label: {}\">{}</summary><span class=\"account-label-details\">{} · severity: {} · blurs: {}</span></details>",
+                html_escape(&label.display_name),
+                html_escape(&label.display_name),
+                html_escape(&label.labeler_name),
+                html_escape(&label.severity),
+                html_escape(&label.blurs),
+            )
+        })
+        .collect()
 }
 
 async fn profile_action_panel<F: OAuthFlow, S: Storage>(
@@ -5824,6 +6360,7 @@ where
     let quote_records = page_records_with_parents(&records, &parents);
     let quote_index = match hydrate_page_content(
         &state.flow,
+        &did,
         state.storage.clone(),
         &records,
         &quote_records,
@@ -5852,6 +6389,7 @@ where
         .get("displayName")
         .and_then(Value::as_str)
         .unwrap_or(&handle);
+    let label_chips = render_account_label_chips(&quote_index.account_labels, subject);
     let action_html = if subject == did {
         String::new()
     } else {
@@ -5909,7 +6447,7 @@ where
     let response = Html(page_shell_with_feeds_and_badge(
         display_name,
         &format!(
-            "<section class=\"profile-card\">{}<div><h1>{}</h1><p class=\"profile-handle\">@{}</p></div></section>{action_html}<header class=\"section-heading\"><h2>Posts</h2></header><ol class=\"post-list\">{posts}</ol>{older}",
+            "<section class=\"profile-card\">{}<div><h1>{}</h1><div class=\"profile-labels\">{label_chips}</div><p class=\"profile-handle\">@{}</p></div></section>{action_html}<header class=\"section-heading\"><h2>Posts</h2></header><ol class=\"post-list\">{posts}</ol>{older}",
             avatar_markup(&profile, "profile-avatar"),
             html_escape(display_name),
             html_escape(&handle)
@@ -6323,6 +6861,7 @@ where
         .collect::<Vec<_>>();
     let quote_index = match hydrate_page_content(
         &state.flow,
+        &viewer_did,
         state.storage.clone(),
         &page_records,
         &page_records,
@@ -6531,7 +7070,8 @@ where
             return (StatusCode::BAD_GATEWAY, "quoted post could not be loaded").into_response();
         }
     };
-    let index = HashMap::from([(uri.clone(), QuoteRenderState::Found(record))]);
+    let mut index = QuoteRenderIndex::default();
+    index.insert(uri.clone(), QuoteRenderState::Found(record));
     let embed = json!({"$type":"app.bsky.embed.record","record":{"record":{"uri":uri}}});
     Html(render_web_quote(state.storage.as_ref(), &embed, &index, 0)).into_response()
 }
@@ -8744,8 +9284,9 @@ fn render_web_post<S: Storage>(
         "/profile?did={}",
         url::form_urlencoded::byte_serialize(record.did.as_bytes()).collect::<String>()
     );
+    let label_chips = render_account_label_chips(&quote_index.account_labels, &record.did);
     let author = format!(
-        "{}<div class=\"post-author\"><a class=\"author-name\" href=\"{}\">{}</a><a class=\"author-handle\" href=\"{}\">@{}</a></div>",
+        "{}<div class=\"post-author\"><a class=\"author-name\" href=\"{}\">{}</a>{label_chips}<a class=\"author-handle\" href=\"{}\">@{}</a></div>",
         avatar_markup_with_priority(&profile, "avatar", eager_avatar),
         html_escape(&profile_uri),
         html_escape(display_name),
