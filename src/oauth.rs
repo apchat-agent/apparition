@@ -74,7 +74,7 @@ const PROFILE_NEGATIVE_TTL: Duration = Duration::from_secs(60 * 60);
 const PAGE_PROFILE_BUDGET: Duration = Duration::from_millis(1500);
 const PAGE_PROFILE_CONCURRENCY: usize = 8;
 const PAGE_QUOTE_CONCURRENCY: usize = 16;
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m4";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m5";
 const WEB_SCRIPT_URL: &str = "/static/app.js?v=js3";
 const SAVED_FEED_CACHE_PREFIX: &str = "saved-feed-preferences:";
 const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=*";
@@ -1928,10 +1928,11 @@ fn page_shell_with_options(
         "app-layout guest-layout"
     };
     format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\"><title>{}</title><link rel=\"stylesheet\" href=\"{}\"><script src=\"{}\" defer></script></head><body><a class=\"skip-link\" href=\"#main-content\">Skip to content</a><div class=\"{layout}\"><aside class=\"left-sidebar\"><a class=\"brand\" href=\"/app\">AppView</a>{navigation}</aside><div class=\"center-column\"><header class=\"center-sticky\">{tabs}</header><main id=\"main-content\" class=\"page-content\">{content}</main></div>{right_sidebar}</div>{mobile_navigation}</body></html>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\"><title>{}</title><link rel=\"stylesheet\" href=\"{}\"><script src=\"{}\" defer></script></head><body>{}<a class=\"skip-link\" href=\"#main-content\">Skip to content</a><div class=\"{layout}\"><aside class=\"left-sidebar\"><a class=\"brand\" href=\"/app\">AppView</a>{navigation}</aside><div class=\"center-column\"><header class=\"center-sticky\">{tabs}</header><main id=\"main-content\" class=\"page-content\">{content}</main></div>{right_sidebar}</div>{mobile_navigation}</body></html>",
         html_escape(title),
         WEB_STYLESHEET_URL,
-        WEB_SCRIPT_URL
+        WEB_SCRIPT_URL,
+        icon_sprite()
     )
 }
 
@@ -2453,6 +2454,7 @@ async fn hydrate_page_content<F: OAuthFlow, S: Storage + 'static>(
         }
         result
     });
+    tokio::task::yield_now().await;
     let profile_fast_path = async move {
         let started = std::time::Instant::now();
         match tokio::time::timeout(Duration::from_millis(25), profile_task).await {
@@ -2572,8 +2574,8 @@ async fn hydrate_page_quotes<F: OAuthFlow, S: Storage>(
     Ok(result)
 }
 
-fn icon_svg(name: &str) -> String {
-    let content = match name {
+fn icon_content(name: &str) -> &'static str {
+    match name {
         "home" => "<path d=\"m3 10 9-7 9 7\"/><path d=\"M5 9v11h14V9M9 20v-6h6v6\"/>",
         "feeds" => {
             "<path d=\"M4 5h16M4 12h16M4 19h16\"/><circle cx=\"7\" cy=\"5\" r=\"1\"/><circle cx=\"17\" cy=\"12\" r=\"1\"/><circle cx=\"10\" cy=\"19\" r=\"1\"/>"
@@ -2595,10 +2597,44 @@ fn icon_svg(name: &str) -> String {
         "more" => {
             "<circle cx=\"5\" cy=\"12\" r=\"1\"/><circle cx=\"12\" cy=\"12\" r=\"1\"/><circle cx=\"19\" cy=\"12\" r=\"1\"/>"
         }
-        _ => return String::new(),
-    };
+        _ => "",
+    }
+}
+
+fn icon_sprite() -> String {
+    const ICONS: [&str; 11] = [
+        "home",
+        "feeds",
+        "notifications",
+        "profile",
+        "compose",
+        "search",
+        "reply",
+        "repost",
+        "like",
+        "share",
+        "more",
+    ];
+    let symbols = ICONS
+        .iter()
+        .map(|name| {
+            format!(
+                "<symbol id=\"i-{name}\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\">{}</symbol>",
+                icon_content(name)
+            )
+        })
+        .collect::<String>();
     format!(
-        "<svg class=\"icon\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\">{content}</svg>"
+        "<svg class=\"icon-sprite\" aria-hidden=\"true\" focusable=\"false\" xmlns=\"http://www.w3.org/2000/svg\">{symbols}</svg>"
+    )
+}
+
+fn icon_svg(name: &str) -> String {
+    if icon_content(name).is_empty() {
+        return String::new();
+    }
+    format!(
+        "<svg class=\"icon\" aria-hidden=\"true\" focusable=\"false\"><use href=\"#i-{name}\"></use></svg>"
     )
 }
 
@@ -2988,7 +3024,8 @@ where
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
     let posts = timeline
         .iter()
-        .map(|record| {
+        .enumerate()
+        .map(|(index, record)| {
             format!(
                 "<li class=\"post-item\">{}</li>",
                 render_web_post(
@@ -2997,6 +3034,7 @@ where
                     &did,
                     write_forms_enabled,
                     true,
+                    index < 6,
                     &quote_index,
                 )
             )
@@ -3217,7 +3255,8 @@ where
         .timeline
         .feed
         .iter()
-        .map(|post| {
+        .enumerate()
+        .map(|(index, post)| {
             let repost = post
                 .reposted_by
                 .as_deref()
@@ -3236,6 +3275,7 @@ where
                     &did,
                     write_forms_enabled,
                     true,
+                    index < 6,
                     &quote_index,
                 )
             )
@@ -3527,7 +3567,8 @@ where
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
     let posts = records
         .iter()
-        .map(|record| {
+        .enumerate()
+        .map(|(index, record)| {
             format!(
                 "<li class=\"post-item\">{}</li>",
                 render_web_post(
@@ -3536,6 +3577,7 @@ where
                     &did,
                     write_forms_enabled,
                     true,
+                    index < 6,
                     &quote_index,
                 )
             )
@@ -3700,7 +3742,8 @@ where
     let render_started = std::time::Instant::now();
     let ancestors_html = ancestors
         .iter()
-        .map(|ancestor| {
+        .enumerate()
+        .map(|(index, ancestor)| {
             format!(
                 "<li class=\"post-item\">{}</li>",
                 render_web_post(
@@ -3709,6 +3752,7 @@ where
                     &viewer_did,
                     write_forms_enabled,
                     false,
+                    index < 6,
                     &quote_index,
                 )
             )
@@ -3761,6 +3805,7 @@ where
                 &record,
                 &viewer_did,
                 write_forms_enabled,
+                true,
                 &quote_index,
             )
         ),
@@ -4099,6 +4144,7 @@ fn render_thread_focus<S: Storage>(
     record: &IndexedRecord,
     viewer_did: &str,
     write_forms_enabled: bool,
+    eager_avatar: bool,
     quote_index: &QuoteRenderIndex,
 ) -> String {
     let profile = profile_view_from_storage(storage, &record.did)
@@ -4232,7 +4278,7 @@ fn render_thread_focus<S: Storage>(
         .unwrap_or_default();
     format!(
         "<article class=\"post-card thread-post-focus\"><header class=\"thread-focus-author\">{}<div class=\"thread-focus-names\"><a class=\"author-name\" href=\"{}\">{}</a><a class=\"author-handle\" href=\"{}\">@{}</a></div></header><p class=\"thread-focus-text\">{text}</p><p class=\"thread-focus-meta\">{time}{reply_policy}</p><hr><div class=\"thread-stats\" aria-label=\"Post statistics\">{stats}</div><hr><div class=\"thread-focus-actions\">{reply_action}{repost_action}{like_action}{share_action}{more_action}</div>{embed}</article>",
-        avatar_markup(&profile, "focus-avatar"),
+        avatar_markup_with_priority(&profile, "focus-avatar", eager_avatar),
         html_escape(&profile_uri),
         html_escape(display_name),
         html_escape(&profile_uri),
@@ -4316,6 +4362,7 @@ fn render_thread_replies<S: Storage>(
                 reply,
                 options.viewer_did,
                 options.write_forms_enabled,
+                false,
                 false,
                 options.quote_index
             )
@@ -4893,7 +4940,7 @@ fn html_escape(value: &str) -> String {
 
 fn render_feed_card(feed: &ResolvedFeed) -> String {
     let href = feed_link_href(feed);
-    let avatar = feed_avatar_markup(feed);
+    let avatar = feed_avatar_markup(feed, 56, 56);
     format!(
         "<li class=\"feed-item\"><a class=\"feed-card\" href=\"{href}\">{avatar}<h2>{}</h2><p>{}</p></a></li>",
         html_escape(&feed.display_name),
@@ -4903,7 +4950,7 @@ fn render_feed_card(feed: &ResolvedFeed) -> String {
 
 fn render_feed_heading(feed: &ResolvedFeed) -> String {
     let href = feed_link_href(feed);
-    let avatar = feed_avatar_markup(feed);
+    let avatar = feed_avatar_markup(feed, 72, 72);
     format!(
         "<header class=\"page-heading feed-heading\">{avatar}<p class=\"eyebrow\"><a href=\"/feeds\">Feeds</a></p><h1>{}</h1><p class=\"page-subtitle\">{}</p><a class=\"feed-address-link\" href=\"{href}\">Feed address</a></header>",
         html_escape(&feed.display_name),
@@ -4919,19 +4966,16 @@ fn form_encoded(value: &str) -> String {
     url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
 
-fn feed_avatar_markup(feed: &ResolvedFeed) -> String {
+fn feed_avatar_markup(feed: &ResolvedFeed, width: u16, height: u16) -> String {
     let Some(avatar) = feed.avatar.as_deref() else {
         return String::new();
     };
-    let Ok(url) = url::Url::parse(avatar) else {
+    let Some(avatar) = avatar_thumbnail_url(avatar) else {
         return String::new();
     };
-    if url.scheme() != "https" || url.username() != "" || url.password().is_some() {
-        return String::new();
-    }
     format!(
-        "<img class=\"feed-avatar\" src=\"{}\" alt=\"\" loading=\"lazy\">",
-        html_escape(avatar)
+        "<img class=\"feed-avatar\" src=\"{}\" alt=\"\" width=\"{width}\" height=\"{height}\" loading=\"lazy\" decoding=\"async\">",
+        html_escape(&avatar)
     )
 }
 
@@ -4978,11 +5022,55 @@ fn safe_avatar_url(profile: &Value) -> Option<&str> {
     .then_some(avatar)
 }
 
+fn avatar_thumbnail_url(avatar: &str) -> Option<String> {
+    let mut url = url::Url::parse(avatar).ok()?;
+    if url.scheme() != "https"
+        || url.host_str() != Some("cdn.bsky.app")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    let mut segments = url.path_segments()?.map(str::to_owned).collect::<Vec<_>>();
+    if segments.len() == 5 && segments[..3] == ["img", "avatar", "plain"] {
+        segments[1] = "avatar_thumbnail".to_owned();
+        if !segments[4].ends_with("@jpeg") {
+            segments[4].push_str("@jpeg");
+        }
+        url.path_segments_mut().ok()?.clear().extend(segments);
+        return Some(url.into());
+    }
+    if segments.len() == 5
+        && segments[..3] == ["img", "avatar_thumbnail", "plain"]
+        && !segments[4].ends_with("@jpeg")
+    {
+        segments[4].push_str("@jpeg");
+        url.path_segments_mut().ok()?.clear().extend(segments);
+    }
+    Some(url.into())
+}
+
+fn avatar_dimensions(class_name: &str) -> (u16, u16) {
+    match class_name {
+        "small-avatar" => (32, 32),
+        "profile-avatar" => (80, 80),
+        "focus-avatar" => (56, 56),
+        "mobile-profile-avatar" => (25, 25),
+        _ => (44, 44),
+    }
+}
+
 fn avatar_markup(profile: &Value, class_name: &str) -> String {
-    if let Some(avatar) = safe_avatar_url(profile) {
+    avatar_markup_with_priority(profile, class_name, false)
+}
+
+fn avatar_markup_with_priority(profile: &Value, class_name: &str, eager: bool) -> String {
+    if let Some(avatar) = safe_avatar_url(profile).and_then(avatar_thumbnail_url) {
+        let (width, height) = avatar_dimensions(class_name);
+        let loading = if eager { "eager" } else { "lazy" };
         format!(
-            "<img class=\"{class_name}\" src=\"{}\" alt=\"\" loading=\"lazy\">",
-            html_escape(avatar)
+            "<img class=\"{class_name}\" src=\"{}\" alt=\"\" width=\"{width}\" height=\"{height}\" loading=\"{loading}\" decoding=\"async\">",
+            html_escape(&avatar)
         )
     } else {
         format!("<span class=\"{class_name} avatar-placeholder\" aria-hidden=\"true\"></span>")
@@ -5071,6 +5159,7 @@ fn render_web_post<S: Storage>(
     viewer_did: &str,
     write_forms_enabled: bool,
     link_text_to_thread: bool,
+    eager_avatar: bool,
     quote_index: &QuoteRenderIndex,
 ) -> String {
     let profile = profile_view_from_storage(storage, &record.did)
@@ -5086,7 +5175,7 @@ fn render_web_post<S: Storage>(
     );
     let author = format!(
         "{}<div class=\"post-author\"><a class=\"author-name\" href=\"{}\">{}</a><a class=\"author-handle\" href=\"{}\">@{}</a></div>",
-        avatar_markup(&profile, "avatar"),
+        avatar_markup_with_priority(&profile, "avatar", eager_avatar),
         html_escape(&profile_uri),
         html_escape(display_name),
         html_escape(&profile_uri),

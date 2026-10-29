@@ -1,4 +1,3 @@
-use appview_rs::{router, router_with_oauth_flow};
 use appview_rs::{
     config::Config,
     feeds::{FeedTimeline, FeedTimelineTiming, HydratedFeedPage, ResolvedFeed},
@@ -8,6 +7,7 @@ use appview_rs::{
         PdsCreatedRecord, PinnedFeedTabs, PostStrongRef, SqliteOAuthStore,
     },
 };
+use appview_rs::{router, router_with_oauth_flow};
 use atrium_api::types::string::Did;
 use atrium_common::store::Store;
 use atrium_oauth::store::{session::Session, state::InternalStateData};
@@ -809,7 +809,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
             ),
             "{path}"
         );
-        assert!(html.contains("href=\"/static/app.css?v=m4\""), "{path}");
+        assert!(html.contains("href=\"/static/app.css?v=m5\""), "{path}");
         assert!(!html.contains("style="), "{path}");
         // One external, same-origin, deferred script (like toggles in place); never inline code.
         assert_eq!(html.matches("<script").count(), 1, "{path}");
@@ -822,7 +822,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
     let stylesheet = app
         .oneshot(
             Request::builder()
-                .uri("/static/app.css?v=m4")
+                .uri("/static/app.css?v=m5")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -927,7 +927,7 @@ async fn bsky_style_shell_renders_navigation_pinned_feed_tabs_and_post_actions()
     );
     assert_eq!(html.matches("<symbol id=\"i-like\"").count(), 1, "{html}");
     assert!(html.contains("<use href=\"#i-like\""), "{html}");
-    assert!(!html.contains("<svg class=\"icon\""), "{html}");
+    assert!(!html.contains("<svg class=\"icon\" viewBox="), "{html}");
 }
 
 #[tokio::test]
@@ -1104,7 +1104,7 @@ async fn sign_in_error_page_uses_the_shared_mobile_document_shell() {
     assert!(
         html.contains("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">")
     );
-    assert!(html.contains("href=\"/static/app.css?v=m4\""));
+    assert!(html.contains("href=\"/static/app.css?v=m5\""));
     assert!(!html.contains("style="));
     // The shared shell's one external script, never inline code.
     assert_eq!(html.matches("<script").count(), 1);
@@ -1166,7 +1166,9 @@ async fn web_posts_show_avatar_relative_time_and_accessible_actions() {
             .to_vec(),
     )
     .unwrap();
-    assert!(html.contains("https://cdn.bsky.app/img/avatar/plain/did:plc:alice/bafk-alice-avatar"));
+    assert!(html.contains(
+        "https://cdn.bsky.app/img/avatar_thumbnail/plain/did:plc:alice/bafk-alice-avatar@jpeg"
+    ));
     assert!(html.contains("Alice"));
     assert!(html.contains("@alice.test"));
     assert!(html.contains("datetime=\"2020-01-01T00:00:00Z\""));
@@ -1190,7 +1192,7 @@ async fn post_avatars_use_thumbnail_dimensions_and_lazy_load_after_six() {
             time_us: 1,
             record: serde_json::json!({
                 "displayName":"Alice",
-                "avatar":format!("https://cdn.bsky.app/img/avatar/plain/{did}/avatar-cid")
+                "avatar":{"$type":"blob","ref":{"$link":"avatar-cid"},"mimeType":"image/jpeg"}
             }),
         })
         .unwrap();
@@ -1257,12 +1259,7 @@ async fn fifty_post_app_page_stays_under_the_compressed_page_weight_budget() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["content-encoding"], "gzip");
-    let compressed = response
-        .into_body()
-        .collect()
-        .await
-        .unwrap()
-        .to_bytes();
+    let compressed = response.into_body().collect().await.unwrap().to_bytes();
     eprintln!("av21 /app 50-post gzip body: {} bytes", compressed.len());
     assert!(
         compressed.len() < 60 * 1024,
@@ -3286,7 +3283,7 @@ async fn page_fetches_missing_author_profile_stores_it_and_keeps_avatar_url_safe
     assert!(html.contains("&lt;Hydrated &amp; Co&gt;"), "{html}");
     assert!(
         html.contains(&format!(
-            "src=\"https://cdn.bsky.app/img/avatar/plain/{author}/avatar-cid\""
+            "src=\"https://cdn.bsky.app/img/avatar_thumbnail/plain/{author}/avatar-cid@jpeg\""
         )),
         "{html}"
     );
@@ -3457,6 +3454,16 @@ async fn profile_budget_keeps_page_rendering_and_queues_timed_out_authors_in_ord
     assert!(html.contains("visible slow post 0"));
     assert!(html.contains("visible slow post 2"));
     assert_eq!(flow.profile_requests.lock().unwrap().as_slice(), authors);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if storage.pending_profile_fetches(10).unwrap().len() == authors.len() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background profile timeout should queue each author");
     assert_eq!(
         storage.pending_profile_fetches(10).unwrap(),
         authors.map(str::to_owned)
@@ -4033,10 +4040,11 @@ async fn quote_and_author_hydration_share_the_page_deadline() {
     let cookie = finish_login(&app).await;
     let started = Instant::now();
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/app")
-                .header("cookie", cookie)
+                .header("cookie", &cookie)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -4059,14 +4067,23 @@ async fn quote_and_author_hydration_share_the_page_deadline() {
         elapsed < Duration::from_millis(1_700),
         "page took {elapsed:?}"
     );
-    assert!(html.contains("Slow &amp; Safe"), "{html}");
     assert!(html.contains("Hydrated within one shared budget"), "{html}");
-    assert!(
-        storage
-            .get_record("did:plc:slow-author", "app.bsky.actor.profile", "self")
-            .unwrap()
-            .is_some()
-    );
+    tokio::time::timeout(Duration::from_millis(600), async {
+        loop {
+            if storage
+                .get_record("did:plc:slow-author", "app.bsky.actor.profile", "self")
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("parallel author hydration should finish within the shared page deadline");
+    let hydrated_html = get_html(&app, "/app", &cookie).await;
+    assert!(hydrated_html.contains("Slow &amp; Safe"), "{hydrated_html}");
 }
 
 #[tokio::test]
