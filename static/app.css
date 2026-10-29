@@ -1495,6 +1495,21 @@ a.quoted-post-card:hover,
   text-decoration: none;
 }
 
+.infinite-scroll-status {
+  margin: 0.75rem 1.25rem 0.35rem;
+  color: var(--muted);
+  font-size: 0.9rem;
+  text-align: center;
+}
+
+.infinite-scroll-retry {
+  display: block;
+  min-height: 2.4rem;
+  margin: 0 auto 0.9rem;
+  padding: 0.45rem 0.85rem;
+  font-size: 0.9rem;
+}
+
 .feed-list {
   display: grid;
   gap: 0.9rem;
