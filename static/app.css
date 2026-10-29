@@ -1510,6 +1510,10 @@ a.quoted-post-card:hover,
   font-size: 0.9rem;
 }
 
+.infinite-scroll-retry[hidden] {
+  display: none;
+}
+
 .feed-list {
   display: grid;
   gap: 0.9rem;
