@@ -74,14 +74,24 @@ impl IdentityBackend for FakeIdentityBackend {
 }
 
 fn database_path() -> PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
+    let unique = 0;
     std::env::temp_dir().join(format!(
         "appview-rs-av22-identity-{}-{unique}.sqlite",
         std::process::id()
     ))
+}
+
+#[test]
+fn parallel_identity_cache_tests_get_distinct_database_paths() {
+    let paths = (0..32)
+        .map(|_| std::thread::spawn(database_path))
+        .map(|thread| thread.join().unwrap())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        paths.len(),
+        32,
+        "parallel tests reused an identity cache path"
+    );
 }
 
 fn cleanup_database(path: &PathBuf) {
