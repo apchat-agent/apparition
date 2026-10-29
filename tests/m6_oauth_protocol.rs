@@ -1613,12 +1613,11 @@ async fn production_post_with_an_empty_video_input_is_accepted() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
     let state = shared.lock().unwrap();
-    assert!(
-        state
-            .requests
-            .iter()
-            .any(|request| request.path.starts_with("/xrpc/com.atproto.repo.createRecord"))
-    );
+    assert!(state.requests.iter().any(|request| {
+        request
+            .path
+            .starts_with("/xrpc/com.atproto.repo.createRecord")
+    }));
     drop(state);
     server.abort();
 }
