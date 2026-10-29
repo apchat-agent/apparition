@@ -7370,8 +7370,9 @@ mod tests {
         assert!(css.contains(".icon {\n  fill: none;"));
         assert!(css.contains(".post-actions .is-liked .icon {\n  fill: var(--accent);"));
         assert!(css.contains(".thread-focus-actions .is-liked .icon {\n  fill: var(--accent);"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m9"));
-        assert!(WEB_SCRIPT_URL.contains("v=js7"));
+        assert!(css.contains(".infinite-scroll-status {"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m10"));
+        assert!(WEB_SCRIPT_URL.contains("v=js8"));
     }
 
     #[test]
