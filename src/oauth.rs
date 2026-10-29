@@ -9239,6 +9239,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timeline_does_not_group_when_its_parent_chain_started_over_twenty_four_hours_earlier()
+    {
+        let storage = Arc::new(MemoryStorage::default());
+        let viewer = "did:plc:reply-viewer";
+        let author = "did:plc:long-thread-author";
+        let root = test_web_post(author, "long-root", 1_000_000, "Long thread root", None);
+        storage.put_record(&root).unwrap();
+        storage.set_follow(viewer, author, true).unwrap();
+        let mut parent_uri = root.uri.clone();
+        for index in 1..=51_u64 {
+            let reply = test_web_post(
+                author,
+                &format!("long-{index}"),
+                1_000_000 + 25 * 60 * 60 * 1_000_000 + index * 60 * 1_000_000,
+                &format!("Long thread reply {index}"),
+                Some(&parent_uri),
+            );
+            storage.put_record(&reply).unwrap();
+            parent_uri = reply.uri.clone();
+        }
+
+        let page = request_test_timeline(storage, viewer).await;
+
+        assert!(!page.contains("class=\"post-item thread-group\""), "{page}");
+        assert!(page.contains("class=\"reply-parent-card\""), "{page}");
+        assert!(!page.contains("Long thread root"), "{page}");
+        assert!(page.contains("Long thread reply 2"), "{page}");
+        assert!(page.contains("Long thread reply 51"), "{page}");
+    }
+
+    #[tokio::test]
     async fn timeline_reply_to_unavailable_parent_shows_a_fallback_line() {
         let storage = Arc::new(MemoryStorage::default());
         let viewer = "did:plc:reply-viewer";
