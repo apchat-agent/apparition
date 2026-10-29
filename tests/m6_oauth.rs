@@ -750,19 +750,24 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
         .unwrap();
         assert!(
             html.contains(
-                "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+                "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">"
             ),
             "{path}"
         );
-        assert!(html.contains("href=\"/static/app.css?v=av20\""), "{path}");
+        assert!(html.contains("href=\"/static/app.css?v=m1\""), "{path}");
         assert!(!html.contains("style="), "{path}");
-        assert!(!html.contains("<script"), "{path}");
+        // One external, same-origin, deferred script (like toggles in place); never inline code.
+        assert_eq!(html.matches("<script").count(), 1, "{path}");
+        assert!(
+            html.contains("<script src=\"/static/app.js?v=js2\" defer></script>"),
+            "{path}"
+        );
     }
 
     let stylesheet = app
         .oneshot(
             Request::builder()
-                .uri("/static/app.css?v=av20")
+                .uri("/static/app.css?v=m1")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1039,11 +1044,13 @@ async fn sign_in_error_page_uses_the_shared_mobile_document_shell() {
     )
     .unwrap();
     assert!(
-        html.contains("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">")
+        html.contains("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">")
     );
-    assert!(html.contains("href=\"/static/app.css?v=av20\""));
+    assert!(html.contains("href=\"/static/app.css?v=m1\""));
     assert!(!html.contains("style="));
-    assert!(!html.contains("<script"));
+    // The shared shell's one external script, never inline code.
+    assert_eq!(html.matches("<script").count(), 1);
+    assert!(html.contains("<script src=\"/static/app.js?v=js2\" defer></script>"));
 }
 
 #[tokio::test]
@@ -1850,6 +1857,44 @@ async fn logged_in_write_forms_use_the_account_oauth_flow() {
             "repost:did:plc:alice:at://did:plc:author/app.bsky.feed.post/r1:bafyreifake",
         ]
     );
+
+    // The like script (static/app.js) sends x-appview-fetch: 1 and gets the new state as JSON, so a like toggles
+    // in place: unlike the post liked above, then like it again.
+    for (body, liked, count) in [
+        (
+            "uri=at%3A%2F%2Fdid%3Aplc%3Aauthor%2Fapp.bsky.feed.post%2Fr1&cid=bafyreifake&intent=delete",
+            false,
+            0,
+        ),
+        (
+            "uri=at%3A%2F%2Fdid%3Aplc%3Aauthor%2Fapp.bsky.feed.post%2Fr1&cid=bafyreifake",
+            true,
+            1,
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/like")
+                    .header("origin", "https://appview.example")
+                    .header("sec-fetch-site", "same-origin")
+                    .header("cookie", &cookie)
+                    .header("x-appview-fetch", "1")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{body}");
+        let json: serde_json::Value = serde_json::from_slice(
+            &response.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(json, serde_json::json!({"liked": liked, "likeCount": count}), "{body}");
+    }
 }
 
 #[tokio::test]

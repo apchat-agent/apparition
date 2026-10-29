@@ -73,7 +73,8 @@ const PROFILE_NEGATIVE_TTL: Duration = Duration::from_secs(60 * 60);
 const PAGE_PROFILE_BUDGET: Duration = Duration::from_millis(1500);
 const PAGE_PROFILE_CONCURRENCY: usize = 8;
 const PAGE_QUOTE_CONCURRENCY: usize = 16;
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=av20";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m1";
+const WEB_SCRIPT_URL: &str = "/static/app.js?v=js2";
 const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=*";
 const WRITE_SCOPES: [&str; 3] = [
     "repo:app.bsky.feed.post?action=create",
@@ -394,6 +395,7 @@ impl OAuthPublic {
         Router::new()
             .route(METADATA_PATH, get(metadata::<F, S>))
             .route("/static/app.css", get(app_stylesheet))
+            .route("/static/app.js", get(app_script))
             .route("/", get(root))
             .route("/login", get(login))
             .route("/oauth/authorize", post(authorize::<F, S>))
@@ -1599,6 +1601,20 @@ where
     Json(state.public.metadata.clone())
 }
 
+/// Optional progressive enhancement (like toggles in place). Every action still works as a plain form without it.
+async fn app_script() -> Response {
+    let mut response = include_str!("../static/app.js").into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/javascript; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    response
+}
+
 async fn app_stylesheet() -> Response {
     let mut response = include_str!("../static/app.css").into_response();
     response.headers_mut().insert(
@@ -1703,9 +1719,10 @@ fn page_shell_with_options(
         "app-layout guest-layout"
     };
     format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>{}</title><link rel=\"stylesheet\" href=\"{}\"></head><body><a class=\"skip-link\" href=\"#main-content\">Skip to content</a><div class=\"{layout}\"><aside class=\"left-sidebar\"><a class=\"brand\" href=\"/app\">AppView</a>{navigation}</aside><div class=\"center-column\"><header class=\"center-sticky\">{tabs}</header><main id=\"main-content\" class=\"page-content\">{content}</main></div>{right_sidebar}</div>{mobile_navigation}</body></html>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\"><title>{}</title><link rel=\"stylesheet\" href=\"{}\"><script src=\"{}\" defer></script></head><body><a class=\"skip-link\" href=\"#main-content\">Skip to content</a><div class=\"{layout}\"><aside class=\"left-sidebar\"><a class=\"brand\" href=\"/app\">AppView</a>{navigation}</aside><div class=\"center-column\"><header class=\"center-sticky\">{tabs}</header><main id=\"main-content\" class=\"page-content\">{content}</main></div>{right_sidebar}</div>{mobile_navigation}</body></html>",
         html_escape(title),
-        WEB_STYLESHEET_URL
+        WEB_STYLESHEET_URL,
+        WEB_SCRIPT_URL
     )
 }
 
@@ -4172,7 +4189,7 @@ where
             )
             .await
             {
-                Ok(()) => return_to_post(&headers, &state.public.public_url, uri),
+                Ok(()) => like_response(&headers, &state.public.public_url, state.storage.as_ref(), &did, uri),
                 Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
             },
             Err(error) => oauth_error(StatusCode::BAD_GATEWAY, &error),
@@ -4183,7 +4200,7 @@ where
             match persist_created_record(state.storage.clone(), &did, "app.bsky.feed.like", created)
                 .await
             {
-                Ok(()) => return_to_post(&headers, &state.public.public_url, uri),
+                Ok(()) => like_response(&headers, &state.public.public_url, state.storage.as_ref(), &did, uri),
                 Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
             }
         }
@@ -4270,6 +4287,30 @@ fn verified_cookie_session<S: Storage>(
         .flatten()
         == Some(generation))
     .then_some((did, session_id, generation, write_access, feed_access))
+}
+
+/// The like script asks with `x-appview-fetch: 1` and gets the new state as JSON instead of a page.
+fn like_response<S: Storage>(
+    headers: &HeaderMap,
+    public_url: &str,
+    storage: &S,
+    did: &str,
+    uri: &str,
+) -> Response {
+    if headers
+        .get("x-appview-fetch")
+        .is_some_and(|value| value.as_bytes() == b"1")
+    {
+        let summary = storage
+            .post_interaction_summary(uri, Some(did))
+            .unwrap_or_default();
+        return Json(json!({
+            "liked": summary.viewer_like.is_some(),
+            "likeCount": summary.like_count,
+        }))
+        .into_response();
+    }
+    return_to_post(headers, public_url, uri)
 }
 
 /// Fragment id of a post's card, so a like or repost can return to the same place on the page.
