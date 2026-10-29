@@ -322,3 +322,85 @@ Deno.test("alt suggestion failure leaves the alt text alone and reports a short 
   assert(status.textContent.length > 0, "a useful failure message should be visible");
   assert(!button.disabled, "the button should be usable after a failure");
 });
+
+Deno.test("posting completes while an alt suggestion is still running", async () => {
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  globalThis.document = {
+    addEventListener() {},
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+  };
+  globalThis.window = { visualViewport: { addEventListener() {} }, location: { assign() {} } };
+  const helpers = new Function(`${source}; return { attachAltSuggestion, handleImageComposerSubmit };`)();
+  assertEquals(typeof helpers.handleImageComposerSubmit, "function");
+
+  let releaseModel;
+  const pendingModel = new Promise((resolve) => { releaseModel = resolve; });
+  let suggestionFinished = false;
+  let clickHandler;
+  const suggestionButton = {
+    disabled: false,
+    addEventListener(_name, listener) { clickHandler = listener; },
+    click() { return clickHandler(); },
+  };
+  helpers.attachAltSuggestion(
+    suggestionButton,
+    { file: { name: "local.png" }, alt: "", suggestedAlt: "" },
+    { value: "" },
+    { textContent: "" },
+    { hidden: true, max: 0, value: 0 },
+    () => pendingModel,
+  );
+  const suggestion = suggestionButton.click().then(() => { suggestionFinished = true; });
+  await Promise.resolve();
+
+  const submitButton = { disabled: false };
+  const error = { hidden: true, textContent: "" };
+  const imageInput = { files: [{ name: "local.png" }] };
+  const form = {
+    action: "/post",
+    querySelector(selector) {
+      if (selector === 'button[type="submit"]') return submitButton;
+      if (selector === "[data-composer-error]") return error;
+      if (selector === "[data-image-input]") return imageInput;
+      return null;
+    },
+  };
+  const originalFormData = globalThis.FormData;
+  const originalFile = globalThis.File;
+  const originalFetch = globalThis.fetch;
+  let didPost = false;
+  class FakeFormData {
+    delete() {}
+    append() {}
+  }
+  class FakeFile {
+    constructor(parts, name, options) { this.parts = parts; this.name = name; this.type = options.type; }
+  }
+  globalThis.FormData = FakeFormData;
+  globalThis.File = FakeFile;
+  globalThis.fetch = async () => {
+    didPost = true;
+    return { ok: true, url: "/app" };
+  };
+  try {
+    await helpers.handleImageComposerSubmit(
+      form,
+      [{ file: { name: "local.png" }, alt: "" }],
+      false,
+      { preventDefault() {} },
+      {
+        loadImage: async () => ({ width: 1, height: 1 }),
+        resizeImage: async () => ({ blob: new Blob(["image"]), width: 1, height: 1 }),
+      },
+    );
+    assert(didPost, "the image post should proceed without waiting for the caption model");
+    assert(!suggestionFinished, "the pending caption request must still be pending after posting");
+  } finally {
+    globalThis.FormData = originalFormData;
+    globalThis.File = originalFile;
+    globalThis.fetch = originalFetch;
+  }
+  releaseModel({ caption: async () => "A photo." });
+  await suggestion;
+});
