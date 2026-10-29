@@ -330,7 +330,9 @@ impl SafeHttpClient {
 
     fn client_for(&self, host: &str, addresses: &[SocketAddr]) -> Result<reqwest::Client, String> {
         let key = ClientKey {
-            host: host.trim_end_matches('.').to_ascii_lowercase(),
+            // reqwest applies resolve_to_addrs overrides to the exact hostname spelling;
+            // preserve a trailing dot so a different override cannot share this client.
+            host: host.to_ascii_lowercase(),
             addresses: addresses.to_vec(),
         };
         let now = Instant::now();
