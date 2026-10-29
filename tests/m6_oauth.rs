@@ -3588,6 +3588,153 @@ async fn quote_failures_distinguish_missing_unavailable_and_budget_placeholder()
 }
 
 #[tokio::test]
+async fn post_action_rows_are_ordered_hide_zero_counts_and_style_thread_numbers() {
+    let storage = Arc::new(MemoryStorage::default());
+    let post_uri = "at://did:plc:friend/app.bsky.feed.post/numbered";
+    for record in [
+        IndexedRecord {
+            did: "did:plc:friend".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "numbered".into(),
+            uri: post_uri.into(),
+            cid: Some("numbered-cid".into()),
+            time_us: 30,
+            record: serde_json::json!({"text":"One useful point 1/2","createdAt":"2026-10-28T00:00:00Z"}),
+        },
+        IndexedRecord {
+            did: "did:plc:alice".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "zero".into(),
+            uri: "at://did:plc:alice/app.bsky.feed.post/zero".into(),
+            cid: Some("zero-cid".into()),
+            time_us: 20,
+            record: serde_json::json!({"text":"A plain post"}),
+        },
+        IndexedRecord {
+            did: "did:plc:alice".into(),
+            collection: "app.bsky.feed.like".into(),
+            rkey: "liked-numbered".into(),
+            uri: "at://did:plc:alice/app.bsky.feed.like/liked-numbered".into(),
+            cid: Some("like-cid".into()),
+            time_us: 19,
+            record: serde_json::json!({"subject":{"uri":post_uri,"cid":"numbered-cid"}}),
+        },
+        IndexedRecord {
+            did: "did:plc:reposter".into(),
+            collection: "app.bsky.feed.repost".into(),
+            rkey: "numbered-repost".into(),
+            uri: "at://did:plc:reposter/app.bsky.feed.repost/numbered-repost".into(),
+            cid: Some("repost-cid".into()),
+            time_us: 18,
+            record: serde_json::json!({"subject":{"uri":post_uri,"cid":"numbered-cid"}}),
+        },
+        IndexedRecord {
+            did: "did:plc:replier".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "numbered-reply".into(),
+            uri: "at://did:plc:replier/app.bsky.feed.post/numbered-reply".into(),
+            cid: Some("reply-cid".into()),
+            time_us: 17,
+            record: serde_json::json!({
+                "text":"reply",
+                "reply":{"root":{"uri":post_uri,"cid":"numbered-cid"},"parent":{"uri":post_uri,"cid":"numbered-cid"}}
+            }),
+        },
+    ] {
+        storage.put_record(&record).unwrap();
+    }
+    storage
+        .set_follow("did:plc:alice", "did:plc:friend", true)
+        .unwrap();
+    storage
+        .set_verified_handle("did:plc:friend", "friend.test")
+        .unwrap();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage);
+    let cookie = finish_login(&app).await;
+    let timeline = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let timeline_html = String::from_utf8(
+        timeline
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    let post = timeline_html
+        .split("id=\"post-did-plc-friend-app-bsky-feed-post-numbered\"")
+        .nth(1)
+        .unwrap();
+    let actions = post.split("<div class=\"post-actions\"").nth(1).unwrap();
+    let action_order = [
+        actions.find("aria-label=\"Open replies\"").unwrap(),
+        actions.find("class=\"repost-menu\"").unwrap(),
+        actions.find("aria-label=\"Unlike post").unwrap(),
+        actions.find("aria-label=\"Share or copy link\"").unwrap(),
+        actions.find("aria-label=\"More post actions\"").unwrap(),
+    ];
+    assert!(action_order.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(
+        actions.contains("class=\"post-action is-liked\""),
+        "{actions}"
+    );
+    assert!(
+        actions.contains("class=\"action-count\">1</span>"),
+        "{actions}"
+    );
+    assert!(post.contains("One useful point <span class=\"thread-number-pill\">1/2</span>"));
+    let zero_post = timeline_html
+        .split("id=\"post-did-plc-alice-app-bsky-feed-post-zero\"")
+        .nth(1)
+        .unwrap();
+    let zero_actions = zero_post
+        .split("<div class=\"post-actions\"")
+        .nth(1)
+        .unwrap();
+    assert!(
+        !zero_actions.contains("class=\"action-count\""),
+        "{zero_actions}"
+    );
+
+    let thread = app
+        .oneshot(
+            Request::builder()
+                .uri(
+                    "/app/thread?uri=at%3A%2F%2Fdid%3Aplc%3Afriend%2Fapp.bsky.feed.post%2Fnumbered",
+                )
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let thread_html = String::from_utf8(
+        thread
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(thread_html.contains("One useful point <span class=\"thread-number-pill\">1/2</span>"));
+}
+
+#[tokio::test]
 async fn web_embeds_render_images_cards_quotes_and_escape_user_content() {
     let storage = Arc::new(MemoryStorage::default());
     storage.register_user("did:plc:alice").unwrap();
