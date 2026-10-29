@@ -106,6 +106,7 @@ async function loadComposerImage(file) {
   if (!input || !previews || !status) return;
 
   const selected = [];
+  let selectionInvalid = false;
   const drawPreviews = () => {
     previews.replaceChildren();
     selected.forEach((item, index) => {
@@ -147,10 +148,12 @@ async function loadComposerImage(file) {
     selected.length = 0;
     const files = [...(input.files || [])];
     if (files.length > 4) {
+      selectionInvalid = true;
       status.textContent = "Choose no more than 4 images.";
       drawPreviews();
       return;
     }
+    selectionInvalid = false;
     status.textContent = "";
     for (const file of files) {
       selected.push({ file, alt: "", previewUrl: URL.createObjectURL(file) });
@@ -159,7 +162,7 @@ async function loadComposerImage(file) {
   });
 
   form.addEventListener("submit", async (event) => {
-    if (!selected.length) return;
+    if (!selected.length && !input.files?.length) return;
     event.preventDefault();
     const button = form.querySelector('button[type="submit"]');
     const error = form.querySelector("[data-composer-error]");
@@ -168,6 +171,7 @@ async function loadComposerImage(file) {
     error.hidden = true;
     error.textContent = "";
     try {
+      if (selectionInvalid) throw new Error("Choose no more than 4 images.");
       const images = [];
       for (const item of selected) {
         const source = await loadComposerImage(item.file);
@@ -181,6 +185,8 @@ async function loadComposerImage(file) {
       for (const image of images) {
         data.append("images", new File([image.blob], image.filename, { type: "image/jpeg" }));
         data.append("alts", image.alt);
+        data.append("widths", String(image.width));
+        data.append("heights", String(image.height));
       }
       const response = await fetch(form.action, {
         method: "POST",

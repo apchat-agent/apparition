@@ -29,10 +29,12 @@ use atrium_oauth::{
     },
 };
 use atrium_xrpc::error::XrpcErrorKind;
-use atrium_xrpc::{Error as XrpcClientError, OutputDataOrBytes, XrpcClient, XrpcRequest};
+use atrium_xrpc::{
+    Error as XrpcClientError, InputDataOrBytes, OutputDataOrBytes, XrpcClient, XrpcRequest,
+};
 use axum::{
     Json, Router,
-    extract::{Form, Query, State},
+    extract::{DefaultBodyLimit, Form, FromRequest, Multipart, Query, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{
         Html, IntoResponse, Redirect, Response,
@@ -162,6 +164,15 @@ pub struct PostStrongRef {
     pub cid: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PostImage {
+    pub bytes: Vec<u8>,
+    pub mime_type: String,
+    pub alt: String,
+    pub width: u32,
+    pub height: u32,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct FetchedAuthorProfile {
     pub profile: Option<IndexedRecord>,
@@ -212,6 +223,33 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
         _quoted: PostStrongRef,
     ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
         Box::pin(async { Err("quote action is not available".to_owned()) })
+    }
+    fn create_post_with_images<'a>(
+        &'a self,
+        _did: &'a str,
+        _text: &'a str,
+        _images: Vec<PostImage>,
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+        Box::pin(async { Err("image post action is not available".to_owned()) })
+    }
+    fn create_reply_with_images<'a>(
+        &'a self,
+        _did: &'a str,
+        _text: &'a str,
+        _root: PostStrongRef,
+        _parent: PostStrongRef,
+        _images: Vec<PostImage>,
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+        Box::pin(async { Err("image reply action is not available".to_owned()) })
+    }
+    fn create_quote_with_images<'a>(
+        &'a self,
+        _did: &'a str,
+        _text: &'a str,
+        _quoted: PostStrongRef,
+        _images: Vec<PostImage>,
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+        Box::pin(async { Err("image quote action is not available".to_owned()) })
     }
     fn fetch_post<'a>(
         &'a self,
@@ -496,6 +534,7 @@ impl OAuthPublic {
             .route("/quote", post(write_quote::<F, S>))
             .route("/like", post(write_like::<F, S>))
             .route("/repost", post(write_repost::<F, S>))
+            .layer(DefaultBodyLimit::max(MAX_POST_BODY_BYTES))
             .with_state(Arc::new(OAuthWebState {
                 public: self.clone(),
                 flow,
@@ -1240,6 +1279,88 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         })
     }
 
+    async fn create_post_with_images(
+        &self,
+        did: &str,
+        text: &str,
+        images: Vec<PostImage>,
+        reply: Option<Value>,
+        quote: Option<PostStrongRef>,
+    ) -> Result<PdsCreatedRecord, String> {
+        let parsed_did = did.parse::<Did>().map_err(|error| error.to_string())?;
+        let session = self
+            .client
+            .restore(&parsed_did)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut blobs = Vec::with_capacity(images.len());
+        for image in &images {
+            let request = XrpcRequest {
+                method: http::Method::POST,
+                nsid: "com.atproto.repo.uploadBlob".to_owned(),
+                parameters: None,
+                input: Some(InputDataOrBytes::Bytes(image.bytes.clone())),
+                encoding: Some(image.mime_type.clone()),
+            };
+            let response: OutputDataOrBytes<Value> = session
+                .send_xrpc::<(), Vec<u8>, Value, Value>(&request)
+                .await
+                .map_err(|error| {
+                    log_pds_xrpc_failure("com.atproto.repo.uploadBlob", &error);
+                    format!("PDS uploadBlob failed: {error:?}")
+                })?;
+            let blob = match response {
+                OutputDataOrBytes::Data(value) => value
+                    .get("blob")
+                    .cloned()
+                    .filter(|blob| blob.get("ref").is_some())
+                    .ok_or_else(|| "PDS uploadBlob returned no blob reference".to_owned())?,
+                OutputDataOrBytes::Bytes(_) => {
+                    return Err("PDS uploadBlob returned a non-JSON response".to_owned());
+                }
+            };
+            blobs.push(blob);
+        }
+
+        let image_records = images
+            .iter()
+            .zip(blobs)
+            .map(|(image, blob)| {
+                json!({
+                    "image":blob,
+                    "alt":image.alt,
+                    "aspectRatio":{"width":image.width,"height":image.height}
+                })
+            })
+            .collect::<Vec<_>>();
+        let images_embed = json!({
+            "$type":"app.bsky.embed.images",
+            "images":image_records
+        });
+        let embed = if let Some(quote) = quote {
+            json!({
+                "$type":"app.bsky.embed.recordWithMedia",
+                "record":{
+                    "$type":"app.bsky.embed.record",
+                    "record":quote
+                },
+                "media":images_embed
+            })
+        } else {
+            images_embed
+        };
+        let mut record = json!({
+            "$type":"app.bsky.feed.post",
+            "text":text,
+            "createdAt":Datetime::now(),
+            "embed":embed
+        });
+        if let Some(reply) = reply {
+            record["reply"] = reply;
+        }
+        self.create_record(did, "app.bsky.feed.post", record).await
+    }
+
     async fn delete_like_record(&self, did: &str, like_uri: &str) -> Result<(), String> {
         let collection = "app.bsky.feed.like";
         let prefix = format!("at://{did}/{collection}/");
@@ -1447,6 +1568,51 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
                 }),
             )
             .await
+        })
+    }
+
+    fn create_post_with_images<'a>(
+        &'a self,
+        did: &'a str,
+        text: &'a str,
+        images: Vec<PostImage>,
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+        Box::pin(async move {
+            AtriumOAuthFlow::create_post_with_images(self, did, text, images, None, None).await
+        })
+    }
+
+    fn create_reply_with_images<'a>(
+        &'a self,
+        did: &'a str,
+        text: &'a str,
+        root: PostStrongRef,
+        parent: PostStrongRef,
+        images: Vec<PostImage>,
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+        Box::pin(async move {
+            AtriumOAuthFlow::create_post_with_images(
+                self,
+                did,
+                text,
+                images,
+                Some(json!({"root":root,"parent":parent})),
+                None,
+            )
+            .await
+        })
+    }
+
+    fn create_quote_with_images<'a>(
+        &'a self,
+        did: &'a str,
+        text: &'a str,
+        quoted: PostStrongRef,
+        images: Vec<PostImage>,
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+        Box::pin(async move {
+            AtriumOAuthFlow::create_post_with_images(self, did, text, images, None, Some(quoted))
+                .await
         })
     }
 
@@ -4866,15 +5032,228 @@ fn render_thread_replies<S: Storage>(
     Ok(html)
 }
 
+const MAX_POST_IMAGES: usize = 4;
+const MAX_IMAGE_BYTES: usize = 1_000_000;
+const MAX_IMAGE_ALT_CHARS: usize = 2000;
+const MAX_POST_BODY_BYTES: usize = 5 * 1024 * 1024;
+
+struct PendingPostImage {
+    bytes: Vec<u8>,
+    mime_type: String,
+}
+
+struct PostSubmission {
+    text: String,
+    parent_uri: Option<String>,
+    quote_uri: Option<String>,
+    images: Vec<PostImage>,
+}
+
+async fn parse_post_submission<F, S>(
+    request: Request,
+    state: &Arc<OAuthWebState<F, S>>,
+) -> Result<PostSubmission, (StatusCode, String)>
+where
+    F: OAuthFlow,
+    S: Storage + 'static,
+{
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if content_type.starts_with("multipart/form-data") {
+        let mut multipart = Multipart::from_request(request, state)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "The multipart post form could not be read. Check the image selection and try again."
+                        .to_owned(),
+                )
+            })?;
+        let mut text = String::new();
+        let mut parent_uri = None;
+        let mut quote_uri = None;
+        let mut pending_images = Vec::new();
+        let mut alts = Vec::new();
+        let mut widths = Vec::new();
+        let mut heights = Vec::new();
+        while let Some(field) = multipart.next_field().await.map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "The multipart post form could not be read. Check the image selection and try again."
+                    .to_owned(),
+            )
+        })? {
+            let name = field.name().unwrap_or_default().to_owned();
+            if name == "images" {
+                let filename = field.file_name().unwrap_or_default().to_owned();
+                let mime_type = field.content_type().unwrap_or_default().to_owned();
+                let bytes = field.bytes().await.map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "An image could not be read from the form.".to_owned(),
+                    )
+                })?;
+                if filename.is_empty() && bytes.is_empty() {
+                    continue;
+                }
+                if pending_images.len() == MAX_POST_IMAGES {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "Choose no more than 4 images per post.".to_owned(),
+                    ));
+                }
+                pending_images.push(PendingPostImage {
+                    bytes: bytes.to_vec(),
+                    mime_type,
+                });
+            } else {
+                let value = field.text().await.map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "A post form field could not be read.".to_owned(),
+                    )
+                })?;
+                match name.as_str() {
+                    "text" => text = value,
+                    "parent_uri" => parent_uri = Some(value),
+                    "quote_uri" => quote_uri = Some(value),
+                    "alts" => alts.push(value),
+                    "widths" => widths.push(value),
+                    "heights" => heights.push(value),
+                    _ => {}
+                }
+            }
+        }
+        let images = validate_post_images(pending_images, alts, widths, heights)?;
+        Ok(PostSubmission {
+            text,
+            parent_uri,
+            quote_uri,
+            images,
+        })
+    } else if content_type.starts_with("application/x-www-form-urlencoded") {
+        let Form(form) = Form::<HashMap<String, String>>::from_request(request, state)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "The post form could not be read.".to_owned(),
+                )
+            })?;
+        Ok(PostSubmission {
+            text: form.get("text").cloned().unwrap_or_default(),
+            parent_uri: form.get("parent_uri").cloned(),
+            quote_uri: form.get("quote_uri").cloned(),
+            images: Vec::new(),
+        })
+    } else {
+        Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Use a post form with text and optional image files.".to_owned(),
+        ))
+    }
+}
+
+fn validate_post_images(
+    pending: Vec<PendingPostImage>,
+    alts: Vec<String>,
+    widths: Vec<String>,
+    heights: Vec<String>,
+) -> Result<Vec<PostImage>, (StatusCode, String)> {
+    if pending.is_empty() {
+        return Ok(Vec::new());
+    }
+    if pending.len() > MAX_POST_IMAGES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Choose no more than 4 images per post.".to_owned(),
+        ));
+    }
+    if alts.len() > pending.len() || widths.len() != pending.len() || heights.len() != pending.len()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Each image needs an alt text value and image dimensions. Reload the form and try again."
+                .to_owned(),
+        ));
+    }
+    pending
+        .into_iter()
+        .enumerate()
+        .map(|(index, image)| {
+            let mime_type = image.mime_type.trim().to_ascii_lowercase();
+            if !matches!(mime_type.as_str(), "image/jpeg" | "image/png" | "image/webp" | "image/gif") {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Images must be JPEG, PNG, WebP, or GIF files.".to_owned(),
+                ));
+            }
+            if image.bytes.len() > MAX_IMAGE_BYTES {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Each image must be no larger than 1,000,000 bytes.".to_owned(),
+                ));
+            }
+            if image_content_type(&image.bytes) != Some(mime_type.as_str()) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "The image contents do not match the declared image type.".to_owned(),
+                ));
+            }
+            let alt = alts.get(index).cloned().unwrap_or_default();
+            if alt.chars().count() > MAX_IMAGE_ALT_CHARS {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Image alt text must be no more than 2,000 characters.".to_owned(),
+                ));
+            }
+            let width = widths[index].parse::<u32>().ok().filter(|value| (1..=2000).contains(value));
+            let height = heights[index].parse::<u32>().ok().filter(|value| (1..=2000).contains(value));
+            let (Some(width), Some(height)) = (width, height) else {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Image dimensions must be between 1 and 2,000 pixels. Enable JavaScript to prepare images for posting."
+                        .to_owned(),
+                ));
+            };
+            Ok(PostImage {
+                bytes: image.bytes,
+                mime_type,
+                alt,
+                width,
+                height,
+            })
+        })
+        .collect()
+}
+
+fn image_content_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
 async fn write_post<F, S>(
     State(state): State<Arc<OAuthWebState<F, S>>>,
-    headers: HeaderMap,
-    Form(form): Form<HashMap<String, String>>,
+    request: Request,
 ) -> Response
 where
     F: OAuthFlow,
     S: Storage + 'static,
 {
+    let headers = request.headers().clone();
     if !same_origin_request(&headers, &state.public.public_url) {
         return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
     }
@@ -4884,14 +5263,35 @@ where
     if !verified_cookie_write_access(&state.public, &headers, state.storage.as_ref()) {
         return oauth_error(StatusCode::FORBIDDEN, "write permissions were not granted");
     }
-    let text = form.get("text").map(String::as_str).unwrap_or("").trim();
+    let submission = match parse_post_submission(request, &state).await {
+        Ok(submission) => submission,
+        Err((status, message)) => return oauth_error(status, &message),
+    };
+    if !submission.images.is_empty()
+        && !verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref())
+    {
+        return oauth_error(
+            StatusCode::FORBIDDEN,
+            "Log in again to enable pictures before posting images.",
+        );
+    }
+    let text = submission.text.trim();
     if text.is_empty() || text.chars().count() > 300 {
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "post text must contain 1 to 300 characters",
         );
     }
-    match state.flow.create_post(&did, text).await {
+    let has_images = !submission.images.is_empty();
+    let created = if !has_images {
+        state.flow.create_post(&did, text).await
+    } else {
+        state
+            .flow
+            .create_post_with_images(&did, text, submission.images)
+            .await
+    };
+    match created {
         Ok(created) => {
             match persist_created_record(state.storage.clone(), &did, "app.bsky.feed.post", created)
                 .await
@@ -4900,19 +5300,34 @@ where
                 Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
             }
         }
-        Err(error) => oauth_error(StatusCode::BAD_GATEWAY, &error),
+        Err(error) => image_or_text_action_error(error, has_images),
     }
+}
+
+fn image_or_text_action_error(error: String, has_images: bool) -> Response {
+    if !has_images {
+        return oauth_error(StatusCode::BAD_GATEWAY, &error);
+    }
+    tracing::warn!(%error, "post with image upload failed before record creation");
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(json!({
+            "error":"ImagePostFailed",
+            "message":"The picture upload or post creation failed. No post was created. Please try again."
+        })),
+    )
+        .into_response()
 }
 
 async fn write_quote<F, S>(
     State(state): State<Arc<OAuthWebState<F, S>>>,
-    headers: HeaderMap,
-    Form(form): Form<HashMap<String, String>>,
+    request: Request,
 ) -> Response
 where
     F: OAuthFlow,
     S: Storage + 'static,
 {
+    let headers = request.headers().clone();
     if !same_origin_request(&headers, &state.public.public_url) {
         return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
     }
@@ -4922,15 +5337,28 @@ where
     if !verified_cookie_write_access(&state.public, &headers, state.storage.as_ref()) {
         return oauth_error(StatusCode::FORBIDDEN, "write permissions were not granted");
     }
-    let text = form.get("text").map(String::as_str).unwrap_or("").trim();
+    let submission = match parse_post_submission(request, &state).await {
+        Ok(submission) => submission,
+        Err((status, message)) => return oauth_error(status, &message),
+    };
+    if !submission.images.is_empty()
+        && !verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref())
+    {
+        return oauth_error(
+            StatusCode::FORBIDDEN,
+            "Log in again to enable pictures before posting images.",
+        );
+    }
+    let text = submission.text.trim();
     if text.is_empty() || text.chars().count() > 300 {
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "quote text must contain 1 to 300 characters",
         );
     }
-    let Some(quote_uri) = form
-        .get("quote_uri")
+    let Some(quote_uri) = submission
+        .quote_uri
+        .as_deref()
         .filter(|uri| post_uri_did(uri).is_some())
     else {
         return oauth_error(StatusCode::BAD_REQUEST, "quote_uri is required");
@@ -4947,9 +5375,18 @@ where
         uri: quoted.uri,
         cid: cid.to_owned(),
     };
-    let created = match state.flow.create_quote(&did, text, quoted_ref).await {
+    let has_images = !submission.images.is_empty();
+    let created = if has_images {
+        state
+            .flow
+            .create_quote_with_images(&did, text, quoted_ref, submission.images)
+            .await
+    } else {
+        state.flow.create_quote(&did, text, quoted_ref).await
+    };
+    let created = match created {
         Ok(created) => created,
-        Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
+        Err(error) => return image_or_text_action_error(error, has_images),
     };
     match persist_created_record(state.storage.clone(), &did, "app.bsky.feed.post", created).await {
         Ok(()) => Redirect::to("/app").into_response(),
@@ -4959,13 +5396,13 @@ where
 
 async fn write_reply<F, S>(
     State(state): State<Arc<OAuthWebState<F, S>>>,
-    headers: HeaderMap,
-    Form(form): Form<HashMap<String, String>>,
+    request: Request,
 ) -> Response
 where
     F: OAuthFlow,
     S: Storage + 'static,
 {
+    let headers = request.headers().clone();
     if !same_origin_request(&headers, &state.public.public_url) {
         return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
     }
@@ -4975,14 +5412,30 @@ where
     if !verified_cookie_write_access(&state.public, &headers, state.storage.as_ref()) {
         return oauth_error(StatusCode::FORBIDDEN, "write permissions were not granted");
     }
-    let text = form.get("text").map(String::as_str).unwrap_or("").trim();
+    let submission = match parse_post_submission(request, &state).await {
+        Ok(submission) => submission,
+        Err((status, message)) => return oauth_error(status, &message),
+    };
+    if !submission.images.is_empty()
+        && !verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref())
+    {
+        return oauth_error(
+            StatusCode::FORBIDDEN,
+            "Log in again to enable pictures before posting images.",
+        );
+    }
+    let text = submission.text.trim();
     if text.is_empty() || text.chars().count() > 300 {
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "reply text must contain 1 to 300 characters",
         );
     }
-    let Some(parent_uri) = form.get("parent_uri").filter(|uri| !uri.trim().is_empty()) else {
+    let Some(parent_uri) = submission
+        .parent_uri
+        .as_deref()
+        .filter(|uri| !uri.trim().is_empty())
+    else {
         return oauth_error(StatusCode::BAD_REQUEST, "parent_uri is required");
     };
     let parent = match load_post_record(&state.flow, state.storage.as_ref(), parent_uri).await {
@@ -5024,13 +5477,21 @@ where
     } else {
         parent_ref.clone()
     };
-    let created = match state
-        .flow
-        .create_reply(&did, text, root_ref, parent_ref)
-        .await
-    {
+    let has_images = !submission.images.is_empty();
+    let created = if has_images {
+        state
+            .flow
+            .create_reply_with_images(&did, text, root_ref, parent_ref, submission.images)
+            .await
+    } else {
+        state
+            .flow
+            .create_reply(&did, text, root_ref, parent_ref)
+            .await
+    };
+    let created = match created {
         Ok(created) => created,
-        Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
+        Err(error) => return image_or_text_action_error(error, has_images),
     };
     let redirect = format!("/app/thread?uri={}", form_encoded(&created.uri));
     match persist_created_record(state.storage.clone(), &did, "app.bsky.feed.post", created).await {
@@ -6309,7 +6770,8 @@ mod tests {
         assert!(css.contains(".icon {\n  fill: none;"));
         assert!(css.contains(".post-actions .is-liked .icon {\n  fill: var(--accent);"));
         assert!(css.contains(".thread-focus-actions .is-liked .icon {\n  fill: var(--accent);"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m6"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m7"));
+        assert!(WEB_SCRIPT_URL.contains("v=js6"));
     }
 
     #[test]

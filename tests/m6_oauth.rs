@@ -551,6 +551,18 @@ fn append_multipart_text_field(body: &mut Vec<u8>, boundary: &str, name: &str, v
     );
 }
 
+fn multipart_text_only_body_with_empty_file(boundary: &str, text: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    append_multipart_text_field(&mut body, boundary, "text", text);
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"images\"; filename=\"\"\r\nContent-Type: application/octet-stream\r\n\r\n\r\n--{boundary}--\r\n"
+        )
+        .as_bytes(),
+    );
+    body
+}
+
 async fn get_html(app: &Router, uri: &str, cookie: &str) -> String {
     let response = app
         .clone()
@@ -876,12 +888,12 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
             ),
             "{path}"
         );
-        assert!(html.contains("href=\"/static/app.css?v=m6\""), "{path}");
+        assert!(html.contains("href=\"/static/app.css?v=m7\""), "{path}");
         assert!(!html.contains("style="), "{path}");
         // One external, same-origin, deferred script (like toggles in place); never inline code.
         assert_eq!(html.matches("<script").count(), 1, "{path}");
         assert!(
-            html.contains("<script src=\"/static/app.js?v=js5\" defer></script>"),
+            html.contains("<script src=\"/static/app.js?v=js6\" defer></script>"),
             "{path}"
         );
     }
@@ -889,7 +901,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
     let stylesheet = app
         .oneshot(
             Request::builder()
-                .uri("/static/app.css?v=m6")
+                .uri("/static/app.css?v=m7")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1051,6 +1063,18 @@ async fn quote_composer_quotes_existing_quote_posts_and_notifies_once() {
     )
     .unwrap();
     assert!(timeline_html.contains("Quote post"), "{timeline_html}");
+    assert!(
+        timeline_html.contains("enctype=\"multipart/form-data\""),
+        "{timeline_html}"
+    );
+    assert!(
+        timeline_html.contains("name=\"images\" accept=\"image/*\" multiple"),
+        "{timeline_html}"
+    );
+    assert!(
+        timeline_html.contains("Choose up to 4 images"),
+        "{timeline_html}"
+    );
 
     let encoded_uri =
         url::form_urlencoded::byte_serialize(quote_uri.as_bytes()).collect::<String>();
@@ -1077,6 +1101,10 @@ async fn quote_composer_quotes_existing_quote_posts_and_notifies_once() {
     )
     .unwrap();
     assert!(compose_html.contains("action=\"/quote\""), "{compose_html}");
+    assert!(
+        compose_html.contains("name=\"images\" accept=\"image/*\" multiple"),
+        "{compose_html}"
+    );
     assert!(
         compose_html.contains("quoted &lt;script&gt;text&lt;/script&gt;"),
         "{compose_html}"
@@ -1171,11 +1199,11 @@ async fn sign_in_error_page_uses_the_shared_mobile_document_shell() {
     assert!(
         html.contains("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">")
     );
-    assert!(html.contains("href=\"/static/app.css?v=m6\""));
+    assert!(html.contains("href=\"/static/app.css?v=m7\""));
     assert!(!html.contains("style="));
     // The shared shell's one external script, never inline code.
     assert_eq!(html.matches("<script").count(), 1);
-    assert!(html.contains("<script src=\"/static/app.js?v=js5\" defer></script>"));
+    assert!(html.contains("<script src=\"/static/app.js?v=js6\" defer></script>"));
 }
 
 #[tokio::test]
@@ -2230,6 +2258,41 @@ async fn invalid_images_are_rejected_before_the_oauth_flow_is_called() {
 }
 
 #[tokio::test]
+async fn multipart_text_only_post_still_works_without_javascript() {
+    let flow = FakeOAuthFlow::default();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow.clone(), Arc::new(MemoryStorage::default()));
+    let cookie = finish_login(&app).await;
+    let boundary = "av26-no-script";
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/post")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", cookie)
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(multipart_text_only_body_with_empty_file(
+                    boundary,
+                    "text only from the native form",
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        flow.actions.lock().unwrap().as_slice(),
+        ["post:did:plc:alice:text only from the native form"]
+    );
+}
+
+#[tokio::test]
 async fn logged_in_write_forms_use_the_account_oauth_flow() {
     let public = OAuthPublic::new("https://appview.example").unwrap();
     let flow = FakeOAuthFlow::default();
@@ -3199,6 +3262,14 @@ async fn reply_form_checks_origin_and_writes_through_to_the_index() {
         .unwrap()
         .router_with_flow(flow, storage.clone());
     let cookie = finish_login(&app).await;
+    let encoded_parent =
+        url::form_urlencoded::byte_serialize(parent_uri.as_bytes()).collect::<String>();
+    let thread_html = get_html(&app, &format!("/thread?uri={encoded_parent}"), &cookie).await;
+    assert!(thread_html.contains("action=\"/reply\""), "{thread_html}");
+    assert!(
+        thread_html.contains("name=\"images\" accept=\"image/*\" multiple"),
+        "{thread_html}"
+    );
     let body =
         "parent_uri=at%3A%2F%2Fdid%3Aplc%3Afriend%2Fapp.bsky.feed.post%2Fparent&text=Reply+text";
 

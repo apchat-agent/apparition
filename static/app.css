@@ -432,6 +432,92 @@ textarea:focus-visible {
   font-weight: 700;
 }
 
+.image-picker {
+  display: grid;
+  gap: 0.55rem;
+  margin: 0;
+  padding: 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 0.8rem;
+}
+
+.image-picker legend {
+  padding-inline: 0.3rem;
+  color: var(--muted);
+  font-size: 0.86rem;
+  font-weight: 750;
+}
+
+.image-picker > label {
+  color: var(--muted);
+  font-size: 0.9rem;
+  font-weight: 650;
+}
+
+.image-picker input[type="file"] {
+  min-height: 44px;
+  padding: 0.4rem;
+  background: var(--surface);
+}
+
+.image-picker-status,
+.picture-permission-hint,
+.composer-error {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.composer-error {
+  color: #b42318;
+}
+
+.image-previews {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr));
+  gap: 0.7rem;
+}
+
+.image-preview {
+  display: grid;
+  grid-template-columns: minmax(4.5rem, 7rem) minmax(0, 1fr);
+  align-items: start;
+  gap: 0.7rem;
+  padding: 0.65rem;
+  border: 1px solid var(--line);
+  border-radius: 0.7rem;
+  background: var(--surface-raised);
+}
+
+.image-preview img {
+  width: 100%;
+  aspect-ratio: 1;
+  border-radius: 0.45rem;
+  object-fit: cover;
+  background: var(--surface);
+}
+
+.image-preview label {
+  display: grid;
+  gap: 0.35rem;
+  font-size: 0.78rem;
+}
+
+.image-preview textarea {
+  min-height: 3.5rem;
+  padding: 0.45rem;
+  font-size: 0.88rem;
+}
+
+.image-preview button {
+  min-height: 38px;
+  margin-top: 0.45rem;
+  padding: 0.4rem 0.7rem;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--line);
+}
+
 .quote-composer .quoted-post-preview {
   margin: 0.25rem 0 0.35rem;
 }

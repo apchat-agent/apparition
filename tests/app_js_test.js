@@ -208,6 +208,9 @@ Deno.test("image canvas resize bounds JPEG bytes and dimensions", async () => {
   const resizeImageCanvasSource = new Function(`${source}; return resizeImageCanvasSource;`)();
   const draws = [];
   globalThis.document = {
+    querySelectorAll() {
+      return [];
+    },
     createElement(tag) {
       assertEquals(tag, "canvas");
       return {
