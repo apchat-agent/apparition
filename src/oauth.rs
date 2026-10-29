@@ -3026,10 +3026,9 @@ async fn hydrate_page_parents<F: OAuthFlow, S: Storage>(
         .cloned()
         .map(|uri| (uri, None))
         .collect::<PageParentIndex>();
-    for uri in &parent_uris {
-        if let Some(record) = storage.record_by_uri("app.bsky.feed.post", uri)? {
-            parents.insert(uri.clone(), Some(record));
-        }
+    let local = storage.records_by_uri("app.bsky.feed.post", &parent_uris)?;
+    for (uri, record) in local {
+        parents.insert(uri, Some(record));
     }
 
     let missing = parent_uris
