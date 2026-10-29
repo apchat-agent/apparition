@@ -1249,6 +1249,7 @@ pub struct AtriumOAuthFlow<B: crate::identity::IdentityBackend = HttpIdentityBac
     store: SqliteOAuthStore,
     feed_client: Arc<FeedClient<B>>,
     http_client: SafeHttpClient,
+    public_appview_base: String,
     video_http_client: reqwest::Client,
     video_service_url: String,
     saved_feed_cache: SavedFeedCache,
@@ -1270,6 +1271,7 @@ impl<B: crate::identity::IdentityBackend> Clone for AtriumOAuthFlow<B> {
             store: self.store.clone(),
             feed_client: self.feed_client.clone(),
             http_client: self.http_client.clone(),
+            public_appview_base: self.public_appview_base.clone(),
             video_http_client: self.video_http_client.clone(),
             video_service_url: self.video_service_url.clone(),
             saved_feed_cache: self.saved_feed_cache.clone(),
@@ -1499,6 +1501,24 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         plc_directory_url: &str,
         guarded_client: SafeHttpClient,
     ) -> Result<Self, String> {
+        Self::new_with_public_appview_base(
+            public,
+            identity_resolver,
+            store,
+            plc_directory_url,
+            guarded_client,
+            PUBLIC_APPVIEW_BASE,
+        )
+    }
+
+    fn new_with_public_appview_base(
+        public: &OAuthPublic,
+        identity_resolver: Arc<IdentityResolver<B>>,
+        store: SqliteOAuthStore,
+        plc_directory_url: &str,
+        guarded_client: SafeHttpClient,
+        public_appview_base: &str,
+    ) -> Result<Self, String> {
         let feed_client = Arc::new(FeedClient::new_with_store(
             Arc::clone(&identity_resolver),
             guarded_client.clone(),
@@ -1567,6 +1587,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             store,
             feed_client,
             http_client: retained_http_client,
+            public_appview_base: public_appview_base.to_owned(),
             video_http_client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
@@ -1898,7 +1919,8 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         drop(cached);
         if !missing.is_empty() {
             let mut url = url::Url::parse(&format!(
-                "{PUBLIC_APPVIEW_BASE}app.bsky.labeler.getServices"
+                "{}app.bsky.labeler.getServices",
+                self.public_appview_base
             ))
             .map_err(|_| "Bluesky AppView URL is invalid".to_owned())?;
             {
@@ -2028,10 +2050,12 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         let labeler_dids = self.labeler_dids_for_viewer(viewer_did).await?;
         let accepted_labelers = labeler_dids.join(",");
         let mut account_raw_labels = Vec::new();
-        for batch in actors.chunks(ACCOUNT_LABEL_PROFILE_BATCH_SIZE) {
-            let mut url =
-                url::Url::parse(&format!("{PUBLIC_APPVIEW_BASE}app.bsky.actor.getProfiles"))
-                    .map_err(|_| "Bluesky AppView URL is invalid".to_owned())?;
+        for batch in actors.chunks(1) {
+            let mut url = url::Url::parse(&format!(
+                "{}app.bsky.actor.getProfiles",
+                self.public_appview_base
+            ))
+            .map_err(|_| "Bluesky AppView URL is invalid".to_owned())?;
             {
                 let mut query = url.query_pairs_mut();
                 for did in batch {
@@ -10374,6 +10398,108 @@ mod tests {
     use tower::ServiceExt;
     use tracing::instrument::WithSubscriber;
     use tracing_subscriber::fmt::MakeWriter;
+
+    #[tokio::test]
+    async fn production_account_label_lookup_batches_all_page_authors_and_sends_labeler_header() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let appview_base = format!("http://{address}/xrpc/");
+        let requests = Arc::new(Mutex::new(Vec::<(String, Option<String>)>::new()));
+        let service_requests = requests.clone();
+        let profile_requests = requests.clone();
+        let server_app = Router::new()
+            .route(
+                "/xrpc/app.bsky.actor.getProfiles",
+                get(move |uri: Uri, headers: axum::http::HeaderMap| {
+                    let requests = profile_requests.clone();
+                    async move {
+                        requests.lock().unwrap().push((
+                            uri.to_string(),
+                            headers
+                                .get("atproto-accept-labelers")
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_owned),
+                        ));
+                        Json(json!({"profiles":[]}))
+                    }
+                }),
+            )
+            .route(
+                "/xrpc/app.bsky.labeler.getServices",
+                get(move |uri: Uri| {
+                    let requests = service_requests.clone();
+                    async move {
+                        requests.lock().unwrap().push((uri.to_string(), None));
+                        Json(json!({"views":[]}))
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, server_app).await.unwrap();
+        });
+
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        let identity = Arc::new(IdentityResolver::new(
+            FeedTestIdentity(HashMap::new()),
+            Duration::from_secs(30),
+        ));
+        let flow = AtriumOAuthFlow::new_with_public_appview_base(
+            &public,
+            identity,
+            SqliteOAuthStore::open(":memory:").unwrap(),
+            "http://127.0.0.1:1/",
+            SafeHttpClient::new().with_http_test_hosts(["127.0.0.1".to_owned()]),
+            &appview_base,
+        )
+        .unwrap();
+        let viewer = "did:plc:viewer";
+        let accepted_labelers = vec![
+            BSKY_MODERATION_LABELER_DID.to_owned(),
+            "did:plc:customlabeler".to_owned(),
+        ];
+        flow.labeler_preference_cache.lock().await.insert(
+            viewer.to_owned(),
+            (
+                tokio::time::Instant::now() + Duration::from_secs(60),
+                accepted_labelers.clone(),
+            ),
+        );
+
+        flow.fetch_account_labels_for_page(
+            viewer,
+            vec![
+                "did:plc:authora".to_owned(),
+                "did:plc:authorb".to_owned(),
+                "did:plc:authorc".to_owned(),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let requests = requests.lock().unwrap();
+        let profile_calls = requests
+            .iter()
+            .filter(|(uri, _)| uri.starts_with("/xrpc/app.bsky.actor.getProfiles?"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            profile_calls.len(),
+            1,
+            "production flow should batch authors"
+        );
+        let query = profile_calls[0].0.split_once('?').unwrap().1;
+        let actors = url::form_urlencoded::parse(query.as_bytes())
+            .filter_map(|(name, value)| (name == "actors").then(|| value.into_owned()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actors,
+            ["did:plc:authora", "did:plc:authorb", "did:plc:authorc"]
+        );
+        let accepted = profile_calls[0].1.as_deref().unwrap();
+        assert!(accepted.contains(BSKY_MODERATION_LABELER_DID), "{accepted}");
+        assert!(accepted.contains("did:plc:customlabeler"), "{accepted}");
+        drop(requests);
+        server.abort();
+    }
 
     #[test]
     fn external_post_record_has_the_atproto_shape_with_optional_thumbnail() {
