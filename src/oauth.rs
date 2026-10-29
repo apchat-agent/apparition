@@ -87,8 +87,8 @@ const PROFILE_NEGATIVE_TTL: Duration = Duration::from_secs(60 * 60);
 const PAGE_PROFILE_BUDGET: Duration = Duration::from_millis(1500);
 const PAGE_PROFILE_CONCURRENCY: usize = 8;
 const PAGE_QUOTE_CONCURRENCY: usize = 16;
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m13";
-const WEB_SCRIPT_URL: &str = "/static/app.js?v=js11";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m14";
+const WEB_SCRIPT_URL: &str = "/static/app.js?v=js12";
 const HLS_SCRIPT_URL: &str = "/static/vendor/hls.min.js?v=1.7.3";
 const ALT_MODEL_DOWNLOAD_BYTES: u64 = 264_713_119;
 const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
@@ -9032,8 +9032,8 @@ mod tests {
         assert!(css.contains(".thread-focus-actions .is-liked .icon {\n  fill: var(--accent);"));
         assert!(css.contains(".infinite-scroll-status {"));
         assert!(css.contains(".infinite-scroll-retry[hidden] {\n  display: none;"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m13"));
-        assert!(WEB_SCRIPT_URL.contains("v=js11"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m14"));
+        assert!(WEB_SCRIPT_URL.contains("v=js12"));
     }
 
     #[test]
