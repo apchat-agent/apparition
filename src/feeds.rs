@@ -54,6 +54,9 @@ pub struct FeedTimeline {
     pub timeline: HydratedFeedPage,
 }
 
+const LIVE_POST_CACHE_ENTRIES: usize = 20_000;
+const LIVE_POST_CACHE_SECS: u64 = 6 * 60 * 60;
+
 pub struct FeedClient<B: IdentityBackend> {
     identity: Arc<IdentityResolver<B>>,
     http: SafeHttpClient,
@@ -272,7 +275,7 @@ impl<B: IdentityBackend> FeedClient<B> {
         skeleton: FeedSkeletonPage,
         storage: &dyn Storage,
     ) -> Result<HydratedFeedPage, String> {
-        const LIVE_FETCH_CONCURRENCY: usize = 8;
+        const LIVE_FETCH_CONCURRENCY: usize = 16;
         const PAGE_BUDGET: Duration = Duration::from_secs(8);
         let count = skeleton.feed.len();
         let cursor = skeleton.cursor;
@@ -391,9 +394,13 @@ impl<B: IdentityBackend> FeedClient<B> {
             time_us,
             record: value,
         };
+        // Kept long and large so a feed refresh only fetches posts it has not seen (feed generators have no
+        // "changes since"). Posts are immutable once written; a deletion shows for at most the TTL.
         let mut cache = self.live_post_cache.lock().await;
-        cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
-        if cache.len() >= 256
+        if cache.len() >= LIVE_POST_CACHE_ENTRIES {
+            cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
+        }
+        if cache.len() >= LIVE_POST_CACHE_ENTRIES
             && let Some(oldest) = cache.keys().next().cloned()
         {
             cache.remove(&oldest);
@@ -401,7 +408,7 @@ impl<B: IdentityBackend> FeedClient<B> {
         cache.insert(
             uri.to_owned(),
             (
-                tokio::time::Instant::now() + Duration::from_secs(10 * 60),
+                tokio::time::Instant::now() + Duration::from_secs(LIVE_POST_CACHE_SECS),
                 record.clone(),
             ),
         );
