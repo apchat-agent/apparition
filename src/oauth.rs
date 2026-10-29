@@ -7927,8 +7927,13 @@ struct TimelinePostItemOptions<'a> {
 
 #[derive(Default)]
 struct TimelinePostGrouping {
-    groups_by_newest: HashMap<usize, Vec<usize>>,
+    groups_by_newest: HashMap<usize, TimelinePostGroup>,
     grouped_indices: HashSet<usize>,
+}
+
+struct TimelinePostGroup {
+    page_members: Vec<usize>,
+    ancestors: Vec<IndexedRecord>,
 }
 
 fn timeline_post_grouping(
@@ -7989,6 +7994,7 @@ fn timeline_post_grouping(
             .filter(|uri| post_uri_did(uri).is_some());
         let mut visited_parents = HashSet::new();
         let mut complete_ancestry = true;
+        let mut ancestors_near_to_far = Vec::new();
         while let Some(uri) = parent_uri {
             if !visited_parents.insert(uri) {
                 break;
@@ -7996,6 +8002,7 @@ fn timeline_post_grouping(
             match parents.get(uri) {
                 Some(Some(parent)) => {
                     oldest = oldest.min(parent.time_us);
+                    ancestors_near_to_far.push(parent.clone());
                     parent_uri = parent
                         .record
                         .pointer("/reply/parent/uri")
@@ -8025,12 +8032,14 @@ fn timeline_post_grouping(
             .copied()
             .max_by_key(|index| (records[*index].time_us, std::cmp::Reverse(*index)))
             .unwrap_or(root);
-        let mut oldest_first = chain;
-        oldest_first.sort_by_key(|index| (records[*index].time_us, records[*index].uri.as_str()));
-        grouping
-            .grouped_indices
-            .extend(oldest_first.iter().copied());
-        grouping.groups_by_newest.insert(newest_index, oldest_first);
+        grouping.grouped_indices.extend(chain.iter().copied());
+        grouping.groups_by_newest.insert(
+            newest_index,
+            TimelinePostGroup {
+                page_members: chain,
+                ancestors: ancestors_near_to_far.into_iter().rev().collect(),
+            },
+        );
     }
     grouping
 }
@@ -8049,53 +8058,56 @@ fn render_timeline_post_items<S: Storage>(
     for (index, record) in records.iter().enumerate() {
         if let Some(group) = grouping.groups_by_newest.get(&index) {
             html.push_str("<li class=\"post-item thread-group\" aria-label=\"Reply thread\">");
-            let self_thread = group.first().is_some_and(|first| {
+            let mut members = group
+                .ancestors
+                .iter()
+                .map(|record| (record, None))
+                .collect::<Vec<_>>();
+            members.extend(
                 group
+                    .page_members
                     .iter()
-                    .all(|member| records[*member].did == records[*first].did)
+                    .map(|member| (records[*member], Some(*member))),
+            );
+            let self_thread = members.first().is_some_and(|(first, _)| {
+                members.iter().all(|(member, _)| member.did == first.did)
             });
-            let visible = if self_thread && group.len() > 10 {
-                group
-                    .iter()
+            let visible = if self_thread && members.len() > 10 {
+                (0..members.len())
                     .take(2)
-                    .chain(group.iter().rev().take(3).rev())
-                    .copied()
+                    .chain((0..members.len()).rev().take(3).rev())
                     .collect::<Vec<_>>()
-            } else if !self_thread && group.len() > 3 {
-                group
-                    .iter()
+            } else if !self_thread && members.len() > 3 {
+                (0..members.len())
                     .take(1)
-                    .chain(group.iter().rev().take(2).rev())
-                    .copied()
+                    .chain((0..members.len()).rev().take(2).rev())
                     .collect::<Vec<_>>()
             } else {
-                group.clone()
+                (0..members.len()).collect()
             };
             for (position, member_index) in visible.iter().enumerate() {
                 if position > 0 {
                     html.push_str(
-                        "<span class=\"reply-connector thread-group-connector\" aria-hidden=\"true\"></span>",
+                        "<span class=\"reply-connector reply-connector-previous thread-group-connector\" aria-hidden=\"true\"></span>",
                     );
                 }
-                html.push_str(
-                    preludes
-                        .get(*member_index)
-                        .map(String::as_str)
-                        .unwrap_or(""),
-                );
+                let (member, page_index) = members[*member_index];
+                if let Some(page_index) = page_index {
+                    html.push_str(preludes.get(page_index).map(String::as_str).unwrap_or(""));
+                }
                 html.push_str(&render_web_post(
                     storage,
-                    records[*member_index],
+                    member,
                     viewer_did,
                     write_forms_enabled,
                     true,
-                    *member_index < 6,
+                    page_index.is_none_or(|page_index| page_index < 6),
                     quote_index,
                 ));
             }
-            let skipped = group.len().saturating_sub(visible.len());
+            let skipped = members.len().saturating_sub(visible.len());
             if skipped > 0 {
-                let root_uri = &records[group[0]].uri;
+                let root_uri = &members[0].0.uri;
                 let thread_uri = format!("/app/thread?uri={}", form_encoded(root_uri));
                 let label = if self_thread {
                     format!("{skipped} more in this thread")
