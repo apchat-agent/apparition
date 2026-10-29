@@ -1149,7 +1149,8 @@ button:hover,
     background: var(--page);
   }
 
-  .mobile-nav a {
+  .mobile-nav a,
+  .mobile-nav button {
     display: grid;
     min-width: 3.5rem;
     min-height: 3.25rem;
@@ -1159,6 +1160,24 @@ button:hover,
     color: var(--muted);
     font-size: 0.7rem;
     text-decoration: none;
+  }
+
+  .mobile-nav button {
+    border: 0;
+    padding: 0;
+    background: transparent;
+  }
+
+  .mobile-nav .mobile-search:disabled {
+    color: var(--muted);
+    opacity: 1;
+  }
+
+  .mobile-profile-avatar {
+    width: 1.55rem;
+    height: 1.55rem;
+    border-radius: 50%;
+    object-fit: cover;
   }
 
   .mobile-nav .icon {

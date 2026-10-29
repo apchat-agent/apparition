@@ -1533,6 +1533,7 @@ fn page_shell_with_feeds(
         active_feed,
         following_active,
         true,
+        None,
     )
 }
 
@@ -1544,6 +1545,7 @@ fn page_shell_with_options(
     active_feed: Option<&str>,
     following_active: bool,
     show_feed_tabs: bool,
+    mobile_navigation_override: Option<&str>,
 ) -> String {
     let navigation = if authenticated {
         format!(
@@ -1568,14 +1570,18 @@ fn page_shell_with_options(
         String::new()
     };
     let mobile_navigation = if authenticated {
-        format!(
-            "<nav class=\"mobile-nav\" aria-label=\"Mobile navigation\"><a href=\"/app\">{}<span>Home</span></a><a href=\"/feeds\">{}<span>Feeds</span></a><a href=\"/notifications\">{}<span>Alerts</span></a><a href=\"/profile\">{}<span>Profile</span></a></nav><a class=\"mobile-compose\" href=\"/app#new-post\" aria-label=\"New post\">{}</a>",
-            icon_svg("home"),
-            icon_svg("feeds"),
-            icon_svg("notifications"),
-            icon_svg("profile"),
-            icon_svg("compose")
-        )
+        mobile_navigation_override
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                format!(
+                    "<nav class=\"mobile-nav\" aria-label=\"Mobile navigation\"><a href=\"/app\">{}<span>Home</span></a><a href=\"/feeds\">{}<span>Feeds</span></a><a href=\"/notifications\">{}<span>Alerts</span></a><a href=\"/profile\">{}<span>Profile</span></a></nav><a class=\"mobile-compose\" href=\"/app#new-post\" aria-label=\"New post\">{}</a>",
+                    icon_svg("home"),
+                    icon_svg("feeds"),
+                    icon_svg("notifications"),
+                    icon_svg("profile"),
+                    icon_svg("compose")
+                )
+            })
     } else {
         String::new()
     };
@@ -2963,6 +2969,7 @@ where
     } else {
         String::new()
     };
+    let mobile_navigation = render_thread_mobile_navigation(state.storage.as_ref(), &viewer_did);
     Html(page_shell_with_options(
         "Thread",
         &format!(
@@ -2979,6 +2986,7 @@ where
         None,
         false,
         false,
+        Some(&mobile_navigation),
     ))
     .into_response()
 }
@@ -3154,6 +3162,20 @@ fn render_thread_reply_bar<S: Storage>(storage: &S, viewer_did: &str) -> String 
     format!(
         "<aside class=\"thread-reply-bar\" aria-label=\"Mobile reply bar\">{}<a href=\"#reply-composer\">Write your reply</a></aside>",
         avatar_markup(&profile, "small-avatar")
+    )
+}
+
+fn render_thread_mobile_navigation<S: Storage>(storage: &S, viewer_did: &str) -> String {
+    let profile = profile_view_from_storage(storage, viewer_did)
+        .unwrap_or_else(|_| json!({"did":viewer_did,"handle":viewer_did}));
+    format!(
+        "<nav class=\"mobile-nav\" aria-label=\"Mobile navigation\"><a href=\"/app\">{}<span>Home</span></a><button class=\"mobile-search\" type=\"button\" aria-label=\"Mobile search\" disabled>{}<span>Search</span></button><a href=\"/feeds\">{}<span>Feeds</span></a><a href=\"/notifications\">{}<span>Notifications</span></a><a href=\"/profile\" aria-label=\"Profile\">{}</a></nav><a class=\"mobile-compose\" href=\"/app#new-post\" aria-label=\"New post\">{}</a>",
+        icon_svg("home"),
+        icon_svg("search"),
+        icon_svg("feeds"),
+        icon_svg("notifications"),
+        avatar_markup(&profile, "mobile-profile-avatar"),
+        icon_svg("compose")
     )
 }
 
