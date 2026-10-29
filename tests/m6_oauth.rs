@@ -1068,7 +1068,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
             ),
             "{path}"
         );
-        assert!(html.contains("href=\"/static/app.css?v=m16\""), "{path}");
+        assert!(html.contains("href=\"/static/app.css?v=m17\""), "{path}");
         assert!(!html.contains("style="), "{path}");
         // Both playback and interaction scripts are local, deferred, and never inline.
         assert_eq!(html.matches("<script").count(), 2, "{path}");
@@ -1082,7 +1082,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
     let stylesheet = app
         .oneshot(
             Request::builder()
-                .uri("/static/app.css?v=m16")
+                .uri("/static/app.css?v=m17")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1382,7 +1382,7 @@ async fn sign_in_error_page_uses_the_shared_mobile_document_shell() {
     );
     assert!(html.contains("Login failed, try again"));
     assert!(html.contains("href=\"/login\""));
-    assert!(html.contains("href=\"/static/app.css?v=m16\""));
+    assert!(html.contains("href=\"/static/app.css?v=m17\""));
     assert!(!html.contains("style="));
     // The shared shell loads both local deferred scripts, never inline code.
     assert_eq!(html.matches("<script").count(), 2);
@@ -5922,6 +5922,39 @@ async fn own_timeline_hides_posts_by_muted_and_blocked_accounts() {
     assert!(html.contains("visible content"), "{html}");
     assert!(!html.contains("muted content"), "{html}");
     assert!(!html.contains("blocked content"), "{html}");
+}
+
+#[tokio::test]
+async fn profile_block_requires_explicit_confirmation() {
+    let storage = Arc::new(MemoryStorage::default());
+    let flow = FakeOAuthFlow::default();
+    let actions = flow.actions.clone();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage.clone());
+    let cookie = finish_login(&app).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/profile/action")
+                .header("origin", "https://appview.example")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("cookie", cookie)
+                .body(Body::from("subject=did%3Aplc%3Afriend&action=block"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(actions.lock().unwrap().is_empty());
+    assert!(
+        storage
+            .records_for_actor_collection("did:plc:alice", "app.bsky.graph.block", 10)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
