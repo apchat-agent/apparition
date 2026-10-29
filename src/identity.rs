@@ -3,11 +3,13 @@ use crate::{
     net::SafeHttpClient,
 };
 use http::{HeaderMap, HeaderValue, header};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     future::Future,
-    sync::Arc,
+    path::Path,
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
 use thiserror::Error;
@@ -81,14 +83,15 @@ impl DidDocument {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Identity {
     pub did: String,
     /// Only set when the handle's DNS/HTTPS assertion and DID document agree.
     pub handle: Option<String>,
 }
 
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Deserialize, Serialize, Error)]
+#[serde(tag = "kind", content = "details")]
 pub enum ResolutionError {
     #[error("invalid handle: {0}")]
     InvalidHandle(String),
@@ -126,10 +129,134 @@ struct CachedIdentity {
     identity: Identity,
 }
 
+const PERSISTED_IDENTITY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const PERSISTED_IDENTITY_FAILURE_TTL: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistedIdentity {
+    identity: Option<Identity>,
+    document: Option<DidDocument>,
+}
+
+/// Small SQLite cache shared by all production identity resolvers. It stores full DID documents so
+/// callers can recover the verified PDS endpoint immediately after process restart.
+#[derive(Clone)]
+pub struct SqliteIdentityCache {
+    connection: Arc<StdMutex<Connection>>,
+}
+
+impl SqliteIdentityCache {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, rusqlite::Error> {
+        let path = path.as_ref();
+        if path != Path::new(":memory:")
+            && let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        }
+        crate::ingest::ensure_private_database_file(path)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        let connection = Connection::open(path)?;
+        connection.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA busy_timeout = 5000;
+             CREATE TABLE IF NOT EXISTS identity_resolution_cache (
+                 cache_key TEXT PRIMARY KEY,
+                 did TEXT NOT NULL,
+                 result_json TEXT NOT NULL,
+                 expires_at_ms INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS identity_resolution_cache_did
+                 ON identity_resolution_cache(did);",
+        )?;
+        Ok(Self {
+            connection: Arc::new(StdMutex::new(connection)),
+        })
+    }
+
+    fn get(
+        &self,
+        key: &str,
+    ) -> Result<Option<Result<PersistedIdentity, ResolutionError>>, rusqlite::Error> {
+        let connection = self.connection.lock().map_err(|_| {
+            rusqlite::Error::InvalidParameterName("identity cache mutex poisoned".to_owned())
+        })?;
+        let stored: Option<(String, i64)> = connection
+            .query_row(
+                "SELECT result_json, expires_at_ms FROM identity_resolution_cache WHERE cache_key=?1",
+                [key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((json, expires_at_ms)) = stored else {
+            return Ok(None);
+        };
+        if expires_at_ms <= unix_time_ms() {
+            connection.execute(
+                "DELETE FROM identity_resolution_cache WHERE cache_key=?1",
+                [key],
+            )?;
+            return Ok(None);
+        }
+        match serde_json::from_str(&json) {
+            Ok(value) => Ok(Some(value)),
+            Err(_) => {
+                connection.execute(
+                    "DELETE FROM identity_resolution_cache WHERE cache_key=?1",
+                    [key],
+                )?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn set(
+        &self,
+        key: &str,
+        did: &str,
+        value: Result<PersistedIdentity, ResolutionError>,
+        ttl: Duration,
+    ) -> Result<(), rusqlite::Error> {
+        let json = serde_json::to_string(&value)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        let now_ms = unix_time_ms();
+        let expires_at_ms = now_ms.saturating_add(ttl.as_millis().min(i64::MAX as u128) as i64);
+        let connection = self.connection.lock().map_err(|_| {
+            rusqlite::Error::InvalidParameterName("identity cache mutex poisoned".to_owned())
+        })?;
+        connection.execute(
+            "DELETE FROM identity_resolution_cache WHERE expires_at_ms <= ?1",
+            [now_ms],
+        )?;
+        connection.execute(
+            "INSERT INTO identity_resolution_cache(cache_key,did,result_json,expires_at_ms)
+             VALUES(?1,?2,?3,?4)
+             ON CONFLICT(cache_key) DO UPDATE SET
+                did=excluded.did,result_json=excluded.result_json,expires_at_ms=excluded.expires_at_ms",
+            params![key, did, json, expires_at_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Remove all aliases, documents, and verified identities for a DID after a Jetstream event.
+    pub fn invalidate_did(&self, did: &str) -> Result<(), rusqlite::Error> {
+        self.connection
+            .lock()
+            .map_err(|_| {
+                rusqlite::Error::InvalidParameterName("identity cache mutex poisoned".to_owned())
+            })?
+            .execute("DELETE FROM identity_resolution_cache WHERE did=?1", [did])?;
+        Ok(())
+    }
+}
+
 pub struct IdentityResolver<B> {
     backend: Arc<B>,
     ttl: Duration,
     cache: RwLock<HashMap<String, CachedIdentity>>,
+    persistent_cache: Option<Arc<SqliteIdentityCache>>,
 }
 
 impl<B: IdentityBackend> IdentityResolver<B> {
@@ -138,53 +265,122 @@ impl<B: IdentityBackend> IdentityResolver<B> {
             backend: Arc::new(backend),
             ttl,
             cache: RwLock::new(HashMap::new()),
+            persistent_cache: None,
         }
+    }
+
+    pub fn with_persistent_cache(mut self, cache: Arc<SqliteIdentityCache>) -> Self {
+        self.persistent_cache = Some(cache);
+        self
     }
 
     pub async fn resolve_handle(&self, handle: &str) -> Result<Identity, ResolutionError> {
         let handle = normalize_handle(handle)?;
         let key = format!("handle:{handle}");
-        if let Some(identity) = self.cached(&key).await {
+        if let Some(cached) = self.persistent_result(&key) {
+            return cached?.identity.ok_or_else(|| {
+                ResolutionError::Backend("cached handle result had no identity".to_owned())
+            });
+        }
+        if self.persistent_cache.is_none()
+            && let Some(identity) = self.cached(&key).await
+        {
             return Ok(identity);
         }
 
-        let did = self.resolve_handle_assertion(&handle).await?;
-        let doc = self
-            .backend
-            .did_document(&did)
-            .await?
-            .ok_or_else(|| ResolutionError::DidNotFound(did.clone()))?;
-        if doc.id != did
-            || !doc
-                .also_known_as
-                .iter()
-                .any(|uri| uri == &format!("at://{handle}"))
-        {
-            return Err(ResolutionError::UnverifiedHandle(handle));
+        let mut resolved_did = None;
+        let result = async {
+            let did = self.resolve_handle_assertion(&handle).await?;
+            resolved_did = Some(did.clone());
+            let doc = self.resolve_did_document(&did).await?;
+            if doc.id != did
+                || !doc
+                    .also_known_as
+                    .iter()
+                    .any(|uri| uri == &format!("at://{handle}"))
+            {
+                return Err(ResolutionError::UnverifiedHandle(handle.clone()));
+            }
+            Ok((
+                Identity {
+                    did,
+                    handle: Some(handle.clone()),
+                },
+                doc,
+            ))
         }
-
-        let identity = Identity {
-            did,
-            handle: Some(handle),
-        };
-        self.insert(key, identity.clone()).await;
-        Ok(identity)
+        .await;
+        match result {
+            Ok((identity, document)) => {
+                self.insert(key.clone(), identity.clone()).await;
+                self.persist_success(
+                    &key,
+                    &identity.did,
+                    Some(identity.clone()),
+                    Some(document.clone()),
+                );
+                self.persist_success(
+                    &format!("did-document:{}", identity.did),
+                    &identity.did,
+                    None,
+                    Some(document),
+                );
+                self.persist_success(
+                    &format!("did-identity:{}", identity.did),
+                    &identity.did,
+                    Some(identity.clone()),
+                    None,
+                );
+                Ok(identity)
+            }
+            Err(error) => {
+                self.persist_failure(&key, resolved_did.as_deref().unwrap_or(""), error.clone());
+                Err(error)
+            }
+        }
     }
 
     pub async fn resolve_did_document(&self, did: &str) -> Result<DidDocument, ResolutionError> {
         validate_did(did)?;
-        let document = self
-            .backend
-            .did_document(did)
-            .await?
-            .ok_or_else(|| ResolutionError::DidNotFound(did.to_owned()))?;
-        if document.id != did {
-            return Err(ResolutionError::DidDocumentMismatch {
-                actual: document.id,
-                requested: did.to_owned(),
-            });
+        let key = format!("did-document:{did}");
+        if let Some(cached) = self.persistent_result(&key) {
+            let document = cached?.document.ok_or_else(|| {
+                ResolutionError::Backend("cached DID document result had no document".to_owned())
+            })?;
+            if document.id != did {
+                return Err(ResolutionError::DidDocumentMismatch {
+                    actual: document.id,
+                    requested: did.to_owned(),
+                });
+            }
+            return Ok(document);
         }
-        Ok(document)
+
+        let result = async {
+            let document = self
+                .backend
+                .did_document(did)
+                .await?
+                .ok_or_else(|| ResolutionError::DidNotFound(did.to_owned()))?;
+            if document.id != did {
+                return Err(ResolutionError::DidDocumentMismatch {
+                    actual: document.id,
+                    requested: did.to_owned(),
+                });
+            }
+            Ok(document)
+        }
+        .await;
+        match result {
+            Ok(document) => {
+                self.persist_success(&key, did, None, Some(document.clone()));
+                Ok(document)
+            }
+            Err(error) => {
+                self.persist_failure(&key, did, error.clone());
+                Err(error)
+            }
+        }
     }
 
     pub async fn verified_handle_for_document(
@@ -210,29 +406,79 @@ impl<B: IdentityBackend> IdentityResolver<B> {
     pub async fn resolve_did(&self, did: &str) -> Result<Identity, ResolutionError> {
         validate_did(did)?;
         let key = format!("did:{did}");
-        if let Some(identity) = self.cached(&key).await {
+        let persistent_key = format!("did-identity:{did}");
+        if let Some(cached) = self.persistent_result(&persistent_key) {
+            return cached?.identity.ok_or_else(|| {
+                ResolutionError::Backend("cached DID identity result had no identity".to_owned())
+            });
+        }
+        if self.persistent_cache.is_none()
+            && let Some(identity) = self.cached(&key).await
+        {
             return Ok(identity);
         }
 
-        let doc = self
-            .backend
-            .did_document(did)
-            .await?
-            .ok_or_else(|| ResolutionError::DidNotFound(did.to_owned()))?;
-        if doc.id != did {
-            return Err(ResolutionError::DidDocumentMismatch {
-                actual: doc.id,
-                requested: did.to_owned(),
-            });
+        let result: Result<Identity, ResolutionError> = async {
+            let doc = self.resolve_did_document(did).await?;
+            let verified_handle = self.verified_handle_for_document(&doc).await?;
+            Ok(Identity {
+                did: did.to_owned(),
+                handle: verified_handle,
+            })
         }
+        .await;
+        match result {
+            Ok(identity) => {
+                self.insert(key, identity.clone()).await;
+                self.persist_success(&persistent_key, did, Some(identity.clone()), None);
+                Ok(identity)
+            }
+            Err(error) => {
+                self.persist_failure(&persistent_key, did, error.clone());
+                Err(error)
+            }
+        }
+    }
 
-        let verified_handle = self.verified_handle_for_document(&doc).await?;
-        let identity = Identity {
-            did: did.to_owned(),
-            handle: verified_handle,
+    fn persistent_result(&self, key: &str) -> Option<Result<PersistedIdentity, ResolutionError>> {
+        let cache = self.persistent_cache.as_ref()?;
+        match cache.get(key) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(%error, cache_key = key, "could not read persistent identity cache");
+                None
+            }
+        }
+    }
+
+    fn persist_success(
+        &self,
+        key: &str,
+        did: &str,
+        identity: Option<Identity>,
+        document: Option<DidDocument>,
+    ) {
+        let Some(cache) = &self.persistent_cache else {
+            return;
         };
-        self.insert(key, identity.clone()).await;
-        Ok(identity)
+        if let Err(error) = cache.set(
+            key,
+            did,
+            Ok(PersistedIdentity { identity, document }),
+            PERSISTED_IDENTITY_TTL,
+        ) {
+            tracing::warn!(%error, cache_key = key, "could not save persistent identity cache");
+        }
+    }
+
+    fn persist_failure(&self, key: &str, did: &str, error: ResolutionError) {
+        let Some(cache) = &self.persistent_cache else {
+            return;
+        };
+        if let Err(storage_error) = cache.set(key, did, Err(error), PERSISTED_IDENTITY_FAILURE_TTL)
+        {
+            tracing::warn!(%storage_error, cache_key = key, "could not save persistent identity failure");
+        }
     }
 
     async fn resolve_handle_assertion(&self, handle: &str) -> Result<String, ResolutionError> {
@@ -261,6 +507,9 @@ impl<B: IdentityBackend> IdentityResolver<B> {
     }
 
     async fn insert(&self, key: String, identity: Identity) {
+        if self.persistent_cache.is_some() {
+            return;
+        }
         self.cache.write().await.insert(
             key,
             CachedIdentity {
@@ -442,6 +691,14 @@ fn normalize_handle(handle: &str) -> Result<String, ResolutionError> {
     } else {
         Err(ResolutionError::InvalidHandle(handle))
     }
+}
+
+fn unix_time_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
 }
 
 fn validate_did(did: &str) -> Result<(), ResolutionError> {

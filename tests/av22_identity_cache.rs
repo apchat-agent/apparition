@@ -157,10 +157,10 @@ async fn jetstream_identity_and_account_events_invalidate_persisted_did_document
     let old_backend = FakeIdentityBackend::default();
     old_backend.publish(ALICE, Some("alice.test"), "https://old-alice-pds.test");
     old_backend.publish(BOB, Some("bob.test"), "https://old-bob-pds.test");
-    let resolver =
-        IdentityResolver::new(old_backend, Duration::ZERO).with_persistent_cache(cache.clone());
-    resolver.resolve_did_document(ALICE).await.unwrap();
-    resolver.resolve_did_document(BOB).await.unwrap();
+    let resolver = IdentityResolver::new(old_backend.clone(), Duration::ZERO)
+        .with_persistent_cache(cache.clone());
+    resolver.resolve_did(ALICE).await.unwrap();
+    resolver.resolve_did(BOB).await.unwrap();
 
     let ingestor = Ingestor::new(Arc::new(MemoryStorage::default()), ScopeMode::Full)
         .with_identity_cache(cache.clone());
@@ -171,13 +171,10 @@ async fn jetstream_identity_and_account_events_invalidate_persisted_did_document
         ])
         .unwrap();
 
-    let new_backend = FakeIdentityBackend::default();
-    new_backend.publish(ALICE, Some("alice.test"), "https://new-alice-pds.test");
-    new_backend.publish(BOB, Some("bob.test"), "https://new-bob-pds.test");
-    let refreshed = IdentityResolver::new(new_backend.clone(), Duration::ZERO)
-        .with_persistent_cache(cache.clone());
+    old_backend.publish(ALICE, Some("alice.test"), "https://new-alice-pds.test");
+    old_backend.publish(BOB, Some("bob.test"), "https://new-bob-pds.test");
     assert_eq!(
-        refreshed
+        resolver
             .resolve_did_document(ALICE)
             .await
             .unwrap()
@@ -186,7 +183,7 @@ async fn jetstream_identity_and_account_events_invalidate_persisted_did_document
         Some("https://new-alice-pds.test")
     );
     assert_eq!(
-        refreshed
+        resolver
             .resolve_did_document(BOB)
             .await
             .unwrap()
@@ -194,7 +191,7 @@ async fn jetstream_identity_and_account_events_invalidate_persisted_did_document
             .as_deref(),
         Some("https://new-bob-pds.test")
     );
-    assert_eq!(new_backend.document_call_count(), 2);
+    assert_eq!(old_backend.document_call_count(), 4);
     drop(cache);
     cleanup_database(&path);
 }

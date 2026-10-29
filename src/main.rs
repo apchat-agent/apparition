@@ -4,7 +4,7 @@ use appview_rs::{
         AtriumRepoVerifier, BackfillWorker, HostRateLimiter, HttpRepoSource, RepoBackfiller,
     },
     config::{Config, OAuthMode},
-    identity::{HandleRefreshWorker, HttpIdentityBackend, IdentityResolver},
+    identity::{HandleRefreshWorker, HttpIdentityBackend, IdentityResolver, SqliteIdentityCache},
     ingest::{Ingestor, JetstreamConsumer, SqliteStorage},
     init_tracing,
     jwt::ServiceJwtVerifier,
@@ -24,22 +24,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let address = listener.local_addr()?;
     let (database_path, oauth_database_path) = appview_rs::config::database_paths(&config.data_dir);
     let storage = Arc::new(SqliteStorage::open(&database_path)?);
+    let identity_cache = Arc::new(SqliteIdentityCache::open(&database_path)?);
     let oauth_store = SqliteOAuthStore::open(&oauth_database_path)?;
     let oauth_key_path = PathBuf::from(&config.data_dir).join("oauth-client-key.json");
     let oauth = match config.oauth_mode {
         OAuthMode::Confidential => OAuthPublic::load_or_create(&config.public_url, oauth_key_path)?,
         OAuthMode::Loopback => OAuthPublic::load_or_create_loopback(address, oauth_key_path)?,
     };
-    let oauth_identity_resolver = Arc::new(IdentityResolver::new(
-        HttpIdentityBackend::default(),
-        Duration::from_secs(1800),
-    ));
+    let oauth_identity_resolver = Arc::new(
+        IdentityResolver::new(HttpIdentityBackend::default(), Duration::from_secs(1800))
+            .with_persistent_cache(identity_cache.clone()),
+    );
     let oauth_flow = oauth
         .atrium_flow(oauth_identity_resolver, oauth_store)
         .map_err(std::io::Error::other)?;
     let profile_refresh_worker =
         ProfileRefreshWorker::new(oauth_flow.clone(), storage.clone(), Duration::from_secs(2));
-    let ingestor = Ingestor::new(storage.clone(), config.scope_mode);
+    let ingestor = Ingestor::new(storage.clone(), config.scope_mode)
+        .with_identity_cache(identity_cache.clone());
     let consumer = JetstreamConsumer::new(ingestor, Duration::from_secs(1))
         .with_idle_timeout(Duration::from_secs(config.jetstream_idle_timeout_secs))
         .with_event_timeout(Duration::from_secs(config.jetstream_event_timeout_secs))
@@ -47,11 +49,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             config.jetstream_stale_cursor_threshold_secs,
         ));
     let jetstream_urls = config.jetstream_urls.clone();
-    let resolver = IdentityResolver::new(HttpIdentityBackend::default(), Duration::from_secs(1800));
-    let jwt_resolver = Arc::new(IdentityResolver::new(
-        HttpIdentityBackend::default(),
-        Duration::from_secs(1800),
-    ));
+    let resolver = IdentityResolver::new(HttpIdentityBackend::default(), Duration::from_secs(1800))
+        .with_persistent_cache(identity_cache.clone());
+    let jwt_resolver = Arc::new(
+        IdentityResolver::new(HttpIdentityBackend::default(), Duration::from_secs(1800))
+            .with_persistent_cache(identity_cache.clone()),
+    );
     let jwt = Arc::new(ServiceJwtVerifier::new(
         jwt_resolver,
         config.appview_did.clone(),
@@ -79,7 +82,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     let handle_refresh_worker = HandleRefreshWorker::new(
         storage.clone(),
-        IdentityResolver::new(HttpIdentityBackend::default(), Duration::from_secs(1800)),
+        IdentityResolver::new(HttpIdentityBackend::default(), Duration::from_secs(1800))
+            .with_persistent_cache(identity_cache),
         Duration::from_secs(1800),
         Duration::from_secs(30),
     );

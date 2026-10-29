@@ -3420,6 +3420,7 @@ struct JetstreamCommit {
 
 pub struct Ingestor<S: Storage> {
     storage: Arc<S>,
+    identity_cache: Option<Arc<crate::identity::SqliteIdentityCache>>,
     scope: ScopeMode,
     cursor: AtomicU64,
     processed: AtomicU64,
@@ -3499,11 +3500,20 @@ impl<S: Storage> Ingestor<S> {
         let cursor = storage.cursor().ok().flatten().unwrap_or_default();
         Self {
             storage,
+            identity_cache: None,
             scope,
             cursor: AtomicU64::new(cursor),
             processed: AtomicU64::new(0),
             batch_metrics: Mutex::new(IngestIntervalMetrics::default()),
         }
+    }
+
+    pub fn with_identity_cache(
+        mut self,
+        identity_cache: Arc<crate::identity::SqliteIdentityCache>,
+    ) -> Self {
+        self.identity_cache = Some(identity_cache);
+        self
     }
 
     pub fn process_json(&self, json: &str) -> Result<(), IngestError> {
@@ -3527,11 +3537,17 @@ impl<S: Storage> Ingestor<S> {
                 time_us: event.time_us,
                 ..JetstreamStorageUpdate::default()
             };
-            if matches!(event.kind.as_str(), "identity" | "account")
-                && (self.storage.is_tracked_did(&event.did)?
-                    || self.storage.is_displayed_did(&event.did)?)
-            {
-                update.handle_refresh = Some(event.did.clone());
+            if matches!(event.kind.as_str(), "identity" | "account") {
+                if let Some(cache) = &self.identity_cache
+                    && let Err(error) = cache.invalidate_did(&event.did)
+                {
+                    tracing::warn!(%error, did = %event.did, "could not invalidate identity cache after Jetstream event");
+                }
+                if self.storage.is_tracked_did(&event.did)?
+                    || self.storage.is_displayed_did(&event.did)?
+                {
+                    update.handle_refresh = Some(event.did.clone());
+                }
             }
             if event.kind == "commit"
                 && let Some(commit) = event.commit
