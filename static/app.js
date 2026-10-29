@@ -1,5 +1,32 @@
 // Like toggles in place instead of reloading the page. Without this script the form posts as before.
 document.addEventListener("submit", async (event) => {
+  const profileForm = event.target;
+  if (profileForm instanceof HTMLFormElement && profileForm.getAttribute("action") === "/profile/action") {
+    event.preventDefault();
+    const prompt = profileForm.dataset.confirm;
+    if (prompt && !window.confirm(prompt)) return;
+    const button = profileForm.querySelector("button[type=submit]");
+    if (button) button.disabled = true;
+    try {
+      const response = await fetch("/profile/action", {
+        method: "POST",
+        body: new URLSearchParams(new FormData(profileForm)),
+        headers: { "x-appview-fetch": "1" },
+        credentials: "same-origin",
+      });
+      if (!response.ok) throw new Error(String(response.status));
+      const result = await response.json();
+      const current = document.querySelector(".profile-actions");
+      if (!current || typeof result.actions_html !== "string") throw new Error("profile actions are unavailable");
+      const replacement = document.createElement("template");
+      replacement.innerHTML = result.actions_html;
+      current.replaceWith(replacement.content);
+    } catch {
+      profileForm.submit();
+    }
+    return;
+  }
+
   const form = event.target;
   if (!(form instanceof HTMLFormElement) || form.getAttribute("action") !== "/like") return;
   const button = form.querySelector("button");

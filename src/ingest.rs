@@ -391,6 +391,12 @@ pub trait Storage: Send + Sync {
         subject_uri: &str,
         limit: usize,
     ) -> Result<Vec<IndexedRecord>, StorageError>;
+    fn records_for_actor_collection(
+        &self,
+        did: &str,
+        collection: &str,
+        limit: usize,
+    ) -> Result<Vec<IndexedRecord>, StorageError>;
     fn follows_for_actor(
         &self,
         did: &str,
@@ -1002,6 +1008,26 @@ impl Storage for MemoryStorage {
             .collect::<Vec<_>>();
         records.sort_by_key(|record| Reverse(record.time_us));
         records.truncate(limit.clamp(1, 101));
+        Ok(records)
+    }
+
+    fn records_for_actor_collection(
+        &self,
+        did: &str,
+        collection: &str,
+        limit: usize,
+    ) -> Result<Vec<IndexedRecord>, StorageError> {
+        let mut records = self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .records
+            .values()
+            .filter(|record| record.collection == collection && record.did == did)
+            .cloned()
+            .collect::<Vec<_>>();
+        records.sort_by_key(|record| Reverse(record.time_us));
+        records.truncate(limit.clamp(1, 10_000));
         Ok(records)
     }
 
@@ -2822,6 +2848,26 @@ impl Storage for SqliteStorage {
         statement
             .query_map(
                 params![collection, subject_uri, limit.clamp(1, 101) as i64],
+                row_to_record,
+            )?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    fn records_for_actor_collection(
+        &self,
+        did: &str,
+        collection: &str,
+        limit: usize,
+    ) -> Result<Vec<IndexedRecord>, StorageError> {
+        let conn = self.read_conn()?;
+        let mut statement = conn.prepare(
+            "SELECT did, collection, rkey, uri, cid, time_us, record_json FROM records
+             WHERE did=?1 AND collection=?2 ORDER BY time_us DESC, uri DESC LIMIT ?3",
+        )?;
+        statement
+            .query_map(
+                params![did, collection, limit.clamp(1, 10_000) as i64],
                 row_to_record,
             )?
             .collect::<Result<Vec<_>, _>>()

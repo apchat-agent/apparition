@@ -3,9 +3,9 @@ use appview_rs::{
     feeds::{FeedTimeline, FeedTimelineTiming, HydratedFeedPage, ResolvedFeed},
     ingest::{IndexedRecord, Ingestor, MemoryStorage, ScopeMode, SqliteStorage, Storage},
     oauth::{
-        FetchedAuthorProfile, OAuthAccount, OAuthCallback, OAuthFlow, OAuthPublic,
-        PdsCreatedRecord, PinnedFeedTabs, PostImage, PostStrongRef, ProfileRefreshWorker,
-        SqliteOAuthStore, WebShutdown,
+        AccountLabel, FetchedAuthorProfile, OAuthAccount, OAuthCallback, OAuthFlow, OAuthPublic,
+        PdsCreatedRecord, PinnedFeedTabs, PostImage, PostStrongRef, ProfileListChoice,
+        ProfileRefreshWorker, SqliteOAuthStore, WebShutdown,
     },
 };
 use appview_rs::{router, router_with_oauth_flow};
@@ -65,6 +65,10 @@ struct FakeOAuthFlow {
     live_posts: Arc<Mutex<std::collections::HashMap<String, IndexedRecord>>>,
     post_requests: Arc<Mutex<Vec<String>>>,
     post_delays_ms: Arc<Mutex<std::collections::HashMap<String, u64>>>,
+    profile_lists: Arc<Mutex<Vec<ProfileListChoice>>>,
+    muted_actors: Arc<Mutex<std::collections::HashSet<String>>>,
+    label_requests: Arc<Mutex<Vec<Vec<String>>>>,
+    account_labels: Arc<Mutex<Vec<AccountLabel>>>,
 }
 
 impl Default for FakeOAuthFlow {
@@ -84,6 +88,10 @@ impl Default for FakeOAuthFlow {
             live_posts: Arc::new(Mutex::new(std::collections::HashMap::new())),
             post_requests: Arc::new(Mutex::new(Vec::new())),
             post_delays_ms: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            profile_lists: Arc::new(Mutex::new(Vec::new())),
+            muted_actors: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            label_requests: Arc::new(Mutex::new(Vec::new())),
+            account_labels: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -469,6 +477,123 @@ impl OAuthFlow for FakeOAuthFlow {
                     "createdAt":"2026-10-28T00:00:00Z"
                 }),
             ))
+        })
+    }
+
+    fn create_profile_graph_record<'a>(
+        &'a self,
+        did: &'a str,
+        collection: &'a str,
+        record: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let rkey = {
+                let mut actions = self.actions.lock().unwrap();
+                let rkey = format!("profile-action-{}", actions.len());
+                actions.push(format!("create:{collection}:{did}:{record}"));
+                rkey
+            };
+            let created = fake_pds_create_record(
+                did,
+                collection,
+                &rkey,
+                &format!("{rkey}-cid"),
+                record.clone(),
+            );
+            if collection == "app.bsky.graph.listitem"
+                && let (Some(list_uri), Some(subject)) = (
+                    record.get("list").and_then(Value::as_str),
+                    record.get("subject").and_then(Value::as_str),
+                )
+            {
+                let mut lists = self.profile_lists.lock().unwrap();
+                if let Some(list) = lists
+                    .iter_mut()
+                    .find(|list| list.uri == list_uri && list.item_uri.is_none())
+                {
+                    list.item_uri = Some(created.uri.clone());
+                }
+                let _ = subject;
+            }
+            Ok(created)
+        })
+    }
+
+    fn delete_profile_graph_record<'a>(
+        &'a self,
+        did: &'a str,
+        collection: &'a str,
+        uri: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.actions
+                .lock()
+                .unwrap()
+                .push(format!("delete:{collection}:{did}:{uri}"));
+            if collection == "app.bsky.graph.listitem" {
+                for list in self.profile_lists.lock().unwrap().iter_mut() {
+                    if list.item_uri.as_deref() == Some(uri) {
+                        list.item_uri = None;
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn set_actor_muted<'a>(
+        &'a self,
+        did: &'a str,
+        subject: &'a str,
+        muted: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.actions.lock().unwrap().push(format!(
+                "{}:{did}:{subject}",
+                if muted { "mute" } else { "unmute" }
+            ));
+            if muted {
+                self.muted_actors.lock().unwrap().insert(subject.to_owned());
+            } else {
+                self.muted_actors.lock().unwrap().remove(subject);
+            }
+            Ok(())
+        })
+    }
+
+    fn muted_actor_dids<'a>(
+        &'a self,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<std::collections::HashSet<String>, String>> + Send + 'a>>
+    {
+        Box::pin(async move { Ok(self.muted_actors.lock().unwrap().clone()) })
+    }
+
+    fn profile_list_choices<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ProfileListChoice>, String>> + Send + 'a>> {
+        Box::pin(async move { Ok(self.profile_lists.lock().unwrap().clone()) })
+    }
+
+    fn account_labels_for_page<'a>(
+        &'a self,
+        _: &'a str,
+        mut actor_dids: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<AccountLabel>, String>> + Send + 'a>> {
+        Box::pin(async move {
+            actor_dids.sort();
+            actor_dids.dedup();
+            self.label_requests.lock().unwrap().push(actor_dids.clone());
+            Ok(self
+                .account_labels
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|label| actor_dids.contains(&label.subject_did))
+                .cloned()
+                .collect())
         })
     }
 

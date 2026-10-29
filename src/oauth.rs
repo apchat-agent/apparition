@@ -87,8 +87,8 @@ const PROFILE_NEGATIVE_TTL: Duration = Duration::from_secs(60 * 60);
 const PAGE_PROFILE_BUDGET: Duration = Duration::from_millis(1500);
 const PAGE_PROFILE_CONCURRENCY: usize = 8;
 const PAGE_QUOTE_CONCURRENCY: usize = 16;
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m15";
-const WEB_SCRIPT_URL: &str = "/static/app.js?v=js13";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m16";
+const WEB_SCRIPT_URL: &str = "/static/app.js?v=js14";
 const HLS_SCRIPT_URL: &str = "/static/vendor/hls.min.js?v=1.7.3";
 const ALT_MODEL_DOWNLOAD_BYTES: u64 = 264_713_119;
 const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
@@ -201,6 +201,25 @@ pub struct PdsCreatedRecord {
     pub cid: String,
     pub record: Value,
     pub time_us: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProfileListChoice {
+    pub uri: String,
+    pub name: String,
+    pub purpose: String,
+    pub item_uri: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountLabel {
+    pub subject_did: String,
+    pub labeler_did: String,
+    pub labeler_name: String,
+    pub value: String,
+    pub display_name: String,
+    pub severity: String,
+    pub blurs: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -577,6 +596,50 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
         Box::pin(async { Err("repost action is not available".to_owned()) })
     }
+    fn create_profile_graph_record<'a>(
+        &'a self,
+        _did: &'a str,
+        _collection: &'a str,
+        _record: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+        Box::pin(async { Err("profile graph action is not available".to_owned()) })
+    }
+    fn delete_profile_graph_record<'a>(
+        &'a self,
+        _did: &'a str,
+        _collection: &'a str,
+        _uri: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Err("profile graph action is not available".to_owned()) })
+    }
+    fn set_actor_muted<'a>(
+        &'a self,
+        _did: &'a str,
+        _subject: &'a str,
+        _muted: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Err("mute action is not available".to_owned()) })
+    }
+    fn muted_actor_dids<'a>(
+        &'a self,
+        _did: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<HashSet<String>, String>> + Send + 'a>> {
+        Box::pin(async { Ok(HashSet::new()) })
+    }
+    fn profile_list_choices<'a>(
+        &'a self,
+        _did: &'a str,
+        _subject: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ProfileListChoice>, String>> + Send + 'a>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    fn account_labels_for_page<'a>(
+        &'a self,
+        _viewer_did: &'a str,
+        _actor_dids: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<AccountLabel>, String>> + Send + 'a>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
     fn timeline<'a>(
         &'a self,
         _did: &'a str,
@@ -919,6 +982,7 @@ impl OAuthPublic {
             )
             .route("/notifications/stream", get(notification_stream::<F, S>))
             .route("/profile", get(profile_page::<F, S>))
+            .route("/profile/action", post(profile_action::<F, S>))
             .route("/thread", get(thread_page::<F, S>))
             .route("/compose", get(quote_composer::<F, S>))
             .route("/link-preview", post(link_preview::<F, S>))
@@ -1146,8 +1210,13 @@ type FeedPageCache = Arc<
 type FeedSkeletonCache = Arc<
     tokio::sync::Mutex<HashMap<(String, String, String), (tokio::time::Instant, FeedSkeletonPage)>>,
 >;
+type MutedActorCache =
+    Arc<tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, HashSet<String>)>>>;
 const SERVICE_AUTH_LIFETIME_SECS: u64 = 30 * 60;
 const FEED_PAGE_CACHE_SECS: u64 = 60;
+const BSKY_APPVIEW_DID: &str = "did:web:api.bsky.app";
+const BSKY_APPVIEW_SERVICE: &str = "bsky_appview";
+const MUTED_ACTOR_CACHE_TTL: Duration = Duration::from_secs(60);
 
 pub struct AtriumOAuthFlow<B: crate::identity::IdentityBackend = HttpIdentityBackend> {
     client: Arc<AppOAuthClient>,
@@ -1162,6 +1231,7 @@ pub struct AtriumOAuthFlow<B: crate::identity::IdentityBackend = HttpIdentityBac
     service_auth_cache: ServiceAuthCache,
     feed_page_cache: FeedPageCache,
     feed_skeleton_cache: FeedSkeletonCache,
+    muted_actor_cache: MutedActorCache,
 }
 
 impl<B: crate::identity::IdentityBackend> Clone for AtriumOAuthFlow<B> {
@@ -1179,6 +1249,7 @@ impl<B: crate::identity::IdentityBackend> Clone for AtriumOAuthFlow<B> {
             service_auth_cache: self.service_auth_cache.clone(),
             feed_page_cache: self.feed_page_cache.clone(),
             feed_skeleton_cache: self.feed_skeleton_cache.clone(),
+            muted_actor_cache: self.muted_actor_cache.clone(),
         }
     }
 }
@@ -1475,6 +1546,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             service_auth_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             feed_page_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             feed_skeleton_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            muted_actor_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -1564,6 +1636,158 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             }
         }
         cached_preferences.unwrap_or_default()
+    }
+
+    async fn list_repo_collection(
+        &self,
+        did: &str,
+        collection: &str,
+    ) -> Result<Vec<Value>, String> {
+        let parsed_did = did
+            .parse::<Did>()
+            .map_err(|_| "viewer DID is invalid".to_owned())?;
+        let session = self
+            .client
+            .restore(&parsed_did)
+            .await
+            .map_err(|_| "OAuth session could not be restored".to_owned())?;
+        let mut records = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..100 {
+            let mut parameters = json!({"repo":did,"collection":collection,"limit":100});
+            if let Some(value) = cursor.as_deref() {
+                parameters["cursor"] = json!(value);
+            }
+            let request = XrpcRequest {
+                method: http::Method::GET,
+                nsid: "com.atproto.repo.listRecords".to_owned(),
+                parameters: Some(parameters),
+                input: None,
+                encoding: None,
+            };
+            let response: OutputDataOrBytes<Value> = session
+                .send_xrpc::<Value, Value, Value, Value>(&request)
+                .await
+                .map_err(|error| {
+                    log_pds_xrpc_failure("com.atproto.repo.listRecords", &error);
+                    "PDS listRecords request failed".to_owned()
+                })?;
+            let response = match response {
+                OutputDataOrBytes::Data(value) => value,
+                OutputDataOrBytes::Bytes(_) => {
+                    return Err("PDS listRecords returned a non-JSON response".to_owned());
+                }
+            };
+            let Some(page) = response.get("records").and_then(Value::as_array) else {
+                return Err("PDS listRecords returned no records array".to_owned());
+            };
+            records.extend(page.iter().cloned());
+            if records.len() > 10_000 {
+                return Err("PDS listRecords returned too many records".to_owned());
+            }
+            cursor = response
+                .get("cursor")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if cursor.is_none() || page.is_empty() {
+                return Ok(records);
+            }
+        }
+        Err("PDS listRecords pagination exceeded its safety limit".to_owned())
+    }
+
+    async fn fetch_muted_actor_dids(&self, did: &str) -> Result<HashSet<String>, String> {
+        if let Some((expires, actors)) = self.muted_actor_cache.lock().await.get(did).cloned()
+            && expires > tokio::time::Instant::now()
+        {
+            return Ok(actors);
+        }
+        let parsed_did = did
+            .parse::<Did>()
+            .map_err(|_| "viewer DID is invalid".to_owned())?;
+        let session = self
+            .client
+            .restore(&parsed_did)
+            .await
+            .map_err(|_| "OAuth session could not be restored".to_owned())?;
+        let proxy_did = BSKY_APPVIEW_DID
+            .parse::<Did>()
+            .map_err(|_| "Bluesky AppView service DID is invalid".to_owned())?;
+        let api = Agent::new(session).api_with_proxy(proxy_did, BSKY_APPVIEW_SERVICE);
+        let mut actors = HashSet::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..100 {
+            let parameters = atrium_api::app::bsky::graph::get_mutes::ParametersData {
+                cursor: cursor.clone(),
+                limit: None,
+            }
+            .into();
+            let page = api
+                .app
+                .bsky
+                .graph
+                .get_mutes(parameters)
+                .await
+                .map_err(|error| format!("Bluesky getMutes request failed: {error:?}"))?;
+            actors.extend(
+                page.data
+                    .mutes
+                    .into_iter()
+                    .map(|profile| profile.did.to_string()),
+            );
+            cursor = page.data.cursor;
+            if cursor.is_none() {
+                let mut cache = self.muted_actor_cache.lock().await;
+                cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
+                cache.insert(
+                    did.to_owned(),
+                    (
+                        tokio::time::Instant::now() + MUTED_ACTOR_CACHE_TTL,
+                        actors.clone(),
+                    ),
+                );
+                return Ok(actors);
+            }
+        }
+        Err("Bluesky getMutes pagination exceeded its safety limit".to_owned())
+    }
+
+    async fn set_muted_actor(&self, did: &str, subject: &str, muted: bool) -> Result<(), String> {
+        let parsed_did = did
+            .parse::<Did>()
+            .map_err(|_| "viewer DID is invalid".to_owned())?;
+        let actor = subject
+            .parse::<Did>()
+            .map(AtIdentifier::Did)
+            .map_err(|_| "profile DID is invalid".to_owned())?;
+        let session = self
+            .client
+            .restore(&parsed_did)
+            .await
+            .map_err(|_| "OAuth session could not be restored".to_owned())?;
+        let proxy_did = BSKY_APPVIEW_DID
+            .parse::<Did>()
+            .map_err(|_| "Bluesky AppView service DID is invalid".to_owned())?;
+        let api = Agent::new(session).api_with_proxy(proxy_did, BSKY_APPVIEW_SERVICE);
+        if muted {
+            api.app
+                .bsky
+                .graph
+                .mute_actor(atrium_api::app::bsky::graph::mute_actor::InputData { actor }.into())
+                .await
+                .map_err(|error| format!("Bluesky mute request failed: {error:?}"))?;
+        } else {
+            api.app
+                .bsky
+                .graph
+                .unmute_actor(
+                    atrium_api::app::bsky::graph::unmute_actor::InputData { actor }.into(),
+                )
+                .await
+                .map_err(|error| format!("Bluesky unmute request failed: {error:?}"))?;
+        }
+        self.muted_actor_cache.lock().await.remove(did);
+        Ok(())
     }
 
     async fn pds_service_did(&self, viewer_did: &str) -> Result<String, String> {
@@ -1989,12 +2213,23 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
     }
 
     async fn delete_like_record(&self, did: &str, like_uri: &str) -> Result<(), String> {
-        let collection = "app.bsky.feed.like";
+        self.delete_repo_record(did, "app.bsky.feed.like", like_uri)
+            .await
+    }
+
+    async fn delete_repo_record(
+        &self,
+        did: &str,
+        collection: &str,
+        uri: &str,
+    ) -> Result<(), String> {
         let prefix = format!("at://{did}/{collection}/");
-        let rkey = like_uri
+        let rkey = uri
             .strip_prefix(&prefix)
             .filter(|rkey| !rkey.is_empty() && !rkey.contains('/'))
-            .ok_or_else(|| "like URI does not belong to this account".to_owned())?;
+            .ok_or_else(|| {
+                "record URI does not belong to this account and collection".to_owned()
+            })?;
         let did = did.parse::<Did>().map_err(|error| error.to_string())?;
         let session = self
             .client
@@ -2458,6 +2693,95 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
                 }),
             )
             .await
+        })
+    }
+
+    fn create_profile_graph_record<'a>(
+        &'a self,
+        did: &'a str,
+        collection: &'a str,
+        record: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+        Box::pin(async move { self.create_record(did, collection, record).await })
+    }
+
+    fn delete_profile_graph_record<'a>(
+        &'a self,
+        did: &'a str,
+        collection: &'a str,
+        uri: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move { self.delete_repo_record(did, collection, uri).await })
+    }
+
+    fn set_actor_muted<'a>(
+        &'a self,
+        did: &'a str,
+        subject: &'a str,
+        muted: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move { self.set_muted_actor(did, subject, muted).await })
+    }
+
+    fn muted_actor_dids<'a>(
+        &'a self,
+        did: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<HashSet<String>, String>> + Send + 'a>> {
+        Box::pin(async move { self.fetch_muted_actor_dids(did).await })
+    }
+
+    fn profile_list_choices<'a>(
+        &'a self,
+        did: &'a str,
+        subject: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ProfileListChoice>, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let lists = self
+                .list_repo_collection(did, "app.bsky.graph.list")
+                .await?;
+            let items = self
+                .list_repo_collection(did, "app.bsky.graph.listitem")
+                .await?;
+            let memberships = items
+                .iter()
+                .filter_map(|item| {
+                    let value = item.get("value")?;
+                    (value.get("subject").and_then(Value::as_str) == Some(subject))
+                        .then(|| {
+                            Some((
+                                value.get("list")?.as_str()?.to_owned(),
+                                item.get("uri")?.as_str()?.to_owned(),
+                            ))
+                        })
+                        .flatten()
+                })
+                .collect::<HashMap<_, _>>();
+            let mut choices = lists
+                .iter()
+                .filter_map(|list| {
+                    let value = list.get("value")?;
+                    let purpose = value.get("purpose")?.as_str()?;
+                    if !matches!(
+                        purpose,
+                        "app.bsky.graph.defs#curatelist" | "app.bsky.graph.defs#modlist"
+                    ) {
+                        return None;
+                    }
+                    let uri = list.get("uri")?.as_str()?.to_owned();
+                    Some(ProfileListChoice {
+                        item_uri: memberships.get(&uri).cloned(),
+                        uri,
+                        name: value
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Untitled list")
+                            .to_owned(),
+                        purpose: purpose.to_owned(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            choices.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+            Ok(choices)
         })
     }
 
@@ -5216,6 +5540,230 @@ fn render_web_notification<S: Storage>(
     )
 }
 
+async fn profile_action_panel<F: OAuthFlow, S: Storage>(
+    flow: &F,
+    public: &OAuthPublic,
+    headers: &HeaderMap,
+    storage: &S,
+    viewer_did: &str,
+    subject_did: &str,
+) -> Result<String, String> {
+    let following = storage
+        .is_following(viewer_did, subject_did)
+        .map_err(|error| error.to_string())?;
+    let follows_you = storage
+        .is_following(subject_did, viewer_did)
+        .map_err(|error| error.to_string())?;
+    let blocked = storage
+        .records_for_actor_collection(viewer_did, "app.bsky.graph.block", 10_000)
+        .map_err(|error| error.to_string())?
+        .iter()
+        .any(|record| record.record.get("subject").and_then(Value::as_str) == Some(subject_did));
+    let follow_access = verified_cookie_follow_access(public, headers, storage);
+    let block_access = verified_cookie_block_access(public, headers, storage);
+    let mute_access = verified_cookie_mute_access(public, headers, storage);
+    let list_access = verified_cookie_list_access(public, headers, storage);
+    let muted = if mute_access {
+        match flow.muted_actor_dids(viewer_did).await {
+            Ok(muted) => muted.contains(subject_did),
+            Err(error) => {
+                tracing::warn!(%error, "could not load the viewer's muted accounts");
+                false
+            }
+        }
+    } else {
+        false
+    };
+    let lists = if list_access {
+        match flow.profile_list_choices(viewer_did, subject_did).await {
+            Ok(lists) => lists,
+            Err(error) => {
+                tracing::warn!(%error, "could not load the viewer's lists");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    Ok(render_profile_actions(
+        subject_did,
+        following,
+        follows_you,
+        blocked,
+        muted,
+        follow_access,
+        block_access,
+        mute_access,
+        list_access,
+        &lists,
+    ))
+}
+
+fn render_profile_actions(
+    subject_did: &str,
+    following: bool,
+    follows_you: bool,
+    blocked: bool,
+    muted: bool,
+    follow_access: bool,
+    block_access: bool,
+    mute_access: bool,
+    list_access: bool,
+    lists: &[ProfileListChoice],
+) -> String {
+    let mut relationships = Vec::new();
+    if following {
+        relationships.push("You follow this account".to_owned());
+    }
+    if follows_you {
+        relationships.push("Follows you".to_owned());
+    }
+    if blocked {
+        relationships.push("Blocked".to_owned());
+    }
+    if muted {
+        relationships.push("Muted".to_owned());
+    }
+    relationships.extend(
+        lists
+            .iter()
+            .filter(|list| list.item_uri.is_some())
+            .map(|list| format!("In {}", html_escape(&list.name))),
+    );
+    let relationships = if relationships.is_empty() {
+        "<span>No relationship</span>".to_owned()
+    } else {
+        relationships
+            .into_iter()
+            .map(|relationship| format!("<span>{relationship}</span>"))
+            .collect::<String>()
+    };
+    let follow = if follow_access {
+        if following {
+            profile_action_form(subject_did, "unfollow", "Unfollow", None, false)
+        } else {
+            profile_action_form(subject_did, "follow", "Follow", None, false)
+        }
+    } else {
+        permission_reauthorization_link(if following { "unfollow" } else { "follow" })
+    };
+    let block = if block_access {
+        if blocked {
+            profile_action_form(subject_did, "unblock", "Unblock", None, false)
+        } else {
+            profile_action_form(subject_did, "block", "Block", None, true)
+        }
+    } else {
+        permission_reauthorization_link(if blocked { "unblock" } else { "block" })
+    };
+    let mute = if mute_access {
+        if muted {
+            profile_action_form(subject_did, "unmute", "Unmute", None, false)
+        } else {
+            profile_action_form(subject_did, "mute", "Mute", None, false)
+        }
+    } else {
+        permission_reauthorization_link(if muted { "unmute" } else { "mute" })
+    };
+    let list_controls = if !list_access {
+        permission_reauthorization_link("lists")
+    } else if lists.is_empty() {
+        "<p class=\"list-empty\">No lists found in your account.</p>".to_owned()
+    } else {
+        lists
+            .iter()
+            .map(|list| {
+                let purpose = if list.purpose.ends_with("#modlist") {
+                    "Moderation list"
+                } else {
+                    "Curate list"
+                };
+                let form = if let Some(item_uri) = list.item_uri.as_deref() {
+                    profile_action_form(
+                        subject_did,
+                        "list_remove",
+                        &format!("Remove from {}", html_escape(&list.name)),
+                        Some(("item_uri", item_uri)),
+                        true,
+                    )
+                } else {
+                    profile_action_form(
+                        subject_did,
+                        "list_add",
+                        &format!("Add to {}", html_escape(&list.name)),
+                        Some(("list_uri", &list.uri)),
+                        false,
+                    )
+                };
+                format!(
+                    "<div class=\"profile-list-choice\">{form}<span class=\"list-purpose\">{purpose}</span></div>"
+                )
+            })
+            .collect::<String>()
+    };
+    format!(
+        "<section class=\"profile-actions\" aria-label=\"Profile actions\"><h2>Relationship</h2><div class=\"profile-relationships\">{relationships}</div><div class=\"profile-action-buttons\">{follow}{block}{mute}</div><div class=\"profile-list-actions\"><h3>Your lists</h3>{list_controls}</div></section>"
+    )
+}
+
+fn permission_reauthorization_link(action: &str) -> String {
+    let description = match action {
+        "follow" => "follow",
+        "unfollow" => "unfollow",
+        "block" => "block",
+        "unblock" => "unblock",
+        "mute" => "mute",
+        "unmute" => "unmute",
+        _ => "add to lists",
+    };
+    format!("<a class=\"permission-prompt\" href=\"/login\">Sign in again to {description}</a>")
+}
+
+fn profile_action_form(
+    subject_did: &str,
+    action: &str,
+    label: &str,
+    extra: Option<(&str, &str)>,
+    confirmation: bool,
+) -> String {
+    let confirm = if confirmation {
+        let label = if action == "block" {
+            "Confirm block"
+        } else {
+            "Confirm removal"
+        };
+        format!(
+            "<label class=\"action-confirm\"><input type=\"checkbox\" name=\"confirm\" value=\"yes\" required>{label}</label>"
+        )
+    } else {
+        String::new()
+    };
+    let data_confirm = if confirmation {
+        if action == "block" {
+            " data-confirm=\"Block this account?\""
+        } else {
+            " data-confirm=\"Remove this account from the list?\""
+        }
+    } else {
+        ""
+    };
+    let extra = extra
+        .map(|(name, value)| {
+            format!(
+                "<input type=\"hidden\" name=\"{}\" value=\"{}\">",
+                html_escape(name),
+                html_escape(value)
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "<form class=\"profile-action-form\" action=\"/profile/action\" method=\"post\" data-profile-action{data_confirm}><input type=\"hidden\" name=\"subject\" value=\"{}\"><input type=\"hidden\" name=\"action\" value=\"{}\">{extra}{confirm}<button type=\"submit\">{}</button></form>",
+        html_escape(subject_did),
+        html_escape(action),
+        html_escape(label)
+    )
+}
+
 async fn profile_page<F, S>(
     State(state): State<Arc<OAuthWebState<F, S>>>,
     headers: HeaderMap,
@@ -5304,6 +5852,23 @@ where
         .get("displayName")
         .and_then(Value::as_str)
         .unwrap_or(&handle);
+    let action_html = if subject == did {
+        String::new()
+    } else {
+        match profile_action_panel(
+            &state.flow,
+            &state.public,
+            &headers,
+            state.storage.as_ref(),
+            &did,
+            subject,
+        )
+        .await
+        {
+            Ok(html) => html,
+            Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+        }
+    };
     let write_forms_enabled =
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
     let posts = render_timeline_post_items(
@@ -5344,7 +5909,7 @@ where
     let response = Html(page_shell_with_feeds_and_badge(
         display_name,
         &format!(
-            "<section class=\"profile-card\">{}<div><h1>{}</h1><p class=\"profile-handle\">@{}</p></div></section><header class=\"section-heading\"><h2>Posts</h2></header><ol class=\"post-list\">{posts}</ol>{older}",
+            "<section class=\"profile-card\">{}<div><h1>{}</h1><p class=\"profile-handle\">@{}</p></div></section>{action_html}<header class=\"section-heading\"><h2>Posts</h2></header><ol class=\"post-list\">{posts}</ol>{older}",
             avatar_markup(&profile, "profile-avatar"),
             html_escape(display_name),
             html_escape(&handle)
@@ -5358,6 +5923,306 @@ where
     .into_response();
     page_timing.render_ms = render_started.elapsed().as_millis() as u64;
     response
+}
+
+async fn profile_action<F, S>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response
+where
+    F: OAuthFlow,
+    S: Storage + 'static,
+{
+    if !same_origin_request(&headers, &state.public.public_url) {
+        return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
+    }
+    let Some(viewer_did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref())
+    else {
+        return Redirect::to("/login").into_response();
+    };
+    let Some(subject_did) = form.get("subject").map(String::as_str) else {
+        return oauth_error(StatusCode::BAD_REQUEST, "profile subject is required");
+    };
+    let Ok(subject) = subject_did.parse::<Did>() else {
+        return oauth_error(StatusCode::BAD_REQUEST, "profile subject DID is invalid");
+    };
+    let subject_did = subject.as_ref();
+    if viewer_did == subject_did {
+        return oauth_error(
+            StatusCode::FORBIDDEN,
+            "profile actions are unavailable on your own profile",
+        );
+    }
+    let Some(action) = form.get("action").map(String::as_str) else {
+        return oauth_error(StatusCode::BAD_REQUEST, "profile action is required");
+    };
+    let (allowed, permission_name) = match action {
+        "follow" | "unfollow" => (
+            verified_cookie_follow_access(&state.public, &headers, state.storage.as_ref()),
+            action,
+        ),
+        "block" | "unblock" => (
+            verified_cookie_block_access(&state.public, &headers, state.storage.as_ref()),
+            action,
+        ),
+        "mute" | "unmute" => (
+            verified_cookie_mute_access(&state.public, &headers, state.storage.as_ref()),
+            action,
+        ),
+        "list_add" | "list_remove" => (
+            verified_cookie_list_access(&state.public, &headers, state.storage.as_ref()),
+            "lists",
+        ),
+        _ => return oauth_error(StatusCode::BAD_REQUEST, "unknown profile action"),
+    };
+    if !allowed {
+        return oauth_error(
+            StatusCode::FORBIDDEN,
+            &format!("Sign in again to {permission_name}"),
+        );
+    }
+    if matches!(action, "block" | "list_remove")
+        && form.get("confirm").map(String::as_str) != Some("yes")
+    {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "confirmation is required for this action",
+        );
+    }
+    let result = match action {
+        "follow" => {
+            let record = json!({
+                "$type":"app.bsky.graph.follow",
+                "subject":subject_did,
+                "createdAt":Datetime::now()
+            });
+            match state
+                .flow
+                .create_profile_graph_record(&viewer_did, "app.bsky.graph.follow", record)
+                .await
+            {
+                Ok(created) => match persist_created_record(
+                    state.storage.clone(),
+                    &viewer_did,
+                    "app.bsky.graph.follow",
+                    created,
+                )
+                .await
+                {
+                    Ok(()) => state
+                        .storage
+                        .set_follow(&viewer_did, subject_did, true)
+                        .map_err(|error| error.to_string()),
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            }
+        }
+        "unfollow" | "unblock" => {
+            let (collection, expected_subject) = if action == "unfollow" {
+                ("app.bsky.graph.follow", subject_did)
+            } else {
+                ("app.bsky.graph.block", subject_did)
+            };
+            let record =
+                match state
+                    .storage
+                    .records_for_actor_collection(&viewer_did, collection, 10_000)
+                {
+                    Ok(records) => records.into_iter().find(|record| {
+                        record.record.get("subject").and_then(Value::as_str)
+                            == Some(expected_subject)
+                    }),
+                    Err(error) => {
+                        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+                    }
+                };
+            let Some(record) = record else {
+                return oauth_error(StatusCode::BAD_REQUEST, "relationship record was not found");
+            };
+            match state
+                .flow
+                .delete_profile_graph_record(&viewer_did, collection, &record.uri)
+                .await
+            {
+                Ok(()) => match remove_deleted_record(
+                    state.storage.clone(),
+                    &viewer_did,
+                    collection,
+                    &record.uri,
+                )
+                .await
+                {
+                    Ok(()) if action == "unfollow" => state
+                        .storage
+                        .set_follow(&viewer_did, subject_did, false)
+                        .map_err(|error| error.to_string()),
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            }
+        }
+        "block" => {
+            let record = json!({
+                "$type":"app.bsky.graph.block",
+                "subject":subject_did,
+                "createdAt":Datetime::now()
+            });
+            match state
+                .flow
+                .create_profile_graph_record(&viewer_did, "app.bsky.graph.block", record)
+                .await
+            {
+                Ok(created) => {
+                    persist_created_record(
+                        state.storage.clone(),
+                        &viewer_did,
+                        "app.bsky.graph.block",
+                        created,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            }
+        }
+        "mute" | "unmute" => {
+            state
+                .flow
+                .set_actor_muted(&viewer_did, subject_did, action == "mute")
+                .await
+        }
+        "list_add" => {
+            let Some(list_uri) = form.get("list_uri").map(String::as_str) else {
+                return oauth_error(StatusCode::BAD_REQUEST, "list URI is required");
+            };
+            let list_prefix = format!("at://{viewer_did}/app.bsky.graph.list/");
+            if !list_uri.starts_with(&list_prefix)
+                || list_uri
+                    .strip_prefix(&list_prefix)
+                    .is_none_or(str::is_empty)
+                || list_uri[list_prefix.len()..].contains('/')
+            {
+                return oauth_error(StatusCode::FORBIDDEN, "list must belong to your account");
+            }
+            let lists = match state
+                .flow
+                .profile_list_choices(&viewer_did, subject_did)
+                .await
+            {
+                Ok(lists) => lists,
+                Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
+            };
+            if !lists.iter().any(|list| list.uri == list_uri) {
+                return oauth_error(
+                    StatusCode::FORBIDDEN,
+                    "list does not belong to your account",
+                );
+            }
+            if lists
+                .iter()
+                .any(|list| list.uri == list_uri && list.item_uri.is_some())
+            {
+                return oauth_error(StatusCode::CONFLICT, "account is already in this list");
+            }
+            let record = json!({
+                "$type":"app.bsky.graph.listitem",
+                "subject":subject_did,
+                "list":list_uri,
+                "createdAt":Datetime::now()
+            });
+            match state
+                .flow
+                .create_profile_graph_record(&viewer_did, "app.bsky.graph.listitem", record)
+                .await
+            {
+                Ok(created) => {
+                    persist_created_record(
+                        state.storage.clone(),
+                        &viewer_did,
+                        "app.bsky.graph.listitem",
+                        created,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            }
+        }
+        "list_remove" => {
+            let Some(item_uri) = form.get("item_uri").map(String::as_str) else {
+                return oauth_error(StatusCode::BAD_REQUEST, "list item URI is required");
+            };
+            let item_prefix = format!("at://{viewer_did}/app.bsky.graph.listitem/");
+            if !item_uri.starts_with(&item_prefix)
+                || item_uri
+                    .strip_prefix(&item_prefix)
+                    .is_none_or(str::is_empty)
+                || item_uri[item_prefix.len()..].contains('/')
+            {
+                return oauth_error(
+                    StatusCode::FORBIDDEN,
+                    "list item must belong to your account",
+                );
+            }
+            let lists = match state
+                .flow
+                .profile_list_choices(&viewer_did, subject_did)
+                .await
+            {
+                Ok(lists) => lists,
+                Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
+            };
+            if !lists
+                .iter()
+                .any(|list| list.item_uri.as_deref() == Some(item_uri))
+            {
+                return oauth_error(
+                    StatusCode::FORBIDDEN,
+                    "list item does not match this account",
+                );
+            }
+            match state
+                .flow
+                .delete_profile_graph_record(&viewer_did, "app.bsky.graph.listitem", item_uri)
+                .await
+            {
+                Ok(()) => {
+                    remove_deleted_record(
+                        state.storage.clone(),
+                        &viewer_did,
+                        "app.bsky.graph.listitem",
+                        item_uri,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            }
+        }
+        _ => unreachable!("profile action was validated above"),
+    };
+    if let Err(error) = result {
+        return oauth_error(StatusCode::BAD_GATEWAY, &error);
+    }
+    if headers
+        .get("x-appview-fetch")
+        .is_some_and(|value| value.as_bytes() == b"1")
+    {
+        return match profile_action_panel(
+            &state.flow,
+            &state.public,
+            &headers,
+            state.storage.as_ref(),
+            &viewer_did,
+            subject_did,
+        )
+        .await
+        {
+            Ok(actions_html) => Json(json!({"actions_html":actions_html})).into_response(),
+            Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+        };
+    }
+    Redirect::to(&format!("/profile?did={}", form_encoded(subject_did))).into_response()
 }
 
 async fn thread_page<F, S>(

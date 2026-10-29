@@ -1454,6 +1454,78 @@ a.quoted-post-card:hover,
   margin: 0.3rem 0 0;
 }
 
+.profile-actions {
+  display: grid;
+  gap: 0.75rem;
+  margin-bottom: 1.25rem;
+  padding: 0.9rem 1.25rem 1.1rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.profile-actions h2,
+.profile-actions h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.profile-relationships,
+.profile-action-buttons,
+.profile-list-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.profile-relationships span,
+.list-purpose {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.profile-action-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0;
+}
+
+.profile-action-form button {
+  min-height: 2.35rem;
+  padding: 0.4rem 0.8rem;
+}
+
+.profile-list-actions {
+  align-items: flex-start;
+}
+
+.profile-list-choice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.6rem;
+  width: 100%;
+}
+
+.action-confirm {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.action-confirm input {
+  margin: 0;
+}
+
+.permission-prompt,
+.list-empty {
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
 .section-heading h2,
 .thread-replies h2 {
   margin: 0 0 0.75rem;
