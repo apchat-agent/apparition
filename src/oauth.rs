@@ -8054,14 +8054,7 @@ fn render_timeline_post_items<S: Storage>(
                     .iter()
                     .all(|member| records[*member].did == records[*first].did)
             });
-            let visible = if self_thread && group.len() > 10 {
-                group
-                    .iter()
-                    .take(2)
-                    .chain(group.iter().rev().take(3).rev())
-                    .copied()
-                    .collect::<Vec<_>>()
-            } else if !self_thread && group.len() > 3 {
+            let visible = if !self_thread && group.len() > 3 {
                 group
                     .iter()
                     .take(1)
@@ -9336,6 +9329,55 @@ mod tests {
         assert!(!page.contains("Long thread root"), "{page}");
         assert!(page.contains("Long thread reply 2"), "{page}");
         assert!(page.contains("Long thread reply 51"), "{page}");
+    }
+
+    #[tokio::test]
+    async fn timeline_caps_long_self_thread_and_links_to_the_thread_view() {
+        let storage = Arc::new(MemoryStorage::default());
+        let viewer = "did:plc:reply-viewer";
+        let author = "did:plc:self-thread-long";
+        let mut records = Vec::new();
+        for index in 0..12_u64 {
+            let parent_uri = records
+                .last()
+                .map(|record: &IndexedRecord| record.uri.clone());
+            let record = test_web_post(
+                author,
+                &format!("self-long-{index}"),
+                index + 1,
+                &format!("Self long post {index}"),
+                parent_uri.as_deref(),
+            );
+            storage.put_record(&record).unwrap();
+            records.push(record);
+        }
+        storage.set_follow(viewer, author, true).unwrap();
+
+        let page = request_test_timeline(storage, viewer).await;
+
+        assert_eq!(
+            page.matches("class=\"post-item thread-group\"").count(),
+            1,
+            "{page}"
+        );
+        assert_eq!(page.matches("class=\"post-card\"").count(), 5, "{page}");
+        for shown in [
+            "Self long post 0",
+            "Self long post 1",
+            "Self long post 9",
+            "Self long post 10",
+            "Self long post 11",
+        ] {
+            assert!(page.contains(shown), "missing {shown}: {page}");
+        }
+        for skipped in 2..=8 {
+            assert!(
+                !page.contains(&format!("Self long post {skipped}")),
+                "{page}"
+            );
+        }
+        assert!(page.contains("7 more in this thread"), "{page}");
+        assert!(page.contains("class=\"thread-more\""), "{page}");
     }
 
     #[tokio::test]
