@@ -3525,6 +3525,187 @@ async fn timeline_fetches_unindexed_quotes_and_renders_safe_nested_media_cards()
 }
 
 #[tokio::test]
+async fn quote_hydration_keeps_page_order_deduplicates_and_skips_other_record_fetches() {
+    let storage = Arc::new(MemoryStorage::default());
+    let feed_uri = "at://did:plc:creator/app.bsky.feed.generator/favorite";
+    storage
+        .put_record(&IndexedRecord {
+            did: "did:plc:creator".into(),
+            collection: "app.bsky.feed.generator".into(),
+            rkey: "favorite".into(),
+            uri: feed_uri.into(),
+            cid: Some("feed-cid".into()),
+            time_us: 1,
+            record: serde_json::json!({"displayName":"A curated feed"}),
+        })
+        .unwrap();
+    let expected_uris = (0..18)
+        .map(|index| format!("at://did:plc:quoted{index}/app.bsky.feed.post/post"))
+        .collect::<Vec<_>>();
+    let mut post_refs = vec![expected_uris[0].clone(), expected_uris[1].clone()];
+    post_refs.push(expected_uris[0].clone());
+    post_refs.push(feed_uri.to_owned());
+    post_refs.extend(expected_uris.iter().skip(2).cloned());
+    for (index, quote_uri) in post_refs.iter().enumerate() {
+        let mut post = fake_feed_post(
+            "did:plc:alice",
+            &format!("outer-{index}"),
+            (1000 - index) as u64,
+            "Outer post",
+        );
+        post.record["embed"] = serde_json::json!({
+            "$type":"app.bsky.embed.record",
+            "record":{"uri":quote_uri,"cid":"quoted-cid"}
+        });
+        storage.put_record(&post).unwrap();
+    }
+    let live_posts = expected_uris
+        .iter()
+        .enumerate()
+        .map(|(index, uri)| {
+            let record = fake_feed_post(&format!("did:plc:quoted{index}"), "post", 1, "Quote");
+            (uri.clone(), record)
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let flow = FakeOAuthFlow {
+        live_posts: Arc::new(Mutex::new(live_posts)),
+        post_delays_ms: Arc::new(Mutex::new(
+            expected_uris.iter().map(|uri| (uri.clone(), 15)).collect(),
+        )),
+        ..FakeOAuthFlow::default()
+    };
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow.clone(), storage);
+    let cookie = finish_login(&app).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+
+    assert_eq!(*flow.post_requests.lock().unwrap(), expected_uris);
+    let requested_profiles = flow.profile_requests.lock().unwrap().clone();
+    assert_eq!(
+        &requested_profiles[..4],
+        [
+            "did:plc:alice",
+            "did:plc:quoted0",
+            "did:plc:quoted1",
+            "did:plc:quoted2"
+        ]
+    );
+    assert!(html.contains("A curated feed"), "{html}");
+    assert_eq!(html.matches("quoted-record-type").count(), 1, "{html}");
+}
+
+#[tokio::test]
+async fn quote_and_author_hydration_share_the_page_deadline() {
+    let storage = Arc::new(MemoryStorage::default());
+    let quote_uri = "at://did:plc:slow-author/app.bsky.feed.post/slow";
+    let mut outer = fake_feed_post("did:plc:alice", "shared-budget", 10, "Outer post");
+    outer.record["embed"] = serde_json::json!({
+        "$type":"app.bsky.embed.record",
+        "record":{"uri":quote_uri,"cid":"slow-cid"}
+    });
+    storage.put_record(&outer).unwrap();
+    let quoted = fake_feed_post(
+        "did:plc:slow-author",
+        "slow",
+        9,
+        "Hydrated within one shared budget",
+    );
+    let flow = FakeOAuthFlow {
+        live_posts: Arc::new(Mutex::new(
+            [(quote_uri.to_owned(), quoted)].into_iter().collect(),
+        )),
+        post_delays_ms: Arc::new(Mutex::new(
+            [(quote_uri.to_owned(), 1_200)].into_iter().collect(),
+        )),
+        author_profiles: Arc::new(Mutex::new(
+            [(
+                "did:plc:slow-author".to_owned(),
+                FetchedAuthorProfile {
+                    profile: Some(IndexedRecord {
+                        did: "did:plc:slow-author".into(),
+                        collection: "app.bsky.actor.profile".into(),
+                        rkey: "self".into(),
+                        uri: "at://did:plc:slow-author/app.bsky.actor.profile/self".into(),
+                        cid: Some("slow-profile-cid".into()),
+                        time_us: 1,
+                        record: serde_json::json!({"displayName":"Slow & Safe"}),
+                    }),
+                    verified_handle: Some("slow.test".into()),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        )),
+        profile_delays_ms: Arc::new(Mutex::new(
+            [("did:plc:slow-author".to_owned(), 1_200)]
+                .into_iter()
+                .collect(),
+        )),
+        ..FakeOAuthFlow::default()
+    };
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage.clone());
+    let cookie = finish_login(&app).await;
+    let started = Instant::now();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let elapsed = started.elapsed();
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+
+    assert!(
+        elapsed < Duration::from_millis(1_700),
+        "page took {elapsed:?}"
+    );
+    assert!(html.contains("Slow &amp; Safe"), "{html}");
+    assert!(html.contains("Hydrated within one shared budget"), "{html}");
+    assert!(
+        storage
+            .get_record("did:plc:slow-author", "app.bsky.actor.profile", "self")
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
 async fn quote_failures_distinguish_missing_unavailable_and_budget_placeholder() {
     let storage = Arc::new(MemoryStorage::default());
     let deleted_uri = "at://did:plc:deleted/app.bsky.feed.post/deleted";
