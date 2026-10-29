@@ -182,6 +182,7 @@ impl Drop for ActiveIdentityCacheRead {
 }
 
 enum IdentityCacheWrite {
+    Flush(SyncSender<()>),
     Set {
         key: String,
         did: String,
@@ -394,6 +395,19 @@ impl SqliteIdentityCache {
         });
         Ok(())
     }
+
+    /// Wait until all writes already queued on the SQLite writer have completed.
+    pub fn flush(&self) -> bool {
+        let (flushed, wait) = sync_channel(0);
+        if self
+            .writer
+            .send(IdentityCacheWrite::Flush(flushed))
+            .is_err()
+        {
+            return false;
+        }
+        wait.recv().is_ok()
+    }
 }
 
 fn read_identity_cache_row(
@@ -420,6 +434,9 @@ fn identity_cache_writer(
 ) {
     while let Ok(write) = receiver.recv() {
         match write {
+            IdentityCacheWrite::Flush(flushed) => {
+                let _ = flushed.send(());
+            }
             IdentityCacheWrite::Set {
                 key,
                 did,
