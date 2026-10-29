@@ -2055,8 +2055,16 @@ async fn old_scope_session_keeps_text_composer_and_shows_picture_reauthorization
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec())
-        .unwrap();
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
     assert!(html.contains("action=\"/post\""), "{html}");
     assert!(html.contains("Log in again to enable pictures"), "{html}");
     assert!(html.contains("href=\"/login\""), "{html}");

@@ -80,7 +80,8 @@ const PAGE_QUOTE_CONCURRENCY: usize = 16;
 const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m6";
 const WEB_SCRIPT_URL: &str = "/static/app.js?v=js5";
 const SAVED_FEED_CACHE_PREFIX: &str = "saved-feed-preferences:";
-const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=*";
+const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=*";
+const BLOB_SCOPE: &str = "blob:image/*";
 const WRITE_SCOPES: [&str; 3] = [
     "repo:app.bsky.feed.post?action=create",
     "repo:app.bsky.feed.like?action=create&action=delete",
@@ -575,10 +576,12 @@ impl OAuthPublic {
         generation: u64,
         write_access: bool,
         feed_access: bool,
+        blob_access: bool,
     ) -> String {
         let expires = unix_time().saturating_add(SESSION_TTL_SECONDS);
-        let payload =
-            format!("{did}\n{expires}\n{session_id}\n{generation}\n{write_access}\n{feed_access}");
+        let payload = format!(
+            "{did}\n{expires}\n{session_id}\n{generation}\n{write_access}\n{feed_access}\n{blob_access}"
+        );
         let encoded = URL_SAFE_NO_PAD.encode(payload.as_bytes());
         let mut mac = HmacSha256::new_from_slice(&self.cookie_key())
             .expect("HMAC accepts keys of any length");
@@ -619,7 +622,10 @@ impl OAuthPublic {
         Some(binding.to_owned())
     }
 
-    fn verify_session_cookie(&self, token: &str) -> Option<(String, String, u64, bool, bool)> {
+    fn verify_session_cookie(
+        &self,
+        token: &str,
+    ) -> Option<(String, String, u64, bool, bool, bool)> {
         let (payload, signature) = token.split_once('.')?;
         let signature = URL_SAFE_NO_PAD.decode(signature).ok()?;
         let mut mac = HmacSha256::new_from_slice(&self.cookie_key()).ok()?;
@@ -632,7 +638,10 @@ impl OAuthPublic {
         let (expires, session) = session.split_once('\n')?;
         let (session_id, generation) = session.split_once('\n')?;
         let (generation, permissions) = generation.split_once('\n')?;
-        let (write_access, feed_access) = permissions
+        let (write_access, permissions) = permissions
+            .split_once('\n')
+            .unwrap_or((permissions, "false\nfalse"));
+        let (feed_access, blob_access) = permissions
             .split_once('\n')
             .unwrap_or((permissions, "false"));
         if expires.parse::<u64>().ok()? <= unix_time()
@@ -647,6 +656,7 @@ impl OAuthPublic {
             generation.parse().ok()?,
             write_access.parse().ok()?,
             feed_access.parse().ok()?,
+            blob_access.parse().ok()?,
         ))
     }
 
@@ -2945,6 +2955,7 @@ where
     let mut response = Redirect::to("/app").into_response();
     let write_access = has_all_write_scopes(account.granted_scope.as_deref());
     let feed_access = has_all_feed_scopes(account.granted_scope.as_deref());
+    let blob_access = has_blob_scope(account.granted_scope.as_deref());
     let cookie = format!(
         "{SESSION_COOKIE}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL_SECONDS}{}",
         state.public.issue_session_cookie(
@@ -2953,6 +2964,7 @@ where
             generation,
             write_access,
             feed_access,
+            blob_access,
         ),
         if state.public.secure_cookies() {
             "; Secure"
@@ -2980,7 +2992,7 @@ where
     if !same_origin_request(&headers, &state.public.public_url) {
         return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
     }
-    let Some((did, session_id, _, _, _)) =
+    let Some((did, session_id, _, _, _, _)) =
         verified_cookie_session(&state.public, &headers, state.storage.as_ref())
     else {
         return clear_session_cookie(
@@ -3152,9 +3164,15 @@ where
         "<p role=\"status\">Read-only: write permissions were not granted, so posting, liking, and reposting are disabled.</p>".to_owned()
     };
     let post_form = if write_forms_enabled {
-        "<form class=\"composer\" action=\"/post\" method=\"post\"><label for=\"new-post\">Write a post</label><textarea id=\"new-post\" name=\"text\" rows=\"3\" maxlength=\"300\" required></textarea><button type=\"submit\">Post</button></form>"
+        format!(
+            "<form class=\"composer image-composer\" action=\"/post\" method=\"post\" enctype=\"multipart/form-data\" data-image-composer><label for=\"new-post\">Write a post</label><textarea id=\"new-post\" name=\"text\" rows=\"3\" maxlength=\"300\" required></textarea>{}<button type=\"submit\">Post</button><p class=\"composer-error\" data-composer-error role=\"alert\" hidden></p></form>",
+            render_image_picker(
+                verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref()),
+                "post-images"
+            )
+        )
     } else {
-        ""
+        String::new()
     };
     let older = if has_more {
         timeline
@@ -4231,7 +4249,11 @@ where
         "<p role=\"status\">Read-only: write permissions were not granted.</p>".to_owned()
     };
     let reply_composer = if write_forms_enabled {
-        render_reply_composer(state.storage.as_ref(), &record)
+        render_reply_composer(
+            state.storage.as_ref(),
+            &record,
+            verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref()),
+        )
     } else {
         String::new()
     };
@@ -4312,8 +4334,12 @@ where
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
     let composer = if write_forms_enabled {
         format!(
-            "<form class=\"composer quote-composer\" action=\"/quote\" method=\"post\"><label for=\"quote-text\">Write a quote post</label><input type=\"hidden\" name=\"quote_uri\" value=\"{}\"><textarea id=\"quote-text\" name=\"text\" rows=\"4\" maxlength=\"300\" required></textarea>{}<button type=\"submit\">Post</button></form>",
+            "<form class=\"composer quote-composer image-composer\" action=\"/quote\" method=\"post\" enctype=\"multipart/form-data\" data-image-composer><label for=\"quote-text\">Write a quote post</label><input type=\"hidden\" name=\"quote_uri\" value=\"{}\"><textarea id=\"quote-text\" name=\"text\" rows=\"4\" maxlength=\"300\" required></textarea>{}{}<button type=\"submit\">Post</button><p class=\"composer-error\" data-composer-error role=\"alert\" hidden></p></form>",
             html_escape(&quoted.uri),
+            render_image_picker(
+                verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref()),
+                "quote-images"
+            ),
             render_quote_preview(state.storage.as_ref(), &quoted)
         )
     } else {
@@ -4554,14 +4580,28 @@ async fn load_post_record_with_source_until<F: OAuthFlow, S: Storage>(
     Ok(Some((record, true)))
 }
 
-fn render_reply_composer<S: Storage>(storage: &S, parent: &IndexedRecord) -> String {
+fn render_reply_composer<S: Storage>(
+    storage: &S,
+    parent: &IndexedRecord,
+    blob_access: bool,
+) -> String {
     let profile = profile_view_from_storage(storage, &parent.did)
         .unwrap_or_else(|_| json!({"did":parent.did,"handle":parent.did}));
     let handle = profile_handle(&profile, &parent.did);
     format!(
-        "<form id=\"reply-composer\" class=\"composer reply-composer\" action=\"/reply\" method=\"post\"><p class=\"reply-context\">Replying to @{}</p><input type=\"hidden\" name=\"parent_uri\" value=\"{}\"><label for=\"reply-text\">Write a reply</label><textarea id=\"reply-text\" name=\"text\" rows=\"3\" maxlength=\"300\" required></textarea><button type=\"submit\">Reply</button></form>",
+        "<form id=\"reply-composer\" class=\"composer reply-composer image-composer\" action=\"/reply\" method=\"post\" enctype=\"multipart/form-data\" data-image-composer><p class=\"reply-context\">Replying to @{}</p><input type=\"hidden\" name=\"parent_uri\" value=\"{}\"><label for=\"reply-text\">Write a reply</label><textarea id=\"reply-text\" name=\"text\" rows=\"3\" maxlength=\"300\" required></textarea>{}<button type=\"submit\">Reply</button><p class=\"composer-error\" data-composer-error role=\"alert\" hidden></p></form>",
         html_escape(&handle),
-        html_escape(&parent.uri)
+        html_escape(&parent.uri),
+        render_image_picker(blob_access, "reply-images")
+    )
+}
+
+fn render_image_picker(blob_access: bool, id: &str) -> String {
+    if !blob_access {
+        return "<p class=\"picture-permission-hint\" role=\"status\"><a href=\"/login\">Log in again to enable pictures</a></p>".to_owned();
+    }
+    format!(
+        "<fieldset class=\"image-picker\"><legend>Add pictures</legend><label for=\"{id}\">Choose up to 4 images</label><input id=\"{id}\" type=\"file\" name=\"images\" accept=\"image/*\" multiple data-image-input><div class=\"image-previews\" data-image-previews></div><p class=\"image-picker-status\" data-image-status role=\"status\"></p></fieldset>"
     )
 }
 
@@ -5171,7 +5211,7 @@ fn verified_cookie_did<S: Storage>(
     headers: &HeaderMap,
     storage: &S,
 ) -> Option<String> {
-    verified_cookie_session(public, headers, storage).map(|(did, _, _, _, _)| did)
+    verified_cookie_session(public, headers, storage).map(|(did, _, _, _, _, _)| did)
 }
 
 fn verified_cookie_write_access<S: Storage>(
@@ -5180,7 +5220,16 @@ fn verified_cookie_write_access<S: Storage>(
     storage: &S,
 ) -> bool {
     verified_cookie_session(public, headers, storage)
-        .is_some_and(|(_, _, _, write_access, _)| write_access)
+        .is_some_and(|(_, _, _, write_access, _, _)| write_access)
+}
+
+fn verified_cookie_blob_access<S: Storage>(
+    public: &OAuthPublic,
+    headers: &HeaderMap,
+    storage: &S,
+) -> bool {
+    verified_cookie_session(public, headers, storage)
+        .is_some_and(|(_, _, _, _, _, blob_access)| blob_access)
 }
 
 fn verified_cookie_feed_access<S: Storage>(
@@ -5189,22 +5238,29 @@ fn verified_cookie_feed_access<S: Storage>(
     storage: &S,
 ) -> bool {
     verified_cookie_session(public, headers, storage)
-        .is_some_and(|(_, _, _, _, feed_access)| feed_access)
+        .is_some_and(|(_, _, _, _, feed_access, _)| feed_access)
 }
 
 fn verified_cookie_session<S: Storage>(
     public: &OAuthPublic,
     headers: &HeaderMap,
     storage: &S,
-) -> Option<(String, String, u64, bool, bool)> {
-    let (did, session_id, generation, write_access, feed_access) =
+) -> Option<(String, String, u64, bool, bool, bool)> {
+    let (did, session_id, generation, write_access, feed_access, blob_access) =
         cookie_value(headers).and_then(|value| public.verify_session_cookie(value))?;
     (storage
         .web_session_generation(&did, &session_id)
         .ok()
         .flatten()
         == Some(generation))
-    .then_some((did, session_id, generation, write_access, feed_access))
+    .then_some((
+        did,
+        session_id,
+        generation,
+        write_access,
+        feed_access,
+        blob_access,
+    ))
 }
 
 /// The like script asks with `x-appview-fetch: 1` and gets the new state as JSON instead of a page.
@@ -6095,6 +6151,10 @@ fn has_all_feed_scopes(scope: Option<&str>) -> bool {
         .all(|required| granted.contains(required))
 }
 
+fn has_blob_scope(scope: Option<&str>) -> bool {
+    scope.is_some_and(|scope| scope.split_whitespace().any(|value| value == BLOB_SCOPE))
+}
+
 fn requested_scopes() -> Vec<Scope> {
     std::iter::once(Scope::Known(KnownScope::Atproto))
         .chain(
@@ -6102,6 +6162,7 @@ fn requested_scopes() -> Vec<Scope> {
                 .iter()
                 .map(|scope| Scope::Unknown((*scope).to_owned())),
         )
+        .chain(std::iter::once(Scope::Unknown(BLOB_SCOPE.to_owned())))
         .chain(
             FEED_SCOPES
                 .iter()
