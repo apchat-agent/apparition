@@ -3,13 +3,18 @@ use crate::{
     net::SafeHttpClient,
 };
 use http::{HeaderMap, HeaderValue, header};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     future::Future,
-    path::Path,
-    sync::{Arc, Mutex as StdMutex},
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc::{Receiver, SyncSender, TrySendError, sync_channel},
+    },
+    thread,
     time::{Duration, Instant},
 };
 use thiserror::Error;
@@ -138,11 +143,67 @@ struct PersistedIdentity {
     document: Option<DidDocument>,
 }
 
-/// Small SQLite cache shared by all production identity resolvers. It stores full DID documents so
-/// callers can recover the verified PDS endpoint immediately after process restart.
+const IDENTITY_CACHE_WRITE_QUEUE: usize = 256;
+
+struct MemoryIdentityEntry {
+    did: String,
+    expires_at: Instant,
+    value: Result<PersistedIdentity, ResolutionError>,
+}
+
+#[derive(Default)]
+struct IdentityCacheMemory {
+    entries: HashMap<String, MemoryIdentityEntry>,
+    invalidated_dids: HashMap<String, IdentityInvalidation>,
+    active_sqlite_reads: usize,
+}
+
+#[derive(Clone, Copy)]
+struct IdentityInvalidation {
+    generation: u64,
+    committed: bool,
+}
+
+struct ActiveIdentityCacheRead {
+    memory: Arc<StdMutex<IdentityCacheMemory>>,
+}
+
+impl Drop for ActiveIdentityCacheRead {
+    fn drop(&mut self) {
+        if let Ok(mut memory) = self.memory.lock() {
+            memory.active_sqlite_reads = memory.active_sqlite_reads.saturating_sub(1);
+            if memory.active_sqlite_reads == 0 {
+                memory
+                    .invalidated_dids
+                    .retain(|_, invalidation| !invalidation.committed);
+            }
+        }
+    }
+}
+
+enum IdentityCacheWrite {
+    Set {
+        key: String,
+        did: String,
+        result_json: String,
+        expires_at_ms: i64,
+    },
+    InvalidateDid {
+        did: String,
+        generation: u64,
+    },
+}
+
+/// Small SQLite cache shared by production identity resolvers. SQLite writes run on one
+/// background thread; callers read the shared in-memory tier first and then use a read-only
+/// connection on Tokio's blocking pool.
 #[derive(Clone)]
 pub struct SqliteIdentityCache {
-    connection: Arc<StdMutex<Connection>>,
+    path: Arc<PathBuf>,
+    writer: SyncSender<IdentityCacheWrite>,
+    memory: Arc<StdMutex<IdentityCacheMemory>>,
+    next_invalidation: Arc<AtomicU64>,
+    dropped_writes: Arc<AtomicU64>,
 }
 
 impl SqliteIdentityCache {
@@ -171,45 +232,91 @@ impl SqliteIdentityCache {
              CREATE INDEX IF NOT EXISTS identity_resolution_cache_did
                  ON identity_resolution_cache(did);",
         )?;
+
+        let (writer, receiver) = sync_channel(IDENTITY_CACHE_WRITE_QUEUE);
+        let memory = Arc::new(StdMutex::new(IdentityCacheMemory::default()));
+        let writer_memory = memory.clone();
+        thread::Builder::new()
+            .name("identity-cache-writer".to_owned())
+            .spawn(move || identity_cache_writer(connection, receiver, writer_memory))
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+
         Ok(Self {
-            connection: Arc::new(StdMutex::new(connection)),
+            path: Arc::new(path.to_owned()),
+            writer,
+            memory,
+            next_invalidation: Arc::new(AtomicU64::new(0)),
+            dropped_writes: Arc::new(AtomicU64::new(0)),
         })
     }
 
-    fn get(
+    async fn get(
         &self,
         key: &str,
     ) -> Result<Option<Result<PersistedIdentity, ResolutionError>>, rusqlite::Error> {
-        let connection = self.connection.lock().map_err(|_| {
-            rusqlite::Error::InvalidParameterName("identity cache mutex poisoned".to_owned())
-        })?;
-        let stored: Option<(String, i64)> = connection
-            .query_row(
-                "SELECT result_json, expires_at_ms FROM identity_resolution_cache WHERE cache_key=?1",
-                [key],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        let Some((json, expires_at_ms)) = stored else {
-            return Ok(None);
-        };
-        if expires_at_ms <= unix_time_ms() {
-            connection.execute(
-                "DELETE FROM identity_resolution_cache WHERE cache_key=?1",
-                [key],
-            )?;
-            return Ok(None);
-        }
-        match serde_json::from_str(&json) {
-            Ok(value) => Ok(Some(value)),
-            Err(_) => {
-                connection.execute(
-                    "DELETE FROM identity_resolution_cache WHERE cache_key=?1",
-                    [key],
-                )?;
-                Ok(None)
+        let use_sqlite = self.path.as_path() != Path::new(":memory:");
+        {
+            let mut memory = self.memory.lock().map_err(|_| {
+                rusqlite::Error::InvalidParameterName(
+                    "identity cache memory lock poisoned".to_owned(),
+                )
+            })?;
+            if let Some(entry) = memory.entries.get(key) {
+                if entry.expires_at > Instant::now() {
+                    return Ok(Some(entry.value.clone()));
+                }
+                memory.entries.remove(key);
+            }
+            if use_sqlite {
+                memory.active_sqlite_reads += 1;
             }
         }
+
+        if !use_sqlite {
+            return Ok(None);
+        }
+        let _active_read = ActiveIdentityCacheRead {
+            memory: self.memory.clone(),
+        };
+        let path = self.path.clone();
+        let read_key = key.to_owned();
+        let stored = tokio::task::spawn_blocking(move || read_identity_cache_row(&path, &read_key))
+            .await
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))??;
+        let Some((did, json, expires_at_ms)) = stored else {
+            return Ok(None);
+        };
+        let now_ms = unix_time_ms();
+        if expires_at_ms <= now_ms {
+            return Ok(None);
+        }
+
+        let value = match serde_json::from_str::<Result<PersistedIdentity, ResolutionError>>(&json)
+        {
+            Ok(value) => value,
+            Err(_) => return Ok(None),
+        };
+        let remaining = Duration::from_millis(expires_at_ms.saturating_sub(now_ms) as u64);
+        let mut memory = self.memory.lock().map_err(|_| {
+            rusqlite::Error::InvalidParameterName("identity cache memory lock poisoned".to_owned())
+        })?;
+        if let Some(invalidation) = memory.invalidated_dids.get(&did).copied() {
+            drop(memory);
+            self.enqueue(IdentityCacheWrite::InvalidateDid {
+                did,
+                generation: invalidation.generation,
+            });
+            return Ok(None);
+        }
+        memory.entries.insert(
+            key.to_owned(),
+            MemoryIdentityEntry {
+                did,
+                expires_at: Instant::now() + remaining,
+                value: value.clone(),
+            },
+        );
+        Ok(Some(value))
     }
 
     fn set(
@@ -218,37 +325,149 @@ impl SqliteIdentityCache {
         did: &str,
         value: Result<PersistedIdentity, ResolutionError>,
         ttl: Duration,
-    ) -> Result<(), rusqlite::Error> {
-        let json = serde_json::to_string(&value)
-            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    ) {
+        let result_json = match serde_json::to_string(&value) {
+            Ok(json) => json,
+            Err(error) => {
+                tracing::warn!(%error, cache_key = key, "could not encode persistent identity cache entry");
+                return;
+            }
+        };
         let now_ms = unix_time_ms();
         let expires_at_ms = now_ms.saturating_add(ttl.as_millis().min(i64::MAX as u128) as i64);
-        let connection = self.connection.lock().map_err(|_| {
-            rusqlite::Error::InvalidParameterName("identity cache mutex poisoned".to_owned())
-        })?;
-        connection.execute(
-            "DELETE FROM identity_resolution_cache WHERE expires_at_ms <= ?1",
-            [now_ms],
-        )?;
-        connection.execute(
-            "INSERT INTO identity_resolution_cache(cache_key,did,result_json,expires_at_ms)
-             VALUES(?1,?2,?3,?4)
-             ON CONFLICT(cache_key) DO UPDATE SET
-                did=excluded.did,result_json=excluded.result_json,expires_at_ms=excluded.expires_at_ms",
-            params![key, did, json, expires_at_ms],
-        )?;
-        Ok(())
+        let Ok(mut memory) = self.memory.lock() else {
+            tracing::warn!(cache_key = key, "identity cache memory lock poisoned");
+            return;
+        };
+        memory.entries.insert(
+            key.to_owned(),
+            MemoryIdentityEntry {
+                did: did.to_owned(),
+                expires_at: Instant::now() + ttl,
+                value,
+            },
+        );
+        drop(memory);
+        self.enqueue(IdentityCacheWrite::Set {
+            key: key.to_owned(),
+            did: did.to_owned(),
+            result_json,
+            expires_at_ms,
+        });
     }
 
-    /// Remove all aliases, documents, and verified identities for a DID after a Jetstream event.
+    fn enqueue(&self, write: IdentityCacheWrite) {
+        if let Err(error) = self.writer.try_send(write) {
+            let dropped = self.dropped_writes.fetch_add(1, Ordering::Relaxed) + 1;
+            match error {
+                TrySendError::Full(_) => tracing::debug!(
+                    dropped_writes = dropped,
+                    "identity cache writer queue is full; dropping update"
+                ),
+                TrySendError::Disconnected(_) => tracing::debug!(
+                    dropped_writes = dropped,
+                    "identity cache writer is stopped; dropping update"
+                ),
+            }
+        }
+    }
+
+    /// Remove all aliases, documents, and verified identities for a DID from memory immediately,
+    /// then queue the SQLite delete without waiting for the writer.
     pub fn invalidate_did(&self, did: &str) -> Result<(), rusqlite::Error> {
-        self.connection
-            .lock()
-            .map_err(|_| {
-                rusqlite::Error::InvalidParameterName("identity cache mutex poisoned".to_owned())
-            })?
-            .execute("DELETE FROM identity_resolution_cache WHERE did=?1", [did])?;
+        let generation = self.next_invalidation.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut memory = self.memory.lock().map_err(|_| {
+            rusqlite::Error::InvalidParameterName("identity cache memory lock poisoned".to_owned())
+        })?;
+        memory.entries.retain(|_, entry| entry.did != did);
+        memory.invalidated_dids.insert(
+            did.to_owned(),
+            IdentityInvalidation {
+                generation,
+                committed: false,
+            },
+        );
+        drop(memory);
+        self.enqueue(IdentityCacheWrite::InvalidateDid {
+            did: did.to_owned(),
+            generation,
+        });
         Ok(())
+    }
+}
+
+fn read_identity_cache_row(
+    path: &Path,
+    key: &str,
+) -> Result<Option<(String, String, i64)>, rusqlite::Error> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    connection.busy_timeout(Duration::from_millis(100))?;
+    connection.query_row(
+        "SELECT did, result_json, expires_at_ms FROM identity_resolution_cache WHERE cache_key=?1",
+        [key],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .optional()
+}
+
+fn identity_cache_writer(
+    connection: Connection,
+    receiver: Receiver<IdentityCacheWrite>,
+    memory: Arc<StdMutex<IdentityCacheMemory>>,
+) {
+    while let Ok(write) = receiver.recv() {
+        match write {
+            IdentityCacheWrite::Set {
+                key,
+                did,
+                result_json,
+                expires_at_ms,
+            } => {
+                let result = connection
+                    .execute(
+                        "DELETE FROM identity_resolution_cache WHERE expires_at_ms <= ?1",
+                        [unix_time_ms()],
+                    )
+                    .and_then(|_| {
+                        connection.execute(
+                            "INSERT INTO identity_resolution_cache(cache_key,did,result_json,expires_at_ms)
+                             VALUES(?1,?2,?3,?4)
+                             ON CONFLICT(cache_key) DO UPDATE SET
+                                did=excluded.did,result_json=excluded.result_json,expires_at_ms=excluded.expires_at_ms",
+                            params![key, did, result_json, expires_at_ms],
+                        )
+                    });
+                if let Err(error) = result {
+                    tracing::warn!(%error, cache_key = key, "could not save persistent identity cache");
+                }
+            }
+            IdentityCacheWrite::InvalidateDid { did, generation } => {
+                match connection
+                    .execute("DELETE FROM identity_resolution_cache WHERE did=?1", [&did])
+                {
+                    Ok(_) => {
+                        if let Ok(mut memory) = memory.lock() {
+                            if let Some(invalidation) = memory.invalidated_dids.get_mut(&did)
+                                && invalidation.generation == generation
+                            {
+                                invalidation.committed = true;
+                            }
+                            if memory.active_sqlite_reads == 0 {
+                                memory
+                                    .invalidated_dids
+                                    .retain(|_, invalidation| !invalidation.committed);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, %did, "could not invalidate persistent identity cache")
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -277,7 +496,7 @@ impl<B: IdentityBackend> IdentityResolver<B> {
     pub async fn resolve_handle(&self, handle: &str) -> Result<Identity, ResolutionError> {
         let handle = normalize_handle(handle)?;
         let key = format!("handle:{handle}");
-        if let Some(cached) = self.persistent_result(&key) {
+        if let Some(cached) = self.persistent_result(&key).await {
             return cached?.identity.ok_or_else(|| {
                 ResolutionError::Backend("cached handle result had no identity".to_owned())
             });
@@ -343,7 +562,7 @@ impl<B: IdentityBackend> IdentityResolver<B> {
     pub async fn resolve_did_document(&self, did: &str) -> Result<DidDocument, ResolutionError> {
         validate_did(did)?;
         let key = format!("did-document:{did}");
-        if let Some(cached) = self.persistent_result(&key) {
+        if let Some(cached) = self.persistent_result(&key).await {
             let document = cached?.document.ok_or_else(|| {
                 ResolutionError::Backend("cached DID document result had no document".to_owned())
             })?;
@@ -407,7 +626,7 @@ impl<B: IdentityBackend> IdentityResolver<B> {
         validate_did(did)?;
         let key = format!("did:{did}");
         let persistent_key = format!("did-identity:{did}");
-        if let Some(cached) = self.persistent_result(&persistent_key) {
+        if let Some(cached) = self.persistent_result(&persistent_key).await {
             return cached?.identity.ok_or_else(|| {
                 ResolutionError::Backend("cached DID identity result had no identity".to_owned())
             });
@@ -440,9 +659,12 @@ impl<B: IdentityBackend> IdentityResolver<B> {
         }
     }
 
-    fn persistent_result(&self, key: &str) -> Option<Result<PersistedIdentity, ResolutionError>> {
+    async fn persistent_result(
+        &self,
+        key: &str,
+    ) -> Option<Result<PersistedIdentity, ResolutionError>> {
         let cache = self.persistent_cache.as_ref()?;
-        match cache.get(key) {
+        match cache.get(key).await {
             Ok(value) => value,
             Err(error) => {
                 tracing::warn!(%error, cache_key = key, "could not read persistent identity cache");
@@ -461,24 +683,19 @@ impl<B: IdentityBackend> IdentityResolver<B> {
         let Some(cache) = &self.persistent_cache else {
             return;
         };
-        if let Err(error) = cache.set(
+        cache.set(
             key,
             did,
             Ok(PersistedIdentity { identity, document }),
             PERSISTED_IDENTITY_TTL,
-        ) {
-            tracing::warn!(%error, cache_key = key, "could not save persistent identity cache");
-        }
+        );
     }
 
     fn persist_failure(&self, key: &str, did: &str, error: ResolutionError) {
         let Some(cache) = &self.persistent_cache else {
             return;
         };
-        if let Err(storage_error) = cache.set(key, did, Err(error), PERSISTED_IDENTITY_FAILURE_TTL)
-        {
-            tracing::warn!(%storage_error, cache_key = key, "could not save persistent identity failure");
-        }
+        cache.set(key, did, Err(error), PERSISTED_IDENTITY_FAILURE_TTL);
     }
 
     async fn resolve_handle_assertion(&self, handle: &str) -> Result<String, ResolutionError> {

@@ -65,7 +65,7 @@ Open [http://127.0.0.1:3000/login](http://127.0.0.1:3000/login), enter an AT Pro
 | TOML field | Environment variable | Default | Purpose |
 | --- | --- | --- | --- |
 | `listen` | `APPVIEW_LISTEN` | `127.0.0.1:3000` | HTTP bind address |
-| `data_dir` | `APPVIEW_DATA_DIR` | `./data` | SQLite database and OAuth client key |
+| `data_dir` | `APPVIEW_DATA_DIR` | `./data` | `appview.db` records, `oauth.db` sessions, `identity-cache.db` identities, and the OAuth client key |
 | `log_filter` | `APPVIEW_LOG_FILTER` | `info` | `tracing` filter |
 | `scope_mode` | `APPVIEW_SCOPE` | `scoped` | `scoped` or `full` indexing |
 | `jetstream_urls` | `APPVIEW_JETSTREAM_URLS` | east Jetstream URL | TOML string array, or comma-separated URLs in the environment |

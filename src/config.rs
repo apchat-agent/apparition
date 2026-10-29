@@ -339,3 +339,8 @@ pub fn database_paths(data_dir: &str) -> (PathBuf, PathBuf) {
     let dir = PathBuf::from(data_dir);
     (dir.join("appview.db"), dir.join("oauth.db"))
 }
+
+/// Path of the persistent identity cache, isolated from the high-write records database.
+pub fn identity_cache_path(data_dir: &str) -> PathBuf {
+    PathBuf::from(data_dir).join("identity-cache.db")
+}

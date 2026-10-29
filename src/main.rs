@@ -3,7 +3,7 @@ use appview_rs::{
     backfill::{
         AtriumRepoVerifier, BackfillWorker, HostRateLimiter, HttpRepoSource, RepoBackfiller,
     },
-    config::{Config, OAuthMode},
+    config::{Config, OAuthMode, identity_cache_path},
     identity::{HandleRefreshWorker, HttpIdentityBackend, IdentityResolver, SqliteIdentityCache},
     ingest::{Ingestor, JetstreamConsumer, SqliteStorage},
     init_tracing,
@@ -24,7 +24,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let address = listener.local_addr()?;
     let (database_path, oauth_database_path) = appview_rs::config::database_paths(&config.data_dir);
     let storage = Arc::new(SqliteStorage::open(&database_path)?);
-    let identity_cache = Arc::new(SqliteIdentityCache::open(&database_path)?);
+    let identity_cache = Arc::new(SqliteIdentityCache::open(identity_cache_path(
+        &config.data_dir,
+    ))?);
     let oauth_store = SqliteOAuthStore::open(&oauth_database_path)?;
     let oauth_key_path = PathBuf::from(&config.data_dir).join("oauth-client-key.json");
     let oauth = match config.oauth_mode {

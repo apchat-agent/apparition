@@ -1,4 +1,5 @@
 use appview_rs::{
+    config::{database_paths, identity_cache_path},
     identity::{
         DidDocument, DidService, IdentityBackend, IdentityResolver, ResolutionError,
         SqliteIdentityCache,
@@ -233,11 +234,8 @@ async fn identity_cache_writer_lock_never_blocks_resolution_or_tokio_progress() 
     let initial_ticks = ticks.load(Ordering::Relaxed);
 
     let started = std::time::Instant::now();
-    let resolved = futures_util::future::join_all(
-        dids.iter()
-            .map(|did| resolver.resolve_did(did)),
-    )
-    .await;
+    let resolved =
+        futures_util::future::join_all(dids.iter().map(|did| resolver.resolve_did(did))).await;
     let elapsed = started.elapsed();
 
     assert!(resolved.iter().all(Result::is_ok));
@@ -306,4 +304,44 @@ async fn account_event_evicts_identity_cache_immediately_while_sqlite_is_locked(
 
     drop(cache);
     cleanup_database(&path);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn records_database_write_lock_does_not_affect_identity_resolution() {
+    let data_dir = std::env::temp_dir().join(format!(
+        "appview-rs-av22-db-isolation-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let (records_path, _) = database_paths(data_dir.to_str().unwrap());
+    let cache_path = identity_cache_path(data_dir.to_str().unwrap());
+    assert_ne!(records_path, cache_path);
+    let cache = Arc::new(SqliteIdentityCache::open(cache_path).unwrap());
+
+    let records_writer = rusqlite::Connection::open(records_path).unwrap();
+    records_writer
+        .execute_batch("PRAGMA journal_mode = WAL; BEGIN IMMEDIATE;")
+        .unwrap();
+    let backend = FakeIdentityBackend::default();
+    backend.publish(ALICE, Some("alice.test"), "https://alice-pds.test");
+    let resolver =
+        IdentityResolver::new(backend, Duration::from_secs(30)).with_persistent_cache(cache);
+
+    let started = std::time::Instant::now();
+    let identity = resolver.resolve_did(ALICE).await.unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(identity.did, ALICE);
+    assert!(!records_writer.is_autocommit());
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "identity resolution waited {elapsed:?} for a records database writer"
+    );
+
+    records_writer.execute_batch("ROLLBACK;").unwrap();
+    drop(resolver);
+    let _ = std::fs::remove_dir_all(data_dir);
 }
