@@ -9484,7 +9484,12 @@ mod tests {
 
         assert_eq!(page.matches("Original text").count(), 1);
         assert!(!page.contains("class=\"reply-parent-card\""));
-        assert!(page.contains("class=\"reply-connector reply-connector-previous\""));
+        assert_eq!(page.matches("class=\"post-item thread-group\"").count(), 1);
+        assert!(
+            page.contains(
+                "class=\"reply-connector reply-connector-previous thread-group-connector\""
+            )
+        );
     }
 
     #[tokio::test]
@@ -9512,7 +9517,8 @@ mod tests {
         let page = request_test_timeline(storage.clone(), viewer).await;
         let (single_lookups, batch_lookups) = storage.record_uri_lookup_counts();
 
-        assert_eq!(page.matches("class=\"reply-parent-card\"").count(), 25);
+        assert_eq!(page.matches("class=\"post-item thread-group\"").count(), 25);
+        assert!(!page.contains("class=\"reply-parent-card\""));
         assert_eq!(
             single_lookups, 0,
             "parent hydration used per-record lookups"
