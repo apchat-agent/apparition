@@ -182,11 +182,14 @@ mod tests {
         MAX_BUCKETS, MAX_REQUEST_BODY_BYTES, RateState, protect, take_rate_slot_with_state,
     };
     use axum::{
+        Json,
         body::{Body, Bytes},
         extract::ConnectInfo,
         http::Request,
+        response::Html,
         routing::{get, post},
     };
+    use http_body_util::BodyExt;
     use std::{
         io::Write,
         net::SocketAddr,
@@ -264,6 +267,52 @@ mod tests {
         assert!(logs.contains("duration_ms="), "{logs}");
         assert!(!logs.contains("query-secret"), "{logs}");
         assert!(!logs.contains("cookie-secret"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn compression_honors_gzip_and_brotli_accept_encoding() {
+        let large_text = "mobile app page ".repeat(300);
+        let app = protect(
+            axum::Router::new()
+                .route(
+                    "/html",
+                    get({
+                        let large_text = large_text.clone();
+                        move || {
+                            let text = large_text.clone();
+                            async move { Html(text) }
+                        }
+                    }),
+                )
+                .route(
+                    "/json",
+                    get(move || {
+                        let text = large_text.clone();
+                        async move { Json(serde_json::json!({"text":text})) }
+                    }),
+                ),
+            false,
+        );
+        for (path, encoding) in [("/html", "gzip"), ("/json", "br")] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header("accept-encoding", encoding)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.headers()["content-encoding"], encoding);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(
+                body.len() < 1_000,
+                "{encoding} response was {} bytes",
+                body.len()
+            );
+        }
     }
 
     #[test]
