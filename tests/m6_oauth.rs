@@ -670,7 +670,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
             ),
             "{path}"
         );
-        assert!(html.contains("href=\"/static/app.css?v=av18\""), "{path}");
+        assert!(html.contains("href=\"/static/app.css?v=av19\""), "{path}");
         assert!(!html.contains("style="), "{path}");
         assert!(!html.contains("<script"), "{path}");
     }
@@ -678,7 +678,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
     let stylesheet = app
         .oneshot(
             Request::builder()
-                .uri("/static/app.css?v=av18")
+                .uri("/static/app.css?v=av19")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -953,7 +953,7 @@ async fn sign_in_error_page_uses_the_shared_mobile_document_shell() {
     assert!(
         html.contains("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">")
     );
-    assert!(html.contains("href=\"/static/app.css?v=av18\""));
+    assert!(html.contains("href=\"/static/app.css?v=av19\""));
     assert!(!html.contains("style="));
     assert!(!html.contains("<script"));
 }
@@ -3057,10 +3057,10 @@ async fn thread_page_uses_large_focus_post_stats_chain_lines_and_reply_bar() {
     assert!(html.contains("class=\"thread-topbar\""), "{html}");
     assert!(html.contains(">Post</h1>"), "{html}");
     assert_eq!(html.matches("thread-post-focus").count(), 1, "{html}");
-    assert!(html.contains("2 reposts"), "{html}");
-    assert!(html.contains("1 quote"), "{html}");
-    assert!(html.contains("1 like"), "{html}");
-    assert!(html.contains("thread-continues"), "{html}");
+    assert!(html.contains("<strong>2</strong> reposts"), "{html}");
+    assert!(html.contains("<strong>1</strong> quote"), "{html}");
+    assert!(html.contains("<strong>1</strong> like"), "{html}");
+    assert_eq!(html.matches("thread-continues").count(), 1, "{html}");
     assert!(html.contains("aria-label=\"Mobile reply bar\""), "{html}");
     assert!(html.contains("Write your reply"), "{html}");
     assert!(html.contains("aria-pressed=\"true\""), "{html}");
@@ -3225,7 +3225,7 @@ async fn web_posts_show_hydrated_authors_and_times_on_timeline_profile_and_threa
     .unwrap();
     assert!(thread_html.contains("Friend &amp; Co"));
     assert!(thread_html.contains("@friend.test"));
-    assert!(thread_html.contains("2026-10-27T09:15:00Z"));
+    assert!(thread_html.contains("09:15 · 27 Oct 2026"));
 }
 
 #[tokio::test]

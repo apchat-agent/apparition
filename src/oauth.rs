@@ -72,7 +72,7 @@ const PROFILE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const PROFILE_NEGATIVE_TTL: Duration = Duration::from_secs(60 * 60);
 const PAGE_PROFILE_BUDGET: Duration = Duration::from_millis(1500);
 const PAGE_PROFILE_CONCURRENCY: usize = 8;
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=av18";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=av19";
 const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=*";
 const WRITE_SCOPES: [&str; 3] = [
     "repo:app.bsky.feed.post?action=create",
@@ -1525,6 +1525,26 @@ fn page_shell_with_feeds(
     active_feed: Option<&str>,
     following_active: bool,
 ) -> String {
+    page_shell_with_options(
+        title,
+        content,
+        authenticated,
+        feeds,
+        active_feed,
+        following_active,
+        true,
+    )
+}
+
+fn page_shell_with_options(
+    title: &str,
+    content: &str,
+    authenticated: bool,
+    feeds: &[ResolvedFeed],
+    active_feed: Option<&str>,
+    following_active: bool,
+    show_feed_tabs: bool,
+) -> String {
     let navigation = if authenticated {
         format!(
             "<nav class=\"primary-nav\" aria-label=\"Main navigation\"><a href=\"/app\">{}<span>Home</span></a><a href=\"/feeds\">{}<span>Feeds</span></a><a href=\"/notifications\">{}<span>Notifications</span></a><a href=\"/profile\">{}<span>Profile</span></a><a class=\"compose-link\" href=\"/app#new-post\">{}<span>New post</span></a><form action=\"/logout\" method=\"post\"><button type=\"submit\">Sign out</button></form></nav>",
@@ -1537,7 +1557,7 @@ fn page_shell_with_feeds(
     } else {
         "<nav class=\"primary-nav\" aria-label=\"Main navigation\"><a href=\"/login\">Sign in</a></nav>".to_owned()
     };
-    let tabs = if authenticated {
+    let tabs = if authenticated && show_feed_tabs {
         render_feed_tabs(feeds, active_feed, following_active)
     } else {
         String::new()
@@ -1969,6 +1989,9 @@ fn icon_svg(name: &str) -> String {
         }
         "like" => {
             "<path d=\"M20.8 8.8c0 5.2-8.8 10.2-8.8 10.2S3.2 14 3.2 8.8A4.8 4.8 0 0 1 12 6.1a4.8 4.8 0 0 1 8.8 2.7Z\"/>"
+        }
+        "share" => {
+            "<circle cx=\"18\" cy=\"5\" r=\"3\"/><circle cx=\"6\" cy=\"12\" r=\"3\"/><circle cx=\"18\" cy=\"19\" r=\"3\"/><path d=\"m8.7 10.7 6.6-4.4M8.7 13.3l6.6 4.4\"/>"
         }
         _ => return String::new(),
     };
@@ -2908,6 +2931,11 @@ where
         })
         .collect::<String>();
     let mut reply_budget = 100;
+    let thread_continuations = thread_reply_records
+        .windows(2)
+        .filter(|pair| pair[0].did == pair[1].did)
+        .map(|pair| pair[0].uri.clone())
+        .collect::<HashSet<_>>();
     let replies_html = match render_thread_replies(
         state.storage.as_ref(),
         &record,
@@ -2915,6 +2943,7 @@ where
         write_forms_enabled,
         depth,
         &mut reply_budget,
+        &thread_continuations,
     ) {
         Ok(replies) => replies,
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
@@ -2929,21 +2958,26 @@ where
     } else {
         String::new()
     };
-    Html(page_shell_with_feeds(
+    let reply_bar = if write_forms_enabled {
+        render_thread_reply_bar(state.storage.as_ref(), &viewer_did)
+    } else {
+        String::new()
+    };
+    Html(page_shell_with_options(
         "Thread",
         &format!(
-            "<header class=\"page-heading\"><p class=\"eyebrow\">Conversation</p><h1>Thread</h1></header>{read_only_message}<section class=\"thread-ancestors\" aria-label=\"Earlier posts in this thread\"><ol class=\"post-list\">{ancestors_html}</ol></section><section class=\"thread-focus\" aria-label=\"Selected post\">{}</section><section class=\"thread-replies\"><h2>Replies</h2>{replies_html}</section>{reply_composer}",
-            render_web_post(
+            "<header class=\"thread-topbar\"><a href=\"/app\" aria-label=\"Back to timeline\">←</a><h1>Post</h1></header>{read_only_message}<section class=\"thread-ancestors\" aria-label=\"Earlier posts in this thread\"><ol class=\"post-list\">{ancestors_html}</ol></section><section class=\"thread-focus\" aria-label=\"Selected post\">{}</section><section class=\"thread-replies\" aria-label=\"Replies\">{replies_html}</section>{reply_composer}{reply_bar}",
+            render_thread_focus(
                 state.storage.as_ref(),
                 &record,
                 &viewer_did,
-                write_forms_enabled,
-                false
+                write_forms_enabled
             )
         ),
         true,
         &pinned_feeds,
         None,
+        false,
         false,
     ))
     .into_response()
@@ -3108,9 +3142,165 @@ fn render_reply_composer<S: Storage>(storage: &S, parent: &IndexedRecord) -> Str
         .unwrap_or_else(|_| json!({"did":parent.did,"handle":parent.did}));
     let handle = profile_handle(&profile, &parent.did);
     format!(
-        "<form class=\"composer reply-composer\" action=\"/reply\" method=\"post\"><p class=\"reply-context\">Replying to @{}</p><input type=\"hidden\" name=\"parent_uri\" value=\"{}\"><label for=\"reply-text\">Write a reply</label><textarea id=\"reply-text\" name=\"text\" rows=\"3\" maxlength=\"300\" required></textarea><button type=\"submit\">Reply</button></form>",
+        "<form id=\"reply-composer\" class=\"composer reply-composer\" action=\"/reply\" method=\"post\"><p class=\"reply-context\">Replying to @{}</p><input type=\"hidden\" name=\"parent_uri\" value=\"{}\"><label for=\"reply-text\">Write a reply</label><textarea id=\"reply-text\" name=\"text\" rows=\"3\" maxlength=\"300\" required></textarea><button type=\"submit\">Reply</button></form>",
         html_escape(&handle),
         html_escape(&parent.uri)
+    )
+}
+
+fn render_thread_reply_bar<S: Storage>(storage: &S, viewer_did: &str) -> String {
+    let profile = profile_view_from_storage(storage, viewer_did)
+        .unwrap_or_else(|_| json!({"did":viewer_did,"handle":viewer_did}));
+    format!(
+        "<aside class=\"thread-reply-bar\" aria-label=\"Mobile reply bar\">{}<a href=\"#reply-composer\">Write your reply</a></aside>",
+        avatar_markup(&profile, "small-avatar")
+    )
+}
+
+fn render_thread_focus<S: Storage>(
+    storage: &S,
+    record: &IndexedRecord,
+    viewer_did: &str,
+    write_forms_enabled: bool,
+) -> String {
+    let profile = profile_view_from_storage(storage, &record.did)
+        .unwrap_or_else(|_| json!({"did":record.did,"handle":record.did}));
+    let handle = profile_handle(&profile, &record.did);
+    let display_name = profile
+        .get("displayName")
+        .and_then(Value::as_str)
+        .unwrap_or(&handle);
+    let profile_uri = format!("/profile?did={}", form_encoded(&record.did));
+    let text = record
+        .record
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let text = if text.chars().count() > MAX_RENDERED_REMOTE_CHARS {
+        html_escape(
+            &text
+                .chars()
+                .take(MAX_RENDERED_REMOTE_CHARS)
+                .collect::<String>(),
+        )
+    } else {
+        html_escape(text)
+    };
+    let time = record
+        .record
+        .get("createdAt")
+        .and_then(Value::as_str)
+        .map(thread_date_label)
+        .unwrap_or_else(|| "time unavailable".to_owned());
+    let threadgate = storage
+        .get_record(&record.did, "app.bsky.feed.threadgate", &record.rkey)
+        .ok()
+        .flatten();
+    let reply_policy = if threadgate.is_none() {
+        " · Everybody can reply"
+    } else {
+        ""
+    };
+    let interactions = storage
+        .post_interaction_summary(&record.uri, Some(viewer_did))
+        .unwrap_or_default();
+    let stats = [
+        (interactions.repost_count, "repost", "reposts"),
+        (interactions.quote_count, "quote", "quotes"),
+        (interactions.like_count, "like", "likes"),
+    ]
+    .into_iter()
+    .filter(|(count, _, _)| *count > 0)
+    .map(|(count, singular, plural)| {
+        format!(
+            "<span><strong>{count}</strong> {}</span>",
+            if count == 1 { singular } else { plural }
+        )
+    })
+    .collect::<Vec<_>>()
+    .join(" ");
+    let thread_uri = format!("/app/thread?uri={}", form_encoded(&record.uri));
+    let uri = html_escape(&record.uri);
+    let cid = html_escape(record.cid.as_deref().unwrap_or(""));
+    let reply_action = format!(
+        "<a class=\"post-action\" href=\"{}\" aria-label=\"Reply\">{}<span>{}</span></a>",
+        html_escape(&thread_uri),
+        icon_svg("reply"),
+        interactions.reply_count
+    );
+    let repost_action = if write_forms_enabled {
+        format!(
+            "<details class=\"repost-menu\"><summary class=\"post-action\" aria-label=\"Repost menu\">{}<span>Repost</span><span>{}</span></summary><div class=\"repost-menu-options\"><form class=\"post-action-form\" action=\"/repost\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\"><button class=\"post-action\" type=\"submit\" aria-label=\"Repost by @{}\">Repost</button></form><a href=\"/compose?quote_uri={}\">Quote post</a></div></details>",
+            icon_svg("repost"),
+            interactions.repost_count,
+            html_escape(&handle),
+            form_encoded(&record.uri)
+        )
+    } else {
+        String::new()
+    };
+    let like_action = if write_forms_enabled {
+        let liked = interactions.viewer_like.is_some();
+        let intent = interactions
+            .viewer_like
+            .as_ref()
+            .map(|like| {
+                format!(
+                    "<input type=\"hidden\" name=\"intent\" value=\"delete\"><input type=\"hidden\" name=\"like_uri\" value=\"{}\">",
+                    html_escape(like)
+                )
+            })
+            .unwrap_or_default();
+        format!(
+            "<form class=\"post-action-form\" action=\"/like\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\">{intent}<button class=\"post-action{}\" type=\"submit\" aria-label=\"Like post by @{}\" aria-pressed=\"{}\">{}<span>{}</span></button></form>",
+            if liked { " is-liked" } else { "" },
+            html_escape(&handle),
+            liked,
+            icon_svg("like"),
+            interactions.like_count
+        )
+    } else {
+        String::new()
+    };
+    let share_action = format!(
+        "<a class=\"post-action\" href=\"{}\" aria-label=\"Share or copy link\">{}<span>Share</span></a>",
+        html_escape(&thread_uri),
+        icon_svg("share")
+    );
+    let more_action = format!(
+        "<details class=\"thread-more-menu\"><summary class=\"post-action\" aria-label=\"More post actions\">…</summary><div class=\"repost-menu-options\"><a href=\"{}\">Copy link</a><a href=\"{}\">View profile</a></div></details>",
+        html_escape(&thread_uri),
+        html_escape(&profile_uri)
+    );
+    let embed = record
+        .record
+        .get("embed")
+        .map(|embed| render_web_embed(storage, &record.did, embed))
+        .unwrap_or_default();
+    format!(
+        "<article class=\"post-card thread-post-focus\"><header class=\"thread-focus-author\">{}<div class=\"thread-focus-names\"><a class=\"author-name\" href=\"{}\">{}</a><a class=\"author-handle\" href=\"{}\">@{}</a></div></header><p class=\"thread-focus-text\">{text}</p><p class=\"thread-focus-meta\">{time}{reply_policy}</p><hr><div class=\"thread-stats\" aria-label=\"Post statistics\">{stats}</div><hr><div class=\"thread-focus-actions\">{reply_action}{repost_action}{like_action}{share_action}{more_action}</div>{embed}</article>",
+        avatar_markup(&profile, "focus-avatar"),
+        html_escape(&profile_uri),
+        html_escape(display_name),
+        html_escape(&profile_uri),
+        html_escape(&handle)
+    )
+}
+
+fn thread_date_label(created_at: &str) -> String {
+    let Ok(created_at) = OffsetDateTime::parse(created_at, &Rfc3339) else {
+        return "time unavailable".to_owned();
+    };
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    format!(
+        "{:02}:{:02} · {} {} {}",
+        created_at.hour(),
+        created_at.minute(),
+        created_at.day(),
+        MONTHS[created_at.month() as usize - 1],
+        created_at.year()
     )
 }
 
@@ -3143,6 +3333,7 @@ fn render_thread_replies<S: Storage>(
     write_forms_enabled: bool,
     depth: usize,
     budget: &mut usize,
+    thread_continuations: &HashSet<String>,
 ) -> Result<String, StorageError> {
     if depth == 0 || *budget == 0 {
         return Ok(String::new());
@@ -3152,22 +3343,25 @@ fn render_thread_replies<S: Storage>(
         return Ok(String::new());
     }
     let mut html = String::from("<ol>");
-    for reply in replies {
+    for reply in &replies {
         if *budget == 0 {
             break;
         }
         *budget -= 1;
         let nested = render_thread_replies(
             storage,
-            &reply,
+            reply,
             viewer_did,
             write_forms_enabled,
             depth - 1,
             budget,
+            thread_continuations,
         )?;
+        let continues = thread_continuations.contains(&reply.uri);
         html.push_str(&format!(
-            "<li class=\"post-item\">{}{nested}</li>",
-            render_web_post(storage, &reply, viewer_did, write_forms_enabled, false)
+            "<li class=\"post-item thread-reply-item{}\">{}{nested}</li>",
+            if continues { " thread-continues" } else { "" },
+            render_web_post(storage, reply, viewer_did, write_forms_enabled, false)
         ));
     }
     html.push_str("</ol>");
