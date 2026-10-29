@@ -8054,7 +8054,14 @@ fn render_timeline_post_items<S: Storage>(
                     .iter()
                     .all(|member| records[*member].did == records[*first].did)
             });
-            let visible = if !self_thread && group.len() > 3 {
+            let visible = if self_thread && group.len() > 10 {
+                group
+                    .iter()
+                    .take(2)
+                    .chain(group.iter().rev().take(3).rev())
+                    .copied()
+                    .collect::<Vec<_>>()
+            } else if !self_thread && group.len() > 3 {
                 group
                     .iter()
                     .take(1)
