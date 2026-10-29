@@ -29,8 +29,16 @@ struct RateState {
 static RATE_STATE: OnceLock<Mutex<RateState>> = OnceLock::new();
 
 pub fn protect(router: Router, public_https: bool) -> Router {
+    protect_with_body_limit(router, public_https, MAX_REQUEST_BODY_BYTES)
+}
+
+pub fn protect_with_body_limit(
+    router: Router,
+    public_https: bool,
+    max_request_body_bytes: usize,
+) -> Router {
     router
-        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
+        .layer(RequestBodyLimitLayer::new(max_request_body_bytes))
         .layer(CompressionLayer::new().gzip(true).br(true))
         .layer(from_fn_with_state(public_https, apply))
 }
