@@ -65,7 +65,10 @@ use std::{
     net::SocketAddr,
     path::{Component, Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -384,25 +387,68 @@ pub struct OAuthWebState<F, S> {
     pub alt_model_dir: Option<PathBuf>,
     feed_page_cache: FeedPageCache,
     notification_streams: Arc<Mutex<HashMap<String, usize>>>,
+    shutdown: WebShutdown,
+}
+
+/// Coordinates web request shutdown and counts active notification streams.
+#[derive(Clone)]
+pub struct WebShutdown {
+    sender: tokio::sync::watch::Sender<bool>,
+    notification_streams: Arc<AtomicUsize>,
+}
+
+impl WebShutdown {
+    pub fn new() -> Self {
+        let (sender, _) = tokio::sync::watch::channel(false);
+        Self {
+            sender,
+            notification_streams: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn shutdown(&self) {
+        self.sender.send_replace(true);
+    }
+
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.sender.subscribe()
+    }
+
+    pub fn active_notification_streams(&self) -> usize {
+        self.notification_streams.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for WebShutdown {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 const MAX_NOTIFICATION_STREAMS_PER_VIEWER: usize = 4;
 
 struct NotificationStreamGuard {
     registry: Arc<Mutex<HashMap<String, usize>>>,
+    active_streams: Arc<AtomicUsize>,
     did: String,
 }
 
 impl NotificationStreamGuard {
-    fn acquire(registry: Arc<Mutex<HashMap<String, usize>>>, did: &str) -> Option<Self> {
+    fn acquire(
+        registry: Arc<Mutex<HashMap<String, usize>>>,
+        active_streams: Arc<AtomicUsize>,
+        did: &str,
+    ) -> Option<Self> {
         let mut streams = registry.lock().ok()?;
         let count = streams.entry(did.to_owned()).or_default();
         if *count >= MAX_NOTIFICATION_STREAMS_PER_VIEWER {
             return None;
         }
         *count += 1;
+        active_streams.fetch_add(1, Ordering::Relaxed);
         Some(Self {
             registry: registry.clone(),
+            active_streams,
             did: did.to_owned(),
         })
     }
@@ -410,6 +456,7 @@ impl NotificationStreamGuard {
 
 impl Drop for NotificationStreamGuard {
     fn drop(&mut self) {
+        self.active_streams.fetch_sub(1, Ordering::Relaxed);
         if let Ok(mut streams) = self.registry.lock()
             && let Some(count) = streams.get_mut(&self.did)
         {
@@ -526,6 +573,38 @@ impl OAuthPublic {
         F: OAuthFlow,
         S: Storage + 'static,
     {
+        self.router_with_flow_and_alt_model_dir_and_shutdown(
+            flow,
+            storage,
+            alt_model_dir,
+            WebShutdown::new(),
+        )
+    }
+
+    pub fn router_with_flow_and_shutdown<F, S>(
+        &self,
+        flow: F,
+        storage: Arc<S>,
+        shutdown: WebShutdown,
+    ) -> Router
+    where
+        F: OAuthFlow,
+        S: Storage + 'static,
+    {
+        self.router_with_flow_and_alt_model_dir_and_shutdown(flow, storage, None, shutdown)
+    }
+
+    pub fn router_with_flow_and_alt_model_dir_and_shutdown<F, S>(
+        &self,
+        flow: F,
+        storage: Arc<S>,
+        alt_model_dir: Option<PathBuf>,
+        shutdown: WebShutdown,
+    ) -> Router
+    where
+        F: OAuthFlow,
+        S: Storage + 'static,
+    {
         Router::new()
             .route(METADATA_PATH, get(metadata::<F, S>))
             .route("/static/app.css", get(app_stylesheet))
@@ -563,6 +642,7 @@ impl OAuthPublic {
                 flow,
                 storage,
                 alt_model_dir,
+                shutdown,
                 feed_page_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 notification_streams: Arc::new(Mutex::new(HashMap::new())),
             }))
@@ -3897,6 +3977,7 @@ fn notification_count_stream<S: Storage + 'static>(
     storage: Arc<S>,
     did: String,
     heartbeat_interval: Duration,
+    shutdown: tokio::sync::watch::Receiver<bool>,
     guard: NotificationStreamGuard,
 ) -> impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>> + Send + 'static {
     let heartbeat_interval = heartbeat_interval.max(Duration::from_millis(1));
@@ -3911,30 +3992,31 @@ fn notification_count_stream<S: Storage + 'static>(
             heartbeat,
             storage,
             did,
+            shutdown,
             guard,
         ),
-        |(initial, mut receiver, mut heartbeat, storage, did, _guard)| async move {
+        |(initial, mut receiver, mut heartbeat, storage, did, _shutdown, _guard)| async move {
             if let Some(count) = initial {
                 return Some((
                     Ok(unread_count_event(count)),
-                    (None, receiver, heartbeat, storage, did, _guard),
+                    (None, receiver, heartbeat, storage, did, _shutdown, _guard),
                 ));
             }
             tokio::select! {
                 _ = heartbeat.tick() => Some((
                     Ok(Event::default().comment("heartbeat")),
-                    (None, receiver, heartbeat, storage, did, _guard),
+                    (None, receiver, heartbeat, storage, did, _shutdown, _guard),
                 )),
                 result = receiver.recv() => match result {
                     Ok(count) => Some((
                         Ok(unread_count_event(count)),
-                        (None, receiver, heartbeat, storage, did, _guard),
+                        (None, receiver, heartbeat, storage, did, _shutdown, _guard),
                     )),
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         let count = storage.unread_notification_count(&did).unwrap_or_default();
                         Some((
                             Ok(unread_count_event(count)),
-                            (None, receiver, heartbeat, storage, did, _guard),
+                            (None, receiver, heartbeat, storage, did, _shutdown, _guard),
                         ))
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
@@ -3978,8 +4060,11 @@ where
     let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    let Some(guard) = NotificationStreamGuard::acquire(state.notification_streams.clone(), &did)
-    else {
+    let Some(guard) = NotificationStreamGuard::acquire(
+        state.notification_streams.clone(),
+        state.shutdown.notification_streams.clone(),
+        &did,
+    ) else {
         return oauth_error(
             StatusCode::TOO_MANY_REQUESTS,
             "too many notification streams for this viewer",
@@ -3996,6 +4081,7 @@ where
         state.storage.clone(),
         did,
         Duration::from_secs(25),
+        state.shutdown.subscribe(),
         guard,
     );
     let mut response = Sse::new(events).into_response();
@@ -7124,9 +7210,22 @@ mod tests {
         let did = "did:plc:stream-test".to_owned();
         let receiver = storage.subscribe_notification_counts(&did);
         let registry = Arc::new(Mutex::new(HashMap::new()));
-        let guard = NotificationStreamGuard::acquire(registry, &did).unwrap();
-        let events =
-            notification_count_stream(receiver, 3, storage, did, Duration::from_millis(10), guard);
+        let shutdown = WebShutdown::new();
+        let guard = NotificationStreamGuard::acquire(
+            registry,
+            shutdown.notification_streams.clone(),
+            &did,
+        )
+        .unwrap();
+        let events = notification_count_stream(
+            receiver,
+            3,
+            storage,
+            did,
+            Duration::from_millis(10),
+            shutdown.subscribe(),
+            guard,
+        );
         let mut body = Sse::new(events).into_response().into_body();
         let initial = tokio::time::timeout(Duration::from_secs(1), body.frame())
             .await

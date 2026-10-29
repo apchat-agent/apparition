@@ -3,7 +3,7 @@ use appview_rs::{
     feeds::{FeedTimeline, FeedTimelineTiming, HydratedFeedPage, ResolvedFeed},
     ingest::{IndexedRecord, Ingestor, MemoryStorage, ScopeMode, SqliteStorage, Storage},
     oauth::{
-        FetchedAuthorProfile, OAuthAccount, OAuthCallback, OAuthFlow, OAuthPublic,
+        FetchedAuthorProfile, OAuthAccount, OAuthCallback, OAuthFlow, OAuthPublic, WebShutdown,
         PdsCreatedRecord, PinnedFeedTabs, PostStrongRef, ProfileRefreshWorker, SqliteOAuthStore,
     },
 };
@@ -3572,6 +3572,59 @@ async fn ingest_like_updates_a_connected_notification_stream_within_one_second()
         .into_data()
         .unwrap();
     assert!(String::from_utf8_lossy(&update).contains("data: 1"));
+}
+
+#[tokio::test]
+async fn graceful_shutdown_ends_connected_notification_stream_and_server() {
+    let storage = Arc::new(MemoryStorage::default());
+    let shutdown = WebShutdown::new();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow_and_shutdown(FakeOAuthFlow::default(), storage, shutdown.clone());
+    let cookie = finish_login(&app).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server_shutdown = shutdown.clone();
+    let server = tokio::spawn(async move {
+        let mut receiver = server_shutdown.subscribe();
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                if !*receiver.borrow() {
+                    let _ = receiver.changed().await;
+                }
+            })
+            .await
+    });
+    let client = reqwest::Client::new();
+    let mut response = tokio::time::timeout(
+        Duration::from_secs(1),
+        client
+            .get(format!("http://{address}/notifications/stream"))
+            .header("cookie", cookie)
+            .send(),
+    )
+    .await
+    .expect("notification stream should connect within one second")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let first = tokio::time::timeout(Duration::from_secs(1), response.chunk())
+        .await
+        .expect("stream should send its initial count")
+        .unwrap()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&first).contains("data: 0"));
+
+    shutdown.shutdown();
+    let end = tokio::time::timeout(Duration::from_secs(1), response.chunk())
+        .await
+        .expect("shutdown should end the notification stream within one second")
+        .unwrap();
+    assert!(end.is_none(), "notification stream must finish on shutdown");
+    tokio::time::timeout(Duration::from_secs(1), server)
+        .await
+        .expect("server should finish graceful shutdown with the stream")
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]
