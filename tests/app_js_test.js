@@ -644,8 +644,9 @@ async function createInfiniteScrollHarness({ cards = ["post-1", "post-2"], mobil
   layout.top = 0;
   const link = new Link("/older-a");
   const windowListeners = new Map();
+  const documentListeners = new Map();
   const documentMock = {
-    addEventListener() {},
+    addEventListener(name, listener) { documentListeners.set(name, listener); },
     querySelector(selector) {
       if (selector === '.pagination-link[rel="next"]') return link;
       if (selector === ".post-list, .notification-list") return list;
@@ -690,6 +691,7 @@ async function createInfiniteScrollHarness({ cards = ["post-1", "post-2"], mobil
     Link,
     Observer,
     documentMock,
+    documentListeners,
     layout,
     link,
     list,
@@ -742,4 +744,61 @@ Deno.test("infinite scroll stops before retaining more than 500 cards", async ()
   assertEquals(harness.list.children.length, 500);
   assert(!harness.link.removed, "the Older link should remain available to continue with a full navigation");
   assert(harness.status.textContent.includes("500"), "the status should explain why automatic loading stopped");
+});
+
+Deno.test("a like form on an appended card uses the existing delegated handler", async () => {
+  const pages = {};
+  const harness = await createInfiniteScrollHarness({
+    responses: [{ ok: true, text: async () => "page-two" }],
+    pages,
+  });
+  const nextList = new harness.Element("ol");
+  nextList.className = "post-list";
+  const card = new harness.Element("li", "post-3");
+  const form = new globalThis.HTMLFormElement();
+  const button = {
+    disabled: false,
+    attributes: new Map([["aria-label", "Like post"], ["aria-pressed", "false"]]),
+    childNodes: [{ nodeType: 3, textContent: "Like" }],
+    classes: new Set(),
+    classList: {
+      toggle(name, force) { force ? button.classes.add(name) : button.classes.delete(name); },
+    },
+    getAttribute(name) { return button.attributes.get(name) ?? null; },
+    setAttribute(name, value) { button.attributes.set(name, value); },
+    querySelector() { return null; },
+    append() {},
+  };
+  form.getAttribute = (name) => name === "action" ? "/like" : null;
+  form.querySelector = (selector) => selector === "button" ? button : null;
+  form.append = () => {};
+  form.submit = () => { form.submitted = true; };
+  card.append(form);
+  nextList.append(card);
+  pages["page-two"] = { list: nextList, link: null };
+
+  const originalFormData = globalThis.FormData;
+  const originalFetch = globalThis.fetch;
+  globalThis.FormData = class {
+    [Symbol.iterator]() { return [][Symbol.iterator](); }
+  };
+  let likeRequests = 0;
+  globalThis.fetch = async (url) => {
+    assertEquals(url, "/like");
+    likeRequests++;
+    return { ok: true, json: async () => ({ liked: true, likeCount: 1 }) };
+  };
+  try {
+    harness.Observer.latest.target.top = -1;
+    harness.scroll();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    let prevented = false;
+    await harness.documentListeners.get("submit")({ target: form, preventDefault() { prevented = true; } });
+    assert(prevented, "the delegated like handler should intercept an appended form");
+    assertEquals(likeRequests, 1);
+    assert(button.classes.has("is-liked"), "the appended card's heart should update in place");
+  } finally {
+    globalThis.FormData = originalFormData;
+    globalThis.fetch = originalFetch;
+  }
 });
