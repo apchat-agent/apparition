@@ -1,4 +1,4 @@
-use appview_rs::router;
+use appview_rs::{router, router_with_oauth_flow};
 use appview_rs::{
     config::Config,
     feeds::{FeedTimeline, FeedTimelineTiming, HydratedFeedPage, ResolvedFeed},
@@ -1219,6 +1219,55 @@ async fn post_avatars_use_thumbnail_dimensions_and_lazy_load_after_six() {
     assert!(
         html.contains("width=\"44\" height=\"44\" loading=\"eager\" decoding=\"async\""),
         "{html}"
+    );
+}
+
+#[tokio::test]
+async fn fifty_post_app_page_stays_under_the_compressed_page_weight_budget() {
+    let storage = Arc::new(MemoryStorage::default());
+    let did = "did:plc:alice";
+    let body = "A representative post with a few sentences about what happened today. \
+        Here are a few details, a thought, and a link to share with friends.";
+    for index in 0..50 {
+        storage
+            .put_record(&fake_feed_post(
+                did,
+                &format!("post-{index}"),
+                1_000 - index,
+                &format!("{body} ({index})"),
+            ))
+            .unwrap();
+    }
+    let app = router_with_oauth_flow(
+        OAuthPublic::new("https://appview.example").unwrap(),
+        FakeOAuthFlow::default(),
+        storage,
+    );
+    let cookie = finish_login(&app).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", cookie)
+                .header("accept-encoding", "gzip")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-encoding"], "gzip");
+    let compressed = response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    eprintln!("av21 /app 50-post gzip body: {} bytes", compressed.len());
+    assert!(
+        compressed.len() < 60 * 1024,
+        "compressed /app body was {} bytes (budget 61440 bytes)",
+        compressed.len()
     );
 }
 
