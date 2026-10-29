@@ -3,7 +3,7 @@ use appview_rs::{
         DidDocument as AppDidDocument, DidService, IdentityBackend, IdentityResolver,
         ResolutionError,
     },
-    ingest::MemoryStorage,
+    ingest::{IndexedRecord, MemoryStorage, Storage},
     net::SafeHttpClient,
     oauth::{OAuthCallback, OAuthFlow, OAuthPublic, PostStrongRef, SqliteOAuthStore},
 };
@@ -22,6 +22,7 @@ use atrium_oauth::{
     OAuthClient, OAuthClientConfig, OAuthResolverConfig, Scope,
 };
 use axum::{
+    Router,
     body::Body,
     http::{Request, StatusCode},
 };
@@ -90,6 +91,9 @@ struct FakeServerState {
     token_sub: Option<String>,
     token_scope: Option<String>,
     create_count: usize,
+    upload_count: usize,
+    upload_fail_on: Option<usize>,
+    create_bodies: Vec<Value>,
 }
 
 #[derive(Clone)]
@@ -116,6 +120,7 @@ struct CapturedRequest {
     path: String,
     headers: HashMap<String, String>,
     body: String,
+    body_bytes: Vec<u8>,
 }
 
 #[tokio::test]
@@ -347,6 +352,216 @@ async fn production_oauth_flow_accepts_standard_callback_and_binds_subject_and_s
         })
         .await;
     assert!(result.unwrap_err().contains("atproto scope"));
+    server.abort();
+}
+
+#[tokio::test]
+async fn production_post_with_two_images_uploads_blobs_before_creating_record() {
+    let public = OAuthPublic::new("https://appview.example").unwrap();
+    let (flow, _, shared, server) =
+        production_flow_with_public(public.clone(), None, Some(EXPECTED_OAUTH_SCOPE)).await;
+    let storage = Arc::new(MemoryStorage::default());
+    let app = public.router_with_flow(flow, storage);
+    let cookie = finish_production_login(&app, &shared).await;
+    let boundary = "protocol-two-pictures";
+    let first = b"\xff\xd8\xfffirst-image";
+    let second = b"\xff\xd8\xffsecond-image";
+    let body = picture_multipart(
+        boundary,
+        "two pictures",
+        None,
+        None,
+        &[
+            ("a.jpg", first, "first alt", 1200, 800),
+            ("b.jpg", second, "second alt", 2000, 1000),
+        ],
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/post")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", cookie)
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let state = shared.lock().unwrap();
+    let upload_requests = state
+        .requests
+        .iter()
+        .filter(|request| {
+            request
+                .path
+                .starts_with("/xrpc/com.atproto.repo.uploadBlob")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(upload_requests.len(), 2);
+    assert_eq!(
+        upload_requests[0]
+            .headers
+            .get("content-type")
+            .map(String::as_str),
+        Some("image/jpeg")
+    );
+    assert_eq!(upload_requests[0].body_bytes, first);
+    assert_eq!(
+        upload_requests[1]
+            .headers
+            .get("content-type")
+            .map(String::as_str),
+        Some("image/jpeg")
+    );
+    assert_eq!(upload_requests[1].body_bytes, second);
+    let create_index = state
+        .requests
+        .iter()
+        .position(|request| {
+            request
+                .path
+                .starts_with("/xrpc/com.atproto.repo.createRecord")
+        })
+        .unwrap();
+    let upload_indices = state
+        .requests
+        .iter()
+        .enumerate()
+        .filter_map(|(index, request)| {
+            request
+                .path
+                .starts_with("/xrpc/com.atproto.repo.uploadBlob")
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert!(upload_indices.iter().all(|index| *index < create_index));
+    assert_eq!(state.create_bodies.len(), 1);
+    let record = &state.create_bodies[0]["record"];
+    assert_eq!(record["embed"]["$type"], "app.bsky.embed.images");
+    assert_eq!(record["embed"]["images"].as_array().unwrap().len(), 2);
+    assert_eq!(record["embed"]["images"][0]["alt"], "first alt");
+    assert_eq!(
+        record["embed"]["images"][0]["aspectRatio"],
+        json!({"width":1200,"height":800})
+    );
+    assert_eq!(record["embed"]["images"][1]["alt"], "second alt");
+    assert_eq!(
+        record["embed"]["images"][1]["aspectRatio"],
+        json!({"width":2000,"height":1000})
+    );
+    drop(state);
+    server.abort();
+}
+
+#[tokio::test]
+async fn second_image_upload_failure_does_not_create_a_post() {
+    let public = OAuthPublic::new("https://appview.example").unwrap();
+    let (flow, _, shared, server) =
+        production_flow_with_public(public.clone(), None, Some(EXPECTED_OAUTH_SCOPE)).await;
+    shared.lock().unwrap().upload_fail_on = Some(2);
+    let app = public.router_with_flow(flow, Arc::new(MemoryStorage::default()));
+    let cookie = finish_production_login(&app, &shared).await;
+    let boundary = "protocol-failed-picture";
+    let body = picture_multipart(
+        boundary,
+        "no half post",
+        None,
+        None,
+        &[
+            ("a.jpg", b"\xff\xd8\xffone", "", 10, 10),
+            ("b.jpg", b"\xff\xd8\xfftwo", "", 20, 20),
+        ],
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/post")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", cookie)
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let state = shared.lock().unwrap();
+    assert_eq!(state.upload_count, 2);
+    assert_eq!(state.create_count, 0);
+    drop(state);
+    server.abort();
+}
+
+#[tokio::test]
+async fn quote_with_an_image_uses_record_with_media() {
+    let public = OAuthPublic::new("https://appview.example").unwrap();
+    let (flow, _, shared, server) =
+        production_flow_with_public(public.clone(), None, Some(EXPECTED_OAUTH_SCOPE)).await;
+    let storage = Arc::new(MemoryStorage::default());
+    let quote_uri = "at://did:plc:quoted/app.bsky.feed.post/target";
+    storage
+        .put_record(&IndexedRecord {
+            did: "did:plc:quoted".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "target".into(),
+            uri: quote_uri.into(),
+            cid: Some("quoted-cid".into()),
+            time_us: 1,
+            record: json!({"$type":"app.bsky.feed.post","text":"quoted"}),
+        })
+        .unwrap();
+    let app = public.router_with_flow(flow, storage);
+    let cookie = finish_production_login(&app, &shared).await;
+    let boundary = "protocol-quote-picture";
+    let body = picture_multipart(
+        boundary,
+        "quote caption",
+        Some(quote_uri),
+        None,
+        &[("quote.jpg", b"\xff\xd8\xffquote", "quote alt", 640, 480)],
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/quote")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", cookie)
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let state = shared.lock().unwrap();
+    let embed = &state.create_bodies[0]["record"]["embed"];
+    assert_eq!(embed["$type"], "app.bsky.embed.recordWithMedia");
+    assert_eq!(embed["record"]["$type"], "app.bsky.embed.record");
+    assert_eq!(
+        embed["record"]["record"],
+        json!({"uri":quote_uri,"cid":"quoted-cid"})
+    );
+    assert_eq!(embed["media"]["$type"], "app.bsky.embed.images");
+    assert_eq!(embed["media"]["images"][0]["alt"], "quote alt");
+    drop(state);
     server.abort();
 }
 
@@ -820,6 +1035,101 @@ fn server_origin(shared: &Arc<Mutex<FakeServerState>>) -> String {
         .unwrap()
 }
 
+async fn finish_production_login(app: &Router, shared: &Arc<Mutex<FakeServerState>>) -> String {
+    let authorize = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/authorize")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("handle=did%3Aplc%3Aabcdefghijklmnopqrstuvwx"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authorize.status(), StatusCode::SEE_OTHER);
+    let login_cookie = authorize.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let state = latest_state(shared);
+    let encoded_state = url::form_urlencoded::byte_serialize(state.as_bytes()).collect::<String>();
+    let encoded_issuer =
+        url::form_urlencoded::byte_serialize(server_origin(shared).as_bytes()).collect::<String>();
+    let callback = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/oauth/callback?code=valid-code&state={encoded_state}&iss={encoded_issuer}"
+                ))
+                .header("cookie", login_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(callback.status(), StatusCode::SEE_OTHER);
+    callback
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .find_map(|header| {
+            let value = header.to_str().ok()?;
+            value
+                .starts_with("appview_session=")
+                .then(|| value.split(';').next().unwrap().to_owned())
+        })
+        .unwrap()
+}
+
+fn picture_multipart(
+    boundary: &str,
+    text: &str,
+    quote_uri: Option<&str>,
+    parent_uri: Option<&str>,
+    images: &[(&str, &[u8], &str, u32, u32)],
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    append_multipart_text(&mut body, boundary, "text", text);
+    if let Some(uri) = quote_uri {
+        append_multipart_text(&mut body, boundary, "quote_uri", uri);
+    }
+    if let Some(uri) = parent_uri {
+        append_multipart_text(&mut body, boundary, "parent_uri", uri);
+    }
+    for (filename, bytes, alt, width, height) in images {
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"images\"; filename=\"{filename}\"\r\nContent-Type: image/jpeg\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(b"\r\n");
+        append_multipart_text(&mut body, boundary, "alts", alt);
+        append_multipart_text(&mut body, boundary, "widths", &width.to_string());
+        append_multipart_text(&mut body, boundary, "heights", &height.to_string());
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    body
+}
+
+fn append_multipart_text(body: &mut Vec<u8>, boundary: &str, name: &str, value: &str) {
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+        )
+        .as_bytes(),
+    );
+}
+
 fn latest_state(shared: &Arc<Mutex<FakeServerState>>) -> String {
     shared
         .lock()
@@ -957,8 +1267,22 @@ async fn serve_one(mut stream: TcpStream, origin: &str, state: Arc<Mutex<FakeSer
                 })
                 .to_string(),
             ),
+            path if path.starts_with("/xrpc/com.atproto.repo.uploadBlob") => {
+                state.upload_count += 1;
+                if state.upload_fail_on == Some(state.upload_count) {
+                    (500, vec![], json!({"error":"UploadFailed","message":"fake upload failure"}).to_string())
+                } else {
+                    let mime = request.headers.get("content-type").map(String::as_str).unwrap_or("application/octet-stream");
+                    (
+                        200,
+                        vec![],
+                        json!({"blob":{"$type":"blob","ref":{"$link":"bafyreiedv4rjxnzxvlvlgqbi4vpqi3s4iuz4buywtkgfjpfjn2gix5cocu"},"mimeType":mime,"size":request.body_bytes.len()}}).to_string(),
+                    )
+                }
+            }
             path if path.starts_with("/xrpc/com.atproto.repo.createRecord") => {
                 state.create_count += 1;
+                state.create_bodies.push(serde_json::from_str(&request.body).unwrap());
                 let number = state.create_count;
                 (
                     200,
@@ -1036,6 +1360,7 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<CapturedRequest
         path,
         headers,
         body: String::from_utf8_lossy(&bytes[header_end..header_end + content_length]).into_owned(),
+        body_bytes: bytes[header_end..header_end + content_length].to_vec(),
     })
 }
 

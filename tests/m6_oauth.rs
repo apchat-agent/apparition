@@ -512,7 +512,7 @@ fn multipart_post_body(
     text: &str,
     parent_uri: Option<&str>,
     quote_uri: Option<&str>,
-    images: &[(&str, &str, &[u8])],
+    images: &[(&str, &str, &[u8], u32, u32)],
     alts: &[&str],
 ) -> Vec<u8> {
     let mut body = Vec::new();
@@ -523,7 +523,7 @@ fn multipart_post_body(
     if let Some(quote_uri) = quote_uri {
         append_multipart_text_field(&mut body, boundary, "quote_uri", quote_uri);
     }
-    for (mime, filename, bytes) in images {
+    for (mime, filename, bytes, width, height) in images {
         body.extend_from_slice(
             format!(
                 "--{boundary}\r\nContent-Disposition: form-data; name=\"images\"; filename=\"{filename}\"\r\nContent-Type: {mime}\r\n\r\n"
@@ -532,6 +532,8 @@ fn multipart_post_body(
         );
         body.extend_from_slice(bytes);
         body.extend_from_slice(b"\r\n");
+        append_multipart_text_field(&mut body, boundary, "widths", &width.to_string());
+        append_multipart_text_field(&mut body, boundary, "heights", &height.to_string());
     }
     for alt in alts {
         append_multipart_text_field(&mut body, boundary, "alts", alt);
@@ -2134,7 +2136,7 @@ async fn old_scope_session_keeps_text_composer_and_shows_picture_reauthorization
         "caption",
         None,
         None,
-        &[("image/jpeg", "a.jpg", &[0xff, 0xd8, 0xff])],
+        &[("image/jpeg", "a.jpg", &[0xff, 0xd8, 0xff], 1, 1)],
         &[""],
     );
     let image_post = app
@@ -2189,7 +2191,7 @@ async fn invalid_images_are_rejected_before_the_oauth_flow_is_called() {
             "caption",
             None,
             None,
-            &[(mime, filename, &bytes)],
+            &[(mime, filename, &bytes, 1, 1)],
             &[""],
         );
         let response = app
