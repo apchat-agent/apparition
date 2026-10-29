@@ -3647,9 +3647,6 @@ where
         }
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
-    if let Err(error) = queue_missing_parent_authors(state.storage.as_ref(), &parents) {
-        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
-    }
     let render_started = std::time::Instant::now();
     let write_forms_enabled =
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
@@ -7535,10 +7532,9 @@ mod tests {
         let reply_did = "did:plc:reply-author";
         let parent = test_web_post(parent_did, "original", 1, "Original text", None);
         let reply = test_web_post(reply_did, "reply", 2, "Reply text", Some(&parent.uri));
-        for record in [&parent, &reply] {
-            storage.put_record(record).unwrap();
-            storage.set_follow(viewer, &record.did, true).unwrap();
-        }
+        storage.put_record(&parent).unwrap();
+        storage.put_record(&reply).unwrap();
+        storage.set_follow(viewer, reply_did, true).unwrap();
         storage
             .set_verified_handle(parent_did, "original.test")
             .unwrap();
@@ -7633,6 +7629,55 @@ mod tests {
         assert_eq!(batch_lookups, 1, "parents should load in one page lookup");
     }
 
+    #[tokio::test]
+    async fn parent_author_cache_miss_does_not_block_and_refresh_fills_the_handle() {
+        let storage = Arc::new(MemoryStorage::default());
+        let viewer = "did:plc:reply-viewer";
+        let parent_did = "did:plc:verylongparentidentifier";
+        let reply_did = "did:plc:reply-author";
+        let parent = test_web_post(parent_did, "original", 1, "Original text", None);
+        let reply = test_web_post(reply_did, "reply", 2, "Reply text", Some(&parent.uri));
+        storage.put_record(&parent).unwrap();
+        storage.put_record(&reply).unwrap();
+        storage.set_follow(viewer, reply_did, true).unwrap();
+        storage
+            .set_verified_handle(reply_did, "reply.test")
+            .unwrap();
+        put_test_profile(&storage, reply_did, "Reply Author");
+        let flow = ParentIdentityTestFlow {
+            parent_did: parent_did.to_owned(),
+            profile_started: Arc::new(tokio::sync::Notify::new()),
+            release_profile: Arc::new(tokio::sync::Notify::new()),
+        };
+
+        let page = tokio::time::timeout(
+            Duration::from_millis(250),
+            request_test_timeline_with_flow(storage.clone(), viewer, flow.clone()),
+        )
+        .await
+        .expect("a cache miss for the parent author must not hold the page open");
+        assert!(page.contains("class=\"reply-parent-card\""));
+        assert!(page.contains("did:…"));
+        assert!(!page.contains("@original.cache.test"));
+
+        let worker =
+            ProfileRefreshWorker::new(flow.clone(), storage.clone(), Duration::from_millis(1));
+        let refresh = tokio::spawn(async move { worker.refresh_once().await });
+        tokio::time::timeout(Duration::from_secs(1), flow.profile_started.notified())
+            .await
+            .expect("queued parent author should reach the existing profile refresh path");
+        assert!(!refresh.is_finished());
+        flow.release_profile.notify_one();
+        assert_eq!(refresh.await.unwrap().unwrap(), 1);
+        assert_eq!(
+            storage.verified_handle(parent_did).unwrap().as_deref(),
+            Some("original.cache.test")
+        );
+
+        let refreshed_page = request_test_timeline_with_flow(storage, viewer, flow).await;
+        assert!(refreshed_page.contains("@original.cache.test"));
+    }
+
     fn test_web_post(
         did: &str,
         rkey: &str,
@@ -7667,19 +7712,30 @@ mod tests {
                 rkey: "self".to_owned(),
                 uri: format!("at://{did}/app.bsky.actor.profile/self"),
                 cid: None,
-                time_us: 1,
+                time_us: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_micros() as u64,
                 record: json!({"displayName":display_name}),
             })
             .unwrap();
     }
 
     async fn request_test_timeline(storage: Arc<MemoryStorage>, viewer: &str) -> String {
+        request_test_timeline_with_flow(storage, viewer, DisabledOAuthFlow).await
+    }
+
+    async fn request_test_timeline_with_flow<F: OAuthFlow>(
+        storage: Arc<MemoryStorage>,
+        viewer: &str,
+        flow: F,
+    ) -> String {
         let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
         let session_id = "av28-timeline-session";
         let generation = storage.rotate_web_session(viewer, session_id).unwrap();
         let token =
             public.issue_session_cookie(viewer, session_id, generation, false, false, false);
-        let app = public.router_with_flow(DisabledOAuthFlow, storage);
+        let app = public.router_with_flow(flow, storage);
         let response = app
             .oneshot(
                 axum::http::Request::builder()
@@ -7692,6 +7748,70 @@ mod tests {
             .unwrap();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[derive(Clone)]
+    struct ParentIdentityTestFlow {
+        parent_did: String,
+        profile_started: Arc<tokio::sync::Notify>,
+        release_profile: Arc<tokio::sync::Notify>,
+    }
+
+    impl OAuthFlow for ParentIdentityTestFlow {
+        fn authorize<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async { Err("test flow does not authorize".to_owned()) })
+        }
+
+        fn callback<'a>(
+            &'a self,
+            _: OAuthCallback,
+        ) -> Pin<Box<dyn Future<Output = Result<OAuthAccount, String>> + Send + 'a>> {
+            Box::pin(async { Err("test flow does not callback".to_owned()) })
+        }
+
+        fn logout<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn fetch_author_profile<'a>(
+            &'a self,
+            did: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<FetchedAuthorProfile, String>> + Send + 'a>>
+        {
+            let did = did.to_owned();
+            let parent_did = self.parent_did.clone();
+            let profile_started = self.profile_started.clone();
+            let release_profile = self.release_profile.clone();
+            Box::pin(async move {
+                if did == parent_did {
+                    profile_started.notify_one();
+                    release_profile.notified().await;
+                }
+                let profile = IndexedRecord {
+                    did: did.clone(),
+                    collection: "app.bsky.actor.profile".to_owned(),
+                    rkey: "self".to_owned(),
+                    uri: format!("at://{did}/app.bsky.actor.profile/self"),
+                    cid: None,
+                    time_us: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_micros() as u64,
+                    record: json!({"displayName":"Original Cache Author"}),
+                };
+                Ok(FetchedAuthorProfile {
+                    profile: Some(profile),
+                    verified_handle: Some("original.cache.test".to_owned()),
+                })
+            })
+        }
     }
 
     const HOUR_US: u64 = 60 * 60 * 1_000_000;
