@@ -3598,10 +3598,9 @@ async fn hydrate_parent_uri_batch<F: OAuthFlow, S: Storage>(
     for uri in parent_uris {
         parents.entry(uri.clone()).or_insert(None);
     }
-    for uri in parent_uris {
-        if let Some(record) = storage.record_by_uri("app.bsky.feed.post", uri)? {
-            parents.insert(uri.clone(), Some(record));
-        }
+    let local = storage.records_by_uri("app.bsky.feed.post", parent_uris)?;
+    for (uri, record) in local {
+        parents.insert(uri, Some(record));
     }
 
     let missing = parent_uris
