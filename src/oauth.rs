@@ -9068,6 +9068,23 @@ mod tests {
     }
 
     #[test]
+    fn profile_action_oauth_scopes_are_requested() {
+        for scope in [
+            "repo:app.bsky.graph.follow?action=create&action=delete",
+            "repo:app.bsky.graph.block?action=create&action=delete",
+            "repo:app.bsky.graph.listitem?action=create&action=delete",
+            "rpc:app.bsky.graph.muteActor?aud=*",
+            "rpc:app.bsky.graph.unmuteActor?aud=*",
+            "rpc:app.bsky.graph.getMutes?aud=*",
+        ] {
+            assert!(
+                REQUESTED_SCOPE.split_whitespace().any(|requested| requested == scope),
+                "missing profile action OAuth scope: {scope}"
+            );
+        }
+    }
+
+    #[test]
     fn legacy_session_cookie_defaults_to_no_video_permission() {
         let public = OAuthPublic::new("https://appview.example").unwrap();
         let payload = URL_SAFE_NO_PAD.encode(
