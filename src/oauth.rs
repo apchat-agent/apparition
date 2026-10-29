@@ -1672,38 +1672,21 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
                 skeleton_cache_hit = true;
                 skeleton
             } else {
-                let auth_started = std::time::Instant::now();
-                let auth_flow = self.clone();
-                let viewer_did = did.to_owned();
-                let service_did = generator.service_did.clone();
-                let auth_task = tokio::spawn(async move {
-                    auth_flow
-                        .service_auth_token(&viewer_did, &service_did)
+                let service_jwt = if did.is_empty() {
+                    None
+                } else {
+                    let auth_started = std::time::Instant::now();
+                    let token = self
+                        .service_auth_token(did, &generator.service_did)
                         .await
-                });
-                let anonymous_skeleton = self
-                    .feed_client
-                    .get_skeleton(&generator, cursor, None)
-                    .await;
-                let skeleton = match anonymous_skeleton {
-                    Ok(skeleton) => {
-                        // Public generators can return immediately; let session token refresh
-                        // warm the cache for later requests without holding up this page.
-                        drop(auth_task);
-                        skeleton
-                    }
-                    Err(anonymous_error) => {
-                        let service_jwt = auth_task
-                            .await
-                            .ok()
-                            .and_then(Result::ok)
-                            .ok_or(anonymous_error)?;
-                        auth_ms = auth_started.elapsed().as_millis() as u64;
-                        self.feed_client
-                            .get_skeleton(&generator, cursor, Some(&service_jwt))
-                            .await?
-                    }
+                        .ok();
+                    auth_ms = auth_started.elapsed().as_millis() as u64;
+                    token
                 };
+                let skeleton = self
+                    .feed_client
+                    .get_skeleton(&generator, cursor, service_jwt.as_deref())
+                    .await?;
                 let mut cache = self.feed_skeleton_cache.lock().await;
                 cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
                 if cache.len() < 1024 {
@@ -6085,10 +6068,12 @@ mod tests {
                 .with_ansi(false)
                 .with_writer(logs.clone())
                 .finish();
-            flow.feed_timeline(FEED_VIEWER_DID, FAILURE_FEED_URI, cursor, &storage)
+            let page = flow
+                .feed_timeline(FEED_VIEWER_DID, FAILURE_FEED_URI, cursor, &storage)
                 .with_subscriber(subscriber)
                 .await
                 .unwrap();
+            assert_eq!(page.timeline.feed.len(), 1);
         }
         let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
         assert_eq!(
@@ -6105,7 +6090,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logged_out_feed_uses_anonymous_skeleton_without_service_auth() {
+    async fn logged_out_feed_is_anonymous_without_service_auth() {
         let (flow, state, server) = feed_test_flow(false).await;
         let storage = feed_test_storage();
         let page = flow
