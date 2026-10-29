@@ -36,6 +36,9 @@ struct FakeOAuthFlow {
     author_profiles: Arc<Mutex<std::collections::HashMap<String, FetchedAuthorProfile>>>,
     profile_requests: Arc<Mutex<Vec<String>>>,
     profile_delays_ms: Arc<Mutex<std::collections::HashMap<String, u64>>>,
+    live_posts: Arc<Mutex<std::collections::HashMap<String, IndexedRecord>>>,
+    post_requests: Arc<Mutex<Vec<String>>>,
+    post_delays_ms: Arc<Mutex<std::collections::HashMap<String, u64>>>,
 }
 
 impl Default for FakeOAuthFlow {
@@ -50,6 +53,9 @@ impl Default for FakeOAuthFlow {
             author_profiles: Arc::new(Mutex::new(std::collections::HashMap::new())),
             profile_requests: Arc::new(Mutex::new(Vec::new())),
             profile_delays_ms: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            live_posts: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            post_requests: Arc::new(Mutex::new(Vec::new())),
+            post_delays_ms: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 }
@@ -212,6 +218,31 @@ impl OAuthFlow for FakeOAuthFlow {
                     "embed":{"$type":"app.bsky.embed.record","record":quoted}
                 }),
             ))
+        })
+    }
+
+    fn fetch_post<'a>(
+        &'a self,
+        uri: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<IndexedRecord, String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.post_requests.lock().unwrap().push(uri.to_owned());
+            let delay_ms = self
+                .post_delays_ms
+                .lock()
+                .unwrap()
+                .get(uri)
+                .copied()
+                .unwrap_or_default();
+            if delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            self.live_posts
+                .lock()
+                .unwrap()
+                .get(uri)
+                .cloned()
+                .ok_or_else(|| "fake PDS has no post for URI".to_owned())
         })
     }
 
@@ -3403,6 +3434,157 @@ async fn web_posts_show_hydrated_authors_and_times_on_timeline_profile_and_threa
     assert!(thread_html.contains("Friend &amp; Co"));
     assert!(thread_html.contains("@friend.test"));
     assert!(thread_html.contains("09:15 · 27 Oct 2026"));
+}
+
+#[tokio::test]
+async fn timeline_fetches_unindexed_quotes_and_renders_safe_nested_media_cards() {
+    let storage = Arc::new(MemoryStorage::default());
+    let quoted_uri = "at://did:plc:quoted/app.bsky.feed.post/quote";
+    let inner_uri = "at://did:plc:inner/app.bsky.feed.post/inner";
+    let mut outer = fake_feed_post("did:plc:alice", "outer-quote", 10, "Outer post");
+    outer.record["embed"] = serde_json::json!({
+        "$type":"app.bsky.embed.recordWithMedia",
+        "media":{"$type":"app.bsky.embed.images","images":[{
+            "image":{"ref":{"$link":"image-cid"}},"alt":"a beach"
+        }]},
+        "record":{"$type":"app.bsky.embed.record","record":{"uri":quoted_uri,"cid":"quote-cid"}}
+    });
+    storage.put_record(&outer).unwrap();
+
+    let mut quoted = fake_feed_post("did:plc:quoted", "quote", 9, "");
+    quoted.record = serde_json::json!({
+        "$type":"app.bsky.feed.post",
+        "text":"Quoted <script>alert(1)</script> & text",
+        "createdAt":"2026-10-28T00:00:00Z",
+        "embed":{"$type":"app.bsky.embed.record","record":{"uri":inner_uri,"cid":"inner-cid"}}
+    });
+    let flow = FakeOAuthFlow {
+        live_posts: Arc::new(Mutex::new(
+            [(quoted_uri.to_owned(), quoted)].into_iter().collect(),
+        )),
+        author_profiles: Arc::new(Mutex::new(
+            [(
+                "did:plc:quoted".to_owned(),
+                FetchedAuthorProfile {
+                    profile: Some(IndexedRecord {
+                        did: "did:plc:quoted".into(),
+                        collection: "app.bsky.actor.profile".into(),
+                        rkey: "self".into(),
+                        uri: "at://did:plc:quoted/app.bsky.actor.profile/self".into(),
+                        cid: Some("quoted-profile-cid".into()),
+                        time_us: 1,
+                        record: serde_json::json!({"displayName":"Quoted <Author>"}),
+                    }),
+                    verified_handle: Some("quoted.test".into()),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        )),
+        ..FakeOAuthFlow::default()
+    };
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow.clone(), storage);
+    let cookie = finish_login(&app).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+
+    assert_eq!(*flow.post_requests.lock().unwrap(), vec![quoted_uri]);
+    assert!(html.contains("quoted-post-card"), "{html}");
+    assert!(html.contains("Quoted &lt;Author&gt;"), "{html}");
+    assert!(html.contains("@quoted.test"), "{html}");
+    assert!(
+        html.contains("Quoted &lt;script&gt;alert(1)&lt;/script&gt; &amp; text"),
+        "{html}"
+    );
+    assert!(
+        html.contains("href=\"/app/thread?uri=at%3A%2F%2Fdid%3Aplc%3Aquoted"),
+        "{html}"
+    );
+    assert!(html.contains("Quoted post</a>"), "{html}");
+    assert!(html.contains("alt=\"a beach\""), "{html}");
+    assert!(html.contains("image-cid"), "{html}");
+    assert!(!html.contains(inner_uri), "{html}");
+}
+
+#[tokio::test]
+async fn quote_failures_distinguish_missing_unavailable_and_budget_placeholder() {
+    let storage = Arc::new(MemoryStorage::default());
+    let deleted_uri = "at://did:plc:deleted/app.bsky.feed.post/deleted";
+    let unavailable_uri = "at://did:plc:blocked/app.bsky.feed.post/blocked";
+    let delayed_uri = "at://did:plc:slow/app.bsky.feed.post/slow";
+    let mut deleted = fake_feed_post("did:plc:alice", "deleted-quote", 30, "Deleted quote");
+    deleted.record["embed"] = serde_json::json!({
+        "$type":"app.bsky.embed.record","record":{"uri":deleted_uri,"cid":"gone"}
+    });
+    let mut unavailable = fake_feed_post("did:plc:alice", "blocked-quote", 20, "Blocked quote");
+    unavailable.record["embed"] = serde_json::json!({
+        "$type":"app.bsky.embed.record",
+        "record":{"$type":"app.bsky.embed.record#viewBlocked","uri":unavailable_uri}
+    });
+    let mut delayed = fake_feed_post("did:plc:alice", "slow-quote", 10, "Slow quote");
+    delayed.record["embed"] = serde_json::json!({
+        "$type":"app.bsky.embed.record","record":{"uri":delayed_uri,"cid":"slow"}
+    });
+    for record in [deleted, unavailable, delayed] {
+        storage.put_record(&record).unwrap();
+    }
+    let flow = FakeOAuthFlow {
+        post_delays_ms: Arc::new(Mutex::new(
+            [(delayed_uri.to_owned(), 1_700)].into_iter().collect(),
+        )),
+        ..FakeOAuthFlow::default()
+    };
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage);
+    let cookie = finish_login(&app).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+
+    assert!(html.contains("Post not found"), "{html}");
+    assert!(html.contains("Post unavailable"), "{html}");
+    assert!(html.contains("Quoted post"), "{html}");
+    assert!(!html.contains(deleted_uri), "{html}");
+    assert!(!html.contains(unavailable_uri), "{html}");
+    assert!(!html.contains(delayed_uri), "{html}");
 }
 
 #[tokio::test]
