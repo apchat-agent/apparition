@@ -771,6 +771,15 @@ function installInfiniteScroll({
 
   const hasClass = (node, name) => node.className?.split(/\s+/).includes(name);
 
+  const nodeWithClassIn = (root, name) => {
+    if (hasClass(root, name)) return root;
+    for (const child of root.children || []) {
+      const found = nodeWithClassIn(child, name);
+      if (found) return found;
+    }
+    return null;
+  };
+
   const threadGroupFor = (node) => {
     let current = node;
     while (current && current !== list) {
@@ -804,12 +813,33 @@ function installInfiniteScroll({
           .find(Boolean);
         if (existingGroup && hasClass(card, "thread-group") && freshPosts.length) {
           for (const duplicate of duplicates) duplicate.remove();
+          const threadMore = nodeWithClassIn(existingGroup, "thread-more");
           for (const post of freshPosts) {
             const connector = document.createElement("span");
             connector.className = "reply-connector thread-group-connector";
             connector.setAttribute("aria-hidden", "true");
-            existingGroup.append(connector, post);
+            post.remove();
+            if (threadMore && typeof existingGroup.insertBefore === "function") {
+              existingGroup.insertBefore(connector, threadMore);
+              existingGroup.insertBefore(post, threadMore);
+            } else {
+              existingGroup.append(connector, post);
+            }
             existingPostNodes.set(post.getAttribute("data-post-uri"), post);
+          }
+          if (threadMore) {
+            const moreMatch = threadMore.textContent.trim().match(/^(\d+) more (replies|in this thread)$/);
+            if (moreMatch) {
+              const remaining = Math.max(0, Number(moreMatch[1]) - freshPosts.length);
+              if (remaining === 0) {
+                threadMore.remove();
+              } else {
+                const label = moreMatch[2] === "replies"
+                  ? remaining === 1 ? "reply" : "replies"
+                  : "in this thread";
+                threadMore.textContent = `${remaining} more ${label}`;
+              }
+            }
           }
           card.remove();
           if (!appended.includes(existingGroup)) appended.push(existingGroup);
