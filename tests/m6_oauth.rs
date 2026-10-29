@@ -743,6 +743,34 @@ fn multipart_text_only_body_with_empty_file(boundary: &str, text: &str) -> Vec<u
     body
 }
 
+fn multipart_native_media_body(
+    boundary: &str,
+    text: &str,
+    file: Option<(&str, &str, &[u8])>,
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    append_multipart_text_field(&mut body, boundary, "text", text);
+    if let Some((mime, filename, bytes)) = file {
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"media\"; filename=\"{filename}\"\r\nContent-Type: {mime}\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(b"\r\n");
+    } else {
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"media\"; filename=\"\"\r\nContent-Type: application/octet-stream\r\n\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    body
+}
+
 async fn get_html(app: &Router, uri: &str, cookie: &str) -> String {
     let response = app
         .clone()
@@ -2576,6 +2604,105 @@ async fn multipart_text_only_post_still_works_without_javascript() {
     assert_eq!(
         flow.actions.lock().unwrap().as_slice(),
         ["post:did:plc:alice:text only from the native form"]
+    );
+}
+
+#[tokio::test]
+async fn native_media_input_accepts_images_skips_empty_parts_and_refuses_video() {
+    let flow = FakeOAuthFlow::default();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow.clone(), Arc::new(MemoryStorage::default()));
+    let cookie = finish_login(&app).await;
+    let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00";
+
+    let image_boundary = "av37-native-image";
+    let image = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/post")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", &cookie)
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={image_boundary}"),
+                )
+                .body(Body::from(multipart_native_media_body(
+                    image_boundary,
+                    "native image",
+                    Some(("image/png", "pixel.png", png)),
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(image.status(), StatusCode::SEE_OTHER);
+
+    let empty_boundary = "av37-native-empty";
+    let empty = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/post")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", &cookie)
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={empty_boundary}"),
+                )
+                .body(Body::from(multipart_native_media_body(
+                    empty_boundary,
+                    "empty media field",
+                    None,
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty.status(), StatusCode::SEE_OTHER);
+
+    let video_boundary = "av37-native-video";
+    let mp4 = b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00";
+    let video = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/post")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", &cookie)
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={video_boundary}"),
+                )
+                .body(Body::from(multipart_native_media_body(
+                    video_boundary,
+                    "native video",
+                    Some(("video/mp4", "clip.mp4", mp4)),
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(video.status(), StatusCode::BAD_REQUEST);
+    let message: Value =
+        serde_json::from_slice(&video.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(
+        message["message"],
+        "Enable JavaScript to validate and upload videos."
+    );
+
+    assert_eq!(
+        flow.actions.lock().unwrap().as_slice(),
+        [
+            "image-post:did:plc:alice:native image:1",
+            "post:did:plc:alice:empty media field"
+        ]
     );
 }
 

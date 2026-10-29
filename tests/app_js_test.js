@@ -371,6 +371,50 @@ Deno.test("video selection metadata and upload progress use the dedicated video 
   assertEquals(button.disabled, false);
 });
 
+Deno.test("unified media selection routes mixed, image-only, one-video, and two-video picks", async () => {
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  globalThis.document = { addEventListener() {}, querySelector() { return null; }, querySelectorAll() { return []; } };
+  globalThis.window = { visualViewport: { addEventListener() {} }, scrollY: 0, scrollX: 0 };
+  const selectMedia = new Function(`${source}; return selectComposerMedia;`)();
+  const file = (name, type) => ({ name, type });
+
+  const mixed = selectMedia([], [file("cat.jpg", "image/jpeg"), file("clip.mp4", "video/mp4")]);
+  assertEquals(mixed.kind, "error");
+  assert(mixed.message.includes("either images or one video"));
+  assertEquals(mixed.items.length, 0);
+
+  const images = selectMedia([], [file("cat.jpg", "image/jpeg"), file("dog.png", "image/png")]);
+  assertEquals(images.kind, "images");
+  assertEquals(images.items.length, 2);
+
+  const video = selectMedia([], [file("clip.mp4", "video/mp4")]);
+  assertEquals(video.kind, "video");
+  assertEquals(video.items.length, 1);
+
+  const twoVideos = selectMedia([], [file("one.mp4", "video/mp4"), file("two.mov", "video/quicktime")]);
+  assertEquals(twoVideos.kind, "error");
+  assert(twoVideos.message.includes("one video"));
+});
+
+Deno.test("unified media selection keeps earlier media when a later pick conflicts or lacks video scope", async () => {
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  globalThis.document = { addEventListener() {}, querySelector() { return null; }, querySelectorAll() { return []; } };
+  globalThis.window = { visualViewport: { addEventListener() {} }, scrollY: 0, scrollX: 0 };
+  const selectMedia = new Function(`${source}; return selectComposerMedia;`)();
+  const image = { name: "cat.jpg", type: "image/jpeg" };
+  const video = { name: "clip.mp4", type: "video/mp4" };
+
+  const conflict = selectMedia([{ file: image, kind: "image" }], [video]);
+  assertEquals(conflict.kind, "error");
+  assert(conflict.message.includes("Remove the selected images"));
+  assertEquals(conflict.items.length, 1);
+  assertEquals(conflict.items[0].file, image);
+
+  const oldScope = selectMedia([], [video], false);
+  assertEquals(oldScope.kind, "error");
+  assertEquals(oldScope.message, "sign in again to post videos");
+});
+
 Deno.test("alt suggestion failure leaves the alt text alone and reports a short message", async () => {
   const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
   globalThis.document = {
