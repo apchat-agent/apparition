@@ -385,6 +385,7 @@ function installInfiniteScroll({
   },
   Observer = globalThis.IntersectionObserver,
 } = {}) {
+  const maximumCards = 500;
   const olderLink = pageDocument.querySelector('.pagination-link[rel="next"]');
   const list = pageDocument.querySelector(".post-list, .notification-list");
   if (!olderLink || !list) return;
@@ -398,6 +399,7 @@ function installInfiniteScroll({
   const scrollTarget = scrollRoot || pageWindow;
   const status = pageDocument.createElement("p");
   status.className = "infinite-scroll-status";
+  status.hidden = true;
   status.setAttribute("role", "status");
   status.setAttribute("aria-live", "polite");
   const retry = pageDocument.createElement("button");
@@ -430,6 +432,7 @@ function installInfiniteScroll({
   const rootTop = () => scrollRoot?.getBoundingClientRect().top ?? 0;
   const updateStatus = (message) => {
     status.textContent = message;
+    status.hidden = !message;
   };
 
   const finish = (message) => {
@@ -437,6 +440,13 @@ function installInfiniteScroll({
     observer?.disconnect();
     updateStatus(message);
     olderLink.remove();
+  };
+
+  const stopAtMemoryLimit = () => {
+    stopped = true;
+    observer?.disconnect();
+    retry.hidden = true;
+    updateStatus(`Showing ${maximumCards} items. Use Older to continue.`);
   };
 
   const postNodesIn = (root) => {
@@ -494,6 +504,10 @@ function installInfiniteScroll({
 
   const loadNextPage = async (manualRetry = false) => {
     if (stopped || inFlight || (retryRequired && !manualRetry)) return;
+    if (pageCards().length >= maximumCards) {
+      stopAtMemoryLimit();
+      return;
+    }
     const href = olderLink.getAttribute("href") || olderLink.href;
     if (!href) {
       finish("You’re all caught up.");
@@ -511,6 +525,12 @@ function installInfiniteScroll({
       if (!response.ok) throw new Error(`Request failed (${response.status}).`);
       const page = parsePage(await response.text(), listSelector);
       if (!page?.list) throw new Error("The next page could not be read.");
+      const incomingCount = [...page.list.children]
+        .filter((item) => !item.className?.split(/\s+/).includes("empty-state")).length;
+      if (pageCards().length + incomingCount > maximumCards) {
+        stopAtMemoryLimit();
+        return;
+      }
       const appended = appendCards(page.list);
       if (!page.link) {
         finish("You’re all caught up.");
