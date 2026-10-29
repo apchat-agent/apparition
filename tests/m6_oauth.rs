@@ -33,6 +33,7 @@ struct FakeOAuthFlow {
     callback_failure: Option<String>,
     action_failure: Option<String>,
     pinned_feeds: Vec<ResolvedFeed>,
+    pinned_feed_delay_ms: u64,
     author_profiles: Arc<Mutex<std::collections::HashMap<String, FetchedAuthorProfile>>>,
     profile_requests: Arc<Mutex<Vec<String>>>,
     profile_delays_ms: Arc<Mutex<std::collections::HashMap<String, u64>>>,
@@ -50,6 +51,7 @@ impl Default for FakeOAuthFlow {
             callback_failure: None,
             action_failure: None,
             pinned_feeds: Vec::new(),
+            pinned_feed_delay_ms: 0,
             author_profiles: Arc::new(Mutex::new(std::collections::HashMap::new())),
             profile_requests: Arc::new(Mutex::new(Vec::new())),
             profile_delays_ms: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -290,7 +292,13 @@ impl OAuthFlow for FakeOAuthFlow {
         _: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<ResolvedFeed>, String>> + Send + 'a>> {
         let feeds = self.pinned_feeds.clone();
-        Box::pin(async move { Ok(feeds) })
+        let delay_ms = self.pinned_feed_delay_ms;
+        Box::pin(async move {
+            if delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            Ok(feeds)
+        })
     }
 
     fn like<'a>(
@@ -1713,6 +1721,68 @@ async fn web_views_and_write_actions_require_a_login_session() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::SEE_OTHER, "{path}");
         assert_eq!(response.headers()["location"], "/login");
+    }
+}
+
+#[tokio::test]
+async fn app_timeline_does_not_wait_for_slow_pinned_feed_resolution() {
+    let storage = Arc::new(MemoryStorage::default());
+    let feeds = (0..38)
+        .map(|index| {
+            let rkey = format!("feed-{index}");
+            ResolvedFeed {
+                uri: format!("at://did:plc:creator/app.bsky.feed.generator/{rkey}"),
+                display_name: if index < 5 {
+                    format!("Feed {index}")
+                } else {
+                    format!("Cached Feed {index}")
+                },
+                description: None,
+                avatar: None,
+                service_did: "did:plc:service".into(),
+                endpoint: "https://feed.example".into(),
+            }
+        })
+        .collect();
+    let flow = FakeOAuthFlow {
+        pinned_feeds: feeds,
+        pinned_feed_delay_ms: 5_000,
+        ..FakeOAuthFlow::default()
+    };
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage);
+    let cookie = finish_login(&app).await;
+    let started = Instant::now();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(elapsed < Duration::from_millis(200), "took {elapsed:?}");
+    for index in 0..38 {
+        let label = if index < 5 {
+            format!("Feed {index}")
+        } else {
+            format!("Cached Feed {index}")
+        };
+        assert!(html.contains(&label), "missing tab {label}");
     }
 }
 
