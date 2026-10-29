@@ -1529,24 +1529,37 @@ fn page_shell_with_feeds(
         title,
         content,
         authenticated,
-        feeds,
-        active_feed,
-        following_active,
-        true,
-        None,
+        PageShellOptions {
+            feeds,
+            active_feed,
+            following_active,
+            show_feed_tabs: true,
+            mobile_navigation_override: None,
+        },
     )
+}
+
+struct PageShellOptions<'a> {
+    feeds: &'a [ResolvedFeed],
+    active_feed: Option<&'a str>,
+    following_active: bool,
+    show_feed_tabs: bool,
+    mobile_navigation_override: Option<&'a str>,
 }
 
 fn page_shell_with_options(
     title: &str,
     content: &str,
     authenticated: bool,
-    feeds: &[ResolvedFeed],
-    active_feed: Option<&str>,
-    following_active: bool,
-    show_feed_tabs: bool,
-    mobile_navigation_override: Option<&str>,
+    options: PageShellOptions<'_>,
 ) -> String {
+    let PageShellOptions {
+        feeds,
+        active_feed,
+        following_active,
+        show_feed_tabs,
+        mobile_navigation_override,
+    } = options;
     let navigation = if authenticated {
         format!(
             "<nav class=\"primary-nav\" aria-label=\"Main navigation\"><a href=\"/app\">{}<span>Home</span></a><a href=\"/feeds\">{}<span>Feeds</span></a><a href=\"/notifications\">{}<span>Notifications</span></a><a href=\"/profile\">{}<span>Profile</span></a><a class=\"compose-link\" href=\"/app#new-post\">{}<span>New post</span></a><form action=\"/logout\" method=\"post\"><button type=\"submit\">Sign out</button></form></nav>",
@@ -2982,11 +2995,13 @@ where
             )
         ),
         true,
-        &pinned_feeds,
-        None,
-        false,
-        false,
-        Some(&mobile_navigation),
+        PageShellOptions {
+            feeds: &pinned_feeds,
+            active_feed: None,
+            following_active: false,
+            show_feed_tabs: false,
+            mobile_navigation_override: Some(&mobile_navigation),
+        },
     ))
     .into_response()
 }
@@ -3076,14 +3091,15 @@ fn render_quote_preview<S: Storage>(storage: &S, quoted: &IndexedRecord) -> Stri
         .get("embed")
         .map(|embed| render_web_embed(storage, &quoted.did, embed))
         .unwrap_or_default();
+    let author = format!(
+        "<span class=\"quoted-author\"><strong>{}</strong> <span>@{}</span></span>",
+        html_escape(display_name),
+        html_escape(&handle)
+    );
     format!(
         "<article class=\"quoted-post-preview\" aria-label=\"Quoted post\"><header>{}{}</header><p class=\"post-text\">{}</p>{embed}</article>",
         avatar_markup(&profile, "small-avatar"),
-        format!(
-            "<span class=\"quoted-author\"><strong>{}</strong> <span>@{}</span></span>",
-            html_escape(display_name),
-            html_escape(&handle)
-        ),
+        author,
         html_escape(text)
     )
 }

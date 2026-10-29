@@ -631,10 +631,10 @@ impl Storage for MemoryStorage {
                 inner.backfill_queue.insert(did.clone());
                 inner.backfill_completed.remove(did);
             }
-            if let Some(did) = &update.handle_refresh {
-                if inner.handle_refresh_queue.insert(did.clone()) {
-                    inner.handle_refresh_order.push_back(did.clone());
-                }
+            if let Some(did) = &update.handle_refresh
+                && inner.handle_refresh_queue.insert(did.clone())
+            {
+                inner.handle_refresh_order.push_back(did.clone());
             }
             inner.cursor = Some(update.time_us);
         }
