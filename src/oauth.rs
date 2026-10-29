@@ -7980,7 +7980,29 @@ fn render_timeline_post_items<S: Storage>(
     for (index, record) in records.iter().enumerate() {
         if let Some(group) = grouping.groups_by_newest.get(&index) {
             html.push_str("<li class=\"post-item thread-group\" aria-label=\"Reply thread\">");
-            for (position, member_index) in group.iter().enumerate() {
+            let self_thread = group.first().is_some_and(|first| {
+                group
+                    .iter()
+                    .all(|member| records[*member].did == records[*first].did)
+            });
+            let visible = if self_thread && group.len() > 10 {
+                group
+                    .iter()
+                    .take(2)
+                    .chain(group.iter().rev().take(3).rev())
+                    .copied()
+                    .collect::<Vec<_>>()
+            } else if !self_thread && group.len() > 3 {
+                group
+                    .iter()
+                    .take(1)
+                    .chain(group.iter().rev().take(2).rev())
+                    .copied()
+                    .collect::<Vec<_>>()
+            } else {
+                group.clone()
+            };
+            for (position, member_index) in visible.iter().enumerate() {
                 if position > 0 {
                     html.push_str(
                         "<span class=\"reply-connector thread-group-connector\" aria-hidden=\"true\"></span>",
@@ -8000,6 +8022,20 @@ fn render_timeline_post_items<S: Storage>(
                     true,
                     *member_index < 6,
                     quote_index,
+                ));
+            }
+            let skipped = group.len().saturating_sub(visible.len());
+            if skipped > 0 {
+                let root_uri = &records[group[0]].uri;
+                let thread_uri = format!("/app/thread?uri={}", form_encoded(root_uri));
+                let label = if self_thread {
+                    format!("{skipped} more in this thread")
+                } else {
+                    format!("{skipped} more replies")
+                };
+                html.push_str(&format!(
+                    "<a class=\"thread-more\" href=\"{}\">{label}</a>",
+                    html_escape(&thread_uri)
                 ));
             }
             html.push_str("</li>");

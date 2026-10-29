@@ -938,6 +938,13 @@ button:hover,
   background: var(--line);
 }
 
+.thread-more {
+  display: inline-block;
+  margin: 0 1.25rem 1rem 3.75rem;
+  color: var(--accent);
+  font-size: 0.9rem;
+}
+
 .notification-reply-parent > .reply-connector {
   bottom: 0.1rem;
 }
