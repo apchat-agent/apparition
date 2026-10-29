@@ -463,9 +463,6 @@ mod tests {
             let body = vec![b'x'; 1024 * 1024 + 1];
             ([(header::CONTENT_TYPE, "text/html")], body).into_response()
         }
-        async fn redirect_private() -> Redirect {
-            Redirect::temporary("http://private.test/private")
-        }
         async fn redirect_1() -> Redirect {
             Redirect::temporary("/redirect-2")
         }
@@ -484,6 +481,8 @@ mod tests {
         }
 
         let private_requests = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
         let app = Router::new()
             .route("/dir/page", get(page))
             .route("/bad-thumbnail-page", get(bad_thumbnail_page))
@@ -493,15 +492,18 @@ mod tests {
             .route("/large.png", get(large_image))
             .route("/wrong", get(wrong_type))
             .route("/large", get(oversized))
-            .route("/redirect", get(redirect_private))
+            .route(
+                "/redirect",
+                get(move || async move {
+                    Redirect::temporary(&format!("http://private.test:{port}/private"))
+                }),
+            )
             .route("/redirect-1", get(redirect_1))
             .route("/redirect-2", get(redirect_2))
             .route("/redirect-3", get(redirect_3))
             .route("/redirect-4", get(redirect_4))
             .route("/private", get(private));
         let app = app.with_state(private_requests.clone());
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
