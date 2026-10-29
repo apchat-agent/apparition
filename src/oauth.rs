@@ -2258,7 +2258,7 @@ async fn hydrate_page_profiles<F: OAuthFlow, S: Storage + 'static>(
         .cloned()
         .collect::<Vec<_>>();
     storage.queue_handle_refresh_ordered(&unresolved_handles)?;
-    tracing::info!(
+    tracing::debug!(
         authors_needed = hydration.authors_needed,
         from_index = hydration.from_index,
         fetched_live = hydration.fetched_live,
@@ -2323,9 +2323,30 @@ async fn hydrate_page_content<F: OAuthFlow, S: Storage + 'static>(
     }
 
     let quote_storage = storage.clone();
+    let profile_flow = flow.clone();
+    let profile_task = tokio::spawn(async move {
+        let result = hydrate_page_profiles(&profile_flow, storage, authors, deadline).await;
+        if let Err(error) = &result {
+            tracing::warn!(%error, "background page profile hydration failed");
+        }
+        result
+    });
+    let profile_fast_path = async move {
+        match tokio::time::timeout(Duration::from_millis(25), profile_task).await {
+            Ok(Ok(result)) => result.map(|_| ()),
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "page profile hydration task failed");
+                Ok(())
+            }
+            Err(_) => {
+                tracing::debug!("page profile hydration continued in background");
+                Ok(())
+            }
+        }
+    };
     let (quotes, profiles) = tokio::join!(
         hydrate_page_quotes(flow, quote_storage.as_ref(), refs, deadline),
-        hydrate_page_profiles(flow, storage, authors, deadline)
+        profile_fast_path
     );
     profiles?;
     quotes
