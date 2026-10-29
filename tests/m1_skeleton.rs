@@ -50,6 +50,10 @@ async fn health_endpoint_returns_json_ok() {
         // Sign-in is a form POST answered by a redirect to the user's authorization
         // server; Safari and Chrome apply form-action to that redirect (2026-10-28).
         assert!(csp.contains("form-action 'self' https:"), "{csp}");
+        // The picture composer previews and resizes the chosen photo through a blob: URL
+        // (static/app.js loadComposerImage); without blob: in img-src every picture fails
+        // to load before upload (ayourtch's iPhone, 2026-10-29).
+        assert!(csp.contains("img-src 'self' blob: "), "{csp}");
         assert!(
             response.headers()["strict-transport-security"]
                 .to_str()
