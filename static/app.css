@@ -929,6 +929,15 @@ button:hover,
   height: 2.825rem;
 }
 
+.thread-group .thread-group-connector {
+  position: static;
+  display: block;
+  width: 1px;
+  height: 1.25rem;
+  margin-left: 2.625rem;
+  background: var(--line);
+}
+
 .notification-reply-parent > .reply-connector {
   bottom: 0.1rem;
 }

@@ -4195,27 +4195,15 @@ where
     let render_started = std::time::Instant::now();
     let write_forms_enabled =
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
-    let posts = timeline
-        .iter()
-        .enumerate()
-        .map(|(index, record)| {
-            render_timeline_post_item(
-                state.storage.as_ref(),
-                record,
-                TimelinePostItemOptions {
-                    prelude: "",
-                    previous_uri: index
-                        .checked_sub(1)
-                        .map(|previous| timeline[previous].uri.as_str()),
-                    parents: &parents,
-                    viewer_did: &did,
-                    write_forms_enabled,
-                    eager_avatar: index < 6,
-                    quote_index: &quote_index,
-                },
-            )
-        })
-        .collect::<String>();
+    let posts = render_timeline_post_items(
+        state.storage.as_ref(),
+        &timeline,
+        &vec![String::new(); timeline.len()],
+        &parents,
+        &did,
+        write_forms_enabled,
+        &quote_index,
+    );
     let posts = if posts.is_empty() {
         "<li class=\"empty-state\">No indexed posts yet.</li>".to_owned()
     } else {
@@ -4457,14 +4445,12 @@ where
     let render_started = std::time::Instant::now();
     let write_forms_enabled =
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
-    let posts = page
+    let feed_preludes = page
         .timeline
         .feed
         .iter()
-        .enumerate()
-        .map(|(index, post)| {
-            let repost = post
-                .reposted_by
+        .map(|post| {
+            post.reposted_by
                 .as_deref()
                 .map(|reposter| {
                     format!(
@@ -4472,24 +4458,18 @@ where
                         html_escape(reposter)
                     )
                 })
-                .unwrap_or_default();
-            render_timeline_post_item(
-                state.storage.as_ref(),
-                &post.record,
-                TimelinePostItemOptions {
-                    prelude: &repost,
-                    previous_uri: index
-                        .checked_sub(1)
-                        .map(|previous| feed_records[previous].uri.as_str()),
-                    parents: &parents,
-                    viewer_did: &did,
-                    write_forms_enabled,
-                    eager_avatar: index < 6,
-                    quote_index: &quote_index,
-                },
-            )
+                .unwrap_or_default()
         })
-        .collect::<String>();
+        .collect::<Vec<_>>();
+    let posts = render_timeline_post_items(
+        state.storage.as_ref(),
+        &feed_records,
+        &feed_preludes,
+        &parents,
+        &did,
+        write_forms_enabled,
+        &quote_index,
+    );
     let posts = if posts.is_empty() {
         "<li class=\"empty-state\">This feed has no available posts on this page.</li>".to_owned()
     } else {
@@ -5201,27 +5181,15 @@ where
         .unwrap_or(&handle);
     let write_forms_enabled =
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
-    let posts = records
-        .iter()
-        .enumerate()
-        .map(|(index, record)| {
-            render_timeline_post_item(
-                state.storage.as_ref(),
-                record,
-                TimelinePostItemOptions {
-                    prelude: "",
-                    previous_uri: index
-                        .checked_sub(1)
-                        .map(|previous| records[previous].uri.as_str()),
-                    parents: &parents,
-                    viewer_did: &did,
-                    write_forms_enabled,
-                    eager_avatar: index < 6,
-                    quote_index: &quote_index,
-                },
-            )
-        })
-        .collect::<String>();
+    let posts = render_timeline_post_items(
+        state.storage.as_ref(),
+        &records,
+        &vec![String::new(); records.len()],
+        &parents,
+        &did,
+        write_forms_enabled,
+        &quote_index,
+    );
     let posts = if posts.is_empty() {
         "<li class=\"empty-state\">No indexed posts yet.</li>".to_owned()
     } else {
@@ -7922,6 +7890,142 @@ struct TimelinePostItemOptions<'a> {
     quote_index: &'a QuoteRenderIndex,
 }
 
+#[derive(Default)]
+struct TimelinePostGrouping {
+    groups_by_newest: HashMap<usize, Vec<usize>>,
+    grouped_indices: HashSet<usize>,
+}
+
+fn timeline_post_grouping(records: &[&IndexedRecord]) -> TimelinePostGrouping {
+    const MAX_THREAD_SPAN_US: u64 = 24 * 60 * 60 * 1_000_000;
+
+    let indices = records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| (record.uri.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut children = HashMap::<usize, Vec<usize>>::new();
+    let mut has_page_parent = HashSet::new();
+    for (index, record) in records.iter().enumerate() {
+        if let Some(parent_index) = record
+            .record
+            .pointer("/reply/parent/uri")
+            .and_then(Value::as_str)
+            .and_then(|uri| indices.get(uri).copied())
+        {
+            children.entry(parent_index).or_default().push(index);
+            has_page_parent.insert(index);
+        }
+    }
+
+    let mut grouping = TimelinePostGrouping::default();
+    for root in 0..records.len() {
+        if has_page_parent.contains(&root) || grouping.grouped_indices.contains(&root) {
+            continue;
+        }
+        let mut chain = vec![root];
+        let mut current = root;
+        loop {
+            let Some(next) = children.get(&current).filter(|next| next.len() == 1) else {
+                break;
+            };
+            current = next[0];
+            if chain.contains(&current) {
+                break;
+            }
+            chain.push(current);
+        }
+        if chain.len() < 2 {
+            continue;
+        }
+        let oldest = chain
+            .iter()
+            .map(|index| records[*index].time_us)
+            .min()
+            .unwrap_or_default();
+        let newest = chain
+            .iter()
+            .map(|index| records[*index].time_us)
+            .max()
+            .unwrap_or_default();
+        if newest.saturating_sub(oldest) > MAX_THREAD_SPAN_US {
+            continue;
+        }
+        let newest_index = chain
+            .iter()
+            .copied()
+            .max_by_key(|index| (records[*index].time_us, std::cmp::Reverse(*index)))
+            .unwrap_or(root);
+        let mut oldest_first = chain;
+        oldest_first.sort_by_key(|index| (records[*index].time_us, records[*index].uri.as_str()));
+        grouping
+            .grouped_indices
+            .extend(oldest_first.iter().copied());
+        grouping.groups_by_newest.insert(newest_index, oldest_first);
+    }
+    grouping
+}
+
+fn render_timeline_post_items<S: Storage>(
+    storage: &S,
+    records: &[&IndexedRecord],
+    preludes: &[String],
+    parents: &PageParentIndex,
+    viewer_did: &str,
+    write_forms_enabled: bool,
+    quote_index: &QuoteRenderIndex,
+) -> String {
+    let grouping = timeline_post_grouping(records);
+    let mut html = String::new();
+    for (index, record) in records.iter().enumerate() {
+        if let Some(group) = grouping.groups_by_newest.get(&index) {
+            html.push_str("<li class=\"post-item thread-group\" aria-label=\"Reply thread\">");
+            for (position, member_index) in group.iter().enumerate() {
+                if position > 0 {
+                    html.push_str(
+                        "<span class=\"reply-connector thread-group-connector\" aria-hidden=\"true\"></span>",
+                    );
+                }
+                html.push_str(
+                    preludes
+                        .get(*member_index)
+                        .map(String::as_str)
+                        .unwrap_or(""),
+                );
+                html.push_str(&render_web_post(
+                    storage,
+                    records[*member_index],
+                    viewer_did,
+                    write_forms_enabled,
+                    true,
+                    *member_index < 6,
+                    quote_index,
+                ));
+            }
+            html.push_str("</li>");
+        } else if grouping.grouped_indices.contains(&index) {
+            continue;
+        } else {
+            html.push_str(&render_timeline_post_item(
+                storage,
+                record,
+                TimelinePostItemOptions {
+                    prelude: preludes.get(index).map(String::as_str).unwrap_or(""),
+                    previous_uri: index
+                        .checked_sub(1)
+                        .map(|previous| records[previous].uri.as_str()),
+                    parents,
+                    viewer_did,
+                    write_forms_enabled,
+                    eager_avatar: index < 6,
+                    quote_index,
+                },
+            ));
+        }
+    }
+    html
+}
+
 fn render_timeline_post_item<S: Storage>(
     storage: &S,
     record: &IndexedRecord,
@@ -9033,10 +9137,22 @@ mod tests {
 
         let page = request_test_timeline(storage, viewer).await;
 
-        assert_eq!(page.matches("class=\"thread-group\"").count(), 1, "{page}");
+        assert_eq!(
+            page.matches("class=\"post-item thread-group\"").count(),
+            1,
+            "{page}"
+        );
         assert_eq!(page.matches("class=\"post-card\"").count(), 3, "{page}");
-        assert_eq!(page.matches("class=\"reply-parent-card\"").count(), 0, "{page}");
-        for text in ["Self thread first", "Self thread second", "Self thread third"] {
+        assert_eq!(
+            page.matches("class=\"reply-parent-card\"").count(),
+            0,
+            "{page}"
+        );
+        for text in [
+            "Self thread first",
+            "Self thread second",
+            "Self thread third",
+        ] {
             assert_eq!(page.matches(text).count(), 1, "{page}");
         }
         let first_position = page.find("Self thread first").unwrap();
