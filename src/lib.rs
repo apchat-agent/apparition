@@ -21,13 +21,12 @@ pub fn router() -> Router {
 
 pub fn router_with_oauth(oauth: oauth::OAuthPublic) -> Router {
     let public_https = oauth.public_url().starts_with("https://");
-    http_security::protect_with_body_limit(
+    http_security::protect_with_picture_body_limit(
         Router::new()
             .route("/xrpc/_health", get(health))
             .route("/healthz", get(health))
             .merge(oauth.router()),
         public_https,
-        5 * 1024 * 1024,
     )
 }
 
@@ -41,13 +40,12 @@ where
     S: ingest::Storage + 'static,
 {
     let public_https = oauth.public_url().starts_with("https://");
-    http_security::protect_with_body_limit(
+    http_security::protect_with_picture_body_limit(
         Router::new()
             .route("/xrpc/_health", get(health))
             .route("/healthz", get(health))
             .merge(oauth.router_with_flow(flow, storage)),
         public_https,
-        5 * 1024 * 1024,
     )
 }
 

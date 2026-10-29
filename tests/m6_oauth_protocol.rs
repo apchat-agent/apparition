@@ -409,9 +409,11 @@ async fn production_post_with_two_images_uploads_blobs_before_creating_record() 
         .collect::<Vec<_>>();
     assert_eq!(upload_requests.len(), 2);
     assert_eq!(upload_requests[0].method, "POST");
-    assert!(upload_requests[0]
-        .path
-        .starts_with("/xrpc/com.atproto.repo.uploadBlob"));
+    assert!(
+        upload_requests[0]
+            .path
+            .starts_with("/xrpc/com.atproto.repo.uploadBlob")
+    );
     assert_eq!(
         upload_requests[0]
             .headers
@@ -1408,7 +1410,11 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<CapturedRequest
     let head = String::from_utf8_lossy(&bytes[..header_end]);
     let mut lines = head.split("\r\n");
     let first = lines.next().unwrap_or_default();
-    let method = first.split_whitespace().next().unwrap_or_default().to_owned();
+    let method = first
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_owned();
     let path = first.split_whitespace().nth(1).unwrap_or("/").to_owned();
     let mut headers = HashMap::new();
     let content_length = lines

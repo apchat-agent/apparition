@@ -16,7 +16,10 @@ async fn picture_route_accepts_a_one_mib_multipart_body() {
     );
     let mut body = b"--image-boundary\r\nContent-Disposition: form-data; name=\"text\"\r\n\r\npicture\r\n--image-boundary\r\nContent-Disposition: form-data; name=\"images\"; filename=\"large.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n".to_vec();
     let trailer = b"\r\n--image-boundary--\r\n";
-    body.extend(std::iter::repeat(b'x').take(1024 * 1024 - body.len() - trailer.len()));
+    body.extend(std::iter::repeat_n(
+        b'x',
+        1024 * 1024 - body.len() - trailer.len(),
+    ));
     body.extend_from_slice(trailer);
     let response = app
         .oneshot(

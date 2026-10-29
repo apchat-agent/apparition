@@ -3,9 +3,10 @@ use axum::{
     body::Body,
     extract::{ConnectInfo, State},
     http::{Request, Response, StatusCode, header},
-    middleware::{Next, from_fn_with_state},
+    middleware::{Next, from_fn, from_fn_with_state},
     response::IntoResponse,
 };
+use http_body_util::Limited;
 use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddr,
@@ -16,6 +17,7 @@ use tower_http::{compression::CompressionLayer, limit::RequestBodyLimitLayer};
 
 const MAX_URI_BYTES: usize = 8 * 1024;
 const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024;
+const MAX_PICTURE_REQUEST_BODY_BYTES: usize = 5 * 1024 * 1024;
 const WINDOW: Duration = Duration::from_secs(60);
 const MAX_BUCKETS: usize = 4096;
 
@@ -41,6 +43,36 @@ pub fn protect_with_body_limit(
         .layer(RequestBodyLimitLayer::new(max_request_body_bytes))
         .layer(CompressionLayer::new().gzip(true).br(true))
         .layer(from_fn_with_state(public_https, apply))
+}
+
+pub fn protect_with_picture_body_limit(router: Router, public_https: bool) -> Router {
+    router
+        .layer(from_fn(limit_picture_request_body))
+        .layer(CompressionLayer::new().gzip(true).br(true))
+        .layer(from_fn_with_state(public_https, apply))
+}
+
+async fn limit_picture_request_body(request: Request<Body>, next: Next) -> Response<Body> {
+    let limit = if request.method() == http::Method::POST
+        && matches!(request.uri().path(), "/post" | "/reply" | "/quote")
+    {
+        MAX_PICTURE_REQUEST_BODY_BYTES
+    } else {
+        MAX_REQUEST_BODY_BYTES
+    };
+    if request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > limit)
+    {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "request body is too large").into_response();
+    }
+
+    let (parts, body) = request.into_parts();
+    let body = Body::new(Limited::new(body, limit));
+    next.run(Request::from_parts(parts, body)).await
 }
 
 async fn apply(
