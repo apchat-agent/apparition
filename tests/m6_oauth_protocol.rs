@@ -963,6 +963,126 @@ async fn fake_pds_receives_quote_post_with_record_embed_strong_ref() {
 }
 
 #[tokio::test]
+async fn fake_pds_records_profile_graph_shapes_and_proxy_mute_rpc() {
+    let (flow, _, shared, server) = production_flow(None, Some(EXPECTED_OAUTH_SCOPE)).await;
+    flow.authorize(DID, "profile-actions-binding")
+        .await
+        .unwrap();
+    let state = latest_state(&shared);
+    flow.callback(OAuthCallback {
+        code: "valid-code".to_owned(),
+        state,
+        issuer: Some(server_origin(&shared)),
+        scope: None,
+        browser_binding: Some("profile-actions-binding".to_owned()),
+    })
+    .await
+    .unwrap();
+
+    for (collection, record) in [
+        (
+            "app.bsky.graph.follow",
+            json!({"$type":"app.bsky.graph.follow","subject":"did:plc:friend","createdAt":"2026-10-29T00:00:00Z"}),
+        ),
+        (
+            "app.bsky.graph.block",
+            json!({"$type":"app.bsky.graph.block","subject":"did:plc:friend","createdAt":"2026-10-29T00:00:00Z"}),
+        ),
+        (
+            "app.bsky.graph.listitem",
+            json!({"$type":"app.bsky.graph.listitem","subject":"did:plc:friend","list":format!("at://{DID}/app.bsky.graph.list/friends"),"createdAt":"2026-10-29T00:00:00Z"}),
+        ),
+    ] {
+        flow.create_profile_graph_record(DID, collection, record)
+            .await
+            .unwrap();
+    }
+    for (collection, rkey) in [
+        ("app.bsky.graph.follow", "follow-record"),
+        ("app.bsky.graph.block", "block-record"),
+        ("app.bsky.graph.listitem", "listitem-record"),
+    ] {
+        flow.delete_profile_graph_record(
+            DID,
+            collection,
+            &format!("at://{DID}/{collection}/{rkey}"),
+        )
+        .await
+        .unwrap();
+    }
+    flow.set_actor_muted(DID, "did:plc:friend", true)
+        .await
+        .unwrap();
+    flow.set_actor_muted(DID, "did:plc:friend", false)
+        .await
+        .unwrap();
+    flow.muted_actor_dids(DID).await.unwrap();
+
+    let state = shared.lock().unwrap();
+    let created = state
+        .requests
+        .iter()
+        .filter(|request| {
+            request
+                .path
+                .starts_with("/xrpc/com.atproto.repo.createRecord")
+        })
+        .map(|request| serde_json::from_str::<Value>(&request.body).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(created.len(), 3);
+    assert_eq!(created[0]["collection"], "app.bsky.graph.follow");
+    assert_eq!(created[0]["record"]["subject"], "did:plc:friend");
+    assert_eq!(created[1]["collection"], "app.bsky.graph.block");
+    assert_eq!(created[1]["record"]["subject"], "did:plc:friend");
+    assert_eq!(created[2]["collection"], "app.bsky.graph.listitem");
+    assert_eq!(created[2]["record"]["subject"], "did:plc:friend");
+    assert_eq!(
+        created[2]["record"]["list"],
+        format!("at://{DID}/app.bsky.graph.list/friends")
+    );
+    let deletes = state
+        .requests
+        .iter()
+        .filter(|request| {
+            request
+                .path
+                .starts_with("/xrpc/com.atproto.repo.deleteRecord")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(deletes.len(), 3);
+    let mute = state
+        .requests
+        .iter()
+        .find(|request| request.path.starts_with("/xrpc/app.bsky.graph.muteActor"))
+        .unwrap();
+    assert_eq!(mute.method, "POST");
+    assert_eq!(
+        mute.headers.get("atproto-proxy").map(String::as_str),
+        Some("did:web:api.bsky.app#bsky_appview")
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&mute.body).unwrap()["actor"],
+        "did:plc:friend"
+    );
+    let unmute = state
+        .requests
+        .iter()
+        .find(|request| request.path.starts_with("/xrpc/app.bsky.graph.unmuteActor"))
+        .unwrap();
+    assert_eq!(
+        unmute.headers.get("atproto-proxy").map(String::as_str),
+        Some("did:web:api.bsky.app#bsky_appview")
+    );
+    assert!(
+        state
+            .requests
+            .iter()
+            .any(|request| request.path.starts_with("/xrpc/app.bsky.graph.getMutes"))
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn live_author_profile_read_uses_the_resolved_pds_and_indexes_record_shape() {
     let (flow, _, shared, server) = production_flow(None, None).await;
     let fetched = flow.fetch_author_profile(DID).await.unwrap();
