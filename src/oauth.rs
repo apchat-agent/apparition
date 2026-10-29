@@ -7371,7 +7371,8 @@ mod tests {
         assert!(css.contains(".post-actions .is-liked .icon {\n  fill: var(--accent);"));
         assert!(css.contains(".thread-focus-actions .is-liked .icon {\n  fill: var(--accent);"));
         assert!(css.contains(".infinite-scroll-status {"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m10"));
+        assert!(css.contains(".infinite-scroll-retry[hidden] {\n  display: none;"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m11"));
         assert!(WEB_SCRIPT_URL.contains("v=js8"));
     }
 
