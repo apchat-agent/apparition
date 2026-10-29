@@ -1576,3 +1576,49 @@ impl Write for CapturedWriter {
         Ok(())
     }
 }
+
+// Hotfix 2026-10-29 (live report): a reply typed without a video still carries the composer's empty
+// `video` file input in its multipart body; the server rejected every such post with
+// "Enable JavaScript to validate and upload videos."
+#[tokio::test]
+async fn production_post_with_an_empty_video_input_is_accepted() {
+    let public = OAuthPublic::new("https://appview.example").unwrap();
+    let (flow, _, shared, server) =
+        production_flow_with_public(public.clone(), None, Some(EXPECTED_OAUTH_SCOPE)).await;
+    let storage = Arc::new(MemoryStorage::default());
+    let app = public.router_with_flow(flow, storage);
+    let cookie = finish_production_login(&app, &shared).await;
+    let boundary = "protocol-empty-video";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"text\"\r\n\r\njust text\r\n\
+         --{boundary}\r\nContent-Disposition: form-data; name=\"video\"; filename=\"\"\r\nContent-Type: application/octet-stream\r\n\r\n\r\n\
+         --{boundary}--\r\n"
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/post")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", cookie)
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let state = shared.lock().unwrap();
+    assert!(
+        state
+            .requests
+            .iter()
+            .any(|request| request.path.starts_with("/xrpc/com.atproto.repo.createRecord"))
+    );
+    drop(state);
+    server.abort();
+}
