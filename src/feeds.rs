@@ -59,6 +59,9 @@ pub struct FeedClient<B: IdentityBackend> {
     http: SafeHttpClient,
     generator_cache: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, ResolvedFeed)>>,
     live_post_cache: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, IndexedRecord)>>,
+    // Failed resolutions are remembered too: the layout resolves every pinned feed on every page,
+    // so an uncached failure would repeat its full network cost on each request.
+    generator_failures: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, String)>>,
 }
 
 impl<B: IdentityBackend> FeedClient<B> {
@@ -68,10 +71,41 @@ impl<B: IdentityBackend> FeedClient<B> {
             http,
             generator_cache: tokio::sync::Mutex::new(HashMap::new()),
             live_post_cache: tokio::sync::Mutex::new(HashMap::new()),
+            generator_failures: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
     pub async fn resolve_feed(&self, uri: &str) -> Result<ResolvedFeed, String> {
+        if let Some((expires, error)) = self.generator_failures.lock().await.get(uri).cloned()
+            && expires > tokio::time::Instant::now()
+        {
+            return Err(error);
+        }
+        let started = std::time::Instant::now();
+        let result = self.resolve_feed_uncached(uri).await;
+        if let Err(error) = &result {
+            tracing::warn!(
+                feed = uri,
+                %error,
+                duration_ms = started.elapsed().as_millis() as u64,
+                "feed generator resolution failed"
+            );
+            let mut failures = self.generator_failures.lock().await;
+            failures.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
+            if failures.len() < 1024 {
+                failures.insert(
+                    uri.to_owned(),
+                    (
+                        tokio::time::Instant::now() + Duration::from_secs(10 * 60),
+                        error.clone(),
+                    ),
+                );
+            }
+        }
+        result
+    }
+
+    async fn resolve_feed_uncached(&self, uri: &str) -> Result<ResolvedFeed, String> {
         if let Some((expires, feed)) = self.generator_cache.lock().await.get(uri).cloned()
             && expires > tokio::time::Instant::now()
         {

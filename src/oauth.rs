@@ -1249,16 +1249,25 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
         did: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<ResolvedFeed>, String>> + Send + 'a>> {
         Box::pin(async move {
+            let started = std::time::Instant::now();
             let preferences = self.saved_feed_preferences(did).await?;
-            let mut feeds = Vec::new();
-            for preference in preferences
-                .iter()
-                .filter(|item| item.feed_type == "feed" && item.pinned)
-            {
-                if let Ok(feed) = self.feed_client.resolve_feed(&preference.value).await {
-                    feeds.push(feed);
-                }
-            }
+            let preferences_ms = started.elapsed().as_millis() as u64;
+            let resolutions = futures_util::future::join_all(
+                preferences
+                    .iter()
+                    .filter(|item| item.feed_type == "feed" && item.pinned)
+                    .map(|preference| self.feed_client.resolve_feed(&preference.value)),
+            )
+            .await;
+            let requested = resolutions.len();
+            let feeds = resolutions.into_iter().flatten().collect::<Vec<_>>();
+            tracing::info!(
+                pinned = requested,
+                resolved = feeds.len(),
+                preferences_ms,
+                duration_ms = started.elapsed().as_millis() as u64,
+                "pinned feed tabs loaded"
+            );
             Ok(feeds)
         })
     }
