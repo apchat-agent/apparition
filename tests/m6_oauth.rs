@@ -507,6 +507,48 @@ async fn finish_login(app: &Router) -> String {
         .unwrap()
 }
 
+fn multipart_post_body(
+    boundary: &str,
+    text: &str,
+    parent_uri: Option<&str>,
+    quote_uri: Option<&str>,
+    images: &[(&str, &str, &[u8])],
+    alts: &[&str],
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    append_multipart_text_field(&mut body, boundary, "text", text);
+    if let Some(parent_uri) = parent_uri {
+        append_multipart_text_field(&mut body, boundary, "parent_uri", parent_uri);
+    }
+    if let Some(quote_uri) = quote_uri {
+        append_multipart_text_field(&mut body, boundary, "quote_uri", quote_uri);
+    }
+    for (mime, filename, bytes) in images {
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"images\"; filename=\"{filename}\"\r\nContent-Type: {mime}\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(b"\r\n");
+    }
+    for alt in alts {
+        append_multipart_text_field(&mut body, boundary, "alts", alt);
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    body
+}
+
+fn append_multipart_text_field(body: &mut Vec<u8>, boundary: &str, name: &str, value: &str) {
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+        )
+        .as_bytes(),
+    );
+}
+
 async fn get_html(app: &Router, uri: &str, cookie: &str) -> String {
     let response = app
         .clone()
@@ -2037,18 +2079,17 @@ async fn old_scope_session_gets_a_friendly_feed_reauthorization_page() {
 #[tokio::test]
 async fn old_scope_session_keeps_text_composer_and_shows_picture_reauthorization_hint() {
     let old_scope = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete";
+    let flow = FakeOAuthFlow::with_granted_scope(Some(old_scope));
     let app = OAuthPublic::new("https://appview.example")
         .unwrap()
-        .router_with_flow(
-            FakeOAuthFlow::with_granted_scope(Some(old_scope)),
-            Arc::new(MemoryStorage::default()),
-        );
+        .router_with_flow(flow.clone(), Arc::new(MemoryStorage::default()));
     let cookie = finish_login(&app).await;
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/app")
-                .header("cookie", cookie)
+                .header("cookie", &cookie)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -2069,6 +2110,121 @@ async fn old_scope_session_keeps_text_composer_and_shows_picture_reauthorization
     assert!(html.contains("Log in again to enable pictures"), "{html}");
     assert!(html.contains("href=\"/login\""), "{html}");
     assert!(!html.contains("type=\"file\""), "{html}");
+
+    let text_post = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/post")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", &cookie)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("text=still+works"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(text_post.status(), StatusCode::SEE_OTHER);
+
+    let boundary = "av26-picture";
+    let body = multipart_post_body(
+        boundary,
+        "caption",
+        None,
+        None,
+        &[("image/jpeg", "a.jpg", &[0xff, 0xd8, 0xff])],
+        &[""],
+    );
+    let image_post = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/post")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", cookie)
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(image_post.status(), StatusCode::FORBIDDEN);
+    let message: Value =
+        serde_json::from_slice(&image_post.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert!(
+        message["message"]
+            .as_str()
+            .unwrap()
+            .contains("Log in again")
+    );
+    assert_eq!(
+        *flow.actions.lock().unwrap(),
+        ["post:did:plc:alice:still works"],
+        "the text-only post succeeds and no image post is attempted"
+    );
+}
+
+#[tokio::test]
+async fn invalid_images_are_rejected_before_the_oauth_flow_is_called() {
+    let flow = FakeOAuthFlow::default();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow.clone(), Arc::new(MemoryStorage::default()));
+    let cookie = finish_login(&app).await;
+    let cases = [
+        ("image/svg+xml", "wrong.svg", b"<svg></svg>".to_vec()),
+        ("image/jpeg", "large.jpg", vec![0x55; 1_000_001]),
+    ];
+    for (mime, filename, bytes) in cases {
+        let boundary = "av26-invalid";
+        let body = multipart_post_body(
+            boundary,
+            "caption",
+            None,
+            None,
+            &[(mime, filename, &bytes)],
+            &[""],
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/post")
+                    .header("origin", "https://appview.example")
+                    .header("sec-fetch-site", "same-origin")
+                    .header("cookie", &cookie)
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{mime} {filename}"
+        );
+        let message: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert!(
+            message["message"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+    }
+    assert!(flow.actions.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
