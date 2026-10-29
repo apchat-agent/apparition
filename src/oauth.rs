@@ -87,7 +87,7 @@ const PROFILE_NEGATIVE_TTL: Duration = Duration::from_secs(60 * 60);
 const PAGE_PROFILE_BUDGET: Duration = Duration::from_millis(1500);
 const PAGE_PROFILE_CONCURRENCY: usize = 8;
 const PAGE_QUOTE_CONCURRENCY: usize = 16;
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m14";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m15";
 const WEB_SCRIPT_URL: &str = "/static/app.js?v=js13";
 const HLS_SCRIPT_URL: &str = "/static/vendor/hls.min.js?v=1.7.3";
 const ALT_MODEL_DOWNLOAD_BYTES: u64 = 264_713_119;
@@ -9281,7 +9281,7 @@ mod tests {
         assert!(css.contains(".thread-focus-actions .is-liked .icon {\n  fill: var(--accent);"));
         assert!(css.contains(".infinite-scroll-status {"));
         assert!(css.contains(".infinite-scroll-retry[hidden] {\n  display: none;"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m14"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m15"));
         assert!(WEB_SCRIPT_URL.contains("v=js13"));
     }
 
@@ -9289,15 +9289,9 @@ mod tests {
     fn mobile_bottom_bar_uses_compact_safe_area_aware_geometry() {
         let css = include_str!("../static/app.css");
 
-        assert!(css.contains(
-            ".mobile-profile-avatar {\n    width: 1.4rem;\n    height: 1.4rem;"
-        ));
-        assert!(css.contains(
-            ".mobile-nav .icon {\n    width: 1.2rem;\n    height: 1.2rem;"
-        ));
-        assert!(css.contains(
-            "padding-bottom: calc(0.1rem + env(safe-area-inset-bottom) * 0.55);"
-        ));
+        assert!(css.contains(".mobile-profile-avatar {\n    width: 1.4rem;\n    height: 1.4rem;"));
+        assert!(css.contains(".mobile-nav .icon {\n    width: 1.2rem;\n    height: 1.2rem;"));
+        assert!(css.contains("padding-bottom: calc(0.1rem + env(safe-area-inset-bottom) * 0.55);"));
         assert!(css.contains("55% of the 34px inset"));
         assert!(css.contains("min-height: 2.1rem;\n    min-width: 44px;"));
         assert!(css.contains(

@@ -1888,15 +1888,15 @@ a.quoted-post-card:hover,
   }
 
   .mobile-profile-avatar {
-    width: 1.55rem;
-    height: 1.55rem;
+    width: 1.4rem;
+    height: 1.4rem;
     border-radius: 50%;
     object-fit: cover;
   }
 
   .mobile-nav .icon {
-    width: 1.3rem;
-    height: 1.3rem;
+    width: 1.2rem;
+    height: 1.2rem;
   }
 
   .mobile-compose {
@@ -2033,16 +2033,23 @@ a.quoted-post-card:hover,
     bottom: 0;
   }
 
+  body:has(.mobile-nav) {
+    --mobile-nav-height: calc(2.1rem + 0.2rem + 1px + env(safe-area-inset-bottom) * 0.55);
+    --mobile-compose-clearance: calc(var(--mobile-nav-height) + 0.75rem);
+  }
+
   /* Icon-only bottom bar at about half the old height (owner, 2026-10-29); labels stay for screen readers. */
   body:has(.mobile-nav) .mobile-nav {
     min-height: 0;
     padding-top: 0.1rem;
-    padding-bottom: calc(0.1rem + env(safe-area-inset-bottom));
+    /* 55% of the 34px inset leaves about 19px below the row; icons retain roughly 15px above the 5px home indicator, 8px from the edge. */
+    padding-bottom: calc(0.1rem + env(safe-area-inset-bottom) * 0.55);
   }
 
   body:has(.mobile-nav) .mobile-nav a,
   body:has(.mobile-nav) .mobile-nav button {
-    min-height: 2.6rem;
+    min-height: 2.1rem;
+    min-width: 44px;
   }
 
   body:has(.mobile-nav) .mobile-nav a > span,
@@ -2056,11 +2063,11 @@ a.quoted-post-card:hover,
   }
 
   body:has(.mobile-nav) .mobile-compose {
-    bottom: calc(3.6rem + env(safe-area-inset-bottom));
+    bottom: var(--mobile-compose-clearance);
   }
 
   body:has(.mobile-nav) .center-column {
-    padding-bottom: 4.5rem;
+    padding-bottom: max(4.25rem, var(--mobile-compose-clearance));
   }
 
   .feed-tab {
