@@ -1120,6 +1120,7 @@ pub struct AtriumOAuthFlow<B: crate::identity::IdentityBackend = HttpIdentityBac
     feed_client: Arc<FeedClient<B>>,
     http_client: SafeHttpClient,
     video_http_client: reqwest::Client,
+    video_service_url: String,
     saved_feed_cache: SavedFeedCache,
     saved_feed_refreshes: SavedFeedRefreshes,
     service_auth_cache: ServiceAuthCache,
@@ -1136,6 +1137,7 @@ impl<B: crate::identity::IdentityBackend> Clone for AtriumOAuthFlow<B> {
             feed_client: self.feed_client.clone(),
             http_client: self.http_client.clone(),
             video_http_client: self.video_http_client.clone(),
+            video_service_url: self.video_service_url.clone(),
             saved_feed_cache: self.saved_feed_cache.clone(),
             saved_feed_refreshes: self.saved_feed_refreshes.clone(),
             service_auth_cache: self.service_auth_cache.clone(),
@@ -1431,6 +1433,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|error| error.to_string())?,
+            video_service_url: VIDEO_SERVICE_URL.to_owned(),
             saved_feed_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             saved_feed_refreshes: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             service_auth_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -1617,7 +1620,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         let token = self
             .service_auth_token(viewer_did, VIDEO_SERVICE_DID, lexicon)
             .await?;
-        let mut url = reqwest::Url::parse(VIDEO_SERVICE_URL)
+        let mut url = reqwest::Url::parse(&self.video_service_url)
             .map_err(|error| format!("video service URL is invalid: {error}"))?;
         url.set_path(&format!("/xrpc/{lexicon}"));
         url.query_pairs_mut()
@@ -1641,7 +1644,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         let token = self
             .service_auth_token(did, VIDEO_SERVICE_DID, "app.bsky.video.uploadVideo")
             .await?;
-        let mut url = reqwest::Url::parse(VIDEO_SERVICE_URL)
+        let mut url = reqwest::Url::parse(&self.video_service_url)
             .map_err(|error| format!("video service URL is invalid: {error}"))?;
         url.set_path("/xrpc/app.bsky.video.uploadVideo");
         url.query_pairs_mut()
@@ -8582,9 +8585,8 @@ mod tests {
     fn video_oauth_scopes_are_explicit_and_old_scopes_do_not_enable_video() {
         for scope in [
             "blob:video/*",
-            "rpc:app.bsky.video.getUploadLimits?aud=did:web:video.bsky.app",
-            "rpc:app.bsky.video.uploadVideo?aud=did:web:video.bsky.app",
-            "rpc:app.bsky.video.getJobStatus?aud=did:web:video.bsky.app",
+            "rpc:app.bsky.video.getUploadLimits?aud=*",
+            "rpc:com.atproto.repo.uploadBlob?aud=*",
         ] {
             assert!(
                 REQUESTED_SCOPE
@@ -8592,9 +8594,26 @@ mod tests {
                     .any(|value| value == scope)
             );
         }
-        let old_scope = "atproto repo:app.bsky.feed.post?action=create blob:image/*";
-        assert!(!has_all_video_scopes(Some(old_scope)));
-        assert!(has_all_video_scopes(Some(REQUESTED_SCOPE)));
+        let granted_scope = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/*";
+        assert!(!has_all_video_scopes(Some(granted_scope)));
+        let updated_scope = format!("{granted_scope} {}", VIDEO_SCOPES.join(" "));
+        assert!(has_all_video_scopes(Some(&updated_scope)));
+    }
+
+    #[test]
+    fn every_requested_rpc_scope_has_a_spec_valid_audience() {
+        for scope in FEED_SCOPES.iter().chain(VIDEO_SCOPES.iter()) {
+            if !scope.starts_with("rpc:") {
+                continue;
+            }
+            let (_, audience) = scope
+                .split_once("?aud=")
+                .unwrap_or_else(|| panic!("RPC scope has no aud parameter: {scope}"));
+            assert!(
+                audience == "*" || audience.contains('#') || audience.contains("%23"),
+                "RPC scope audience must be * or a DID service reference: {scope}"
+            );
+        }
     }
 
     #[test]
@@ -9342,7 +9361,9 @@ mod tests {
     #[derive(Default)]
     struct FeedTestState {
         auth_calls: usize,
+        auth_requests: Vec<(String, String)>,
         skeleton_authorizations: Vec<Option<String>>,
+        pds_url: String,
         fail_auth: bool,
     }
 
@@ -9382,6 +9403,7 @@ mod tests {
         let pds = format!("http://127.0.0.1:{}", address.port());
         let service_endpoint = format!("{pds}/fg");
         let state = Arc::new(Mutex::new(FeedTestState {
+            pds_url: pds.clone(),
             fail_auth,
             ..FeedTestState::default()
         }));
@@ -9404,11 +9426,20 @@ mod tests {
             )
             .route(
                 "/xrpc/com.atproto.server.getServiceAuth",
-                get(move || {
+                get(move |uri: Uri| {
                     let state = auth_state.clone();
                     async move {
                         let mut state = state.lock().unwrap();
                         state.auth_calls += 1;
+                        let parameters = url::form_urlencoded::parse(
+                            uri.query().unwrap_or_default().as_bytes(),
+                        )
+                        .into_owned()
+                        .collect::<HashMap<_, _>>();
+                        state.auth_requests.push((
+                            parameters.get("aud").cloned().unwrap_or_default(),
+                            parameters.get("lxm").cloned().unwrap_or_default(),
+                        ));
                         if state.fail_auth {
                             (
                                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -9418,6 +9449,24 @@ mod tests {
                             (StatusCode::OK, Json(json!({"token":SERVICE_JWT})))
                         }
                     }
+                }),
+            )
+            .route(
+                "/xrpc/app.bsky.video.getUploadLimits",
+                get(|| async {
+                    Json(json!({"canUpload":true,"remainingDailyVideos":5,"remainingDailyBytes":1000}))
+                }),
+            )
+            .route(
+                "/xrpc/app.bsky.video.uploadVideo",
+                post(|_: Bytes| async {
+                    Json(json!({
+                        "jobStatus":{
+                            "jobId":"job-1",
+                            "state":"JOB_STATE_COMPLETED",
+                            "blob":{"ref":{"$link":"bafk-video"},"mimeType":"video/mp4","size":99}
+                        }
+                    }))
                 }),
             )
             .route(
@@ -9663,6 +9712,43 @@ mod tests {
         let state = state.lock().unwrap();
         assert_eq!(state.auth_calls, 0);
         assert_eq!(state.skeleton_authorizations.as_slice(), [None]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn video_upload_uses_pds_upload_blob_service_auth_parameters() {
+        let (mut flow, state, server) = feed_test_flow(false).await;
+        flow.video_service_url = state.lock().unwrap().pds_url.clone();
+        let (mut temporary, mut file) = create_temporary_video_file().unwrap();
+        file.write_all(b"video").await.unwrap();
+        drop(file);
+        let path = temporary.take_path();
+        let video = PostVideo {
+            path,
+            mime_type: "video/mp4".to_owned(),
+            alt: String::new(),
+            width: 1920,
+            height: 1080,
+            duration_seconds: 1.0,
+            size_bytes: 5,
+            filename: "clip.mp4".to_owned(),
+        };
+
+        let blob = flow.upload_video_blob(FEED_VIEWER_DID, &video).await.unwrap();
+        assert_eq!(blob.pointer("/ref/$link").and_then(Value::as_str), Some("bafk-video"));
+        assert_eq!(
+            state.lock().unwrap().auth_requests.as_slice(),
+            &[
+                (
+                    VIDEO_SERVICE_DID.to_owned(),
+                    "app.bsky.video.getUploadLimits".to_owned()
+                ),
+                (
+                    "did:web:127.0.0.1".to_owned(),
+                    "com.atproto.repo.uploadBlob".to_owned()
+                ),
+            ]
+        );
         server.abort();
     }
 

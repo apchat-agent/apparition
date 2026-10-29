@@ -1613,7 +1613,7 @@ async fn web_callback_rejects_a_forged_login_cookie_independently_of_the_flow() 
 }
 
 #[tokio::test]
-async fn callback_turns_an_upstream_panic_into_an_error_response() {
+async fn callback_turns_an_upstream_panic_into_a_login_retry_page() {
     let app = OAuthPublic::new("https://appview.example")
         .unwrap()
         .router_with_flow(PanicCallbackFlow, Arc::new(MemoryStorage::default()));
@@ -1628,7 +1628,17 @@ async fn callback_turns_an_upstream_panic_into_an_error_response() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .contains("text/html")
+    );
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(html.contains("Login failed, try again"), "{html}");
+    assert!(html.contains("href=\"/login\""), "{html}");
 }
 
 #[tokio::test]
