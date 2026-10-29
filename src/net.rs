@@ -1,10 +1,10 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
-    sync::{Arc, OnceLock},
-    time::Duration,
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 use tokio::{net::lookup_host, sync::Semaphore, time::timeout};
 use url::Url;
@@ -13,6 +13,8 @@ const MAX_REDIRECTS: usize = 5;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_OAUTH_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const HTTP_CLIENT_CACHE_CAPACITY: usize = 512;
+const HTTP_CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 static OUTBOUND_REQUESTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 // Repository backfill downloads are large and keep their permits for up to REQUEST_TIMEOUT each.
@@ -86,6 +88,22 @@ pub trait HostResolver: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, String>> + Send + 'a>>;
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct ClientKey {
+    host: String,
+    addresses: Vec<SocketAddr>,
+}
+
+struct CachedHttpClient {
+    client: reqwest::Client,
+    last_used: Instant,
+}
+
+#[derive(Default)]
+struct HttpClientPool {
+    clients: HashMap<ClientKey, CachedHttpClient>,
+}
+
 #[derive(Default)]
 struct SystemResolver;
 
@@ -109,6 +127,7 @@ pub struct SafeHttpClient {
     resolver: Arc<dyn HostResolver>,
     http_test_hosts: HashSet<String>,
     background: bool,
+    clients: Arc<Mutex<HttpClientPool>>,
 }
 
 impl SafeHttpClient {
@@ -117,6 +136,7 @@ impl SafeHttpClient {
             resolver: Arc::new(SystemResolver),
             http_test_hosts: HashSet::new(),
             background: false,
+            clients: Arc::new(Mutex::new(HttpClientPool::default())),
         }
     }
 
@@ -125,6 +145,7 @@ impl SafeHttpClient {
             resolver: Arc::new(resolver),
             http_test_hosts: HashSet::new(),
             background: false,
+            clients: Arc::new(Mutex::new(HttpClientPool::default())),
         }
     }
 
@@ -165,10 +186,13 @@ impl SafeHttpClient {
         if !test_http && addresses.iter().copied().any(is_forbidden_ip) {
             return Err("host resolved to a forbidden address".to_owned());
         }
-        Ok(addresses
+        let mut addresses = addresses
             .into_iter()
             .map(|address| SocketAddr::new(address, port))
-            .collect())
+            .collect::<Vec<_>>();
+        addresses.sort_unstable();
+        addresses.dedup();
+        Ok(addresses)
     }
 
     pub async fn send(
@@ -217,17 +241,7 @@ impl SafeHttpClient {
             let host = url
                 .host_str()
                 .ok_or_else(|| "outbound URL has no host".to_owned())?;
-            let mut client = reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(5))
-                .timeout(REQUEST_TIMEOUT)
-                .redirect(reqwest::redirect::Policy::none())
-                .no_proxy();
-            if host.parse::<IpAddr>().is_err() {
-                client = client.resolve_to_addrs(host, &addresses);
-            }
-            let client = client
-                .build()
-                .map_err(|_| "outbound HTTP client could not be initialized".to_owned())?;
+            let client = self.client_for(host, &addresses)?;
             let response = client
                 .request(request.method().clone(), url.clone())
                 .headers(request.headers().clone())
@@ -312,6 +326,59 @@ impl SafeHttpClient {
                 .map_err(|_| "outbound HTTP response is invalid".to_owned());
         }
         Err("outbound redirect limit exceeded".to_owned())
+    }
+
+    fn client_for(&self, host: &str, addresses: &[SocketAddr]) -> Result<reqwest::Client, String> {
+        let key = ClientKey {
+            host: host.trim_end_matches('.').to_ascii_lowercase(),
+            addresses: addresses.to_vec(),
+        };
+        let now = Instant::now();
+        let mut pool = self
+            .clients
+            .lock()
+            .map_err(|_| "outbound HTTP client cache is unavailable".to_owned())?;
+        pool.clients
+            .retain(|_, cached| now.duration_since(cached.last_used) < HTTP_CLIENT_IDLE_TIMEOUT);
+        if let Some(cached) = pool.clients.get_mut(&key) {
+            cached.last_used = now;
+            return Ok(cached.client.clone());
+        }
+
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(REQUEST_TIMEOUT)
+            .pool_idle_timeout(HTTP_CLIENT_IDLE_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy();
+        if host.parse::<IpAddr>().is_err() {
+            builder = builder.resolve_to_addrs(host, addresses);
+        }
+        let client = builder
+            .build()
+            .map_err(|_| "outbound HTTP client could not be initialized".to_owned())?;
+        if pool.clients.len() >= HTTP_CLIENT_CACHE_CAPACITY
+            && let Some(oldest) = pool
+                .clients
+                .iter()
+                .min_by_key(|(_, cached)| cached.last_used)
+                .map(|(key, _)| key.clone())
+        {
+            pool.clients.remove(&oldest);
+        }
+        tracing::debug!(
+            host = %key.host,
+            address_count = key.addresses.len(),
+            "created outbound HTTP connection pool"
+        );
+        pool.clients.insert(
+            key,
+            CachedHttpClient {
+                client: client.clone(),
+                last_used: now,
+            },
+        );
+        Ok(client)
     }
 }
 
