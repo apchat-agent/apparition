@@ -301,6 +301,14 @@ impl OAuthFlow for FakeOAuthFlow {
         })
     }
 
+    fn pinned_feed_tabs<'a>(
+        &'a self,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ResolvedFeed>, String>> + Send + 'a>> {
+        let feeds = self.pinned_feeds.clone();
+        Box::pin(async move { Ok(feeds) })
+    }
+
     fn like<'a>(
         &'a self,
         did: &'a str,
@@ -1959,11 +1967,14 @@ async fn logged_in_write_forms_use_the_account_oauth_flow() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "{body}");
-        let json: serde_json::Value = serde_json::from_slice(
-            &response.into_body().collect().await.unwrap().to_bytes(),
-        )
-        .unwrap();
-        assert_eq!(json, serde_json::json!({"liked": liked, "likeCount": count}), "{body}");
+        let json: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"liked": liked, "likeCount": count}),
+            "{body}"
+        );
     }
 }
 

@@ -5,6 +5,7 @@ use crate::{
 };
 use futures_util::{StreamExt, stream};
 use http::HeaderMap;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
@@ -13,7 +14,7 @@ use std::{
 };
 use url::Url;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedFeed {
     pub uri: String,
     pub display_name: String,
@@ -56,6 +57,52 @@ pub struct FeedTimeline {
 
 const LIVE_POST_CACHE_ENTRIES: usize = 20_000;
 const LIVE_POST_CACHE_SECS: u64 = 6 * 60 * 60;
+const FEED_GENERATOR_CACHE_PREFIX: &str = "feed-generator:";
+
+#[derive(Serialize, Deserialize)]
+enum CachedGeneratorResolution {
+    Success(ResolvedFeed),
+    Failure(String),
+}
+
+fn generator_cache_key(uri: &str) -> String {
+    format!("{FEED_GENERATOR_CACHE_PREFIX}{uri}")
+}
+
+fn unix_time_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or_default()
+}
+
+fn fallback_feed(uri: &str) -> ResolvedFeed {
+    let display_name = parse_feed_uri(uri)
+        .ok()
+        .map(|(_, _, rkey)| {
+            rkey.split(['-', '_', '.'])
+                .filter(|part| !part.is_empty())
+                .map(|part| {
+                    let mut chars = part.chars();
+                    chars
+                        .next()
+                        .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "Feed".to_owned());
+    ResolvedFeed {
+        uri: uri.to_owned(),
+        display_name,
+        description: None,
+        avatar: None,
+        service_did: String::new(),
+        endpoint: String::new(),
+    }
+}
 
 pub struct FeedClient<B: IdentityBackend> {
     identity: Arc<IdentityResolver<B>>,
@@ -65,9 +112,12 @@ pub struct FeedClient<B: IdentityBackend> {
     // Failed resolutions are remembered too: the layout resolves every pinned feed on every page,
     // so an uncached failure would repeat its full network cost on each request.
     generator_failures: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, String)>>,
+    cache_store: Option<crate::oauth::SqliteOAuthStore>,
+    background_resolutions: tokio::sync::Mutex<HashSet<String>>,
+    resolution_slots: Arc<tokio::sync::Semaphore>,
 }
 
-impl<B: IdentityBackend> FeedClient<B> {
+impl<B: IdentityBackend + 'static> FeedClient<B> {
     pub fn new(identity: Arc<IdentityResolver<B>>, http: SafeHttpClient) -> Self {
         Self {
             identity,
@@ -75,10 +125,86 @@ impl<B: IdentityBackend> FeedClient<B> {
             generator_cache: tokio::sync::Mutex::new(HashMap::new()),
             live_post_cache: tokio::sync::Mutex::new(HashMap::new()),
             generator_failures: tokio::sync::Mutex::new(HashMap::new()),
+            cache_store: None,
+            background_resolutions: tokio::sync::Mutex::new(HashSet::new()),
+            resolution_slots: Arc::new(tokio::sync::Semaphore::new(8)),
         }
     }
 
+    pub fn new_with_store(
+        identity: Arc<IdentityResolver<B>>,
+        http: SafeHttpClient,
+        store: crate::oauth::SqliteOAuthStore,
+    ) -> Self {
+        let mut client = Self::new(identity, http);
+        client.cache_store = Some(store);
+        client
+    }
+
+    /// Feed tabs use persisted metadata when available and never wait for resolution I/O.
+    pub async fn feed_for_tab(self: &Arc<Self>, uri: &str) -> ResolvedFeed {
+        let now_ms = unix_time_ms();
+        if let Some(store) = &self.cache_store
+            && let Ok(Some((json, stored_at_ms))) = store.web_cache_get(&generator_cache_key(uri))
+            && let Ok(cached) = serde_json::from_str::<CachedGeneratorResolution>(&json)
+        {
+            let age_ms = now_ms.saturating_sub(stored_at_ms).max(0) as u64;
+            match cached {
+                CachedGeneratorResolution::Success(feed) if age_ms < 24 * 60 * 60 * 1000 => {
+                    self.generator_cache.lock().await.insert(
+                        uri.to_owned(),
+                        (
+                            tokio::time::Instant::now() + Duration::from_secs(24 * 60 * 60),
+                            feed.clone(),
+                        ),
+                    );
+                    if age_ms > 60 * 60 * 1000 {
+                        self.start_background_resolution(uri.to_owned()).await;
+                    }
+                    return feed;
+                }
+                CachedGeneratorResolution::Failure(_) if age_ms < 60 * 60 * 1000 => {
+                    return fallback_feed(uri);
+                }
+                _ => {}
+            }
+        }
+        self.start_background_resolution(uri.to_owned()).await;
+        fallback_feed(uri)
+    }
+
+    async fn start_background_resolution(self: &Arc<Self>, uri: String) {
+        let mut pending = self.background_resolutions.lock().await;
+        if !pending.insert(uri.clone()) {
+            return;
+        }
+        drop(pending);
+        let client = Arc::clone(self);
+        tokio::spawn(async move {
+            let permit = client.resolution_slots.clone().acquire_owned().await;
+            if permit.is_ok() {
+                let _ = client.resolve_feed(&uri).await;
+            }
+            client.background_resolutions.lock().await.remove(&uri);
+        });
+    }
+
     pub async fn resolve_feed(&self, uri: &str) -> Result<ResolvedFeed, String> {
+        if let Some(store) = &self.cache_store
+            && let Ok(Some((json, stored_at_ms))) = store.web_cache_get(&generator_cache_key(uri))
+            && let Ok(cached) = serde_json::from_str::<CachedGeneratorResolution>(&json)
+        {
+            let age_ms = unix_time_ms().saturating_sub(stored_at_ms).max(0) as u64;
+            match cached {
+                CachedGeneratorResolution::Success(feed) if age_ms < 24 * 60 * 60 * 1000 => {
+                    return Ok(feed);
+                }
+                CachedGeneratorResolution::Failure(error) if age_ms < 60 * 60 * 1000 => {
+                    return Err(error);
+                }
+                _ => {}
+            }
+        }
         if let Some((expires, error)) = self.generator_failures.lock().await.get(uri).cloned()
             && expires > tokio::time::Instant::now()
         {
@@ -104,6 +230,7 @@ impl<B: IdentityBackend> FeedClient<B> {
                     ),
                 );
             }
+            self.save_resolution(uri, &CachedGeneratorResolution::Failure(error.clone()));
         }
         result
     }
@@ -202,11 +329,21 @@ impl<B: IdentityBackend> FeedClient<B> {
         cache.insert(
             uri.to_owned(),
             (
-                tokio::time::Instant::now() + Duration::from_secs(60 * 60),
+                tokio::time::Instant::now() + Duration::from_secs(24 * 60 * 60),
                 feed.clone(),
             ),
         );
+        self.save_resolution(uri, &CachedGeneratorResolution::Success(feed.clone()));
         Ok(feed)
+    }
+
+    fn save_resolution(&self, uri: &str, value: &CachedGeneratorResolution) {
+        if let Some(store) = &self.cache_store
+            && let Ok(json) = serde_json::to_string(value)
+            && let Err(error) = store.web_cache_set(&generator_cache_key(uri), &json)
+        {
+            tracing::warn!(feed = uri, %error, "could not persist feed generator cache");
+        }
     }
 
     pub async fn get_skeleton(
@@ -495,7 +632,7 @@ pub fn feed_avatar_url(avatar: &Value, creator_did: &str) -> Option<String> {
     ))
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavedFeedPreference {
     pub id: String,
     pub feed_type: String,
@@ -572,7 +709,7 @@ pub fn parse_saved_feed_preferences(response: &Value) -> Vec<SavedFeedPreference
 
 #[cfg(test)]
 mod tests {
-    use super::{FeedClient, ResolvedFeed, parse_saved_feed_preferences};
+    use super::{FeedClient, ResolvedFeed, parse_saved_feed_preferences, unix_time_ms};
     use crate::{
         identity::{DidDocument, DidService, IdentityBackend, IdentityResolver, ResolutionError},
         ingest::IndexedRecord,
@@ -670,10 +807,19 @@ mod tests {
     }
 
     async fn fake_pds() -> (String, tokio::task::JoinHandle<()>) {
-        let app = Router::new().fallback(any(|uri: Uri| async move {
+        fake_pds_with_generator_delay(Duration::ZERO).await
+    }
+
+    async fn fake_pds_with_generator_delay(
+        generator_delay: Duration,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new().fallback(any(move |uri: Uri| async move {
             if uri.path() == "/xrpc/com.atproto.repo.getRecord" {
                 let query = uri.query().unwrap_or_default();
                 if query.contains("collection=app.bsky.feed.generator") {
+                    if query.contains("rkey=slow-") {
+                        tokio::time::sleep(generator_delay).await;
+                    }
                     let service_did = if query.contains("rkey=web") { "did:web:generator.test" } else { "did:plc:generator" };
                     axum::Json(json!({ "uri": format!("at://{CREATOR}/app.bsky.feed.generator/{}", if query.contains("rkey=web") { "web" } else { "plc" }), "cid":"bafyreitest", "value":{"did":service_did,"displayName":"Example","description":"A feed","avatar":"https://img.test/avatar"} })).into_response()
                 } else if query.contains("rkey=live") {
@@ -784,6 +930,76 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("bsky_fg"), "{error}");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn feed_tabs_fall_back_during_slow_resolution_and_survive_client_restart() {
+        use futures_util::future::join_all;
+        let (pds, server) = fake_pds_with_generator_delay(Duration::from_secs(5)).await;
+        let port = pds.rsplit(':').next().unwrap().to_owned();
+        let identity = resolver(pds, format!("http://localhost:{port}/feed"));
+        let db = std::env::temp_dir().join(format!(
+            "appview-feed-cache-{}-{}.sqlite",
+            std::process::id(),
+            unix_time_ms()
+        ));
+        let store = crate::oauth::SqliteOAuthStore::open(&db).unwrap();
+        let client = Arc::new(FeedClient::new_with_store(
+            identity.clone(),
+            SafeHttpClient::with_resolver(TestResolver)
+                .with_http_test_hosts(["localhost".to_owned()]),
+            store.clone(),
+        ));
+        let uris = (0..38)
+            .map(|index| {
+                format!(
+                    "at://{CREATOR}/app.bsky.feed.generator/{}",
+                    if index < 5 {
+                        format!("slow-{index}")
+                    } else {
+                        format!("cached-{index}")
+                    }
+                )
+            })
+            .collect::<Vec<_>>();
+        for uri in uris.iter().skip(5) {
+            client.resolve_feed(uri).await.unwrap();
+        }
+        let started = tokio::time::Instant::now();
+        let tabs = tokio::time::timeout(
+            Duration::from_millis(200),
+            join_all(uris.iter().map(|uri| client.feed_for_tab(uri))),
+        )
+        .await
+        .expect("tabs should not wait for five slow generator resolutions");
+        assert_eq!(tabs.len(), 38);
+        for (index, feed) in tabs.iter().enumerate() {
+            assert_eq!(
+                feed.display_name,
+                if index < 5 {
+                    format!("Slow {index}")
+                } else {
+                    "Example".to_owned()
+                }
+            );
+        }
+        assert!(started.elapsed() < Duration::from_millis(200));
+
+        tokio::time::sleep(Duration::from_millis(5_200)).await;
+        let restarted = Arc::new(FeedClient::new_with_store(
+            identity,
+            SafeHttpClient::with_resolver(TestResolver)
+                .with_http_test_hosts(["localhost".to_owned()]),
+            store,
+        ));
+        for uri in &uris {
+            let feed = restarted.feed_for_tab(uri).await;
+            assert_eq!(feed.display_name, "Example");
+        }
+        server.abort();
+        let _ = std::fs::remove_file(&db);
+        let _ = std::fs::remove_file(db.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(db.with_extension("sqlite-shm"));
     }
 
     #[tokio::test]

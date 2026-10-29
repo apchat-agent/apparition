@@ -75,6 +75,7 @@ const PAGE_PROFILE_CONCURRENCY: usize = 8;
 const PAGE_QUOTE_CONCURRENCY: usize = 16;
 const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m4";
 const WEB_SCRIPT_URL: &str = "/static/app.js?v=js3";
+const SAVED_FEED_CACHE_PREFIX: &str = "saved-feed-preferences:";
 const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=*";
 const WRITE_SCOPES: [&str; 3] = [
     "repo:app.bsky.feed.post?action=create",
@@ -86,6 +87,17 @@ const FEED_SCOPES: [&str; 2] = [
     "rpc:app.bsky.feed.getFeedSkeleton?aud=*",
 ];
 type HmacSha256 = Hmac<Sha256>;
+
+fn saved_feed_cache_key(did: &str) -> String {
+    format!("{SAVED_FEED_CACHE_PREFIX}{did}")
+}
+
+fn unix_time_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or_default()
+}
 
 #[derive(Debug, Error)]
 pub enum OAuthConfigError {
@@ -241,6 +253,14 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
         _did: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<ResolvedFeed>, String>> + Send + 'a>> {
         Box::pin(async { Ok(Vec::new()) })
+    }
+    /// Return feed tab data that is already available without waiting for network resolution.
+    /// Production flows override this to use persisted metadata and refresh it in the background.
+    fn pinned_feed_tabs<'a>(
+        &'a self,
+        did: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ResolvedFeed>, String>> + Send + 'a>> {
+        self.pinned_feeds(did)
     }
     fn feed_timeline<'a>(
         &'a self,
@@ -597,6 +617,7 @@ type AppOAuthClient = OAuthClient<
 >;
 type SavedFeedCache =
     Arc<tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, Vec<SavedFeedPreference>)>>>;
+type SavedFeedRefreshes = Arc<tokio::sync::Mutex<HashSet<String>>>;
 // Keyed by (viewer DID, feed generator service DID).
 type ServiceAuthCache =
     Arc<tokio::sync::Mutex<HashMap<(String, String), (tokio::time::Instant, String)>>>;
@@ -614,6 +635,7 @@ pub struct AtriumOAuthFlow<B: crate::identity::IdentityBackend = HttpIdentityBac
     feed_client: Arc<FeedClient<B>>,
     http_client: SafeHttpClient,
     saved_feed_cache: SavedFeedCache,
+    saved_feed_refreshes: SavedFeedRefreshes,
     service_auth_cache: ServiceAuthCache,
     feed_page_cache: FeedPageCache,
 }
@@ -627,6 +649,7 @@ impl<B: crate::identity::IdentityBackend> Clone for AtriumOAuthFlow<B> {
             feed_client: self.feed_client.clone(),
             http_client: self.http_client.clone(),
             saved_feed_cache: self.saved_feed_cache.clone(),
+            saved_feed_refreshes: self.saved_feed_refreshes.clone(),
             service_auth_cache: self.service_auth_cache.clone(),
             feed_page_cache: self.feed_page_cache.clone(),
         }
@@ -665,8 +688,14 @@ impl SqliteOAuthStore {
         }
         crate::ingest::ensure_private_database_file(path)?;
         let connection = Connection::open(path)?;
+        let migration_started = std::time::Instant::now();
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;
+             CREATE TABLE IF NOT EXISTS web_cache (
+                 cache_key TEXT PRIMARY KEY,
+                 value_json TEXT NOT NULL,
+                 stored_at_ms INTEGER NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS oauth_states (
                  state TEXT PRIMARY KEY,
                  value_json TEXT NOT NULL,
@@ -677,9 +706,43 @@ impl SqliteOAuthStore {
                  value_json TEXT NOT NULL
              );",
         )?;
+        tracing::info!(
+            elapsed_ms = migration_started.elapsed().as_millis() as u64,
+            "OAuth cache schema migration complete"
+        );
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
         })
+    }
+
+    pub(crate) fn web_cache_get(&self, key: &str) -> Result<Option<(String, i64)>, String> {
+        self.connection
+            .lock()
+            .map_err(|_| "OAuth cache database lock is poisoned".to_owned())?
+            .query_row(
+                "SELECT value_json, stored_at_ms FROM web_cache WHERE cache_key=?1",
+                [key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn web_cache_set(&self, key: &str, value_json: &str) -> Result<(), String> {
+        let stored_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+            .unwrap_or_default();
+        self.connection
+            .lock()
+            .map_err(|_| "OAuth cache database lock is poisoned".to_owned())?
+            .execute(
+                "INSERT INTO web_cache(cache_key,value_json,stored_at_ms) VALUES(?1,?2,?3)
+                 ON CONFLICT(cache_key) DO UPDATE SET value_json=excluded.value_json,stored_at_ms=excluded.stored_at_ms",
+                params![key, value_json, stored_at_ms],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     fn get_json<T: for<'de> Deserialize<'de>>(
@@ -807,9 +870,10 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         plc_directory_url: &str,
         guarded_client: SafeHttpClient,
     ) -> Result<Self, String> {
-        let feed_client = Arc::new(FeedClient::new(
+        let feed_client = Arc::new(FeedClient::new_with_store(
             Arc::clone(&identity_resolver),
             guarded_client.clone(),
+            store.clone(),
         ));
         let retained_http_client = guarded_client.clone();
         let http_client = Arc::new(guarded_client);
@@ -875,6 +939,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             feed_client,
             http_client: retained_http_client,
             saved_feed_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            saved_feed_refreshes: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             service_auth_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             feed_page_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
@@ -915,6 +980,12 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             }
         };
         let preferences = parse_saved_feed_preferences(&response);
+        let cache_key = saved_feed_cache_key(&did);
+        if let Ok(value_json) = serde_json::to_string(&preferences)
+            && let Err(error) = self.store.web_cache_set(&cache_key, &value_json)
+        {
+            tracing::warn!(%error, "could not persist saved feed preferences");
+        }
         let mut cache = self.saved_feed_cache.lock().await;
         cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
         if cache.len() >= 4096
@@ -930,6 +1001,36 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             ),
         );
         Ok(preferences)
+    }
+
+    async fn saved_feed_preferences_for_tabs(&self, did: &str) -> Vec<SavedFeedPreference> {
+        if let Some((expires, preferences)) = self.saved_feed_cache.lock().await.get(did).cloned()
+            && expires > tokio::time::Instant::now()
+        {
+            return preferences;
+        }
+        let mut cached_preferences = None;
+        let mut refresh = true;
+        if let Ok(Some((json, stored_at_ms))) = self.store.web_cache_get(&saved_feed_cache_key(did))
+            && let Ok(preferences) = serde_json::from_str::<Vec<SavedFeedPreference>>(&json)
+        {
+            let age_ms = unix_time_ms().saturating_sub(stored_at_ms).max(0) as u64;
+            refresh = age_ms > 60 * 60 * 1000;
+            cached_preferences = Some(preferences);
+        }
+        if refresh {
+            let mut pending = self.saved_feed_refreshes.lock().await;
+            if pending.insert(did.to_owned()) {
+                drop(pending);
+                let flow = self.clone();
+                let did = did.to_owned();
+                tokio::spawn(async move {
+                    let _ = flow.saved_feed_preferences(&did).await;
+                    flow.saved_feed_refreshes.lock().await.remove(&did);
+                });
+            }
+        }
+        cached_preferences.unwrap_or_default()
     }
 
     async fn service_auth_token(
@@ -1474,7 +1575,7 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
             .await;
             let requested = resolutions.len();
             let feeds = resolutions.into_iter().flatten().collect::<Vec<_>>();
-            tracing::info!(
+            tracing::debug!(
                 pinned = requested,
                 resolved = feeds.len(),
                 preferences_ms,
@@ -1482,6 +1583,25 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
                 "pinned feed tabs loaded"
             );
             Ok(feeds)
+        })
+    }
+
+    fn pinned_feed_tabs<'a>(
+        &'a self,
+        did: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ResolvedFeed>, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let preferences = self.saved_feed_preferences_for_tabs(did).await;
+            let uris = preferences
+                .into_iter()
+                .filter(|item| item.feed_type == "feed" && item.pinned)
+                .map(|item| item.value)
+                .collect::<Vec<_>>();
+            let tabs = futures_util::future::join_all(
+                uris.iter().map(|uri| self.feed_client.feed_for_tab(uri)),
+            )
+            .await;
+            Ok(tabs)
         })
     }
 
@@ -1783,7 +1903,7 @@ async fn pinned_feeds_for_layout<F: OAuthFlow>(
     if !has_permission {
         return Vec::new();
     }
-    match flow.pinned_feeds(did).await {
+    match flow.pinned_feed_tabs(did).await {
         Ok(feeds) => feeds,
         Err(error) => {
             tracing::warn!(%error, "could not load pinned feed tabs");
@@ -2808,7 +2928,7 @@ where
     if !verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()) {
         return feed_reauthorization_page();
     }
-    let feeds = match state.flow.pinned_feeds(&did).await {
+    let feeds = match state.flow.pinned_feed_tabs(&did).await {
         Ok(feeds) => feeds,
         Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
     };
@@ -4189,7 +4309,13 @@ where
             )
             .await
             {
-                Ok(()) => like_response(&headers, &state.public.public_url, state.storage.as_ref(), &did, uri),
+                Ok(()) => like_response(
+                    &headers,
+                    &state.public.public_url,
+                    state.storage.as_ref(),
+                    &did,
+                    uri,
+                ),
                 Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
             },
             Err(error) => oauth_error(StatusCode::BAD_GATEWAY, &error),
@@ -4200,7 +4326,13 @@ where
             match persist_created_record(state.storage.clone(), &did, "app.bsky.feed.like", created)
                 .await
             {
-                Ok(()) => like_response(&headers, &state.public.public_url, state.storage.as_ref(), &did, uri),
+                Ok(()) => like_response(
+                    &headers,
+                    &state.public.public_url,
+                    state.storage.as_ref(),
+                    &did,
+                    uri,
+                ),
                 Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
             }
         }
