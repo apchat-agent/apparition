@@ -2838,7 +2838,7 @@ where
             )
             .await
             {
-                Ok(()) => Redirect::to("/app").into_response(),
+                Ok(()) => return_to_post(&headers, &state.public.public_url, uri),
                 Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
             },
             Err(error) => oauth_error(StatusCode::BAD_GATEWAY, &error),
@@ -2849,7 +2849,7 @@ where
             match persist_created_record(state.storage.clone(), &did, "app.bsky.feed.like", created)
                 .await
             {
-                Ok(()) => Redirect::to("/app").into_response(),
+                Ok(()) => return_to_post(&headers, &state.public.public_url, uri),
                 Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
             }
         }
@@ -2890,7 +2890,7 @@ where
         )
         .await
         {
-            Ok(()) => Redirect::to("/app").into_response(),
+            Ok(()) => return_to_post(&headers, &state.public.public_url, uri),
             Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
         },
         Err(error) => oauth_error(StatusCode::BAD_GATEWAY, &error),
@@ -2936,6 +2936,39 @@ fn verified_cookie_session<S: Storage>(
         .flatten()
         == Some(generation))
     .then_some((did, session_id, generation, write_access, feed_access))
+}
+
+/// Fragment id of a post's card, so a like or repost can return to the same place on the page.
+fn post_anchor(uri: &str) -> String {
+    let id = uri
+        .trim_start_matches("at://")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>();
+    format!("post-{id}")
+}
+
+/// After a like or repost, go back to the page the form was on (same origin, under /app), scrolled to the
+/// post, instead of the top of the home timeline.
+fn return_to_post(headers: &HeaderMap, public_url: &str, uri: &str) -> Response {
+    let anchor = post_anchor(uri);
+    let back = headers
+        .get(header::REFERER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| reqwest::Url::parse(value).ok())
+        .zip(reqwest::Url::parse(public_url).ok())
+        .filter(|(referer, public)| {
+            referer.scheme() == public.scheme()
+                && referer.host_str() == public.host_str()
+                && referer.port_or_known_default() == public.port_or_known_default()
+                && referer.path().starts_with("/app")
+        })
+        .map(|(referer, _)| match referer.query() {
+            Some(query) => format!("{}?{query}", referer.path()),
+            None => referer.path().to_owned(),
+        })
+        .unwrap_or_else(|| "/app".to_owned());
+    Redirect::to(&format!("{back}#{anchor}")).into_response()
 }
 
 fn same_origin_request(headers: &HeaderMap, public_url: &str) -> bool {
@@ -3339,8 +3372,9 @@ fn render_web_post<S: Storage>(
         .get("embed")
         .map(|embed| render_web_embed(storage, &record.did, embed))
         .unwrap_or_default();
+    let anchor = post_anchor(&record.uri);
     format!(
-        "<article class=\"post-card\"><header class=\"post-header\">{author}{time}</header>{reply_context}<p class=\"post-text\">{text}</p>{embed}<div class=\"post-actions\" aria-label=\"Post actions\">{actions}</div></article>"
+        "<article class=\"post-card\" id=\"{anchor}\"><header class=\"post-header\">{author}{time}</header>{reply_context}<p class=\"post-text\">{text}</p>{embed}<div class=\"post-actions\" aria-label=\"Post actions\">{actions}</div></article>"
     )
 }
 

@@ -957,3 +957,8 @@ button:hover,
     font-size: 0.8rem;
   }
 }
+
+/* A like or repost returns to #post-...; keep the card clear of the sticky header. */
+.post-card {
+  scroll-margin-top: 5rem;
+}
