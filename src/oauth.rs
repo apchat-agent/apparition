@@ -9286,6 +9286,29 @@ mod tests {
     }
 
     #[test]
+    fn mobile_bottom_bar_uses_compact_safe_area_aware_geometry() {
+        let css = include_str!("../static/app.css");
+
+        assert!(css.contains(
+            ".mobile-profile-avatar {\n    width: 1.4rem;\n    height: 1.4rem;"
+        ));
+        assert!(css.contains(
+            ".mobile-nav .icon {\n    width: 1.2rem;\n    height: 1.2rem;"
+        ));
+        assert!(css.contains(
+            "padding-bottom: calc(0.1rem + env(safe-area-inset-bottom) * 0.55);"
+        ));
+        assert!(css.contains("55% of the 34px inset"));
+        assert!(css.contains("min-height: 2.1rem;\n    min-width: 44px;"));
+        assert!(css.contains(
+            "--mobile-nav-height: calc(2.1rem + 0.2rem + 1px + env(safe-area-inset-bottom) * 0.55);"
+        ));
+        assert!(css.contains("bottom: var(--mobile-compose-clearance);"));
+        assert!(css.contains("padding-bottom: max(4.25rem, var(--mobile-compose-clearance));"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m15"));
+    }
+
+    #[test]
     fn notification_groups_respect_type_subject_age_and_read_boundary() {
         let notices = vec![
             web_notice("alice", "like", 200 * HOUR_US, Some("post-a")),
