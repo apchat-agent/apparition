@@ -195,3 +195,63 @@ async fn jetstream_identity_and_account_events_invalidate_persisted_did_document
     drop(cache);
     cleanup_database(&path);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn identity_cache_writer_lock_never_blocks_resolution_or_tokio_progress() {
+    let path = database_path();
+    let cache = Arc::new(SqliteIdentityCache::open(&path).unwrap());
+    let backend = FakeIdentityBackend::default();
+    let dids = (0..20)
+        .map(|index| format!("did:plc:user{index}"))
+        .collect::<Vec<_>>();
+    for did in &dids {
+        backend.publish(did, None, "https://pds.test");
+    }
+    let resolver = Arc::new(
+        IdentityResolver::new(backend, Duration::from_secs(30))
+            .with_persistent_cache(cache.clone()),
+    );
+
+    let blocker = rusqlite::Connection::open(&path).unwrap();
+    blocker
+        .execute_batch("PRAGMA journal_mode = WAL; BEGIN IMMEDIATE;")
+        .unwrap();
+    let release_thread = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(3));
+        blocker.execute_batch("ROLLBACK;").unwrap();
+    });
+
+    let ticks = Arc::new(AtomicUsize::new(0));
+    let ticker_ticks = ticks.clone();
+    let ticker = tokio::spawn(async move {
+        loop {
+            ticker_ticks.fetch_add(1, Ordering::Relaxed);
+            tokio::task::yield_now().await;
+        }
+    });
+    tokio::task::yield_now().await;
+    let initial_ticks = ticks.load(Ordering::Relaxed);
+
+    let started = std::time::Instant::now();
+    let resolved = futures_util::future::join_all(
+        dids.iter()
+            .map(|did| resolver.resolve_did(did)),
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    assert!(resolved.iter().all(Result::is_ok));
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "identity resolution waited {elapsed:?} for a SQLite writer"
+    );
+    assert!(
+        ticks.load(Ordering::Relaxed) > initial_ticks,
+        "the current-thread Tokio worker stopped making progress during identity resolution"
+    );
+
+    ticker.abort();
+    release_thread.join().unwrap();
+    drop(cache);
+    cleanup_database(&path);
+}
