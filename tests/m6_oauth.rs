@@ -1,11 +1,11 @@
 use appview_rs::router;
 use appview_rs::{
     config::Config,
-    feeds::ResolvedFeed,
+    feeds::{FeedTimeline, FeedTimelineTiming, HydratedFeedPage, ResolvedFeed},
     ingest::{IndexedRecord, Ingestor, MemoryStorage, ScopeMode, SqliteStorage, Storage},
     oauth::{
         FetchedAuthorProfile, OAuthAccount, OAuthCallback, OAuthFlow, OAuthPublic,
-        PdsCreatedRecord, PostStrongRef, SqliteOAuthStore,
+        PdsCreatedRecord, PinnedFeedTabs, PostStrongRef, SqliteOAuthStore,
     },
 };
 use atrium_api::types::string::Did;
@@ -34,6 +34,7 @@ struct FakeOAuthFlow {
     action_failure: Option<String>,
     pinned_feeds: Vec<ResolvedFeed>,
     pinned_feed_delay_ms: u64,
+    feed_timeline_delay_ms: u64,
     author_profiles: Arc<Mutex<std::collections::HashMap<String, FetchedAuthorProfile>>>,
     profile_requests: Arc<Mutex<Vec<String>>>,
     profile_delays_ms: Arc<Mutex<std::collections::HashMap<String, u64>>>,
@@ -52,6 +53,7 @@ impl Default for FakeOAuthFlow {
             action_failure: None,
             pinned_feeds: Vec::new(),
             pinned_feed_delay_ms: 0,
+            feed_timeline_delay_ms: 0,
             author_profiles: Arc::new(Mutex::new(std::collections::HashMap::new())),
             profile_requests: Arc::new(Mutex::new(Vec::new())),
             profile_delays_ms: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -304,9 +306,46 @@ impl OAuthFlow for FakeOAuthFlow {
     fn pinned_feed_tabs<'a>(
         &'a self,
         _: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<ResolvedFeed>, String>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<PinnedFeedTabs, String>> + Send + 'a>> {
         let feeds = self.pinned_feeds.clone();
-        Box::pin(async move { Ok(feeds) })
+        Box::pin(async move {
+            Ok(PinnedFeedTabs {
+                feeds,
+                ..PinnedFeedTabs::default()
+            })
+        })
+    }
+
+    fn feed_timeline<'a>(
+        &'a self,
+        _: &'a str,
+        uri: &'a str,
+        _: Option<&'a str>,
+        _: &'a dyn Storage,
+    ) -> Pin<Box<dyn Future<Output = Result<FeedTimeline, String>> + Send + 'a>> {
+        let uri = uri.to_owned();
+        let delay_ms = self.feed_timeline_delay_ms;
+        Box::pin(async move {
+            if delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            Ok(FeedTimeline {
+                generator: ResolvedFeed {
+                    uri,
+                    display_name: "Slow feed".into(),
+                    description: None,
+                    avatar: None,
+                    service_did: "did:plc:service".into(),
+                    endpoint: "https://feed.example".into(),
+                },
+                timeline: HydratedFeedPage {
+                    feed: Vec::new(),
+                    cursor: None,
+                    dropped_count: 0,
+                },
+                timing: FeedTimelineTiming::default(),
+            })
+        })
     }
 
     fn like<'a>(
@@ -2166,6 +2205,32 @@ async fn web_post_actions_and_logout_reject_same_site_cross_origin_requests() {
     }
     assert!(actions.lock().unwrap().is_empty());
     assert!(storage.is_registered("did:plc:alice").unwrap());
+}
+
+#[tokio::test]
+async fn repeated_feed_page_request_uses_the_sixty_second_page_cache() {
+    let flow = FakeOAuthFlow {
+        feed_timeline_delay_ms: 2_000,
+        ..FakeOAuthFlow::default()
+    };
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, Arc::new(MemoryStorage::default()));
+    let cookie = finish_login(&app).await;
+    let uri = "/app/feed?uri=at%3A%2F%2Fdid%3Aplc%3Acreator%2Fapp.bsky.feed.generator%2Fslow";
+    let first_started = Instant::now();
+    let first = get_html(&app, uri, &cookie).await;
+    assert!(first.contains("Slow feed"), "{first}");
+    assert!(first_started.elapsed() >= Duration::from_secs(2));
+
+    let second_started = Instant::now();
+    let second = get_html(&app, uri, &cookie).await;
+    assert!(second.contains("Slow feed"), "{second}");
+    assert!(
+        second_started.elapsed() < Duration::from_millis(100),
+        "cached feed page took {:?}",
+        second_started.elapsed()
+    );
 }
 
 #[tokio::test]

@@ -2,7 +2,8 @@ use crate::identity::{HttpIdentityBackend, IdentityResolver};
 use crate::{
     api::profile_view_from_storage,
     feeds::{
-        FeedClient, FeedTimeline, ResolvedFeed, SavedFeedPreference, parse_saved_feed_preferences,
+        FeedClient, FeedTimeline, FeedTimelineTiming, ResolvedFeed, SavedFeedPreference,
+        parse_saved_feed_preferences,
     },
     ingest::{
         IndexedNotification, IndexedRecord, MemoryStorage, NotificationCursor, ProfileIndexEntry,
@@ -163,6 +164,13 @@ pub struct FetchedAuthorProfile {
     pub verified_handle: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PinnedFeedTabs {
+    pub feeds: Vec<ResolvedFeed>,
+    pub preferences_ms: u64,
+    pub tabs_ms: u64,
+}
+
 pub trait OAuthFlow: Clone + Send + Sync + 'static {
     fn authorize<'a>(
         &'a self,
@@ -259,8 +267,15 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
     fn pinned_feed_tabs<'a>(
         &'a self,
         did: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<ResolvedFeed>, String>> + Send + 'a>> {
-        self.pinned_feeds(did)
+    ) -> Pin<Box<dyn Future<Output = Result<PinnedFeedTabs, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let started = std::time::Instant::now();
+            Ok(PinnedFeedTabs {
+                feeds: self.pinned_feeds(did).await?,
+                preferences_ms: 0,
+                tabs_ms: started.elapsed().as_millis() as u64,
+            })
+        })
     }
     fn feed_timeline<'a>(
         &'a self,
@@ -284,6 +299,7 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
                     cursor: None,
                     dropped_count: 0,
                 },
+                timing: FeedTimelineTiming::default(),
             })
         })
     }
@@ -1589,19 +1605,26 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
     fn pinned_feed_tabs<'a>(
         &'a self,
         did: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<ResolvedFeed>, String>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<PinnedFeedTabs, String>> + Send + 'a>> {
         Box::pin(async move {
+            let preferences_started = std::time::Instant::now();
             let preferences = self.saved_feed_preferences_for_tabs(did).await;
+            let preferences_ms = preferences_started.elapsed().as_millis() as u64;
             let uris = preferences
                 .into_iter()
                 .filter(|item| item.feed_type == "feed" && item.pinned)
                 .map(|item| item.value)
                 .collect::<Vec<_>>();
+            let tabs_started = std::time::Instant::now();
             let tabs = futures_util::future::join_all(
                 uris.iter().map(|uri| self.feed_client.feed_for_tab(uri)),
             )
             .await;
-            Ok(tabs)
+            Ok(PinnedFeedTabs {
+                feeds: tabs,
+                preferences_ms,
+                tabs_ms: tabs_started.elapsed().as_millis() as u64,
+            })
         })
     }
 
@@ -1621,29 +1644,36 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
             if let Some((expires, page)) = self.feed_page_cache.lock().await.get(&key).cloned()
                 && expires > tokio::time::Instant::now()
             {
+                let mut page = page;
+                page.timing = FeedTimelineTiming {
+                    cache_hit: true,
+                    ..FeedTimelineTiming::default()
+                };
                 return Ok(page);
             }
-            let started = std::time::Instant::now();
+            let resolve_started = std::time::Instant::now();
             let generator = self.feed_client.resolve_feed(uri).await?;
-            let resolve_ms = started.elapsed().as_millis() as u64;
+            let resolve_ms = resolve_started.elapsed().as_millis() as u64;
+            let auth_started = std::time::Instant::now();
             let service_jwt = self
                 .service_auth_token(did, &generator.service_did)
                 .await
                 .ok();
-            let auth_ms = started.elapsed().as_millis() as u64 - resolve_ms;
+            let auth_ms = auth_started.elapsed().as_millis() as u64;
+            let skeleton_started = std::time::Instant::now();
             let skeleton = self
                 .feed_client
                 .get_skeleton(&generator, cursor, service_jwt.as_deref())
                 .await?;
-            let skeleton_ms = started.elapsed().as_millis() as u64 - resolve_ms - auth_ms;
+            let skeleton_ms = skeleton_started.elapsed().as_millis() as u64;
+            let hydration_started = std::time::Instant::now();
             let timeline = self.feed_client.hydrate_skeleton(skeleton, storage).await?;
-            tracing::info!(
+            tracing::debug!(
                 feed = uri,
                 resolve_ms,
                 auth_ms,
                 skeleton_ms,
-                hydrate_ms =
-                    started.elapsed().as_millis() as u64 - resolve_ms - auth_ms - skeleton_ms,
+                hydrate_ms = hydration_started.elapsed().as_millis() as u64,
                 posts = timeline.feed.len(),
                 dropped = timeline.dropped_count,
                 "feed page loaded"
@@ -1651,6 +1681,12 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
             let page = FeedTimeline {
                 generator,
                 timeline,
+                timing: FeedTimelineTiming {
+                    session_token_refresh_ms: auth_ms,
+                    timeline_fetch_live_ms: resolve_ms.saturating_add(skeleton_ms),
+                    skeleton_hydration_ms: hydration_started.elapsed().as_millis() as u64,
+                    cache_hit: false,
+                },
             };
             let mut cache = self.feed_page_cache.lock().await;
             cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
@@ -1899,15 +1935,15 @@ async fn pinned_feeds_for_layout<F: OAuthFlow>(
     flow: &F,
     did: &str,
     has_permission: bool,
-) -> Vec<ResolvedFeed> {
+) -> PinnedFeedTabs {
     if !has_permission {
-        return Vec::new();
+        return PinnedFeedTabs::default();
     }
     match flow.pinned_feed_tabs(did).await {
-        Ok(feeds) => feeds,
+        Ok(tabs) => tabs,
         Err(error) => {
             tracing::warn!(%error, "could not load pinned feed tabs");
-            Vec::new()
+            PinnedFeedTabs::default()
         }
     }
 }
@@ -1937,6 +1973,12 @@ struct QuotedRecordRef {
 
 type QuoteRenderIndex = HashMap<String, QuoteRenderState>;
 
+struct PageContentHydration {
+    quote_index: QuoteRenderIndex,
+    profile_hydration_ms: u64,
+    quote_hydration_ms: u64,
+}
+
 #[derive(Default)]
 struct ThreadAncestorStats {
     from_index: usize,
@@ -1950,17 +1992,35 @@ enum AncestorSource {
     Live,
 }
 
-struct ThreadPageTiming {
+struct WebPageTiming {
+    page: &'static str,
     started: std::time::Instant,
+    session_token_refresh_ms: u64,
+    preferences_ms: u64,
+    tabs_ms: u64,
+    timeline_fetch_index_ms: u64,
+    timeline_fetch_live_ms: u64,
+    profile_hydration_ms: u64,
+    quote_hydration_ms: u64,
+    render_ms: u64,
     ancestors_from_index: usize,
     ancestors_live: usize,
     ancestors_timed_out: usize,
 }
 
-impl ThreadPageTiming {
-    fn new() -> Self {
+impl WebPageTiming {
+    fn new(page: &'static str) -> Self {
         Self {
+            page,
             started: std::time::Instant::now(),
+            session_token_refresh_ms: 0,
+            preferences_ms: 0,
+            tabs_ms: 0,
+            timeline_fetch_index_ms: 0,
+            timeline_fetch_live_ms: 0,
+            profile_hydration_ms: 0,
+            quote_hydration_ms: 0,
+            render_ms: 0,
             ancestors_from_index: 0,
             ancestors_live: 0,
             ancestors_timed_out: 0,
@@ -1968,14 +2028,23 @@ impl ThreadPageTiming {
     }
 }
 
-impl Drop for ThreadPageTiming {
+impl Drop for WebPageTiming {
     fn drop(&mut self) {
         tracing::info!(
+            page = self.page,
+            session_token_refresh_ms = self.session_token_refresh_ms,
+            preferences_ms = self.preferences_ms,
+            tabs_ms = self.tabs_ms,
+            timeline_fetch_index_ms = self.timeline_fetch_index_ms,
+            timeline_fetch_live_ms = self.timeline_fetch_live_ms,
+            profile_hydration_ms = self.profile_hydration_ms,
+            quote_hydration_ms = self.quote_hydration_ms,
+            render_ms = self.render_ms,
             ancestors_from_index = self.ancestors_from_index,
             ancestors_live = self.ancestors_live,
             ancestors_timed_out = self.ancestors_timed_out,
             total_ms = self.started.elapsed().as_millis() as u64,
-            "thread page loaded"
+            "web page phases"
         );
     }
 }
@@ -2295,7 +2364,7 @@ async fn hydrate_page_content<F: OAuthFlow, S: Storage + 'static>(
     page_records: &[&IndexedRecord],
     leading_authors: impl IntoIterator<Item = String>,
     deadline: tokio::time::Instant,
-) -> Result<QuoteRenderIndex, StorageError> {
+) -> Result<PageContentHydration, StorageError> {
     let mut refs = Vec::new();
     let mut seen_refs = HashSet::new();
     for record in page_records {
@@ -2332,24 +2401,30 @@ async fn hydrate_page_content<F: OAuthFlow, S: Storage + 'static>(
         result
     });
     let profile_fast_path = async move {
+        let started = std::time::Instant::now();
         match tokio::time::timeout(Duration::from_millis(25), profile_task).await {
-            Ok(Ok(result)) => result.map(|_| ()),
+            Ok(Ok(result)) => result.map(|_| started.elapsed().as_millis() as u64),
             Ok(Err(error)) => {
                 tracing::warn!(%error, "page profile hydration task failed");
-                Ok(())
+                Ok(started.elapsed().as_millis() as u64)
             }
             Err(_) => {
                 tracing::debug!("page profile hydration continued in background");
-                Ok(())
+                Ok(started.elapsed().as_millis() as u64)
             }
         }
     };
-    let (quotes, profiles) = tokio::join!(
-        hydrate_page_quotes(flow, quote_storage.as_ref(), refs, deadline),
-        profile_fast_path
-    );
-    profiles?;
-    quotes
+    let quote_hydration = async {
+        let started = std::time::Instant::now();
+        let quotes = hydrate_page_quotes(flow, quote_storage.as_ref(), refs, deadline).await;
+        (quotes, started.elapsed().as_millis() as u64)
+    };
+    let (quote_hydration, profile_hydration_ms) = tokio::join!(quote_hydration, profile_fast_path);
+    Ok(PageContentHydration {
+        quote_index: quote_hydration.0?,
+        profile_hydration_ms: profile_hydration_ms?,
+        quote_hydration_ms: quote_hydration.1,
+    })
 }
 
 fn quoted_record_ref(embed: &Value) -> Option<QuotedRecordRef> {
@@ -2805,15 +2880,21 @@ where
     F: OAuthFlow,
     S: Storage + 'static,
 {
+    let mut page_timing = WebPageTiming::new("app");
+    let session_started = std::time::Instant::now();
     let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return Redirect::to("/login").into_response();
     };
-    let pinned_feeds = pinned_feeds_for_layout(
+    page_timing.session_token_refresh_ms = session_started.elapsed().as_millis() as u64;
+    let tabs = pinned_feeds_for_layout(
         &state.flow,
         &did,
         verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()),
     )
     .await;
+    page_timing.preferences_ms = tabs.preferences_ms;
+    page_timing.tabs_ms = tabs.tabs_ms;
+    let pinned_feeds = tabs.feeds;
     let limit = query
         .get("limit")
         .and_then(|value| value.parse::<usize>().ok())
@@ -2822,6 +2903,7 @@ where
     let cursor = query
         .get("cursor")
         .and_then(|cursor| RecordCursor::parse(cursor));
+    let timeline_started = std::time::Instant::now();
     let timeline_page = match state
         .storage
         .timeline_posts(&did, cursor.as_ref(), limit + 1)
@@ -2829,6 +2911,7 @@ where
         Ok(records) => records,
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
+    page_timing.timeline_fetch_index_ms = timeline_started.elapsed().as_millis() as u64;
     let has_more = timeline_page.len() > limit;
     let timeline = timeline_page.iter().take(limit).collect::<Vec<_>>();
     let quote_index = match hydrate_page_content(
@@ -2840,9 +2923,14 @@ where
     )
     .await
     {
-        Ok(index) => index,
+        Ok(hydration) => {
+            page_timing.profile_hydration_ms = hydration.profile_hydration_ms;
+            page_timing.quote_hydration_ms = hydration.quote_hydration_ms;
+            hydration.quote_index
+        }
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
+    let render_started = std::time::Instant::now();
     let write_forms_enabled =
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
     let posts = timeline
@@ -2922,7 +3010,7 @@ where
     } else {
         String::new()
     };
-    Html(page_shell_with_feeds(
+    let response = Html(page_shell_with_feeds(
         "Timeline",
         &format!(
             "<header class=\"page-heading\"><p class=\"eyebrow\">Your feed</p><h1>Timeline</h1><p class=\"page-subtitle\">Posts from accounts in your local view.</p></header>{read_only_message}{indexing_status}{post_form}<ol class=\"post-list\">{posts}</ol>{older}",
@@ -2932,7 +3020,9 @@ where
         None,
         true,
     ))
-    .into_response()
+    .into_response();
+    page_timing.render_ms = render_started.elapsed().as_millis() as u64;
+    response
 }
 
 async fn feeds_page<F, S>(
@@ -2950,7 +3040,7 @@ where
         return feed_reauthorization_page();
     }
     let feeds = match state.flow.pinned_feed_tabs(&did).await {
-        Ok(feeds) => feeds,
+        Ok(tabs) => tabs.feeds,
         Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
     };
     let entries = feeds.iter().map(render_feed_card).collect::<String>();
@@ -2981,15 +3071,19 @@ where
     F: OAuthFlow,
     S: Storage + 'static,
 {
+    let mut page_timing = WebPageTiming::new("feed");
+    let session_started = std::time::Instant::now();
     let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return Redirect::to("/login").into_response();
     };
+    page_timing.session_token_refresh_ms = session_started.elapsed().as_millis() as u64;
     if !verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()) {
         return feed_reauthorization_page();
     }
     let Some(uri) = query.get("uri").filter(|uri| !uri.is_empty()) else {
         return oauth_error(StatusCode::BAD_REQUEST, "feed uri is required");
     };
+    let timeline_started = std::time::Instant::now();
     let page = match state
         .flow
         .feed_timeline(
@@ -3003,6 +3097,14 @@ where
         Ok(page) => page,
         Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
     };
+    page_timing.session_token_refresh_ms = page
+        .timing
+        .session_token_refresh_ms
+        .saturating_add(page_timing.session_token_refresh_ms);
+    page_timing.timeline_fetch_live_ms = page.timing.timeline_fetch_live_ms;
+    if page.timing.cache_hit {
+        page_timing.timeline_fetch_index_ms = timeline_started.elapsed().as_millis() as u64;
+    }
     let feed_records = page
         .timeline
         .feed
@@ -3018,9 +3120,14 @@ where
     )
     .await
     {
-        Ok(index) => index,
+        Ok(hydration) => {
+            page_timing.profile_hydration_ms = hydration.profile_hydration_ms;
+            page_timing.quote_hydration_ms = hydration.quote_hydration_ms;
+            hydration.quote_index
+        }
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
+    let render_started = std::time::Instant::now();
     let write_forms_enabled =
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
     let posts = page
@@ -3076,8 +3183,10 @@ where
             )
         })
         .unwrap_or_default();
-    let pinned_feeds = pinned_feeds_for_layout(&state.flow, &did, true).await;
-    Html(page_shell_with_feeds(
+    let tabs = pinned_feeds_for_layout(&state.flow, &did, true).await;
+    page_timing.preferences_ms = tabs.preferences_ms;
+    page_timing.tabs_ms = tabs.tabs_ms;
+    let response = Html(page_shell_with_feeds(
         &page.generator.display_name,
         &format!(
             "{}{}<ol class=\"post-list\">{posts}</ol>{older}",
@@ -3085,11 +3194,13 @@ where
             skipped
         ),
         true,
-        &pinned_feeds,
+        &tabs.feeds,
         Some(&page.generator.uri),
         false,
     ))
-    .into_response()
+    .into_response();
+    page_timing.render_ms = render_started.elapsed().as_millis() as u64;
+    response
 }
 
 async fn notifications_page<F, S>(
@@ -3101,15 +3212,20 @@ where
     F: OAuthFlow,
     S: Storage + 'static,
 {
+    let mut page_timing = WebPageTiming::new("notifications");
+    let session_started = std::time::Instant::now();
     let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return Redirect::to("/login").into_response();
     };
-    let pinned_feeds = pinned_feeds_for_layout(
+    page_timing.session_token_refresh_ms = session_started.elapsed().as_millis() as u64;
+    let tabs = pinned_feeds_for_layout(
         &state.flow,
         &did,
         verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()),
     )
     .await;
+    page_timing.preferences_ms = tabs.preferences_ms;
+    page_timing.tabs_ms = tabs.tabs_ms;
     let limit = query
         .get("limit")
         .and_then(|value| value.parse::<usize>().ok())
@@ -3118,6 +3234,7 @@ where
     let before = query
         .get("cursor")
         .and_then(|cursor| NotificationCursor::parse(cursor));
+    let timeline_started = std::time::Instant::now();
     let page = match state
         .storage
         .notifications_for(&did, before.as_ref(), limit + 1)
@@ -3125,6 +3242,7 @@ where
         Ok(page) => page,
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
+    page_timing.timeline_fetch_index_ms = timeline_started.elapsed().as_millis() as u64;
     let has_more = page.len() > limit;
     let visible = page.iter().take(limit).collect::<Vec<_>>();
     let notification_records = visible
@@ -3140,9 +3258,14 @@ where
     )
     .await
     {
-        Ok(index) => index,
+        Ok(hydration) => {
+            page_timing.profile_hydration_ms = hydration.profile_hydration_ms;
+            page_timing.quote_hydration_ms = hydration.quote_hydration_ms;
+            hydration.quote_index
+        }
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
+    let render_started = std::time::Instant::now();
     let items = visible
         .iter()
         .map(|notification| {
@@ -3174,17 +3297,19 @@ where
     } else {
         String::new()
     };
-    Html(page_shell_with_feeds(
+    let response = Html(page_shell_with_feeds(
         "Notifications",
         &format!(
             "<header class=\"page-heading\"><p class=\"eyebrow\">What’s happening</p><h1>Notifications</h1><p class=\"page-subtitle\">Recent activity around your posts and profile.</p></header><ol class=\"notification-list\">{items}</ol>{older}"
         ),
         true,
-        &pinned_feeds,
+        &tabs.feeds,
         None,
         false,
     ))
-    .into_response()
+    .into_response();
+    page_timing.render_ms = render_started.elapsed().as_millis() as u64;
+    response
 }
 
 fn render_web_notification<S: Storage>(
@@ -3255,15 +3380,20 @@ where
     F: OAuthFlow,
     S: Storage + 'static,
 {
+    let mut page_timing = WebPageTiming::new("profile");
+    let session_started = std::time::Instant::now();
     let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return Redirect::to("/login").into_response();
     };
-    let pinned_feeds = pinned_feeds_for_layout(
+    page_timing.session_token_refresh_ms = session_started.elapsed().as_millis() as u64;
+    let tabs = pinned_feeds_for_layout(
         &state.flow,
         &did,
         verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()),
     )
     .await;
+    page_timing.preferences_ms = tabs.preferences_ms;
+    page_timing.tabs_ms = tabs.tabs_ms;
     let subject = query.get("did").map(String::as_str).unwrap_or(&did);
     let limit = query
         .get("limit")
@@ -3273,6 +3403,7 @@ where
     let cursor = query
         .get("cursor")
         .and_then(|cursor| RecordCursor::parse(cursor));
+    let timeline_started = std::time::Instant::now();
     let records = match state
         .storage
         .author_posts(subject, cursor.as_ref(), limit + 1, true)
@@ -3280,6 +3411,7 @@ where
         Ok(records) => records,
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
+    page_timing.timeline_fetch_index_ms = timeline_started.elapsed().as_millis() as u64;
     let has_more = records.len() > limit;
     let records = records.iter().take(limit).collect::<Vec<_>>();
     let quote_index = match hydrate_page_content(
@@ -3291,9 +3423,14 @@ where
     )
     .await
     {
-        Ok(index) => index,
+        Ok(hydration) => {
+            page_timing.profile_hydration_ms = hydration.profile_hydration_ms;
+            page_timing.quote_hydration_ms = hydration.quote_hydration_ms;
+            hydration.quote_index
+        }
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
+    let render_started = std::time::Instant::now();
     let profile = match profile_view_from_storage(state.storage.as_ref(), subject) {
         Ok(profile) => profile,
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
@@ -3347,7 +3484,7 @@ where
     } else {
         String::new()
     };
-    Html(page_shell_with_feeds(
+    let response = Html(page_shell_with_feeds(
         display_name,
         &format!(
             "<section class=\"profile-card\">{}<div><h1>{}</h1><p class=\"profile-handle\">@{}</p></div></section><header class=\"section-heading\"><h2>Posts</h2></header><ol class=\"post-list\">{posts}</ol>{older}",
@@ -3356,11 +3493,13 @@ where
             html_escape(&handle)
         ),
         true,
-        &pinned_feeds,
+        &tabs.feeds,
         None,
         false,
     ))
-    .into_response()
+    .into_response();
+    page_timing.render_ms = render_started.elapsed().as_millis() as u64;
+    response
 }
 
 async fn thread_page<F, S>(
@@ -3372,28 +3511,43 @@ where
     F: OAuthFlow,
     S: Storage + 'static,
 {
-    let mut page_timing = ThreadPageTiming::new();
+    let mut page_timing = WebPageTiming::new("thread");
+    let session_started = std::time::Instant::now();
     let Some(viewer_did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref())
     else {
         return Redirect::to("/login").into_response();
     };
-    let pinned_feeds = pinned_feeds_for_layout(
+    page_timing.session_token_refresh_ms = session_started.elapsed().as_millis() as u64;
+    let tabs = pinned_feeds_for_layout(
         &state.flow,
         &viewer_did,
         verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()),
     )
     .await;
+    page_timing.preferences_ms = tabs.preferences_ms;
+    page_timing.tabs_ms = tabs.tabs_ms;
     let page_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
     let Some(uri) = query.get("uri") else {
         return oauth_error(StatusCode::BAD_REQUEST, "uri is required");
     };
-    let record =
-        match load_post_record_until(&state.flow, state.storage.as_ref(), uri, page_deadline).await
-        {
-            Ok(Some(record)) => record,
-            Ok(None) => return oauth_error(StatusCode::NOT_FOUND, "post not found"),
-            Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
-        };
+    let record_started = std::time::Instant::now();
+    let (record, record_was_live) = match load_post_record_with_source_until(
+        &state.flow,
+        state.storage.as_ref(),
+        uri,
+        page_deadline,
+    )
+    .await
+    {
+        Ok(Some(record)) => record,
+        Ok(None) => return oauth_error(StatusCode::NOT_FOUND, "post not found"),
+        Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
+    };
+    if record_was_live {
+        page_timing.timeline_fetch_live_ms += record_started.elapsed().as_millis() as u64;
+    } else {
+        page_timing.timeline_fetch_index_ms += record_started.elapsed().as_millis() as u64;
+    }
     let write_forms_enabled =
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
     let parent_height = query
@@ -3406,6 +3560,7 @@ where
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(3)
         .min(6);
+    let ancestors_started = std::time::Instant::now();
     let (ancestors, ancestor_stats) = match thread_ancestors(
         &state.flow,
         state.storage.as_ref(),
@@ -3421,6 +3576,12 @@ where
     page_timing.ancestors_from_index = ancestor_stats.from_index;
     page_timing.ancestors_live = ancestor_stats.live;
     page_timing.ancestors_timed_out = ancestor_stats.timed_out;
+    let ancestors_ms = ancestors_started.elapsed().as_millis() as u64;
+    if ancestor_stats.live > 0 || ancestor_stats.timed_out > 0 {
+        page_timing.timeline_fetch_live_ms += ancestors_ms;
+    } else {
+        page_timing.timeline_fetch_index_ms += ancestors_ms;
+    }
     let mut thread_reply_records = Vec::new();
     let mut author_reply_budget = 100;
     if let Err(error) = collect_thread_reply_records(
@@ -3446,9 +3607,14 @@ where
     )
     .await
     {
-        Ok(index) => index,
+        Ok(hydration) => {
+            page_timing.profile_hydration_ms = hydration.profile_hydration_ms;
+            page_timing.quote_hydration_ms = hydration.quote_hydration_ms;
+            hydration.quote_index
+        }
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
+    let render_started = std::time::Instant::now();
     let ancestors_html = ancestors
         .iter()
         .map(|ancestor| {
@@ -3503,7 +3669,7 @@ where
         String::new()
     };
     let mobile_navigation = render_thread_mobile_navigation(state.storage.as_ref(), &viewer_did);
-    Html(page_shell_with_options(
+    let response = Html(page_shell_with_options(
         "Thread",
         &format!(
             "<header class=\"thread-topbar\"><a href=\"/app\" aria-label=\"Back to timeline\">←</a><h1>Post</h1></header>{read_only_message}<section class=\"thread-ancestors\" aria-label=\"Earlier posts in this thread\"><ol class=\"post-list\">{ancestors_html}</ol></section><section class=\"thread-focus\" aria-label=\"Selected post\">{}</section><section class=\"thread-replies\" aria-label=\"Replies\">{replies_html}</section>{reply_composer}{reply_bar}",
@@ -3517,14 +3683,16 @@ where
         ),
         true,
         PageShellOptions {
-            feeds: &pinned_feeds,
+            feeds: &tabs.feeds,
             active_feed: None,
             following_active: false,
             show_feed_tabs: false,
             mobile_navigation_override: Some(&mobile_navigation),
         },
     ))
-    .into_response()
+    .into_response();
+    page_timing.render_ms = render_started.elapsed().as_millis() as u64;
+    response
 }
 
 async fn quote_composer<F, S>(
@@ -3578,7 +3746,7 @@ where
             render_quote_preview(state.storage.as_ref(), &quoted)
         )
     };
-    let pinned_feeds = pinned_feeds_for_layout(
+    let tabs = pinned_feeds_for_layout(
         &state.flow,
         &viewer_did,
         verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()),
@@ -3588,7 +3756,7 @@ where
         "Quote post",
         &format!("<header class=\"page-heading\"><h1>Quote post</h1></header>{composer}"),
         true,
-        &pinned_feeds,
+        &tabs.feeds,
         None,
         false,
     ))
@@ -3781,11 +3949,24 @@ async fn load_post_record_until<F: OAuthFlow, S: Storage>(
     uri: &str,
     deadline: tokio::time::Instant,
 ) -> Result<Option<IndexedRecord>, String> {
+    Ok(
+        load_post_record_with_source_until(flow, storage, uri, deadline)
+            .await?
+            .map(|(record, _)| record),
+    )
+}
+
+async fn load_post_record_with_source_until<F: OAuthFlow, S: Storage>(
+    flow: &F,
+    storage: &S,
+    uri: &str,
+    deadline: tokio::time::Instant,
+) -> Result<Option<(IndexedRecord, bool)>, String> {
     if let Some(record) = storage
         .record_by_uri("app.bsky.feed.post", uri)
         .map_err(|error| error.to_string())?
     {
-        return Ok(Some(record));
+        return Ok(Some((record, false)));
     }
     let record = tokio::time::timeout_at(deadline, flow.fetch_post(uri))
         .await
@@ -3793,7 +3974,7 @@ async fn load_post_record_until<F: OAuthFlow, S: Storage>(
     if record.uri != uri || record.collection != "app.bsky.feed.post" {
         return Err("post fetch returned a different record".to_owned());
     }
-    Ok(Some(record))
+    Ok(Some((record, true)))
 }
 
 fn render_reply_composer<S: Storage>(storage: &S, parent: &IndexedRecord) -> String {

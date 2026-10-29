@@ -53,6 +53,15 @@ pub struct HydratedFeedPage {
 pub struct FeedTimeline {
     pub generator: ResolvedFeed,
     pub timeline: HydratedFeedPage,
+    pub timing: FeedTimelineTiming,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FeedTimelineTiming {
+    pub session_token_refresh_ms: u64,
+    pub timeline_fetch_live_ms: u64,
+    pub skeleton_hydration_ms: u64,
+    pub cache_hit: bool,
 }
 
 const LIVE_POST_CACHE_ENTRIES: usize = 20_000;
