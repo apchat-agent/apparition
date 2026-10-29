@@ -1800,6 +1800,49 @@ struct QuotedRecordRef {
 
 type QuoteRenderIndex = HashMap<String, QuoteRenderState>;
 
+#[derive(Default)]
+struct ThreadAncestorStats {
+    from_index: usize,
+    live: usize,
+    timed_out: usize,
+}
+
+#[derive(Clone, Copy)]
+enum AncestorSource {
+    Index,
+    Live,
+}
+
+struct ThreadPageTiming {
+    started: std::time::Instant,
+    ancestors_from_index: usize,
+    ancestors_live: usize,
+    ancestors_timed_out: usize,
+}
+
+impl ThreadPageTiming {
+    fn new() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            ancestors_from_index: 0,
+            ancestors_live: 0,
+            ancestors_timed_out: 0,
+        }
+    }
+}
+
+impl Drop for ThreadPageTiming {
+    fn drop(&mut self) {
+        tracing::info!(
+            ancestors_from_index = self.ancestors_from_index,
+            ancestors_live = self.ancestors_live,
+            ancestors_timed_out = self.ancestors_timed_out,
+            total_ms = self.started.elapsed().as_millis() as u64,
+            "thread page loaded"
+        );
+    }
+}
+
 pub struct ProfileRefreshWorker<F, S> {
     flow: F,
     storage: Arc<S>,
@@ -3171,6 +3214,8 @@ where
     F: OAuthFlow,
     S: Storage + 'static,
 {
+    let mut page_timing = ThreadPageTiming::new();
+    let page_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
     let Some(viewer_did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref())
     else {
         return Redirect::to("/login").into_response();
@@ -3184,28 +3229,40 @@ where
     let Some(uri) = query.get("uri") else {
         return oauth_error(StatusCode::BAD_REQUEST, "uri is required");
     };
-    let record = match load_post_record(&state.flow, state.storage.as_ref(), uri).await {
-        Ok(Some(record)) => record,
-        Ok(None) => return oauth_error(StatusCode::NOT_FOUND, "post not found"),
-        Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
-    };
+    let record =
+        match load_post_record_until(&state.flow, state.storage.as_ref(), uri, page_deadline).await
+        {
+            Ok(Some(record)) => record,
+            Ok(None) => return oauth_error(StatusCode::NOT_FOUND, "post not found"),
+            Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
+        };
     let write_forms_enabled =
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
     let parent_height = query
         .get("parentHeight")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(80)
-        .min(20);
+        .min(6);
     let depth = query
         .get("depth")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(3)
         .min(6);
-    let ancestors =
-        match thread_ancestors(&state.flow, state.storage.as_ref(), &record, parent_height).await {
-            Ok(ancestors) => ancestors,
-            Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
-        };
+    let (ancestors, ancestor_stats) = match thread_ancestors(
+        &state.flow,
+        state.storage.as_ref(),
+        &record,
+        parent_height,
+        page_deadline,
+    )
+    .await
+    {
+        Ok(ancestors) => ancestors,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+    };
+    page_timing.ancestors_from_index = ancestor_stats.from_index;
+    page_timing.ancestors_live = ancestor_stats.live;
+    page_timing.ancestors_timed_out = ancestor_stats.timed_out;
     let mut thread_reply_records = Vec::new();
     let mut author_reply_budget = 100;
     if let Err(error) = collect_thread_reply_records(
@@ -3227,7 +3284,7 @@ where
         state.storage.clone(),
         &page_records,
         std::iter::empty(),
-        tokio::time::Instant::now() + PAGE_PROFILE_BUDGET,
+        page_deadline,
     )
     .await
     {
@@ -3285,7 +3342,7 @@ where
         String::new()
     };
     let mobile_navigation = render_thread_mobile_navigation(state.storage.as_ref(), &viewer_did);
-    Html(page_shell_with_options(
+    let response = Html(page_shell_with_options(
         "Thread",
         &format!(
             "<header class=\"thread-topbar\"><a href=\"/app\" aria-label=\"Back to timeline\">←</a><h1>Post</h1></header>{read_only_message}<section class=\"thread-ancestors\" aria-label=\"Earlier posts in this thread\"><ol class=\"post-list\">{ancestors_html}</ol></section><section class=\"thread-focus\" aria-label=\"Selected post\">{}</section><section class=\"thread-replies\" aria-label=\"Replies\">{replies_html}</section>{reply_composer}{reply_bar}",
@@ -3306,7 +3363,8 @@ where
             mobile_navigation_override: Some(&mobile_navigation),
         },
     ))
-    .into_response()
+    .into_response();
+    response
 }
 
 async fn quote_composer<F, S>(
@@ -3413,7 +3471,9 @@ async fn thread_ancestors<F: OAuthFlow, S: Storage>(
     storage: &S,
     record: &IndexedRecord,
     parent_height: usize,
-) -> Result<Vec<IndexedRecord>, String> {
+    deadline: tokio::time::Instant,
+) -> Result<(Vec<IndexedRecord>, ThreadAncestorStats), String> {
+    let mut stats = ThreadAncestorStats::default();
     let mut ancestors = Vec::new();
     let mut visited = HashSet::from([record.uri.clone()]);
     let mut parent_uri = record
@@ -3421,30 +3481,124 @@ async fn thread_ancestors<F: OAuthFlow, S: Storage>(
         .pointer("/reply/parent/uri")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let root_uri = record
+        .record
+        .pointer("/reply/root/uri")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let mut initial_uris = Vec::new();
+    if let Some(parent) = parent_uri
+        .as_ref()
+        .filter(|uri| post_uri_did(uri).is_some())
+    {
+        initial_uris.push(parent.clone());
+    }
+    if let Some(root) = root_uri.as_ref().filter(|uri| post_uri_did(uri).is_some())
+        && !initial_uris.contains(root)
+    {
+        initial_uris.push(root.clone());
+    }
+    let mut records_by_uri = HashMap::new();
+    let mut source_by_uri = HashMap::new();
+    let mut missing = Vec::new();
+    for uri in initial_uris {
+        match storage
+            .record_by_uri("app.bsky.feed.post", &uri)
+            .map_err(|error| error.to_string())?
+        {
+            Some(local) => {
+                records_by_uri.insert(uri.clone(), local);
+                source_by_uri.insert(uri, AncestorSource::Index);
+            }
+            None => missing.push(uri),
+        }
+    }
+    let attempted_initial = missing.iter().cloned().collect::<HashSet<_>>();
+    let flow_for_initial = flow.clone();
+    let mut completed = HashSet::new();
+    let mut initial_fetches = stream::iter(missing.iter().cloned().map(move |uri| {
+        let flow = flow_for_initial.clone();
+        async move {
+            let fetched = flow.fetch_post(&uri).await;
+            (uri, fetched)
+        }
+    }))
+    .buffer_unordered(PAGE_QUOTE_CONCURRENCY);
+    let initial_result = tokio::time::timeout_at(deadline, async {
+        while let Some((uri, fetched)) = initial_fetches.next().await {
+            completed.insert(uri.clone());
+            if let Ok(parent) = fetched
+                && parent.uri == uri
+                && parent.collection == "app.bsky.feed.post"
+            {
+                records_by_uri.insert(uri.clone(), parent);
+                source_by_uri.insert(uri, AncestorSource::Live);
+            }
+        }
+    })
+    .await;
+    if initial_result.is_err() {
+        stats.timed_out += missing
+            .iter()
+            .filter(|uri| !completed.contains(*uri))
+            .count();
+    }
+
     for _ in 0..parent_height {
         let Some(uri) = parent_uri else { break };
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
         if !visited.insert(uri.clone()) {
             break;
         }
-        let local_parent = storage
-            .record_by_uri("app.bsky.feed.post", &uri)
-            .map_err(|error| error.to_string())?;
-        let parent = match local_parent {
-            Some(parent) => parent,
-            None => match flow.fetch_post(&uri).await {
-                Ok(parent) if parent.uri == uri => parent,
-                Ok(_) | Err(_) => break,
+        let parent = match records_by_uri.remove(&uri) {
+            Some(parent) => {
+                match source_by_uri.remove(&uri) {
+                    Some(AncestorSource::Index) => stats.from_index += 1,
+                    Some(AncestorSource::Live) => stats.live += 1,
+                    None => {}
+                }
+                parent
+            }
+            None if attempted_initial.contains(&uri) => break,
+            None => match storage
+                .record_by_uri("app.bsky.feed.post", &uri)
+                .map_err(|error| error.to_string())?
+            {
+                Some(parent) => {
+                    stats.from_index += 1;
+                    parent
+                }
+                None => match tokio::time::timeout_at(deadline, flow.fetch_post(&uri)).await {
+                    Err(_) => {
+                        stats.timed_out += 1;
+                        break;
+                    }
+                    Ok(Ok(parent))
+                        if parent.uri == uri && parent.collection == "app.bsky.feed.post" =>
+                    {
+                        stats.live += 1;
+                        parent
+                    }
+                    Ok(Ok(_)) | Ok(Err(_)) => break,
+                },
             },
         };
-        parent_uri = parent
+        let next_parent_uri = parent
             .record
             .pointer("/reply/parent/uri")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        let is_root = root_uri.as_deref() == Some(uri.as_str());
         ancestors.push(parent);
+        if is_root {
+            break;
+        }
+        parent_uri = next_parent_uri;
     }
     ancestors.reverse();
-    Ok(ancestors)
+    Ok((ancestors, stats))
 }
 
 async fn load_post_record<F: OAuthFlow, S: Storage>(
@@ -3452,13 +3606,30 @@ async fn load_post_record<F: OAuthFlow, S: Storage>(
     storage: &S,
     uri: &str,
 ) -> Result<Option<IndexedRecord>, String> {
+    load_post_record_until(
+        flow,
+        storage,
+        uri,
+        tokio::time::Instant::now() + Duration::from_secs(10),
+    )
+    .await
+}
+
+async fn load_post_record_until<F: OAuthFlow, S: Storage>(
+    flow: &F,
+    storage: &S,
+    uri: &str,
+    deadline: tokio::time::Instant,
+) -> Result<Option<IndexedRecord>, String> {
     if let Some(record) = storage
         .record_by_uri("app.bsky.feed.post", uri)
         .map_err(|error| error.to_string())?
     {
         return Ok(Some(record));
     }
-    let record = flow.fetch_post(uri).await?;
+    let record = tokio::time::timeout_at(deadline, flow.fetch_post(uri))
+        .await
+        .map_err(|_| "post fetch timed out".to_owned())??;
     if record.uri != uri || record.collection != "app.bsky.feed.post" {
         return Err("post fetch returned a different record".to_owned());
     }
