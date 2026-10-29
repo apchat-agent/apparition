@@ -73,8 +73,8 @@ const PROFILE_NEGATIVE_TTL: Duration = Duration::from_secs(60 * 60);
 const PAGE_PROFILE_BUDGET: Duration = Duration::from_millis(1500);
 const PAGE_PROFILE_CONCURRENCY: usize = 8;
 const PAGE_QUOTE_CONCURRENCY: usize = 16;
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m3";
-const WEB_SCRIPT_URL: &str = "/static/app.js?v=js2";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m4";
+const WEB_SCRIPT_URL: &str = "/static/app.js?v=js3";
 const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=*";
 const WRITE_SCOPES: [&str; 3] = [
     "repo:app.bsky.feed.post?action=create",

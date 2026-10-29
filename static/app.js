@@ -52,3 +52,11 @@ document.addEventListener("submit", async (event) => {
     button.disabled = false;
   }
 });
+
+// Phones: the app frame is pinned to the screen (app.css), so the document itself should never be scrolled. iOS can
+// still leave it scrolled after the keyboard closes; put it back.
+const resetDocumentScroll = () => {
+  if (document.querySelector(".mobile-nav") && (window.scrollY !== 0 || window.scrollX !== 0)) window.scrollTo(0, 0);
+};
+document.addEventListener("focusout", () => setTimeout(resetDocumentScroll, 100));
+window.visualViewport?.addEventListener("resize", resetDocumentScroll);

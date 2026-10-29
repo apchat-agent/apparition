@@ -754,12 +754,12 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
             ),
             "{path}"
         );
-        assert!(html.contains("href=\"/static/app.css?v=m3\""), "{path}");
+        assert!(html.contains("href=\"/static/app.css?v=m4\""), "{path}");
         assert!(!html.contains("style="), "{path}");
         // One external, same-origin, deferred script (like toggles in place); never inline code.
         assert_eq!(html.matches("<script").count(), 1, "{path}");
         assert!(
-            html.contains("<script src=\"/static/app.js?v=js2\" defer></script>"),
+            html.contains("<script src=\"/static/app.js?v=js3\" defer></script>"),
             "{path}"
         );
     }
@@ -767,7 +767,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
     let stylesheet = app
         .oneshot(
             Request::builder()
-                .uri("/static/app.css?v=m3")
+                .uri("/static/app.css?v=m4")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1046,11 +1046,11 @@ async fn sign_in_error_page_uses_the_shared_mobile_document_shell() {
     assert!(
         html.contains("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">")
     );
-    assert!(html.contains("href=\"/static/app.css?v=m3\""));
+    assert!(html.contains("href=\"/static/app.css?v=m4\""));
     assert!(!html.contains("style="));
     // The shared shell's one external script, never inline code.
     assert_eq!(html.matches("<script").count(), 1);
-    assert!(html.contains("<script src=\"/static/app.js?v=js2\" defer></script>"));
+    assert!(html.contains("<script src=\"/static/app.js?v=js3\" defer></script>"));
 }
 
 #[tokio::test]

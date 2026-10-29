@@ -1418,11 +1418,19 @@ a.quoted-post-card:hover,
    layout instead of position: fixed. A fixed bar lags behind Safari's collapsing URL bar while scrolling and
    detaches from it (the owner's report, also a bsky.app bug). Guest pages have no bottom bar and keep normal scrolling. */
 @media (max-width: 799px) {
+  /* Pinned with position: fixed, not only sized to 100dvh: iOS Safari still scrolls the document behind an
+     overflow: hidden body (after the keyboard closes, or when a scroll chains past the top of the post list), and the
+     whole app slid up and left a blank half screen (owner's screenshot, 2026-10-29). */
+  html:has(.mobile-nav) {
+    height: 100%;
+    overflow: hidden;
+  }
+
   body:has(.mobile-nav) {
-    position: relative;
+    position: fixed;
+    inset: 0;
     display: flex;
-    height: 100vh;
-    height: 100dvh;
+    height: auto;
     min-height: 0;
     flex-direction: column;
     overflow: hidden;
@@ -1432,6 +1440,8 @@ a.quoted-post-card:hover,
     flex: 1 1 auto;
     min-height: 0;
     overflow-y: auto;
+    overscroll-behavior-y: contain;
+    -webkit-overflow-scrolling: touch;
   }
 
   body:has(.mobile-nav) .center-column {
