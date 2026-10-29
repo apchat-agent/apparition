@@ -5769,6 +5769,87 @@ mod tests {
         assert!(WEB_STYLESHEET_URL.contains("v=m6"));
     }
 
+    #[test]
+    fn notification_groups_respect_type_subject_age_and_read_boundary() {
+        let notices = vec![
+            web_notice("alice", "like", 200 * HOUR_US, Some("post-a")),
+            web_notice("bob", "like", 199 * HOUR_US, Some("post-a")),
+            web_notice("carol", "like", 152 * HOUR_US, Some("post-a")),
+            web_notice("dave", "like", 199 * HOUR_US, Some("post-b")),
+            web_notice("erin", "repost", 199 * HOUR_US, Some("post-a")),
+            web_notice("frank", "follow", 199 * HOUR_US, None),
+            web_notice("grace", "follow", 198 * HOUR_US, None),
+            web_notice("heidi", "like", 198 * HOUR_US, Some("post-a")),
+        ];
+
+        let groups = group_web_notifications(&notices, 199 * HOUR_US);
+        let likes_a = groups
+            .iter()
+            .filter(|group| group.reason == "like" && group.reason_subject.as_deref() == Some("post-a"))
+            .collect::<Vec<_>>();
+        assert_eq!(likes_a.len(), 3);
+        assert_eq!(likes_a[0].events.len(), 2);
+        assert_eq!(likes_a[1].events.len(), 1);
+        assert!(groups.iter().any(|group| group.reason == "follow" && group.events.len() == 2));
+        assert!(groups.iter().any(|group| group.reason == "repost" && group.events.len() == 1));
+        assert!(groups.iter().any(|group| group.reason == "like" && group.reason_subject.as_deref() == Some("post-b")));
+    }
+
+    #[test]
+    fn notification_group_pages_keep_a_group_whole_without_duplicates() {
+        let notices = vec![
+            web_notice("alice", "like", 10 * HOUR_US, Some("post-a")),
+            web_notice("bob", "like", 9 * HOUR_US, Some("post-a")),
+            web_notice("carol", "like", 8 * HOUR_US, Some("post-b")),
+            web_notice("dave", "reply", 7 * HOUR_US, Some("post-c")),
+        ];
+        let groups = group_web_notifications(&notices, 0);
+        let (first, has_more) = notification_group_page(&groups, None, 1);
+        assert!(has_more);
+        assert_eq!(first[0].events.len(), 2);
+        let cursor = notification_group_cursor(first.last().unwrap());
+        let (second, has_more) = notification_group_page(&groups, Some(&cursor), 1);
+        assert!(has_more);
+        assert_eq!(second[0].events.len(), 1);
+        assert_ne!(first[0].events[0].record.uri, second[0].events[0].record.uri);
+    }
+
+    const HOUR_US: u64 = 60 * 60 * 1_000_000;
+
+    fn web_notice(
+        actor: &str,
+        reason: &str,
+        time_us: u64,
+        reason_subject: Option<&str>,
+    ) -> IndexedNotification {
+        let collection = match reason {
+            "like" => "app.bsky.feed.like",
+            "repost" => "app.bsky.feed.repost",
+            "follow" => "app.bsky.graph.follow",
+            _ => "app.bsky.feed.post",
+        };
+        let subject_uri = reason_subject.map(|subject| {
+            format!("at://did:plc:viewer/app.bsky.feed.post/{subject}")
+        });
+        IndexedNotification {
+            record: IndexedRecord {
+                did: format!("did:plc:{actor}"),
+                collection: collection.to_owned(),
+                rkey: actor.to_owned(),
+                uri: format!("at://did:plc:{actor}/{collection}/{actor}"),
+                cid: None,
+                time_us,
+                record: match reason {
+                    "like" | "repost" => json!({"subject":{"uri":subject_uri}}),
+                    "follow" => json!({"subject":"did:plc:viewer"}),
+                    _ => json!({"text":"reply body"}),
+                },
+            },
+            reason: reason.to_owned(),
+            reason_subject: subject_uri,
+        }
+    }
+
     #[derive(Clone)]
     struct FeedTestIdentity(HashMap<String, DidDocument>);
 
