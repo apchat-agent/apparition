@@ -1565,17 +1565,38 @@ async fn serve_one(mut stream: TcpStream, origin: &str, state: Arc<Mutex<FakeSer
             }
             path if path.starts_with("/xrpc/com.atproto.repo.createRecord") => {
                 state.create_count += 1;
-                state.create_bodies.push(serde_json::from_str(&request.body).unwrap());
+                let body: Value = serde_json::from_str(&request.body).unwrap();
+                state.create_bodies.push(body.clone());
                 let number = state.create_count;
+                let collection = body["collection"].as_str().unwrap_or("app.bsky.feed.post");
                 (
                     200,
                     vec![],
                     json!({
-                        "uri":format!("at://{DID}/app.bsky.feed.post/reply-{number}"),
+                        "uri":format!("at://{DID}/{collection}/record-{number}"),
                         "cid":"bafyreiedv4rjxnzxvlvlgqbi4vpqi3s4iuz4buywtkgfjpfjn2gix5cocu",
                         "commit":{"cid":"bafyreiedv4rjxnzxvlvlgqbi4vpqi3s4iuz4buywtkgfjpfjn2gix5cocu","rev":"3lq6p4xgrb22a"}
                     })
                     .to_string(),
+                )
+            }
+            path if path.starts_with("/xrpc/com.atproto.repo.deleteRecord") => {
+                (
+                    200,
+                    vec![],
+                    json!({"commit":{"cid":"bafyreiedv4rjxnzxvlvlgqbi4vpqi3s4iuz4buywtkgfjpfjn2gix5cocu","rev":"3lq6p4xgrb22a"}}).to_string(),
+                )
+            }
+            path if path.starts_with("/xrpc/app.bsky.graph.getMutes") => {
+                (200, vec![], json!({"mutes":[]}).to_string())
+            }
+            path if path.starts_with("/xrpc/app.bsky.graph.muteActor")
+                || path.starts_with("/xrpc/app.bsky.graph.unmuteActor") =>
+            {
+                (
+                    200,
+                    vec![("Content-Type", "application/octet-stream")],
+                    String::new(),
                 )
             }
             path if path.starts_with("/xrpc/com.atproto.repo.getRecord") => (
@@ -1662,12 +1683,19 @@ async fn write_response(stream: &mut TcpStream, status: u16, headers: &[(&str, &
         403 => "Forbidden",
         _ => "Not Found",
     };
+    let content_type = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| *value)
+        .unwrap_or("application/json");
     let mut response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len()
     );
     for (name, value) in headers {
-        response.push_str(&format!("{name}: {value}\r\n"));
+        if !name.eq_ignore_ascii_case("content-type") {
+            response.push_str(&format!("{name}: {value}\r\n"));
+        }
     }
     response.push_str("\r\n");
     response.push_str(body);
