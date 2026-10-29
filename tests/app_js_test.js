@@ -781,6 +781,11 @@ async function createInfiniteScrollHarness({ cards = ["post-1", "post-2"], mobil
         this.children.push(node);
       }
     }
+    insertBefore(node, reference) {
+      const index = this.children.indexOf(reference);
+      node.parentElement = this;
+      this.children.splice(index < 0 ? this.children.length : index, 0, node);
+    }
     after(...nodes) { this.afterNodes = [...(this.afterNodes || []), ...nodes]; }
     addEventListener(name, listener) { this.listeners.set(name, listener); }
     setAttribute(name, value) { this.attributes.set(name, String(value)); }
@@ -952,7 +957,10 @@ Deno.test("infinite scroll merges a new reply into an on-screen thread without r
   const postB = new harness.Element("article");
   postB.setAttribute("data-post-kind", "post");
   postB.setAttribute("data-post-uri", "thread-B");
-  existingGroup.append(postA, postB);
+  const threadMore = new harness.Element("a");
+  threadMore.className = "thread-more";
+  threadMore.textContent = "2 more replies";
+  existingGroup.append(postA, postB, threadMore);
   harness.list.append(existingGroup);
 
   const nextList = new harness.Element("ol");
@@ -976,6 +984,11 @@ Deno.test("infinite scroll merges a new reply into an on-screen thread without r
   assert(!existingGroup.removed, "the on-screen group must remain attached");
   assert(harness.list.children.includes(existingGroup));
   assert(existingGroup.children.includes(postC), "the new reply should join the on-screen group");
+  assertEquals(threadMore.textContent, "1 more reply");
+  assert(
+    existingGroup.children.indexOf(postC) < existingGroup.children.indexOf(threadMore),
+    "the more link should stay after the newly loaded reply",
+  );
   const uriCounts = new Map();
   const collect = (node) => {
     const uri = node.getAttribute?.("data-post-uri");
