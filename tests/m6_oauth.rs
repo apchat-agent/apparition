@@ -35,6 +35,7 @@ struct FakeOAuthFlow {
     pinned_feeds: Vec<ResolvedFeed>,
     author_profiles: Arc<Mutex<std::collections::HashMap<String, FetchedAuthorProfile>>>,
     profile_requests: Arc<Mutex<Vec<String>>>,
+    profile_delays_ms: Arc<Mutex<std::collections::HashMap<String, u64>>>,
 }
 
 impl Default for FakeOAuthFlow {
@@ -48,6 +49,7 @@ impl Default for FakeOAuthFlow {
             pinned_feeds: Vec::new(),
             author_profiles: Arc::new(Mutex::new(std::collections::HashMap::new())),
             profile_requests: Arc::new(Mutex::new(Vec::new())),
+            profile_delays_ms: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 }
@@ -76,6 +78,22 @@ fn fake_pds_create_record(
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_micros() as u64,
+    }
+}
+
+fn fake_feed_post(did: &str, rkey: &str, time_us: u64, text: &str) -> IndexedRecord {
+    IndexedRecord {
+        did: did.to_owned(),
+        collection: "app.bsky.feed.post".to_owned(),
+        rkey: rkey.to_owned(),
+        uri: format!("at://{did}/app.bsky.feed.post/{rkey}"),
+        cid: Some(format!("{rkey}-cid")),
+        time_us,
+        record: serde_json::json!({
+            "$type":"app.bsky.feed.post",
+            "text":text,
+            "createdAt":"2026-10-28T00:00:00Z"
+        }),
     }
 }
 
@@ -203,6 +221,16 @@ impl OAuthFlow for FakeOAuthFlow {
     ) -> Pin<Box<dyn Future<Output = Result<FetchedAuthorProfile, String>> + Send + 'a>> {
         Box::pin(async move {
             self.profile_requests.lock().unwrap().push(did.to_owned());
+            let delay_ms = self
+                .profile_delays_ms
+                .lock()
+                .unwrap()
+                .get(did)
+                .copied()
+                .unwrap_or_default();
+            if delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
             self.author_profiles
                 .lock()
                 .unwrap()
@@ -368,6 +396,31 @@ async fn finish_login(app: &Router) -> String {
                 .then(|| value.split(';').next().unwrap().to_owned())
         })
         .unwrap()
+}
+
+async fn get_html(app: &Router, uri: &str, cookie: &str) -> String {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{uri}");
+    String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap()
 }
 
 #[derive(Clone)]
@@ -784,7 +837,7 @@ async fn bsky_style_shell_renders_navigation_pinned_feed_tabs_and_post_actions()
 }
 
 #[tokio::test]
-async fn quote_composer_shows_post_and_quote_write_is_indexed_with_one_notification() {
+async fn quote_composer_quotes_existing_quote_posts_and_notifies_once() {
     let storage = Arc::new(MemoryStorage::default());
     let quote_uri = "at://did:plc:author/app.bsky.feed.post/original";
     storage
@@ -801,7 +854,11 @@ async fn quote_composer_shows_post_and_quote_write_is_indexed_with_one_notificat
             record: serde_json::json!({
                 "$type":"app.bsky.feed.post",
                 "text":"quoted <script>text</script>",
-                "createdAt":"2026-10-28T00:00:00Z"
+                "createdAt":"2026-10-28T00:00:00Z",
+                "embed":{
+                    "$type":"app.bsky.embed.record",
+                    "record":{"uri":"at://did:plc:root/app.bsky.feed.post/already-quoted","cid":"nested-cid"}
+                }
             }),
         })
         .unwrap();
@@ -2918,6 +2975,97 @@ async fn page_fetches_missing_author_profile_stores_it_and_keeps_avatar_url_safe
 }
 
 #[tokio::test]
+async fn profile_fetch_order_deduplicates_page_authors_and_negative_caches_failures() {
+    let storage = Arc::new(MemoryStorage::default());
+    let first = "did:plc:first";
+    let second = "did:plc:second";
+    for author in [first, second] {
+        storage.set_follow("did:plc:alice", author, true).unwrap();
+    }
+    storage
+        .put_record(&fake_feed_post(first, "top", 30, "top from first"))
+        .unwrap();
+    storage
+        .put_record(&fake_feed_post(second, "middle", 20, "middle from second"))
+        .unwrap();
+    storage
+        .put_record(&fake_feed_post(first, "lower", 10, "lower from first"))
+        .unwrap();
+    let flow = FakeOAuthFlow::default();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow.clone(), storage.clone());
+    let cookie = finish_login(&app).await;
+
+    let first_html = get_html(&app, "/app", &cookie).await;
+    assert!(
+        first_html.find("top from first").unwrap() < first_html.find("middle from second").unwrap()
+    );
+    assert_eq!(
+        flow.profile_requests.lock().unwrap().as_slice(),
+        [first, second]
+    );
+    assert_eq!(
+        storage.pending_handle_refreshes(10).unwrap(),
+        [first.to_owned(), second.to_owned()]
+    );
+
+    let second_html = get_html(&app, "/app", &cookie).await;
+    assert!(second_html.contains("top from first"));
+    assert_eq!(
+        flow.profile_requests.lock().unwrap().as_slice(),
+        [first, second],
+        "the fresh negative cache should prevent another PDS read"
+    );
+    let status = storage.profile_index_snapshot().unwrap();
+    assert!(!status[first].has_profile);
+    assert!(!status[second].has_profile);
+}
+
+#[tokio::test]
+async fn profile_budget_keeps_page_rendering_and_queues_timed_out_authors_in_order() {
+    let storage = Arc::new(MemoryStorage::default());
+    let authors = [
+        "did:plc:slow-first",
+        "did:plc:slow-second",
+        "did:plc:slow-third",
+    ];
+    let flow = FakeOAuthFlow::default();
+    for (index, author) in authors.iter().enumerate() {
+        storage.set_follow("did:plc:alice", author, true).unwrap();
+        storage
+            .put_record(&fake_feed_post(
+                author,
+                &format!("slow-{index}"),
+                30 - index as u64,
+                &format!("visible slow post {index}"),
+            ))
+            .unwrap();
+        flow.profile_delays_ms
+            .lock()
+            .unwrap()
+            .insert((*author).to_owned(), 2_000);
+    }
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow.clone(), storage.clone());
+    let cookie = finish_login(&app).await;
+
+    let html = get_html(&app, "/app", &cookie).await;
+    assert!(html.contains("visible slow post 0"));
+    assert!(html.contains("visible slow post 2"));
+    assert_eq!(flow.profile_requests.lock().unwrap().as_slice(), authors);
+    assert_eq!(
+        storage.pending_profile_fetches(10).unwrap(),
+        authors.map(str::to_owned)
+    );
+    assert_eq!(
+        storage.pending_handle_refreshes(10).unwrap(),
+        authors.map(str::to_owned)
+    );
+}
+
+#[tokio::test]
 async fn thread_page_uses_large_focus_post_stats_chain_lines_and_reply_bar() {
     let storage = Arc::new(MemoryStorage::default());
     let root_uri = "at://did:plc:root/app.bsky.feed.post/root";
@@ -2964,9 +3112,21 @@ async fn thread_page_uses_large_focus_post_stats_chain_lines_and_reply_bar() {
             rkey: "reply-one".into(),
             uri: "at://did:plc:author/app.bsky.feed.post/reply-one".into(),
             cid: Some("reply-one-cid".into()),
-            time_us: 4,
+            time_us: 6,
             record: serde_json::json!({
                 "text":"first chain reply",
+                "reply":{"root":{"uri":root_uri,"cid":"root-cid"},"parent":{"uri":focus_uri,"cid":"focus-cid"}}
+            }),
+        },
+        IndexedRecord {
+            did: "did:plc:other-author".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "reply-three".into(),
+            uri: "at://did:plc:other-author/app.bsky.feed.post/reply-three".into(),
+            cid: Some("reply-three-cid".into()),
+            time_us: 4,
+            record: serde_json::json!({
+                "text":"different author reply",
                 "reply":{"root":{"uri":root_uri,"cid":"root-cid"},"parent":{"uri":focus_uri,"cid":"focus-cid"}}
             }),
         },
@@ -3063,6 +3223,14 @@ async fn thread_page_uses_large_focus_post_stats_chain_lines_and_reply_bar() {
     assert_eq!(html.matches("thread-continues").count(), 1, "{html}");
     assert!(html.contains("aria-label=\"Mobile reply bar\""), "{html}");
     assert!(html.contains("Write your reply"), "{html}");
+    assert!(
+        html.contains("aria-label=\"Mobile search\""),
+        "thread mobile navigation should include its search tab"
+    );
+    assert!(
+        html.contains("mobile-profile-avatar"),
+        "thread mobile navigation should show the viewer avatar"
+    );
     assert!(html.contains("aria-pressed=\"true\""), "{html}");
     assert!(!html.contains("0 quotes"), "{html}");
 
