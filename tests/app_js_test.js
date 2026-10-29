@@ -919,6 +919,57 @@ Deno.test("av33: a video in an appended card gets a native HLS source", async ()
   assertEquals(video.dataset.videoInitialized, "true", "the appended video should initialize only once");
 });
 
+Deno.test("av33: a pending quote replaces its loading placeholder with the fetched card", async () => {
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  const start = source.indexOf("function fillDeferredQuotes(");
+  const end = source.indexOf("\nfillDeferredQuotes();", start);
+  assert(start >= 0 && end > start, "app.js should install deferred quote fills");
+  const fillDeferredQuotes = new Function(`${source.slice(start, end)}; return fillDeferredQuotes;`)();
+  const card = {
+    dataset: {},
+    matches() { return false; },
+    querySelectorAll() { return []; },
+  };
+  const placeholder = {
+    dataset: {},
+    matches(selector) { return selector === "[data-quote-fragment]"; },
+    querySelectorAll() { return []; },
+    getAttribute(name) {
+      return ({
+        "data-quote-fragment": "/quote-fragment?uri=at%3A%2F%2Fdid%3Aplc%3Aauthor%2Fapp.bsky.feed.post%2Fpost",
+      })[name] ?? null;
+    },
+    replaceWith(node) { this.replacedWith = node; },
+  };
+  let request;
+  const originalFetch = globalThis.fetch;
+  const originalDocument = globalThis.document;
+  const originalDOMParser = globalThis.DOMParser;
+  globalThis.document = { createElement() { return {}; } };
+  globalThis.DOMParser = class {
+    parseFromString(html) {
+      assert(html.includes("quoted-post-card"));
+      return { querySelector(selector) { return selector === ".quoted-post-card" ? card : null; } };
+    }
+  };
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return { ok: true, text: async () => "<article class=\"quoted-post-card\">Loaded quote</article>" };
+  };
+  try {
+    fillDeferredQuotes(placeholder);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEquals(request.url, placeholder.getAttribute("data-quote-fragment"));
+    assertEquals(request.options.credentials, "same-origin");
+    assertEquals(request.options.headers.Accept, "text/html");
+    assertEquals(placeholder.replacedWith, card);
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.document = originalDocument;
+    globalThis.DOMParser = originalDOMParser;
+  }
+});
+
 Deno.test("infinite scroll errors wait for an explicit retry and do not storm requests", async () => {
   const pages = {};
   const harness = await createInfiniteScrollHarness({
