@@ -2440,14 +2440,10 @@ async fn hydrate_page_content<F: OAuthFlow, S: Storage + 'static>(
     tokio::task::yield_now().await;
     let profile_fast_path = async move {
         let started = std::time::Instant::now();
-        match tokio::time::timeout(Duration::from_millis(25), profile_task).await {
-            Ok(Ok(result)) => result.map(|_| started.elapsed().as_millis() as u64),
-            Ok(Err(error)) => {
+        match profile_task.await {
+            Ok(result) => result.map(|_| started.elapsed().as_millis() as u64),
+            Err(error) => {
                 tracing::warn!(%error, "page profile hydration task failed");
-                Ok(started.elapsed().as_millis() as u64)
-            }
-            Err(_) => {
-                tracing::debug!("page profile hydration continued in background");
                 Ok(started.elapsed().as_millis() as u64)
             }
         }
