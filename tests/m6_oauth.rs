@@ -26,7 +26,7 @@ use tower::ServiceExt;
 use tracing::{Event, Subscriber, field::Visit};
 use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
-const EXPECTED_OAUTH_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=did:web:video.bsky.app rpc:app.bsky.video.uploadVideo?aud=did:web:video.bsky.app rpc:app.bsky.video.getJobStatus?aud=did:web:video.bsky.app";
+const EXPECTED_OAUTH_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=*";
 
 #[derive(Clone)]
 struct ProfileHydrationTiming(Arc<Mutex<Option<u64>>>);
@@ -1241,7 +1241,7 @@ async fn sign_in_error_page_uses_the_shared_mobile_document_shell() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(response.status(), StatusCode::OK);
     let html = String::from_utf8(
         response
             .into_body()
@@ -1255,6 +1255,8 @@ async fn sign_in_error_page_uses_the_shared_mobile_document_shell() {
     assert!(
         html.contains("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">")
     );
+    assert!(html.contains("Login failed, try again"));
+    assert!(html.contains("href=\"/login\""));
     assert!(html.contains("href=\"/static/app.css?v=m14\""));
     assert!(!html.contains("style="));
     // The shared shell loads both local deferred scripts, never inline code.
@@ -1613,7 +1615,7 @@ async fn web_callback_rejects_a_forged_login_cookie_independently_of_the_flow() 
 }
 
 #[tokio::test]
-async fn callback_turns_an_upstream_panic_into_an_error_response() {
+async fn callback_turns_an_upstream_panic_into_a_login_retry_page() {
     let app = OAuthPublic::new("https://appview.example")
         .unwrap()
         .router_with_flow(PanicCallbackFlow, Arc::new(MemoryStorage::default()));
@@ -1628,7 +1630,17 @@ async fn callback_turns_an_upstream_panic_into_an_error_response() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .contains("text/html")
+    );
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(html.contains("Login failed, try again"), "{html}");
+    assert!(html.contains("href=\"/login\""), "{html}");
 }
 
 #[tokio::test]
