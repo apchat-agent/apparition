@@ -5660,3 +5660,55 @@ async fn callback_rejects_sessions_without_the_required_atproto_scope() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(!storage.is_registered("did:plc:alice").unwrap());
 }
+
+#[tokio::test]
+async fn profile_page_shows_relationship_and_actions_for_other_accounts_only() {
+    let storage = Arc::new(MemoryStorage::default());
+    storage
+        .put_record(&IndexedRecord {
+            did: "did:plc:alice".into(),
+            collection: "app.bsky.graph.follow".into(),
+            rkey: "friend-follow".into(),
+            uri: "at://did:plc:alice/app.bsky.graph.follow/friend-follow".into(),
+            cid: Some("follow-cid".into()),
+            time_us: 2,
+            record: serde_json::json!({"subject":"did:plc:friend"}),
+        })
+        .unwrap();
+    storage
+        .set_follow("did:plc:alice", "did:plc:friend", true)
+        .unwrap();
+    storage
+        .set_follow("did:plc:friend", "did:plc:alice", true)
+        .unwrap();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage);
+    let cookie = finish_login(&app).await;
+
+    let other = get_html(&app, "/profile?did=did%3Aplc%3Afriend", &cookie).await;
+    assert!(other.contains("class=\"profile-actions\""), "{other}");
+    assert!(other.contains("You follow this account"), "{other}");
+    assert!(other.contains("Follows you"), "{other}");
+    assert!(other.contains("Unfollow"), "{other}");
+
+    let own = get_html(&app, "/profile?did=did%3Aplc%3Aalice", &cookie).await;
+    assert!(!own.contains("class=\"profile-actions\""), "{own}");
+    assert!(!own.contains("name=\"subject\""), "{own}");
+}
+
+#[tokio::test]
+async fn old_scope_profile_shows_per_action_reauthorization_messages() {
+    let storage = Arc::new(MemoryStorage::default());
+    let old_scope = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=*";
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::with_granted_scope(Some(old_scope)), storage);
+    let cookie = finish_login(&app).await;
+    let html = get_html(&app, "/profile?did=did%3Aplc%3Afriend", &cookie).await;
+
+    assert!(html.contains("Sign in again to follow"), "{html}");
+    assert!(html.contains("Sign in again to block"), "{html}");
+    assert!(html.contains("Sign in again to mute"), "{html}");
+    assert!(html.contains("Sign in again to add to lists"), "{html}");
+}
