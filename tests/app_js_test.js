@@ -775,6 +775,19 @@ async function createInfiniteScrollHarness({ cards = ["post-1", "post-2"], mobil
       this.removed = false;
       this.hidden = false;
     }
+    querySelectorAll(selector) {
+      const matches = [];
+      const visit = (node) => {
+        for (const child of node.children || []) {
+          if (selector === "video[data-video-playlist]" && child.tagName === "VIDEO" && child.getAttribute("data-video-playlist")) {
+            matches.push(child);
+          }
+          visit(child);
+        }
+      };
+      visit(this);
+      return matches;
+    }
     append(...nodes) {
       for (const node of nodes) {
         node.parentElement = this;
@@ -875,6 +888,36 @@ async function createInfiniteScrollHarness({ cards = ["post-1", "post-2"], mobil
     windowMock,
   };
 }
+
+Deno.test("av33: a video in an appended card gets a native HLS source", async () => {
+  const pages = {};
+  const harness = await createInfiniteScrollHarness({
+    responses: [{ ok: true, text: async () => "page-two" }],
+    pages,
+  });
+  const card = new harness.Element("li", "post-video");
+  const playlist = "https://video.bsky.app/watch/did%3Aplc%3Atest/cid/playlist.m3u8";
+  const video = {
+    tagName: "VIDEO",
+    dataset: {},
+    attributes: new Map([["data-video-playlist", playlist]]),
+    src: "",
+    getAttribute(name) { return this.attributes.get(name) ?? null; },
+    canPlayType(type) { return type === "application/vnd.apple.mpegurl" ? "maybe" : ""; },
+  };
+  card.append(video);
+  const nextList = new harness.Element("ol");
+  nextList.className = "post-list";
+  nextList.append(card);
+  pages["page-two"] = { list: nextList, link: null };
+
+  harness.Observer.latest.target.top = -1;
+  harness.scroll();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assertEquals(video.src, playlist, "native-HLS browsers need a playlist source on appended videos");
+  assertEquals(video.dataset.videoInitialized, "true", "the appended video should initialize only once");
+});
 
 Deno.test("infinite scroll errors wait for an explicit retry and do not storm requests", async () => {
   const pages = {};

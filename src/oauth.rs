@@ -8847,6 +8847,119 @@ mod tests {
     }
 
     #[test]
+    fn av33_pending_quote_renders_a_deferred_fragment_placeholder() {
+        let storage = MemoryStorage::default();
+        let uri = "at://did:plc:quoted-author/app.bsky.feed.post/quoted";
+        let embed = quote_embed(uri);
+        let index = HashMap::from([(uri.to_owned(), QuoteRenderState::Pending)]);
+
+        let rendered = render_web_quote(&storage, &embed, &index, 0);
+
+        assert!(rendered.contains("data-quote-fragment=\"/quote-fragment?uri="), "{rendered}");
+        assert!(rendered.contains("Loading quoted post"), "{rendered}");
+        assert!(!rendered.contains(">Quoted post</a>"), "{rendered}");
+    }
+
+    #[test]
+    fn av33_nested_quote_link_keeps_its_label_and_adds_the_known_author_handle() {
+        let storage = MemoryStorage::default();
+        let did = "did:plc:nested-author";
+        storage.set_verified_handle(did, "nested.author.test").unwrap();
+        let embed = quote_embed(&format!("at://{did}/app.bsky.feed.post/nested"));
+
+        let rendered = render_web_quote(&storage, &embed, &QuoteRenderIndex::new(), 1);
+
+        assert!(rendered.contains("Quoted post"), "{rendered}");
+        assert!(rendered.contains("@nested.author.test"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn av33_timeline_group_ancestor_quote_uses_the_page_quote_hydration_batch() {
+        let storage = Arc::new(MemoryStorage::default());
+        let viewer = "did:plc:av33-viewer";
+        let author = "did:plc:av33-thread-author";
+        let root = test_web_post(author, "root", 1, "Thread group ancestor", None);
+        let quote = test_web_post(
+            "did:plc:av33-quoted-author",
+            "quoted",
+            1,
+            "Hydrated ancestor quote body",
+            None,
+        );
+        let mut root_with_quote = root.clone();
+        root_with_quote.record["embed"] = quote_embed(&quote.uri);
+        let first = test_web_post(author, "reply-1", 2, "Thread reply one", Some(&root.uri));
+        let newest = test_web_post(author, "reply-2", 3, "Thread reply two", Some(&first.uri));
+        for record in [&first, &newest] {
+            storage.put_record(record).unwrap();
+        }
+        storage.set_follow(viewer, author, true).unwrap();
+        let flow = QuoteHydrationTestFlow::new([root_with_quote, quote.clone()]);
+
+        let page = request_test_timeline_at_with_flow(
+            storage,
+            viewer,
+            "/app?limit=2",
+            flow.clone(),
+        )
+        .await;
+
+        assert!(page.contains("class=\"post-item thread-group\""), "{page}");
+        assert!(page.contains("Thread group ancestor"), "{page}");
+        assert!(page.contains("Hydrated ancestor quote body"), "{page}");
+        let mut fetched = flow.fetched.lock().unwrap().clone();
+        fetched.sort();
+        let mut expected = vec![root.uri, quote.uri];
+        expected.sort();
+        assert_eq!(fetched, expected, "one parent fetch and one batched quote fetch");
+    }
+
+    #[tokio::test]
+    async fn av33_quote_fragment_endpoint_returns_the_fetched_quoted_post_card() {
+        let storage = Arc::new(MemoryStorage::default());
+        let viewer = "did:plc:av33-fragment-viewer";
+        let quoted = test_web_post(
+            "did:plc:av33-fragment-author",
+            "fragment",
+            1,
+            "Fetched quote fragment body",
+            None,
+        );
+        let flow = QuoteHydrationTestFlow::new([quoted.clone()]);
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let session_id = "av33-quote-fragment-session";
+        let generation = storage.rotate_web_session(viewer, session_id).unwrap();
+        let token = public.issue_session_cookie(
+            viewer,
+            session_id,
+            generation,
+            SessionPermissions {
+                write: false,
+                feed: false,
+                blob: false,
+                video: false,
+            },
+        );
+        let app = public.router_with_flow(flow, storage);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/quote-fragment?uri={}", form_encoded(&quoted.uri)))
+                    .header("cookie", format!("{SESSION_COOKIE}={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let fragment = String::from_utf8(body.to_vec()).unwrap();
+        assert!(fragment.contains("class=\"quoted-post-card\""), "{fragment}");
+        assert!(fragment.contains("Fetched quote fragment body"), "{fragment}");
+    }
+
+    #[test]
     fn video_oauth_scopes_are_explicit_and_old_scopes_do_not_enable_video() {
         for scope in [
             "blob:video/*",
@@ -9682,6 +9795,74 @@ mod tests {
 
         let refreshed_page = request_test_timeline_with_flow(storage, viewer, flow).await;
         assert!(refreshed_page.contains("@original.cache.test"));
+    }
+
+    fn quote_embed(uri: &str) -> Value {
+        json!({
+            "$type":"app.bsky.embed.record",
+            "record":{
+                "$type":"app.bsky.embed.record#view",
+                "record":{"$type":"app.bsky.feed.defs#postView","uri":uri,"cid":"quote-cid"}
+            }
+        })
+    }
+
+    #[derive(Clone)]
+    struct QuoteHydrationTestFlow {
+        records: Arc<HashMap<String, IndexedRecord>>,
+        fetched: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl QuoteHydrationTestFlow {
+        fn new(records: impl IntoIterator<Item = IndexedRecord>) -> Self {
+            Self {
+                records: Arc::new(
+                    records
+                        .into_iter()
+                        .map(|record| (record.uri.clone(), record))
+                        .collect(),
+                ),
+                fetched: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl OAuthFlow for QuoteHydrationTestFlow {
+        fn authorize<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async { Err("test flow does not authorize".to_owned()) })
+        }
+
+        fn callback<'a>(
+            &'a self,
+            _: OAuthCallback,
+        ) -> Pin<Box<dyn Future<Output = Result<OAuthAccount, String>> + Send + 'a>> {
+            Box::pin(async { Err("test flow does not callback".to_owned()) })
+        }
+
+        fn logout<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn fetch_post<'a>(
+            &'a self,
+            uri: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<IndexedRecord, String>> + Send + 'a>> {
+            let uri = uri.to_owned();
+            self.fetched.lock().unwrap().push(uri.clone());
+            let record = self
+                .records
+                .get(&uri)
+                .cloned()
+                .ok_or_else(|| "fixture post was not found".to_owned());
+            Box::pin(async move { record })
+        }
     }
 
     fn test_web_post(

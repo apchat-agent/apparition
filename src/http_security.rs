@@ -242,6 +242,36 @@ mod tests {
     };
     use tower::ServiceExt;
 
+    #[tokio::test]
+    async fn av33_csp_allows_the_video_cdn_redirect_origin_for_playback_and_thumbnails() {
+        let router = protect(
+            axum::Router::new().route("/", get(|| async { "ok" })),
+            false,
+        );
+        let response = router
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap();
+
+        for directive in ["img-src", "media-src", "connect-src"] {
+            let policy = csp
+                .split(';')
+                .map(str::trim)
+                .find(|policy| policy.starts_with(directive))
+                .unwrap();
+            assert!(
+                policy.contains("https://video.cdn.bsky.app"),
+                "{directive} must permit the video service's redirected CDN host: {policy}"
+            );
+        }
+    }
+
     struct CapturedMakeWriter(Arc<Mutex<Vec<u8>>>);
 
     struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
