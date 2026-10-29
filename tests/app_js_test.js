@@ -240,3 +240,85 @@ Deno.test("image canvas resize bounds JPEG bytes and dimensions", async () => {
   assertEquals(result.height, 1000);
   assert(draws.length > 0);
 });
+
+Deno.test("alt suggestion loads only after its button is clicked and protects edits", async () => {
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  globalThis.document = {
+    addEventListener() {},
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+  };
+  globalThis.window = { visualViewport: { addEventListener() {} } };
+  const attachAltSuggestion = new Function(`${source}; return attachAltSuggestion;`)();
+  assertEquals(typeof attachAltSuggestion, "function");
+
+  let clickHandler;
+  let modelLoads = 0;
+  const button = {
+    disabled: false,
+    addEventListener(name, listener) {
+      assertEquals(name, "click");
+      clickHandler = listener;
+    },
+    click() {
+      return clickHandler();
+    },
+  };
+  const item = { file: { name: "local.jpg" }, alt: "", suggestedAlt: "" };
+  const altInput = { value: "" };
+  const status = { textContent: "" };
+  const progress = { hidden: true, max: 0, value: 0 };
+  const suggestions = ["A dog on a beach.", "A brown dog on a beach.", "A dog beside the sea."];
+  const loader = async () => {
+    modelLoads++;
+    return { caption: async () => suggestions.shift() };
+  };
+
+  attachAltSuggestion(button, item, altInput, status, progress, loader);
+  assertEquals(modelLoads, 0, "the model must stay unloaded until the user taps the button");
+  await button.click();
+  assertEquals(modelLoads, 1);
+  assertEquals(altInput.value, "A dog on a beach.");
+  assertEquals(item.alt, "A dog on a beach.");
+
+  altInput.value = "My own description.";
+  await button.click();
+  assertEquals(altInput.value, "My own description.", "a user edit must win over a later suggestion");
+  altInput.value = "A dog on a beach.";
+  await button.click();
+  assertEquals(altInput.value, "A dog beside the sea.", "the previous suggestion may be replaced");
+});
+
+Deno.test("alt suggestion failure leaves the alt text alone and reports a short message", async () => {
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  globalThis.document = {
+    addEventListener() {},
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+  };
+  globalThis.window = { visualViewport: { addEventListener() {} } };
+  const attachAltSuggestion = new Function(`${source}; return attachAltSuggestion;`)();
+  assertEquals(typeof attachAltSuggestion, "function");
+  let clickHandler;
+  const button = {
+    disabled: false,
+    addEventListener(_name, listener) {
+      clickHandler = listener;
+    },
+    click() {
+      return clickHandler();
+    },
+  };
+  const item = { file: { name: "local.jpg" }, alt: "Carefully written alt text", suggestedAlt: "" };
+  const altInput = { value: item.alt };
+  const status = { textContent: "" };
+  const progress = { hidden: true, max: 0, value: 0 };
+
+  attachAltSuggestion(button, item, altInput, status, progress, async () => {
+    throw new Error("fake model download failure");
+  });
+  await button.click();
+  assertEquals(altInput.value, "Carefully written alt text");
+  assert(status.textContent.length > 0, "a useful failure message should be visible");
+  assert(!button.disabled, "the button should be usable after a failure");
+});
