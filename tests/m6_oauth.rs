@@ -3139,6 +3139,81 @@ async fn page_fetches_missing_author_profile_stores_it_and_keeps_avatar_url_safe
 }
 
 #[tokio::test]
+async fn app_timeline_does_not_wait_for_slow_profile_hydration() {
+    let storage = Arc::new(MemoryStorage::default());
+    let author = "did:plc:slow-author";
+    storage.set_follow("did:plc:alice", author, true).unwrap();
+    storage
+        .put_record(&fake_feed_post(author, "post", 2, "visible immediately"))
+        .unwrap();
+    let flow = FakeOAuthFlow::default();
+    flow.profile_delays_ms
+        .lock()
+        .unwrap()
+        .insert(author.into(), 1_000);
+    flow.author_profiles.lock().unwrap().insert(
+        author.into(),
+        FetchedAuthorProfile {
+            profile: Some(IndexedRecord {
+                did: author.into(),
+                collection: "app.bsky.actor.profile".into(),
+                rkey: "self".into(),
+                uri: format!("at://{author}/app.bsky.actor.profile/self"),
+                cid: Some("profile-cid".into()),
+                time_us: 1_800_000_000_000_000,
+                record: serde_json::json!({
+                    "$type":"app.bsky.actor.profile",
+                    "displayName":"Slowly hydrated"
+                }),
+            }),
+            verified_handle: Some("slow-author.test".into()),
+        },
+    );
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage.clone());
+    let cookie = finish_login(&app).await;
+    let started = Instant::now();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(elapsed < Duration::from_millis(200), "took {elapsed:?}");
+    assert!(html.contains("visible immediately"), "{html}");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if storage
+                .get_record(author, "app.bsky.actor.profile", "self")
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background hydration should store the profile");
+}
+
+#[tokio::test]
 async fn profile_fetch_order_deduplicates_page_authors_and_negative_caches_failures() {
     let storage = Arc::new(MemoryStorage::default());
     let first = "did:plc:first";
