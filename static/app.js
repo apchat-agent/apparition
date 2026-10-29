@@ -372,6 +372,138 @@ if (altTestForm) {
   }
 }
 
+function installInfiniteScroll({
+  pageDocument = document,
+  pageWindow = window,
+  fetchPage = (...args) => fetch(...args),
+  parsePage = (html, selector) => {
+    const parsed = new DOMParser().parseFromString(html, "text/html");
+    return {
+      list: parsed.querySelector(selector),
+      link: parsed.querySelector('.pagination-link[rel="next"]'),
+    };
+  },
+  Observer = globalThis.IntersectionObserver,
+} = {}) {
+  const olderLink = pageDocument.querySelector('.pagination-link[rel="next"]');
+  const list = pageDocument.querySelector(".post-list, .notification-list");
+  if (!olderLink || !list) return;
+
+  const isNotificationList = list.classList?.contains("notification-list") ||
+    list.className.split(/\s+/).includes("notification-list");
+  const listSelector = isNotificationList ? ".notification-list" : ".post-list";
+  const layout = pageDocument.querySelector(".app-layout");
+  const isNarrow = pageWindow.matchMedia?.("(max-width: 799px)").matches || false;
+  const scrollRoot = pageDocument.querySelector(".mobile-nav") && isNarrow ? layout : null;
+  const scrollTarget = scrollRoot || pageWindow;
+  const status = pageDocument.createElement("p");
+  status.className = "infinite-scroll-status";
+  status.setAttribute("role", "status");
+  status.setAttribute("aria-live", "polite");
+  const retry = pageDocument.createElement("button");
+  retry.className = "infinite-scroll-retry";
+  retry.type = "button";
+  retry.textContent = "Retry";
+  retry.hidden = true;
+  olderLink.after(status, retry);
+
+  let sentinel;
+  let inFlight = false;
+  let stopped = false;
+  let retryRequired = false;
+
+  const pageCards = () => [...list.children].filter((item) => !item.className?.split(/\s+/).includes("empty-state"));
+  const positionSentinel = (cards = pageCards()) => {
+    if (!cards.length) {
+      sentinel = undefined;
+      return;
+    }
+    const nextSentinel = cards[Math.floor((cards.length - 1) / 2)];
+    if (sentinel && sentinel !== nextSentinel) observer?.unobserve(sentinel);
+    sentinel = nextSentinel;
+    sentinel.setAttribute("data-infinite-scroll-sentinel", "");
+    observer?.observe(sentinel);
+  };
+
+  const observer = Observer ? new Observer(() => checkPosition(), { root: scrollRoot, threshold: 0 }) : null;
+
+  const rootTop = () => scrollRoot?.getBoundingClientRect().top ?? 0;
+  const updateStatus = (message) => {
+    status.textContent = message;
+  };
+
+  const finish = (message) => {
+    stopped = true;
+    observer?.disconnect();
+    updateStatus(message);
+    olderLink.remove();
+  };
+
+  const appendCards = (nextList) => {
+    const newCards = [...nextList.children].filter((item) => !item.className?.split(/\s+/).includes("empty-state"));
+    for (const empty of [...list.children].filter((item) => item.className?.split(/\s+/).includes("empty-state"))) {
+      empty.remove();
+    }
+    for (const card of newCards) list.append(card);
+    return newCards;
+  };
+
+  const loadNextPage = async (manualRetry = false) => {
+    if (stopped || inFlight || (retryRequired && !manualRetry)) return;
+    const href = olderLink.getAttribute("href") || olderLink.href;
+    if (!href) {
+      finish("You’re all caught up.");
+      return;
+    }
+    inFlight = true;
+    retryRequired = false;
+    retry.hidden = true;
+    updateStatus("Loading older posts…");
+    try {
+      const response = await fetchPage(href, {
+        credentials: "same-origin",
+        headers: { Accept: "text/html" },
+      });
+      if (!response.ok) throw new Error(`Request failed (${response.status}).`);
+      const page = parsePage(await response.text(), listSelector);
+      if (!page?.list) throw new Error("The next page could not be read.");
+      const appended = appendCards(page.list);
+      if (!page.link) {
+        finish("You’re all caught up.");
+        return;
+      }
+      const nextHref = page.link.getAttribute("href") || page.link.href;
+      if (!nextHref) {
+        finish("You’re all caught up.");
+        return;
+      }
+      olderLink.setAttribute("href", nextHref);
+      olderLink.href = nextHref;
+      olderLink.textContent = page.link.textContent || "Older";
+      updateStatus("");
+      positionSentinel(appended.length ? appended : pageCards());
+    } catch {
+      retryRequired = true;
+      updateStatus("Couldn’t load more. Try again.");
+      retry.hidden = false;
+    } finally {
+      inFlight = false;
+    }
+  };
+
+  function checkPosition() {
+    if (stopped || inFlight || retryRequired || !sentinel) return;
+    if (sentinel.getBoundingClientRect().top <= rootTop()) void loadNextPage();
+  }
+
+  retry.addEventListener("click", () => void loadNextPage(true));
+  scrollTarget.addEventListener("scroll", checkPosition, { passive: true });
+  positionSentinel();
+  checkPosition();
+}
+
+installInfiniteScroll();
+
 // Phones: the app frame is pinned to the screen (app.css), so the document itself should never be scrolled. iOS can
 // still leave it scrolled after the keyboard closes; put it back.
 const resetDocumentScroll = () => {

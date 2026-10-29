@@ -454,8 +454,9 @@ Deno.test("posting completes while an alt suggestion is still running", async ()
 
 Deno.test("infinite scroll loads once past the newest page midpoint in the pinned phone frame", async () => {
   const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
-  const installInfiniteScroll = new Function(`${source}; return installInfiniteScroll;`)();
-  assertEquals(typeof installInfiniteScroll, "function", "app.js should expose its infinite-scroll installer");
+  const setupSourceEnd = source.indexOf("\ninstallInfiniteScroll();");
+  assert(setupSourceEnd > 0, "app.js should automatically install infinite scroll after defining it");
+  const setupSource = source.slice(0, setupSourceEnd);
 
   class Element {
     constructor(tag = "div", uri = "") {
@@ -496,6 +497,7 @@ Deno.test("infinite scroll loads once past the newest page midpoint in the pinne
     }
     observe(target) { this.target = target; }
     unobserve(target) { if (this.target === target) this.target = null; }
+    disconnect() { this.target = null; }
     fire(isIntersecting = true) {
       this.callback([{ target: this.target, isIntersecting }]);
     }
@@ -506,6 +508,7 @@ Deno.test("infinite scroll loads once past the newest page midpoint in the pinne
   list.className = "post-list";
   list.append(...initialCards);
   const layout = new Element("div");
+  layout.top = 0;
   const link = new Link("/older-a");
   const documentMock = {
     addEventListener() {},
@@ -542,13 +545,15 @@ Deno.test("infinite scroll loads once past the newest page midpoint in the pinne
   nextList.className = "post-list";
   nextList.append(...nextCards);
   let parsedPage;
+  const installInfiniteScroll = new Function(`${setupSource}; return installInfiniteScroll;`)();
+  assertEquals(typeof installInfiniteScroll, "function", "app.js should expose its infinite-scroll installer");
   installInfiniteScroll({
-    fetch: (url) => {
+    fetchPage: (url) => {
       requests.push(url);
       return pendingResponse;
     },
     parsePage: () => parsedPage,
-    IntersectionObserver: Observer,
+    Observer,
   });
 
   assertEquals(Observer.latest.options.root, layout, "the narrow pinned app should observe its real scroll container");
