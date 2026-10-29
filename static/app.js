@@ -275,7 +275,7 @@ function attachAltSuggestion(button, item, altInput, status, progress, loadModel
 }
 
 async function handleImageComposerSubmit(form, selected, selectionInvalid, event, helpers = {}) {
-  const input = form.querySelector("[data-image-input]");
+  const input = form.querySelector("[data-media-input]");
   if (!selected.length && !input?.files?.length) return;
   event.preventDefault();
   const button = form.querySelector('button[type="submit"]');
@@ -294,6 +294,7 @@ async function handleImageComposerSubmit(form, selected, selectionInvalid, event
       images.push({ ...resized, filename, alt: item.alt });
     }
     const data = new FormData(form);
+    data.delete("media");
     data.delete("images");
     data.delete("alts");
     for (const image of images) {
@@ -335,6 +336,41 @@ function videoMimeType(file) {
   return ({ mp4: "video/mp4", webm: "video/webm", mov: "video/quicktime" })[extension] || "";
 }
 
+function selectComposerMedia(current, incoming, videoAccess = true, imageAccess = true) {
+  const existing = current || [];
+  const files = [...(incoming || [])];
+  if (!files.length) {
+    return { kind: existing.some((item) => item.kind === "video") ? "video" : existing.length ? "images" : "none", items: existing, message: "" };
+  }
+
+  const kinds = files.map((file) => {
+    if ((file.type || "").startsWith("image/") || /\.(jpe?g|png|webp|gif)$/i.test(file.name || "")) return "image";
+    if ((file.type || "").startsWith("video/") || videoMimeType(file)) return "video";
+    return "unsupported";
+  });
+  const unchanged = (message) => ({ kind: "error", items: existing, message });
+  if (kinds.includes("unsupported")) return unchanged("Choose images or one MP4, WebM, or MOV video.");
+  if (new Set(kinds).size > 1) return unchanged("Choose either images or one video, not both.");
+
+  const kind = kinds[0];
+  if (kind === "image") {
+    if (!imageAccess) return unchanged("Log in again to enable pictures.");
+    if (existing.some((item) => item.kind === "video")) {
+      return unchanged("Remove the selected video before choosing images.");
+    }
+    if (existing.length + files.length > 4) return unchanged("Choose no more than 4 images.");
+    return { kind: "images", items: [...existing, ...files.map((file) => ({ file, kind: "image" }))], message: "" };
+  }
+
+  if (!files.every((file) => videoMimeType(file))) return unchanged("Choose an MP4, WebM, or MOV video.");
+  if (!videoAccess) return unchanged("sign in again to post videos");
+  if (existing.some((item) => item.kind === "image")) {
+    return unchanged("Remove the selected images before choosing a video.");
+  }
+  if (existing.length + files.length > 1) return unchanged("Choose one video per post.");
+  return { kind: "video", items: [...existing, ...files.map((file) => ({ file, kind: "video" }))], message: "" };
+}
+
 function formatVideoDuration(seconds) {
   if (!Number.isFinite(seconds) || seconds < 0) return "Unknown duration";
   const whole = Math.floor(seconds);
@@ -347,11 +383,47 @@ function probeVideoMetadata(videoUrl, createElement = (tag) => document.createEl
   return new Promise((resolve, reject) => {
     const video = createElement("video");
     video.preload = "metadata";
-    video.onloadedmetadata = () => resolve({
-      duration: video.duration,
-      width: video.videoWidth,
-      height: video.videoHeight,
-    });
+    let metadata;
+    let complete = false;
+    let fallback;
+    const finish = (posterUrl = "") => {
+      if (complete || !metadata) return;
+      complete = true;
+      clearTimeout(fallback);
+      resolve({ ...metadata, posterUrl });
+    };
+    const capturePoster = () => {
+      if (complete || !metadata) return;
+      let posterUrl = "";
+      try {
+        const canvas = createElement("canvas");
+        const scale = Math.min(1, 640 / metadata.width);
+        canvas.width = Math.max(1, Math.round(metadata.width * scale));
+        canvas.height = Math.max(1, Math.round(metadata.height * scale));
+        const context = canvas.getContext("2d");
+        if (context) {
+          context.drawImage(video, 0, 0, canvas.width, canvas.height);
+          posterUrl = previewImageObjectUrl(canvas.toDataURL("image/jpeg", 0.82));
+        }
+      } catch {
+        // Some codecs cannot be drawn to canvas; the local video preview remains available.
+      }
+      finish(posterUrl);
+    };
+    video.onloadedmetadata = () => {
+      metadata = {
+        duration: video.duration,
+        width: video.videoWidth,
+        height: video.videoHeight,
+      };
+      fallback = setTimeout(() => finish(), 1200);
+      video.onseeked = capturePoster;
+      try {
+        video.currentTime = Math.min(0.5, video.duration / 2);
+      } catch {
+        finish();
+      }
+    };
     video.onerror = () => reject(new Error("The selected video could not be opened."));
     video.src = videoUrl;
   });
@@ -378,6 +450,8 @@ async function handleVideoComposerSubmit(form, selected, event, helpers = {}) {
     if ([...alt].length > MAX_VIDEO_ALT_CHARS) throw new Error("Video alt text must be no more than 2,000 characters.");
     const Data = helpers.FormData || FormData;
     const data = new Data(form);
+    data.delete("media");
+    data.delete("images");
     const FileType = helpers.File || File;
     data.set("video", new FileType([selected.file], selected.file.name || "video", { type: selected.mimeType }));
     data.set("video_duration", String(selected.metadata.duration));
@@ -435,86 +509,6 @@ async function handleVideoComposerSubmit(form, selected, event, helpers = {}) {
     if (progress) progress.hidden = true;
     if (button) button.disabled = false;
   }
-}
-
-function attachVideoComposer(form, helpers = {}) {
-  const input = form.querySelector("[data-video-input]");
-  const preview = form.querySelector("[data-video-preview]");
-  const summary = form.querySelector("[data-video-summary]");
-  const removeButton = form.querySelector("[data-video-remove]");
-  const imageInput = form.querySelector("[data-image-input]");
-  if (!input || !preview || !summary) return null;
-  let selected = null;
-  let previewUrl = "";
-  const makeUrl = helpers.createObjectURL || ((file) => URL.createObjectURL(file));
-  const revokeUrl = helpers.revokeObjectURL || ((url) => URL.revokeObjectURL(url));
-  const reset = (clearInput = true) => {
-    if (previewUrl) revokeUrl(previewUrl);
-    previewUrl = "";
-    selected = null;
-    if (clearInput) input.value = "";
-    preview.removeAttribute("src");
-    preview.hidden = true;
-    summary.textContent = "No video selected.";
-    if (removeButton) removeButton.hidden = true;
-    if (imageInput) imageInput.disabled = false;
-  };
-  input.addEventListener("change", async () => {
-    const file = input.files?.[0];
-    reset(false);
-    if (!file) return;
-    const mimeType = videoMimeType(file);
-    if (!mimeType) {
-      summary.textContent = "Choose an MP4, WebM, or MOV video.";
-      selected = { file, valid: false, error: summary.textContent };
-      if (imageInput) imageInput.disabled = true;
-      return;
-    }
-    if (file.size > MAX_VIDEO_BYTES) {
-      summary.textContent = "Videos can be up to 300 MB. Choose a smaller file.";
-      selected = { file, valid: false, error: summary.textContent };
-      if (imageInput) imageInput.disabled = true;
-      return;
-    }
-    if (imageInput?.files?.length) {
-      summary.textContent = "Remove the selected images before choosing a video.";
-      input.value = "";
-      return;
-    }
-    if (imageInput) imageInput.disabled = true;
-    previewUrl = makeUrl(file);
-    preview.src = previewUrl;
-    preview.hidden = false;
-    if (removeButton) removeButton.hidden = false;
-    selected = { file, mimeType, valid: false, metadata: null };
-    summary.textContent = `Video size: ${new Intl.NumberFormat().format(file.size)} bytes. Reading duration…`;
-    try {
-      const metadata = await (helpers.probe || probeVideoMetadata)(previewUrl, helpers.createElement);
-      if (selected?.file !== file) return;
-      if (!Number.isFinite(metadata.duration) || metadata.duration <= 0) {
-        throw new Error("The video duration could not be read.");
-      }
-      selected.metadata = metadata;
-      selected.valid = metadata.duration <= MAX_VIDEO_DURATION_SECONDS && metadata.width > 0 && metadata.height > 0;
-      selected.error = metadata.duration > MAX_VIDEO_DURATION_SECONDS
-        ? "Videos can be up to 10 minutes long."
-        : "The video dimensions could not be read.";
-      summary.textContent = `${new Intl.NumberFormat().format(file.size)} bytes · ${formatVideoDuration(metadata.duration)} · ${metadata.width}×${metadata.height}${selected.valid ? "" : ` · ${selected.error}`}`;
-    } catch (reason) {
-      if (selected?.file !== file) return;
-      selected.error = reason instanceof Error ? reason.message : "Video details could not be read.";
-      summary.textContent = `${new Intl.NumberFormat().format(file.size)} bytes · ${selected.error}`;
-    }
-  });
-  removeButton?.addEventListener("click", reset);
-  form.addEventListener("submit", (event) => {
-    if (selected) void handleVideoComposerSubmit(form, selected, event, helpers);
-  });
-  return {
-    setImagesSelected(selectedImages) {
-      input.disabled = selectedImages;
-    },
-  };
 }
 
 function previewImageObjectUrl(dataUrl) {
@@ -626,93 +620,167 @@ function attachLinkPreview(form, helpers = {}) {
   return { updateImagePrecedence };
 }
 
-(document.querySelectorAll?.("form[data-image-composer]") || []).forEach((form) => {
+function attachMediaComposer(form, helpers = {}) {
   const linkPreview = attachLinkPreview(form);
-  const videoComposer = attachVideoComposer(form);
-  const input = form.querySelector("[data-image-input]");
-  const previews = form.querySelector("[data-image-previews]");
-  const status = form.querySelector("[data-image-status]");
-  if (!input || !previews || !status) return;
+  const input = form.querySelector("[data-media-input]");
+  const previews = form.querySelector("[data-media-previews]");
+  const status = form.querySelector("[data-media-status]");
+  const videoAltLabel = form.querySelector("[data-video-alt-label]");
+  if (!input || !previews || !status) return null;
 
   const selected = [];
-  let selectionInvalid = false;
+  const makeUrl = helpers.createObjectURL || ((file) => URL.createObjectURL(file));
+  const revokeUrl = helpers.revokeObjectURL || ((url) => URL.revokeObjectURL(url));
+  const canPostVideo = input.dataset?.videoAccess !== "false";
+  const canPostImages = input.dataset?.imageAccess !== "false";
+  const clearInput = () => {
+    try {
+      input.value = "";
+    } catch {
+      // File inputs can be read-only in lightweight DOM test doubles.
+    }
+  };
+  const updatePreviewState = () => {
+    const imageCount = selected.filter((item) => item.kind === "image").length;
+    linkPreview.updateImagePrecedence(imageCount);
+    if (videoAltLabel) videoAltLabel.hidden = !selected.some((item) => item.kind === "video");
+  };
   const drawPreviews = () => {
     previews.replaceChildren();
     selected.forEach((item, index) => {
       const preview = document.createElement("div");
-      preview.className = "image-preview";
-      const image = document.createElement("img");
-      image.src = item.previewUrl;
-      image.alt = "";
+      preview.className = item.kind === "video" ? "media-preview media-video-preview" : "media-preview image-preview";
       const details = document.createElement("div");
-      const altLabel = document.createElement("label");
-      altLabel.textContent = `Alt text for image ${index + 1} (optional)`;
-      const altInput = document.createElement("textarea");
-      altInput.name = "alts";
-      altInput.rows = 2;
-      altInput.maxLength = 2000;
-      altInput.value = item.alt;
-      altInput.addEventListener("input", () => {
-        item.alt = altInput.value;
-      });
-      altLabel.append(altInput);
-      const suggestion = document.createElement("button");
-      suggestion.type = "button";
-      suggestion.className = "alt-suggestion-button";
-      suggestion.textContent = "Suggest alt text";
-      const suggestionStatus = document.createElement("p");
-      suggestionStatus.className = "alt-suggestion-status";
-      suggestionStatus.setAttribute("role", "status");
-      const suggestionProgress = document.createElement("progress");
-      suggestionProgress.className = "alt-suggestion-progress";
-      suggestionProgress.hidden = true;
-      suggestionProgress.max = ALT_MODEL_DOWNLOAD_BYTES;
-      suggestionProgress.value = 0;
-      attachAltSuggestion(suggestion, item, altInput, suggestionStatus, suggestionProgress);
+      if (item.kind === "video") {
+        if (item.posterUrl) {
+          const poster = document.createElement("img");
+          poster.src = item.posterUrl;
+          poster.alt = "Video preview frame";
+          preview.append(poster);
+        } else {
+          const video = document.createElement("video");
+          video.src = item.previewUrl;
+          video.muted = true;
+          video.playsInline = true;
+          video.preload = "metadata";
+          preview.append(video);
+        }
+        const summary = document.createElement("p");
+        summary.className = "media-video-summary";
+        summary.textContent = item.summary || `${new Intl.NumberFormat().format(item.file.size)} bytes · Reading duration…`;
+        details.append(summary);
+      } else {
+        const image = document.createElement("img");
+        image.src = item.previewUrl;
+        image.alt = "";
+        preview.append(image);
+        const altLabel = document.createElement("label");
+        altLabel.textContent = `Alt text for image ${index + 1} (optional)`;
+        const altInput = document.createElement("textarea");
+        altInput.name = "alts";
+        altInput.rows = 2;
+        altInput.maxLength = 2000;
+        altInput.value = item.alt;
+        altInput.addEventListener("input", () => {
+          item.alt = altInput.value;
+        });
+        altLabel.append(altInput);
+        const suggestion = document.createElement("button");
+        suggestion.type = "button";
+        suggestion.className = "alt-suggestion-button";
+        suggestion.textContent = "Suggest alt text";
+        const suggestionStatus = document.createElement("p");
+        suggestionStatus.className = "alt-suggestion-status";
+        suggestionStatus.setAttribute("role", "status");
+        const suggestionProgress = document.createElement("progress");
+        suggestionProgress.className = "alt-suggestion-progress";
+        suggestionProgress.hidden = true;
+        suggestionProgress.max = ALT_MODEL_DOWNLOAD_BYTES;
+        suggestionProgress.value = 0;
+        attachAltSuggestion(suggestion, item, altInput, suggestionStatus, suggestionProgress);
+        details.append(altLabel, suggestion, suggestionProgress, suggestionStatus);
+      }
       const remove = document.createElement("button");
       remove.type = "button";
-      remove.textContent = "Remove";
-      remove.setAttribute("aria-label", `Remove image ${index + 1}`);
+      remove.className = "media-remove";
+      remove.textContent = "×";
+      remove.setAttribute("aria-label", item.kind === "video" ? "Remove video" : `Remove image ${index + 1}`);
       remove.addEventListener("click", () => {
-        URL.revokeObjectURL(item.previewUrl);
+        revokeUrl(item.previewUrl);
+        if (item.posterUrl) revokeUrl(item.posterUrl);
         selected.splice(index, 1);
         status.textContent = "";
-        videoComposer?.setImagesSelected(selected.length > 0);
-        linkPreview.updateImagePrecedence(selected.length);
+        updatePreviewState();
         drawPreviews();
       });
-      details.append(altLabel, suggestion, suggestionProgress, suggestionStatus, remove);
-      preview.append(image, details);
+      details.append(remove);
+      preview.append(details);
       previews.append(preview);
     });
   };
 
-  input.addEventListener("change", () => {
-    selected.forEach((item) => URL.revokeObjectURL(item.previewUrl));
-    selected.length = 0;
-    linkPreview.updateImagePrecedence(0);
+  input.addEventListener("change", async () => {
     const files = [...(input.files || [])];
-    videoComposer?.setImagesSelected(files.length > 0);
-    if (files.length > 4) {
-      selectionInvalid = true;
-      status.textContent = "Choose no more than 4 images.";
-      drawPreviews();
+    clearInput();
+    if (!files.length) return;
+    const selection = selectComposerMedia(selected, files, canPostVideo, canPostImages);
+    if (selection.kind === "error") {
+      status.textContent = selection.message;
       return;
     }
-    selectionInvalid = false;
     status.textContent = "";
-    for (const file of files) {
-      selected.push({ file, alt: "", previewUrl: URL.createObjectURL(file) });
+    const added = selection.items.slice(selected.length);
+    for (const item of added) {
+      item.previewUrl = makeUrl(item.file);
+      if (item.kind === "image") {
+        item.alt = "";
+      } else {
+        item.mimeType = videoMimeType(item.file);
+        item.valid = false;
+        item.metadata = null;
+        item.error = "Wait until video details are ready.";
+        if (item.file.size > MAX_VIDEO_BYTES) {
+          item.error = "Videos can be up to 300 MB. Choose a smaller file.";
+          item.summary = `${new Intl.NumberFormat().format(item.file.size)} bytes · ${item.error}`;
+        }
+      }
+      selected.push(item);
     }
-    videoComposer?.setImagesSelected(selected.length > 0);
-    linkPreview.updateImagePrecedence(selected.length);
+    updatePreviewState();
     drawPreviews();
+    const video = added.find((item) => item.kind === "video");
+    if (video && video.file.size <= MAX_VIDEO_BYTES) {
+      try {
+        const metadata = await (helpers.probe || probeVideoMetadata)(video.previewUrl, helpers.createElement);
+        if (selected[0] !== video) return;
+        if (!Number.isFinite(metadata.duration) || metadata.duration <= 0) {
+          throw new Error("The video duration could not be read.");
+        }
+        video.metadata = metadata;
+        video.posterUrl = metadata.posterUrl;
+        video.valid = metadata.duration <= MAX_VIDEO_DURATION_SECONDS && metadata.width > 0 && metadata.height > 0;
+        video.error = metadata.duration > MAX_VIDEO_DURATION_SECONDS
+          ? "Videos can be up to 10 minutes long."
+          : "The video dimensions could not be read.";
+        video.summary = `${new Intl.NumberFormat().format(video.file.size)} bytes · ${formatVideoDuration(metadata.duration)} · ${metadata.width}×${metadata.height}${video.valid ? "" : ` · ${video.error}`}`;
+      } catch (reason) {
+        if (selected[0] !== video) return;
+        video.error = reason instanceof Error ? reason.message : "Video details could not be read.";
+        video.summary = `${new Intl.NumberFormat().format(video.file.size)} bytes · ${video.error}`;
+      }
+      drawPreviews();
+    }
   });
 
   form.addEventListener("submit", (event) => {
-    void handleImageComposerSubmit(form, selected, selectionInvalid, event);
+    const video = selected.find((item) => item.kind === "video");
+    if (video) void handleVideoComposerSubmit(form, video, event, helpers);
+    else if (selected.length) void handleImageComposerSubmit(form, selected, false, event, helpers);
   });
-});
+  return { selected };
+}
+
+(document.querySelectorAll?.("form[data-media-composer]") || []).forEach((form) => attachMediaComposer(form));
 
 const altTestForm = document.querySelector?.("form[data-alt-test]");
 if (altTestForm) {

@@ -87,8 +87,8 @@ const PROFILE_NEGATIVE_TTL: Duration = Duration::from_secs(60 * 60);
 const PAGE_PROFILE_BUDGET: Duration = Duration::from_millis(1500);
 const PAGE_PROFILE_CONCURRENCY: usize = 8;
 const PAGE_QUOTE_CONCURRENCY: usize = 16;
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m19";
-const WEB_SCRIPT_URL: &str = "/static/app.js?v=js15";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m20";
+const WEB_SCRIPT_URL: &str = "/static/app.js?v=js16";
 const HLS_SCRIPT_URL: &str = "/static/vendor/hls.min.js?v=1.7.3";
 const ALT_MODEL_DOWNLOAD_BYTES: u64 = 264_713_119;
 const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
@@ -5182,14 +5182,11 @@ where
     };
     let post_form = if write_forms_enabled {
         format!(
-            "<form class=\"composer image-composer\" action=\"/post\" method=\"post\" enctype=\"multipart/form-data\" data-image-composer><label for=\"new-post\">Write a post</label><textarea id=\"new-post\" name=\"text\" rows=\"3\" maxlength=\"300\" required></textarea>{}{}{}<button type=\"submit\">Post</button><p class=\"composer-error\" data-composer-error role=\"alert\" hidden></p></form>",
-            render_image_picker(
+            "<form class=\"composer media-composer\" action=\"/post\" method=\"post\" enctype=\"multipart/form-data\" data-media-composer><label for=\"new-post\">Write a post</label><textarea id=\"new-post\" name=\"text\" rows=\"3\" maxlength=\"300\" required></textarea>{}{}<button type=\"submit\">Post</button><p class=\"composer-error\" data-composer-error role=\"alert\" hidden></p></form>",
+            render_media_picker(
                 verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref()),
-                "post-images"
-            ),
-            render_video_picker(
                 verified_cookie_video_access(&state.public, &headers, state.storage.as_ref()),
-                "post-video",
+                "post-media"
             ),
             render_link_picker("post-link")
         )
@@ -7240,15 +7237,12 @@ where
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
     let composer = if write_forms_enabled {
         format!(
-            "<form class=\"composer quote-composer image-composer\" action=\"/quote\" method=\"post\" enctype=\"multipart/form-data\" data-image-composer><label for=\"quote-text\">Write a quote post</label><input type=\"hidden\" name=\"quote_uri\" value=\"{}\"><textarea id=\"quote-text\" name=\"text\" rows=\"4\" maxlength=\"300\" required></textarea>{}{}{}{}<button type=\"submit\">Post</button><p class=\"composer-error\" data-composer-error role=\"alert\" hidden></p></form>",
+            "<form class=\"composer quote-composer media-composer\" action=\"/quote\" method=\"post\" enctype=\"multipart/form-data\" data-media-composer><label for=\"quote-text\">Write a quote post</label><input type=\"hidden\" name=\"quote_uri\" value=\"{}\"><textarea id=\"quote-text\" name=\"text\" rows=\"4\" maxlength=\"300\" required></textarea>{}{}{}<button type=\"submit\">Post</button><p class=\"composer-error\" data-composer-error role=\"alert\" hidden></p></form>",
             html_escape(&quoted.uri),
-            render_image_picker(
+            render_media_picker(
                 verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref()),
-                "quote-images"
-            ),
-            render_video_picker(
                 verified_cookie_video_access(&state.public, &headers, state.storage.as_ref()),
-                "quote-video",
+                "quote-media",
             ),
             render_link_picker("quote-link"),
             render_quote_preview(state.storage.as_ref(), &quoted)
@@ -7530,30 +7524,20 @@ fn render_reply_composer<S: Storage>(
         .unwrap_or_else(|_| json!({"did":parent.did,"handle":parent.did}));
     let handle = profile_handle(&profile, &parent.did);
     format!(
-        "<form id=\"reply-composer\" class=\"composer reply-composer image-composer\" action=\"/reply\" method=\"post\" enctype=\"multipart/form-data\" data-image-composer><p class=\"reply-context\">Replying to @{}</p><input type=\"hidden\" name=\"parent_uri\" value=\"{}\"><label for=\"reply-text\">Write a reply</label><textarea id=\"reply-text\" name=\"text\" rows=\"3\" maxlength=\"300\" required></textarea>{}{}{}<button type=\"submit\">Reply</button><p class=\"composer-error\" data-composer-error role=\"alert\" hidden></p></form>",
+        "<form id=\"reply-composer\" class=\"composer reply-composer media-composer\" action=\"/reply\" method=\"post\" enctype=\"multipart/form-data\" data-media-composer><p class=\"reply-context\">Replying to @{}</p><input type=\"hidden\" name=\"parent_uri\" value=\"{}\"><label for=\"reply-text\">Write a reply</label><textarea id=\"reply-text\" name=\"text\" rows=\"3\" maxlength=\"300\" required></textarea>{}{}<button type=\"submit\">Reply</button><p class=\"composer-error\" data-composer-error role=\"alert\" hidden></p></form>",
         html_escape(&handle),
         html_escape(&parent.uri),
-        render_image_picker(blob_access, "reply-images"),
-        render_video_picker(video_access, "reply-video"),
+        render_media_picker(blob_access, video_access, "reply-media"),
         render_link_picker("reply-link")
     )
 }
 
-fn render_image_picker(blob_access: bool, id: &str) -> String {
-    if !blob_access {
-        return "<p class=\"picture-permission-hint\" role=\"status\"><a href=\"/login\">Log in again to enable pictures</a></p>".to_owned();
+fn render_media_picker(image_access: bool, video_access: bool, id: &str) -> String {
+    if !image_access && !video_access {
+        return "<p class=\"picture-permission-hint\" role=\"status\"><a href=\"/login\">Log in again to enable pictures</a></p><p class=\"video-permission-hint\" role=\"status\"><a href=\"/login\">sign in again to post videos</a></p>".to_owned();
     }
     format!(
-        "<fieldset class=\"image-picker\"><legend>Add pictures</legend><label for=\"{id}\">Choose up to 4 images</label><input id=\"{id}\" type=\"file\" name=\"images\" accept=\"image/*\" multiple data-image-input><div class=\"image-previews\" data-image-previews></div><p class=\"image-picker-status\" data-image-status role=\"status\"></p></fieldset>"
-    )
-}
-
-fn render_video_picker(video_access: bool, id: &str) -> String {
-    if !video_access {
-        return "<p class=\"video-permission-hint\" role=\"status\"><a href=\"/login\">sign in again to post videos</a></p>".to_owned();
-    }
-    format!(
-        "<fieldset class=\"video-picker\"><legend>Add a video</legend><label for=\"{id}\">Choose one MP4, WebM, or MOV video (up to 300 MB and 10 minutes)</label><input id=\"{id}\" type=\"file\" name=\"video\" accept=\"video/mp4,video/webm,video/quicktime,.mp4,.webm,.mov\" data-video-input><video class=\"video-picker-preview\" data-video-preview muted controls playsinline preload=\"metadata\" hidden></video><p class=\"video-picker-status\" data-video-summary role=\"status\" aria-live=\"polite\">No video selected.</p><label class=\"video-alt-label\" for=\"{id}-alt\">Video alt text (optional)<textarea id=\"{id}-alt\" name=\"video_alt\" maxlength=\"2000\" rows=\"2\" data-video-alt></textarea></label><button type=\"button\" data-video-remove hidden>Remove video</button><progress data-video-progress max=\"100\" value=\"0\" hidden></progress><p class=\"video-upload-status\" data-video-upload-status role=\"status\" aria-live=\"polite\"></p></fieldset>"
+        "<fieldset class=\"media-picker\"><legend>Add media</legend><input class=\"media-file-input\" id=\"{id}\" type=\"file\" name=\"media\" accept=\"image/*,video/mp4,video/webm,video/quicktime\" multiple data-media-input data-image-access=\"{image_access}\" data-video-access=\"{video_access}\"><label class=\"media-add-button\" for=\"{id}\"><span aria-hidden=\"true\">＋</span> Add media</label><p class=\"media-picker-hint\">Up to 4 pictures, or one video up to 300 MB and 10 minutes.</p><div class=\"media-previews\" data-media-previews></div><p class=\"media-picker-status\" data-media-status role=\"status\" aria-live=\"polite\"></p><label class=\"video-alt-label\" for=\"{id}-alt\" data-video-alt-label hidden>Video alt text (optional)<textarea id=\"{id}-alt\" name=\"video_alt\" maxlength=\"2000\" rows=\"2\" data-video-alt></textarea></label><progress data-video-progress max=\"100\" value=\"0\" hidden></progress><p class=\"video-upload-status\" data-video-upload-status role=\"status\" aria-live=\"polite\"></p></fieldset>"
     )
 }
 
@@ -8150,9 +8134,9 @@ where
             )
         })? {
             let name = field.name().unwrap_or_default().to_owned();
-            if name == "video" {
-                // The composer always sends its file input; with no file picked it is an empty part.
+            if name == "video" || name == "media" || name == "images" {
                 let filename = field.file_name().unwrap_or_default().to_owned();
+                let mime_type = field.content_type().unwrap_or_default().to_owned();
                 let bytes = field.bytes().await.map_err(|_| {
                     (
                         StatusCode::BAD_REQUEST,
@@ -8162,21 +8146,13 @@ where
                 if filename.is_empty() && bytes.is_empty() {
                     continue;
                 }
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "Enable JavaScript to validate and upload videos.".to_owned(),
-                ));
-            }
-            if name == "images" {
-                let filename = field.file_name().unwrap_or_default().to_owned();
-                let mime_type = field.content_type().unwrap_or_default().to_owned();
-                let bytes = field.bytes().await.map_err(|_| {
-                    (
+                if name == "video" || media_file_is_video(&mime_type, &filename) {
+                    return Err((
                         StatusCode::BAD_REQUEST,
-                        "An image could not be read from the form.".to_owned(),
-                    )
-                })?;
-                if filename.is_empty() && bytes.is_empty() {
+                        "Enable JavaScript to validate and upload videos.".to_owned(),
+                    ));
+                }
+                if !matches!(name.as_str(), "media" | "images") {
                     continue;
                 }
                 if pending_images.len() == MAX_POST_IMAGES {
@@ -8255,7 +8231,10 @@ fn validate_post_images(
             "Choose no more than 4 images per post.".to_owned(),
         ));
     }
-    if alts.len() > pending.len() || widths.len() != pending.len() || heights.len() != pending.len()
+    let has_dimensions = !widths.is_empty() || !heights.is_empty();
+    if alts.len() > pending.len()
+        || widths.len() != heights.len()
+        || (has_dimensions && widths.len() != pending.len())
     {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -8293,9 +8272,17 @@ fn validate_post_images(
                     "Image alt text must be no more than 2,000 characters.".to_owned(),
                 ));
             }
-            let width = widths[index].parse::<u32>().ok().filter(|value| (1..=2000).contains(value));
-            let height = heights[index].parse::<u32>().ok().filter(|value| (1..=2000).contains(value));
-            let (Some(width), Some(height)) = (width, height) else {
+            let dimensions = if has_dimensions {
+                widths[index]
+                    .parse::<u32>()
+                    .ok()
+                    .zip(heights[index].parse::<u32>().ok())
+            } else {
+                image_dimensions(&image.bytes, &mime_type)
+            };
+            let Some((width, height)) = dimensions
+                .filter(|(width, height)| (1..=2000).contains(width) && (1..=2000).contains(height))
+            else {
                 return Err((
                     StatusCode::BAD_REQUEST,
                     "Image dimensions must be between 1 and 2,000 pixels. Enable JavaScript to prepare images for posting."
@@ -8324,6 +8311,95 @@ fn image_content_type(bytes: &[u8]) -> Option<&'static str> {
         Some("image/webp")
     } else {
         None
+    }
+}
+
+fn media_file_is_video(mime_type: &str, filename: &str) -> bool {
+    let mime_type = mime_type.trim().to_ascii_lowercase();
+    mime_type.starts_with("video/")
+        || matches!(
+            Path::new(filename)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "mp4" | "webm" | "mov"
+        )
+}
+
+fn image_dimensions(bytes: &[u8], mime_type: &str) -> Option<(u32, u32)> {
+    match mime_type {
+        "image/png" if bytes.len() >= 24 => Some((
+            u32::from_be_bytes(bytes[16..20].try_into().ok()?),
+            u32::from_be_bytes(bytes[20..24].try_into().ok()?),
+        )),
+        "image/gif" if bytes.len() >= 10 => Some((
+            u16::from_le_bytes(bytes[6..8].try_into().ok()?) as u32,
+            u16::from_le_bytes(bytes[8..10].try_into().ok()?) as u32,
+        )),
+        "image/jpeg" => jpeg_dimensions(bytes),
+        "image/webp" => webp_dimensions(bytes),
+        _ => None,
+    }
+}
+
+fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if !bytes.starts_with(&[0xff, 0xd8]) {
+        return None;
+    }
+    let mut offset = 2;
+    while offset + 4 <= bytes.len() {
+        if bytes[offset] != 0xff {
+            offset += 1;
+            continue;
+        }
+        while offset < bytes.len() && bytes[offset] == 0xff {
+            offset += 1;
+        }
+        let marker = *bytes.get(offset)?;
+        offset += 1;
+        if matches!(marker, 0xd8 | 0xd9 | 0x01 | 0xd0..=0xd7) {
+            continue;
+        }
+        let length = u16::from_be_bytes(bytes.get(offset..offset + 2)?.try_into().ok()?) as usize;
+        if length < 2 || offset + length > bytes.len() {
+            return None;
+        }
+        if matches!(marker, 0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf) {
+            let height =
+                u16::from_be_bytes(bytes.get(offset + 3..offset + 5)?.try_into().ok()?) as u32;
+            let width =
+                u16::from_be_bytes(bytes.get(offset + 5..offset + 7)?.try_into().ok()?) as u32;
+            return Some((width, height));
+        }
+        offset += length;
+    }
+    None
+}
+
+fn webp_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 20 || !bytes.starts_with(b"RIFF") || &bytes[8..12] != b"WEBP" {
+        return None;
+    }
+    match &bytes[12..16] {
+        b"VP8X" if bytes.len() >= 30 => {
+            let width =
+                u32::from(bytes[24]) | (u32::from(bytes[25]) << 8) | (u32::from(bytes[26]) << 16);
+            let height =
+                u32::from(bytes[27]) | (u32::from(bytes[28]) << 8) | (u32::from(bytes[29]) << 16);
+            Some((width + 1, height + 1))
+        }
+        b"VP8 " if bytes.len() >= 30 && bytes.get(23..26) == Some(&[0x9d, 0x01, 0x2a]) => {
+            let width = u16::from_le_bytes(bytes[26..28].try_into().ok()?) & 0x3fff;
+            let height = u16::from_le_bytes(bytes[28..30].try_into().ok()?) & 0x3fff;
+            Some((u32::from(width), u32::from(height)))
+        }
+        b"VP8L" if bytes.len() >= 25 && bytes[20] == 0x2f => {
+            let bits = u32::from_le_bytes(bytes[21..25].try_into().ok()?);
+            Some(((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1))
+        }
+        _ => None,
     }
 }
 
@@ -11203,8 +11279,8 @@ mod tests {
         assert!(css.contains(".thread-focus-actions .is-liked .icon {\n  fill: var(--accent);"));
         assert!(css.contains(".infinite-scroll-status {"));
         assert!(css.contains(".infinite-scroll-retry[hidden] {\n  display: none;"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m19"));
-        assert!(WEB_SCRIPT_URL.contains("v=js15"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m20"));
+        assert!(WEB_SCRIPT_URL.contains("v=js16"));
     }
 
     #[test]
@@ -11222,7 +11298,7 @@ mod tests {
         ));
         assert!(css.contains("bottom: var(--mobile-compose-clearance);"));
         assert!(css.contains("padding-bottom: max(4.25rem, var(--mobile-compose-clearance));"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m19"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m20"));
     }
 
     #[test]

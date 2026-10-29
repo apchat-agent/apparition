@@ -736,7 +736,7 @@ fn multipart_text_only_body_with_empty_file(boundary: &str, text: &str) -> Vec<u
     append_multipart_text_field(&mut body, boundary, "text", text);
     body.extend_from_slice(
         format!(
-            "--{boundary}\r\nContent-Disposition: form-data; name=\"images\"; filename=\"\"\r\nContent-Type: application/octet-stream\r\n\r\n\r\n--{boundary}--\r\n"
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"images\"; filename=\"\"\r\nContent-Type: application/octet-stream\r\n\r\n\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"video\"; filename=\"\"\r\nContent-Type: application/octet-stream\r\n\r\n\r\n--{boundary}--\r\n"
         )
         .as_bytes(),
     );
@@ -1096,13 +1096,13 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
             ),
             "{path}"
         );
-        assert!(html.contains("href=\"/static/app.css?v=m19\""), "{path}");
+        assert!(html.contains("href=\"/static/app.css?v=m20\""), "{path}");
         assert!(!html.contains("style="), "{path}");
         // Both playback and interaction scripts are local, deferred, and never inline.
         assert_eq!(html.matches("<script").count(), 2, "{path}");
         assert!(html.contains("<script src=\"/static/vendor/hls.min.js?v=1.7.3\" defer></script>"));
         assert!(
-            html.contains("<script src=\"/static/app.js?v=js15\" defer></script>"),
+            html.contains("<script src=\"/static/app.js?v=js16\" defer></script>"),
             "{path}"
         );
     }
@@ -1110,7 +1110,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
     let stylesheet = app
         .oneshot(
             Request::builder()
-                .uri("/static/app.css?v=m19")
+                .uri("/static/app.css?v=m20")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1278,11 +1278,13 @@ async fn quote_composer_quotes_existing_quote_posts_and_notifies_once() {
         "{timeline_html}"
     );
     assert!(
-        timeline_html.contains("name=\"images\" accept=\"image/*\" multiple"),
+        timeline_html.contains(
+            "name=\"media\" accept=\"image/*,video/mp4,video/webm,video/quicktime\" multiple"
+        ),
         "{timeline_html}"
     );
     assert!(
-        timeline_html.contains("Choose up to 4 images"),
+        timeline_html.contains("Up to 4 pictures, or one video"),
         "{timeline_html}"
     );
 
@@ -1312,7 +1314,9 @@ async fn quote_composer_quotes_existing_quote_posts_and_notifies_once() {
     .unwrap();
     assert!(compose_html.contains("action=\"/quote\""), "{compose_html}");
     assert!(
-        compose_html.contains("name=\"images\" accept=\"image/*\" multiple"),
+        compose_html.contains(
+            "name=\"media\" accept=\"image/*,video/mp4,video/webm,video/quicktime\" multiple"
+        ),
         "{compose_html}"
     );
     assert!(
@@ -1411,12 +1415,12 @@ async fn sign_in_error_page_uses_the_shared_mobile_document_shell() {
     );
     assert!(html.contains("Login failed, try again"));
     assert!(html.contains("href=\"/login\""));
-    assert!(html.contains("href=\"/static/app.css?v=m19\""));
+    assert!(html.contains("href=\"/static/app.css?v=m20\""));
     assert!(!html.contains("style="));
     // The shared shell loads both local deferred scripts, never inline code.
     assert_eq!(html.matches("<script").count(), 2);
     assert!(html.contains("<script src=\"/static/vendor/hls.min.js?v=1.7.3\" defer></script>"));
-    assert!(html.contains("<script src=\"/static/app.js?v=js15\" defer></script>"));
+    assert!(html.contains("<script src=\"/static/app.js?v=js16\" defer></script>"));
 }
 
 #[tokio::test]
@@ -2396,10 +2400,19 @@ async fn old_scope_session_keeps_text_and_picture_composer_and_requires_video_re
     .unwrap();
     assert!(html.contains("action=\"/post\""), "{html}");
     assert!(!html.contains("Log in again to enable pictures"), "{html}");
-    assert!(html.contains("sign in again to post videos"), "{html}");
-    assert!(html.contains("href=\"/login\""), "{html}");
-    assert!(html.contains("data-image-input"), "{html}");
+    assert!(
+        !html.contains("sign in again to post videos"),
+        "video scope feedback appears when selected"
+    );
+    assert!(html.contains("data-media-input"), "{html}");
+    assert!(html.contains("data-image-access=\"true\""), "{html}");
+    assert!(html.contains("data-video-access=\"false\""), "{html}");
+    assert!(
+        html.contains("accept=\"image/*,video/mp4,video/webm,video/quicktime\""),
+        "{html}"
+    );
     assert!(!html.contains("data-video-input"), "{html}");
+    assert_eq!(html.matches("type=\"file\"").count(), 1, "{html}");
 
     let text_post = app
         .clone()
@@ -2614,7 +2627,8 @@ async fn native_media_input_accepts_images_skips_empty_parts_and_refuses_video()
         .unwrap()
         .router_with_flow(flow.clone(), Arc::new(MemoryStorage::default()));
     let cookie = finish_login(&app).await;
-    let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00";
+    let png =
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00";
 
     let image_boundary = "av37-native-image";
     let image = app
@@ -3692,7 +3706,9 @@ async fn reply_form_checks_origin_and_writes_through_to_the_index() {
     let thread_html = get_html(&app, &format!("/thread?uri={encoded_parent}"), &cookie).await;
     assert!(thread_html.contains("action=\"/reply\""), "{thread_html}");
     assert!(
-        thread_html.contains("name=\"images\" accept=\"image/*\" multiple"),
+        thread_html.contains(
+            "name=\"media\" accept=\"image/*,video/mp4,video/webm,video/quicktime\" multiple"
+        ),
         "{thread_html}"
     );
     let body =

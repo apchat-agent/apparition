@@ -323,6 +323,7 @@ Deno.test("video selection metadata and upload progress use the dedicated video 
   class FakeFormData {
     values = new Map();
     constructor() {}
+    delete(name) { this.values.delete(name); }
     set(name, value) { this.values.set(name, value); }
     get(name) { return this.values.get(name); }
   }
@@ -413,6 +414,15 @@ Deno.test("unified media selection keeps earlier media when a later pick conflic
   const oldScope = selectMedia([], [video], false);
   assertEquals(oldScope.kind, "error");
   assertEquals(oldScope.message, "sign in again to post videos");
+
+  const reverseConflict = selectMedia([{ file: video, kind: "video" }], [image]);
+  assertEquals(reverseConflict.kind, "error");
+  assert(reverseConflict.message.includes("Remove the selected video"));
+  assertEquals(reverseConflict.items[0].file, video);
+
+  const secondVideo = selectMedia([{ file: video, kind: "video" }], [{ name: "second.mp4", type: "video/mp4" }]);
+  assertEquals(secondVideo.kind, "error");
+  assert(secondVideo.message.includes("one video"));
 });
 
 Deno.test("alt suggestion failure leaves the alt text alone and reports a short message", async () => {
@@ -473,9 +483,9 @@ Deno.test("each selected image renders an opt-in alt suggestion button", async (
   const linkImageNote = makeElement("notice");
   const form = {
     querySelector(selector) {
-      if (selector === "[data-image-input]") return input;
-      if (selector === "[data-image-previews]") return previews;
-      if (selector === "[data-image-status]") return status;
+      if (selector === "[data-media-input]") return input;
+      if (selector === "[data-media-previews]") return previews;
+      if (selector === "[data-media-status]") return status;
       if (selector === "[data-link-input]") return linkInput;
       if (selector === "[data-link-preview]") return linkButton;
       if (selector === "[data-link-status]") return linkStatus;
@@ -489,7 +499,7 @@ Deno.test("each selected image renders an opt-in alt suggestion button", async (
     addEventListener() {},
     createElement: makeElement,
     querySelector(selector) { return selector === "form[data-alt-test]" ? null : null; },
-    querySelectorAll(selector) { return selector === "form[data-image-composer]" ? [form] : []; },
+    querySelectorAll(selector) { return selector === "form[data-media-composer]" ? [form] : []; },
   };
   globalThis.window = { visualViewport: { addEventListener() {} } };
   new Function(source)();
@@ -503,7 +513,7 @@ Deno.test("each selected image renders an opt-in alt suggestion button", async (
   assert(suggestion, "the alt field should have its own suggestion button");
   assertEquals(suggestion.type, "button", "suggesting must not submit the post form");
   assertEquals(typeof suggestion.listeners.get("click"), "function");
-  const remove = details.children.find((child) => child.tag === "button" && child.textContent === "Remove");
+  const remove = details.children.find((child) => child.tag === "button" && child.attributes["aria-label"] === "Remove image 1");
   remove.listeners.get("click")();
   assert(linkImageNote.hidden, "removing the last picture should clear the precedence notice");
 });
@@ -547,7 +557,7 @@ Deno.test("posting completes while an alt suggestion is still running", async ()
     querySelector(selector) {
       if (selector === 'button[type="submit"]') return submitButton;
       if (selector === "[data-composer-error]") return error;
-      if (selector === "[data-image-input]") return imageInput;
+      if (selector === "[data-media-input]") return imageInput;
       return null;
     },
   };
