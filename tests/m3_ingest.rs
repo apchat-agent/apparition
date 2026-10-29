@@ -17,7 +17,7 @@ use tracing_subscriber::prelude::*;
 #[path = "support/synthetic_db.rs"]
 mod synthetic_db;
 
-static TRACING_TEST_LOCK: Mutex<()> = Mutex::new(());
+static TRACING_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 static TRACING_TEST_INIT: Once = Once::new();
 
 fn event(
@@ -89,7 +89,7 @@ fn sqlite_ingest_follow_scope_queries_do_not_scan_follows() {
 
 #[test]
 fn ingest_batches_log_parse_scope_record_apply_and_commit_phases_at_debug() {
-    let _tracing_test_guard = TRACING_TEST_LOCK.lock().unwrap();
+    let _tracing_test_guard = TRACING_TEST_LOCK.blocking_lock();
     TRACING_TEST_INIT.call_once(|| {
         let subscriber =
             tracing_subscriber::registry().with(tracing_subscriber::filter::LevelFilter::TRACE);
@@ -1124,7 +1124,7 @@ async fn consumer_reconnects_after_a_silent_websocket_and_rotates_urls() {
 
 #[tokio::test]
 async fn event_processing_timeout_releases_connection_and_logs_event_identity() {
-    let _tracing_test_guard = TRACING_TEST_LOCK.lock().unwrap();
+    let _tracing_test_guard = TRACING_TEST_LOCK.lock().await;
     let db_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
         .join(format!("av9-event-timeout-{}.db", std::process::id()));
@@ -1198,7 +1198,7 @@ async fn event_processing_timeout_releases_connection_and_logs_event_identity() 
 
 #[tokio::test(flavor = "current_thread")]
 async fn metrics_are_emitted_during_idle_periods_with_zero_events_and_cursor_lag() {
-    let _tracing_test_guard = TRACING_TEST_LOCK.lock().unwrap();
+    let _tracing_test_guard = TRACING_TEST_LOCK.lock().await;
     let storage = Arc::new(MemoryStorage::default());
     let ingestor = Ingestor::new(storage, ScopeMode::Full);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1250,7 +1250,7 @@ async fn metrics_are_emitted_during_idle_periods_with_zero_events_and_cursor_lag
 
 #[tokio::test]
 async fn websocket_connection_lifecycle_is_logged_at_info() {
-    let _tracing_test_guard = TRACING_TEST_LOCK.lock().unwrap();
+    let _tracing_test_guard = TRACING_TEST_LOCK.lock().await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {

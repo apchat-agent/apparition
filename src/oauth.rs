@@ -3215,7 +3215,6 @@ where
     S: Storage + 'static,
 {
     let mut page_timing = ThreadPageTiming::new();
-    let page_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
     let Some(viewer_did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref())
     else {
         return Redirect::to("/login").into_response();
@@ -3226,6 +3225,7 @@ where
         verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()),
     )
     .await;
+    let page_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
     let Some(uri) = query.get("uri") else {
         return oauth_error(StatusCode::BAD_REQUEST, "uri is required");
     };
@@ -3313,15 +3313,18 @@ where
         .filter(|pair| pair[0].did == pair[1].did)
         .map(|pair| pair[0].uri.clone())
         .collect::<HashSet<_>>();
+    let reply_options = ThreadReplyRenderOptions {
+        viewer_did: &viewer_did,
+        write_forms_enabled,
+        thread_continuations: &thread_continuations,
+        quote_index: &quote_index,
+    };
     let replies_html = match render_thread_replies(
         state.storage.as_ref(),
         &record,
-        &viewer_did,
-        write_forms_enabled,
+        &reply_options,
         depth,
         &mut reply_budget,
-        &thread_continuations,
-        &quote_index,
     ) {
         Ok(replies) => replies,
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
@@ -3342,7 +3345,7 @@ where
         String::new()
     };
     let mobile_navigation = render_thread_mobile_navigation(state.storage.as_ref(), &viewer_did);
-    let response = Html(page_shell_with_options(
+    Html(page_shell_with_options(
         "Thread",
         &format!(
             "<header class=\"thread-topbar\"><a href=\"/app\" aria-label=\"Back to timeline\">←</a><h1>Post</h1></header>{read_only_message}<section class=\"thread-ancestors\" aria-label=\"Earlier posts in this thread\"><ol class=\"post-list\">{ancestors_html}</ol></section><section class=\"thread-focus\" aria-label=\"Selected post\">{}</section><section class=\"thread-replies\" aria-label=\"Replies\">{replies_html}</section>{reply_composer}{reply_bar}",
@@ -3363,8 +3366,7 @@ where
             mobile_navigation_override: Some(&mobile_navigation),
         },
     ))
-    .into_response();
-    response
+    .into_response()
 }
 
 async fn quote_composer<F, S>(
@@ -3462,7 +3464,7 @@ fn render_quote_preview<S: Storage>(storage: &S, quoted: &IndexedRecord) -> Stri
         "<article class=\"quoted-post-preview\" aria-label=\"Quoted post\"><header>{}{}</header><p class=\"post-text\">{}</p>{embed}</article>",
         avatar_markup(&profile, "small-avatar"),
         author,
-        html_escape(text)
+        render_post_text(text)
     )
 }
 
@@ -3855,15 +3857,19 @@ fn collect_thread_reply_records<S: Storage>(
     Ok(())
 }
 
+struct ThreadReplyRenderOptions<'a> {
+    viewer_did: &'a str,
+    write_forms_enabled: bool,
+    thread_continuations: &'a HashSet<String>,
+    quote_index: &'a QuoteRenderIndex,
+}
+
 fn render_thread_replies<S: Storage>(
     storage: &S,
     record: &IndexedRecord,
-    viewer_did: &str,
-    write_forms_enabled: bool,
+    options: &ThreadReplyRenderOptions<'_>,
     depth: usize,
     budget: &mut usize,
-    thread_continuations: &HashSet<String>,
-    quote_index: &QuoteRenderIndex,
 ) -> Result<String, StorageError> {
     if depth == 0 || *budget == 0 {
         return Ok(String::new());
@@ -3878,27 +3884,18 @@ fn render_thread_replies<S: Storage>(
             break;
         }
         *budget -= 1;
-        let nested = render_thread_replies(
-            storage,
-            reply,
-            viewer_did,
-            write_forms_enabled,
-            depth - 1,
-            budget,
-            thread_continuations,
-            quote_index,
-        )?;
-        let continues = thread_continuations.contains(&reply.uri);
+        let nested = render_thread_replies(storage, reply, options, depth - 1, budget)?;
+        let continues = options.thread_continuations.contains(&reply.uri);
         html.push_str(&format!(
             "<li class=\"post-item thread-reply-item{}\">{}{nested}</li>",
             if continues { " thread-continues" } else { "" },
             render_web_post(
                 storage,
                 reply,
-                viewer_did,
-                write_forms_enabled,
+                options.viewer_did,
+                options.write_forms_enabled,
                 false,
-                quote_index
+                options.quote_index
             )
         ));
     }
@@ -4815,6 +4812,11 @@ fn render_web_embed_with_quotes<S: Storage>(
     quote_index: &QuoteRenderIndex,
     quote_depth: usize,
 ) -> String {
+    if quote_depth > 0
+        && embed.get("$type").and_then(Value::as_str) == Some("app.bsky.embed.recordWithMedia")
+    {
+        return render_web_quote(storage, embed, quote_index, quote_depth);
+    }
     match embed.get("$type").and_then(Value::as_str) {
         Some("app.bsky.embed.images") => render_web_images(author_did, embed),
         Some("app.bsky.embed.external") => render_web_external(embed),
