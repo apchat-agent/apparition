@@ -925,6 +925,9 @@ async fn bsky_style_shell_renders_navigation_pinned_feed_tabs_and_post_actions()
         html.contains("href=\"/app/thread?uri=at%3A%2F%2Fdid%3Aplc%3Aalice"),
         "{html}"
     );
+    assert_eq!(html.matches("<symbol id=\"i-like\"").count(), 1, "{html}");
+    assert!(html.contains("<use href=\"#i-like\""), "{html}");
+    assert!(!html.contains("<svg class=\"icon\""), "{html}");
 }
 
 #[tokio::test]
@@ -1171,6 +1174,52 @@ async fn web_posts_show_avatar_relative_time_and_accessible_actions() {
     assert!(html.contains("aria-label=\"Open replies\""));
     assert!(html.contains("aria-label=\"Like post by @alice.test\""));
     assert!(html.contains("aria-label=\"Repost by @alice.test\""));
+}
+
+#[tokio::test]
+async fn post_avatars_use_thumbnail_dimensions_and_lazy_load_after_six() {
+    let storage = Arc::new(MemoryStorage::default());
+    let did = "did:plc:alice";
+    storage
+        .put_record(&IndexedRecord {
+            did: did.into(),
+            collection: "app.bsky.actor.profile".into(),
+            rkey: "self".into(),
+            uri: format!("at://{did}/app.bsky.actor.profile/self"),
+            cid: Some("profile-cid".into()),
+            time_us: 1,
+            record: serde_json::json!({
+                "displayName":"Alice",
+                "avatar":format!("https://cdn.bsky.app/img/avatar/plain/{did}/avatar-cid")
+            }),
+        })
+        .unwrap();
+    for index in 0..7 {
+        storage
+            .put_record(&fake_feed_post(
+                did,
+                &format!("post-{index}"),
+                100 - index,
+                "Post",
+            ))
+            .unwrap();
+    }
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage);
+    let cookie = finish_login(&app).await;
+    let html = get_html(&app, "/app", &cookie).await;
+    assert!(
+        html.contains(&format!("img/avatar_thumbnail/plain/{did}/avatar-cid@jpeg")),
+        "{html}"
+    );
+    assert_eq!(html.matches("loading=\"eager\"").count(), 6, "{html}");
+    assert_eq!(html.matches("loading=\"lazy\"").count(), 1, "{html}");
+    assert_eq!(html.matches("decoding=\"async\"").count(), 7, "{html}");
+    assert!(
+        html.contains("width=\"44\" height=\"44\" loading=\"eager\" decoding=\"async\""),
+        "{html}"
+    );
 }
 
 #[tokio::test]
