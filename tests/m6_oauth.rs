@@ -2918,6 +2918,179 @@ async fn page_fetches_missing_author_profile_stores_it_and_keeps_avatar_url_safe
 }
 
 #[tokio::test]
+async fn thread_page_uses_large_focus_post_stats_chain_lines_and_reply_bar() {
+    let storage = Arc::new(MemoryStorage::default());
+    let root_uri = "at://did:plc:root/app.bsky.feed.post/root";
+    let focus_uri = "at://did:plc:author/app.bsky.feed.post/focus";
+    for record in [
+        IndexedRecord {
+            did: "did:plc:root".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "root".into(),
+            uri: root_uri.into(),
+            cid: Some("root-cid".into()),
+            time_us: 1,
+            record: serde_json::json!({"text":"thread root"}),
+        },
+        IndexedRecord {
+            did: "did:plc:author".into(),
+            collection: "app.bsky.actor.profile".into(),
+            rkey: "self".into(),
+            uri: "at://did:plc:author/app.bsky.actor.profile/self".into(),
+            cid: Some("author-profile".into()),
+            time_us: 2,
+            record: serde_json::json!({
+                "displayName":"Thread Author",
+                "avatar":{"$type":"blob","ref":{"$link":"avatar-cid"}}
+            }),
+        },
+        IndexedRecord {
+            did: "did:plc:author".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "focus".into(),
+            uri: focus_uri.into(),
+            cid: Some("focus-cid".into()),
+            time_us: 3,
+            record: serde_json::json!({
+                "$type":"app.bsky.feed.post",
+                "text":"focused post",
+                "createdAt":"2026-10-28T12:34:00Z",
+                "reply":{"root":{"uri":root_uri,"cid":"root-cid"},"parent":{"uri":root_uri,"cid":"root-cid"}}
+            }),
+        },
+        IndexedRecord {
+            did: "did:plc:author".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "reply-one".into(),
+            uri: "at://did:plc:author/app.bsky.feed.post/reply-one".into(),
+            cid: Some("reply-one-cid".into()),
+            time_us: 4,
+            record: serde_json::json!({
+                "text":"first chain reply",
+                "reply":{"root":{"uri":root_uri,"cid":"root-cid"},"parent":{"uri":focus_uri,"cid":"focus-cid"}}
+            }),
+        },
+        IndexedRecord {
+            did: "did:plc:author".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "reply-two".into(),
+            uri: "at://did:plc:author/app.bsky.feed.post/reply-two".into(),
+            cid: Some("reply-two-cid".into()),
+            time_us: 5,
+            record: serde_json::json!({
+                "text":"second chain reply",
+                "reply":{"root":{"uri":root_uri,"cid":"root-cid"},"parent":{"uri":focus_uri,"cid":"focus-cid"}}
+            }),
+        },
+        IndexedRecord {
+            did: "did:plc:alice".into(),
+            collection: "app.bsky.feed.like".into(),
+            rkey: "like-focus".into(),
+            uri: "at://did:plc:alice/app.bsky.feed.like/like-focus".into(),
+            cid: Some("like-cid".into()),
+            time_us: 6,
+            record: serde_json::json!({"subject":{"uri":focus_uri,"cid":"focus-cid"}}),
+        },
+        IndexedRecord {
+            did: "did:plc:reposter1".into(),
+            collection: "app.bsky.feed.repost".into(),
+            rkey: "repost1".into(),
+            uri: "at://did:plc:reposter1/app.bsky.feed.repost/repost1".into(),
+            cid: Some("repost1-cid".into()),
+            time_us: 7,
+            record: serde_json::json!({"subject":{"uri":focus_uri,"cid":"focus-cid"}}),
+        },
+        IndexedRecord {
+            did: "did:plc:reposter2".into(),
+            collection: "app.bsky.feed.repost".into(),
+            rkey: "repost2".into(),
+            uri: "at://did:plc:reposter2/app.bsky.feed.repost/repost2".into(),
+            cid: Some("repost2-cid".into()),
+            time_us: 8,
+            record: serde_json::json!({"subject":{"uri":focus_uri,"cid":"focus-cid"}}),
+        },
+        IndexedRecord {
+            did: "did:plc:quoter".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "quote".into(),
+            uri: "at://did:plc:quoter/app.bsky.feed.post/quote".into(),
+            cid: Some("quote-cid".into()),
+            time_us: 9,
+            record: serde_json::json!({
+                "text":"quote",
+                "embed":{"$type":"app.bsky.embed.record","record":{"uri":focus_uri,"cid":"focus-cid"}}
+            }),
+        },
+    ] {
+        storage.put_record(&record).unwrap();
+    }
+    storage
+        .set_verified_handle("did:plc:author", "author.test")
+        .unwrap();
+    let flow = FakeOAuthFlow::default();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow.clone(), storage);
+    let cookie = finish_login(&app).await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/thread?uri=at%3A%2F%2Fdid%3Aplc%3Aauthor%2Fapp.bsky.feed.post%2Ffocus")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("class=\"thread-topbar\""), "{html}");
+    assert!(html.contains(">Post</h1>"), "{html}");
+    assert_eq!(html.matches("thread-post-focus").count(), 1, "{html}");
+    assert!(html.contains("2 reposts"), "{html}");
+    assert!(html.contains("1 quote"), "{html}");
+    assert!(html.contains("1 like"), "{html}");
+    assert!(html.contains("thread-continues"), "{html}");
+    assert!(html.contains("aria-label=\"Mobile reply bar\""), "{html}");
+    assert!(html.contains("Write your reply"), "{html}");
+    assert!(html.contains("aria-pressed=\"true\""), "{html}");
+    assert!(!html.contains("0 quotes"), "{html}");
+
+    let reply = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/reply")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", cookie)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(format!(
+                    "parent_uri={}&text=reply+to+focus",
+                    url::form_urlencoded::byte_serialize(focus_uri.as_bytes()).collect::<String>()
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        flow.actions.lock().unwrap().last().unwrap(),
+        &format!("reply:did:plc:alice:reply to focus:{root_uri}:root-cid:{focus_uri}:focus-cid")
+    );
+}
+
+#[tokio::test]
 async fn web_posts_show_hydrated_authors_and_times_on_timeline_profile_and_thread() {
     let storage = Arc::new(MemoryStorage::default());
     storage.register_user("did:plc:alice").unwrap();
