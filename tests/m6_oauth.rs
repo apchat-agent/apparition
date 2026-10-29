@@ -1773,21 +1773,30 @@ async fn logged_in_write_forms_use_the_account_oauth_flow() {
         .unwrap()
         .to_owned();
 
-    for (path, body) in [
-        ("/post", "text=hello+world"),
+    // A like or repost returns to the referring page (same origin, under /app) at the post's card.
+    for (path, body, referer, location) in [
+        ("/post", "text=hello+world", None, "/app"),
         (
             "/like",
             "uri=at%3A%2F%2Fdid%3Aplc%3Aauthor%2Fapp.bsky.feed.post%2Fr1&cid=bafyreifake",
+            Some("https://appview.example/app/feed?uri=at%3A%2F%2Ffeed"),
+            "/app/feed?uri=at%3A%2F%2Ffeed#post-did-plc-author-app-bsky-feed-post-r1",
         ),
         (
             "/repost",
             "uri=at%3A%2F%2Fdid%3Aplc%3Aauthor%2Fapp.bsky.feed.post%2Fr1&cid=bafyreifake",
+            Some("https://elsewhere.example/app/feed"),
+            "/app#post-did-plc-author-app-bsky-feed-post-r1",
         ),
     ] {
+        let mut request = Request::builder();
+        if let Some(referer) = referer {
+            request = request.header("referer", referer);
+        }
         let response = app
             .clone()
             .oneshot(
-                Request::builder()
+                request
                     .method("POST")
                     .uri(path)
                     .header("origin", "https://appview.example")
@@ -1800,7 +1809,7 @@ async fn logged_in_write_forms_use_the_account_oauth_flow() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SEE_OTHER, "{path}");
-        assert_eq!(response.headers()["location"], "/app");
+        assert_eq!(response.headers()["location"], location, "{path}");
     }
     assert_eq!(
         *actions.lock().unwrap(),
