@@ -202,3 +202,38 @@ Deno.test("notification badges update from SSE and fall back to 30-second pollin
   assertEquals(requests.length, 2);
   assertEquals(badges[0].textContent, "2");
 });
+
+Deno.test("image canvas resize bounds JPEG bytes and dimensions", async () => {
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  const resizeImageCanvasSource = new Function(`${source}; return resizeImageCanvasSource;`)();
+  const draws = [];
+  globalThis.document = {
+    createElement(tag) {
+      assertEquals(tag, "canvas");
+      return {
+        width: 0,
+        height: 0,
+        getContext() {
+          return {
+            drawImage(image, x, y, width, height) {
+              draws.push({ image, x, y, width, height });
+            },
+          };
+        },
+        toBlob(callback, mime, quality) {
+          assertEquals(mime, "image/jpeg");
+          const bytes = Math.ceil(this.width * this.height * quality * 0.12);
+          callback(new Blob([new Uint8Array(bytes)], { type: mime }));
+        },
+      };
+    },
+  };
+
+  const result = await resizeImageCanvasSource({ width: 6000, height: 3000 });
+  assert(result.blob.size <= 950_000, `expected <= 950000 bytes, got ${result.blob.size}`);
+  assertEquals(result.blob.type, "image/jpeg");
+  assert(Math.max(result.width, result.height) <= 2000);
+  assertEquals(result.width, 2000);
+  assertEquals(result.height, 1000);
+  assert(draws.length > 0);
+});
