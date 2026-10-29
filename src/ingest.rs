@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     cmp::Reverse,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -29,6 +29,7 @@ const BACKFILL_RETRY_BASE: Duration = Duration::from_secs(5);
 const BACKFILL_RETRY_MAX: Duration = Duration::from_secs(60 * 60);
 const MAX_BACKFILL_QUEUE: usize = 1_000;
 const BACKFILL_BATCH_SIZE: usize = 8;
+const MAX_PROFILE_FETCH_QUEUE: usize = 10_000;
 const JETSTREAM_BATCH_SIZE: usize = 200;
 const JETSTREAM_BATCH_DELAY: Duration = Duration::from_millis(250);
 
@@ -57,6 +58,10 @@ fn epoch_micros() -> i64 {
         .unwrap_or_default()
         .as_micros()
         .min(i64::MAX as u128) as i64
+}
+
+fn profile_time_ms(time_us: u64) -> i64 {
+    i64::try_from(time_us / 1_000).unwrap_or(i64::MAX)
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
@@ -109,6 +114,12 @@ pub struct PostInteractionSummary {
     pub quote_count: usize,
     pub viewer_like: Option<String>,
     pub viewer_repost: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProfileIndexEntry {
+    pub has_profile: bool,
+    pub fetched_at_ms: i64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -384,6 +395,15 @@ pub trait Storage: Send + Sync {
         limit: usize,
     ) -> Result<Vec<IndexedRecord>, StorageError>;
     fn profile_counts(&self, did: &str) -> Result<(usize, usize, usize), StorageError>;
+    fn profile_index_snapshot(&self) -> Result<HashMap<String, ProfileIndexEntry>, StorageError>;
+    fn set_profile_index_entry(
+        &self,
+        did: &str,
+        entry: ProfileIndexEntry,
+    ) -> Result<(), StorageError>;
+    fn enqueue_profile_fetches(&self, dids: &[String]) -> Result<(), StorageError>;
+    fn pending_profile_fetches(&self, limit: usize) -> Result<Vec<String>, StorageError>;
+    fn complete_profile_fetch(&self, did: &str) -> Result<(), StorageError>;
     fn notifications_for(
         &self,
         did: &str,
@@ -442,6 +462,7 @@ pub trait Storage: Send + Sync {
     fn is_displayed_did(&self, did: &str) -> Result<bool, StorageError>;
     fn stale_handle_dids(&self, ttl: Duration, limit: usize) -> Result<Vec<String>, StorageError>;
     fn queue_handle_refresh(&self, did: &str) -> Result<(), StorageError>;
+    fn queue_handle_refresh_ordered(&self, dids: &[String]) -> Result<(), StorageError>;
     fn pending_handle_refreshes(&self, limit: usize) -> Result<Vec<String>, StorageError>;
     fn complete_handle_refresh(&self, did: &str) -> Result<(), StorageError>;
     fn bytes_on_disk(&self) -> u64;
@@ -504,6 +525,9 @@ struct MemoryState {
     verified_handles: HashMap<String, (String, Instant)>,
     invalid_handles: HashMap<String, Instant>,
     handle_refresh_queue: HashSet<String>,
+    handle_refresh_order: VecDeque<String>,
+    profile_index: HashMap<String, ProfileIndexEntry>,
+    profile_fetch_queue: VecDeque<String>,
 }
 
 struct BackfillRetry {
@@ -518,11 +542,17 @@ impl Storage for MemoryStorage {
             record.collection.clone(),
             record.rkey.clone(),
         );
-        self.inner
-            .lock()
-            .map_err(|_| StorageError::Poisoned)?
-            .records
-            .insert(key, record.clone());
+        let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        inner.records.insert(key, record.clone());
+        if record.collection == "app.bsky.actor.profile" {
+            inner.profile_index.insert(
+                record.did.clone(),
+                ProfileIndexEntry {
+                    has_profile: true,
+                    fetched_at_ms: profile_time_ms(record.time_us),
+                },
+            );
+        }
         Ok(())
     }
 
@@ -543,11 +573,29 @@ impl Storage for MemoryStorage {
                     record.rkey.clone(),
                 );
                 inner.records.insert(key, record.clone());
+                if record.collection == "app.bsky.actor.profile" {
+                    inner.profile_index.insert(
+                        record.did.clone(),
+                        ProfileIndexEntry {
+                            has_profile: true,
+                            fetched_at_ms: profile_time_ms(record.time_us),
+                        },
+                    );
+                }
             }
             if let Some((did, collection, rkey)) = &update.delete {
                 inner
                     .records
                     .remove(&(did.clone(), collection.clone(), rkey.clone()));
+                if collection == "app.bsky.actor.profile" {
+                    inner.profile_index.insert(
+                        did.clone(),
+                        ProfileIndexEntry {
+                            has_profile: false,
+                            fetched_at_ms: epoch_millis(),
+                        },
+                    );
+                }
             }
             for follow in &update.follows {
                 let edge = (follow.actor.clone(), follow.subject.clone());
@@ -584,7 +632,9 @@ impl Storage for MemoryStorage {
                 inner.backfill_completed.remove(did);
             }
             if let Some(did) = &update.handle_refresh {
-                inner.handle_refresh_queue.insert(did.clone());
+                if inner.handle_refresh_queue.insert(did.clone()) {
+                    inner.handle_refresh_order.push_back(did.clone());
+                }
             }
             inner.cursor = Some(update.time_us);
         }
@@ -620,6 +670,7 @@ impl Storage for MemoryStorage {
         inner
             .records
             .retain(|(record_did, _, _), _| record_did != did);
+        let mut latest_profile = None;
         let old_follows = inner
             .follows
             .iter()
@@ -642,7 +693,19 @@ impl Storage for MemoryStorage {
                 record.rkey.clone(),
             );
             inner.records.insert(key, record.clone());
+            if record.collection == "app.bsky.actor.profile" {
+                latest_profile = Some(record.time_us);
+            }
         }
+        inner.profile_index.insert(
+            did.to_owned(),
+            ProfileIndexEntry {
+                has_profile: latest_profile.is_some(),
+                fetched_at_ms: latest_profile
+                    .map(profile_time_ms)
+                    .unwrap_or_else(epoch_millis),
+            },
+        );
         for subject in following {
             let inserted = inner.follows.insert((did.to_owned(), subject.clone()));
             if inserted && inner.tracked.registered.contains(did) {
@@ -663,11 +726,19 @@ impl Storage for MemoryStorage {
     }
 
     fn delete_record(&self, did: &str, collection: &str, rkey: &str) -> Result<(), StorageError> {
-        self.inner
-            .lock()
-            .map_err(|_| StorageError::Poisoned)?
+        let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        inner
             .records
             .remove(&(did.to_owned(), collection.to_owned(), rkey.to_owned()));
+        if collection == "app.bsky.actor.profile" {
+            inner.profile_index.insert(
+                did.to_owned(),
+                ProfileIndexEntry {
+                    has_profile: false,
+                    fetched_at_ms: epoch_millis(),
+                },
+            );
+        }
         Ok(())
     }
 
@@ -817,6 +888,56 @@ impl Storage for MemoryStorage {
             }
         }
         Ok((follows, followers, posts))
+    }
+
+    fn profile_index_snapshot(&self) -> Result<HashMap<String, ProfileIndexEntry>, StorageError> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .profile_index
+            .clone())
+    }
+
+    fn set_profile_index_entry(
+        &self,
+        did: &str,
+        entry: ProfileIndexEntry,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .profile_index
+            .insert(did.to_owned(), entry);
+        Ok(())
+    }
+
+    fn enqueue_profile_fetches(&self, dids: &[String]) -> Result<(), StorageError> {
+        let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        for did in dids {
+            if !inner.profile_fetch_queue.contains(did) {
+                inner.profile_fetch_queue.push_back(did.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn pending_profile_fetches(&self, limit: usize) -> Result<Vec<String>, StorageError> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .profile_fetch_queue
+            .iter()
+            .take(limit.max(1))
+            .cloned()
+            .collect())
+    }
+
+    fn complete_profile_fetch(&self, did: &str) -> Result<(), StorageError> {
+        let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        inner.profile_fetch_queue.retain(|queued| queued != did);
+        Ok(())
     }
 
     fn notifications_for(
@@ -1324,32 +1445,50 @@ impl Storage for MemoryStorage {
     }
 
     fn queue_handle_refresh(&self, did: &str) -> Result<(), StorageError> {
-        self.inner
-            .lock()
-            .map_err(|_| StorageError::Poisoned)?
-            .handle_refresh_queue
-            .insert(did.to_owned());
+        let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        if inner.handle_refresh_queue.insert(did.to_owned()) {
+            inner.handle_refresh_order.push_back(did.to_owned());
+        }
+        Ok(())
+    }
+
+    fn queue_handle_refresh_ordered(&self, dids: &[String]) -> Result<(), StorageError> {
+        let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut seen = HashSet::new();
+        let mut ordered = dids
+            .iter()
+            .filter(|did| seen.insert((*did).clone()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let prioritized = ordered.iter().cloned().collect::<HashSet<_>>();
+        let mut remainder = inner
+            .handle_refresh_order
+            .iter()
+            .filter(|did| !prioritized.contains(*did))
+            .cloned()
+            .collect::<Vec<_>>();
+        for did in &ordered {
+            inner.handle_refresh_queue.insert(did.clone());
+        }
+        ordered.append(&mut remainder);
+        inner.handle_refresh_order = ordered.into();
         Ok(())
     }
 
     fn pending_handle_refreshes(&self, limit: usize) -> Result<Vec<String>, StorageError> {
         let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
-        let mut dids = inner
-            .handle_refresh_queue
+        Ok(inner
+            .handle_refresh_order
             .iter()
+            .take(limit.max(1))
             .cloned()
-            .collect::<Vec<_>>();
-        dids.sort();
-        dids.truncate(limit.max(1));
-        Ok(dids)
+            .collect())
     }
 
     fn complete_handle_refresh(&self, did: &str) -> Result<(), StorageError> {
-        self.inner
-            .lock()
-            .map_err(|_| StorageError::Poisoned)?
-            .handle_refresh_queue
-            .remove(did);
+        let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        inner.handle_refresh_queue.remove(did);
+        inner.handle_refresh_order.retain(|queued| queued != did);
         Ok(())
     }
 
@@ -1371,6 +1510,7 @@ pub struct SqliteStorage {
     checkpointer_stop: Arc<AtomicBool>,
     checkpoint_backlog: Arc<AtomicU64>,
     tracked: Arc<RwLock<TrackedSet>>,
+    profile_index: Arc<RwLock<HashMap<String, ProfileIndexEntry>>>,
 }
 
 impl Drop for SqliteStorage {
@@ -1404,6 +1544,31 @@ fn build_tracked_set(connection: &Connection) -> Result<(TrackedSet, u64), Stora
         }
     }
     Ok((tracked, active_follow_edges))
+}
+
+fn build_profile_index(
+    connection: &Connection,
+) -> Result<HashMap<String, ProfileIndexEntry>, StorageError> {
+    let mut index = HashMap::new();
+    let mut statement = connection
+        .prepare("SELECT did, has_profile, fetched_at_ms FROM profile_index_status ORDER BY did")?;
+    for row in statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, bool>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })? {
+        let (did, has_profile, fetched_at_ms) = row?;
+        index.insert(
+            did,
+            ProfileIndexEntry {
+                has_profile,
+                fetched_at_ms,
+            },
+        );
+    }
+    Ok(index)
 }
 
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
@@ -1538,7 +1703,22 @@ impl SqliteStorage {
              CREATE TABLE IF NOT EXISTS handle_refresh_queue (
                  did TEXT PRIMARY KEY,
                  requested_at INTEGER NOT NULL DEFAULT (unixepoch())
+             );
+             CREATE TABLE IF NOT EXISTS profile_index_status (
+                 did TEXT PRIMARY KEY,
+                 has_profile INTEGER NOT NULL,
+                 fetched_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS profile_fetch_queue (
+                 seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                 did TEXT NOT NULL UNIQUE
              );",
+        )?;
+        connection.execute(
+            "INSERT OR IGNORE INTO profile_index_status(did,has_profile,fetched_at_ms)
+             SELECT did,1,MAX(time_us)/1000 FROM records
+             WHERE collection='app.bsky.actor.profile' GROUP BY did",
+            [],
         )?;
         migrate_follow_state(&connection)?;
         connection.execute_batch(
@@ -1570,6 +1750,14 @@ impl SqliteStorage {
             tracked_set_build_ms,
             "Built in-memory tracked DID set"
         );
+        let profile_index_build_started = Instant::now();
+        let profile_index = build_profile_index(&connection)?;
+        let profile_index_build_ms = profile_index_build_started.elapsed().as_secs_f64() * 1000.0;
+        tracing::info!(
+            profiles = profile_index.len(),
+            profile_index_build_ms,
+            "Built in-memory profile index"
+        );
         let mut read_connections = Vec::new();
         if path.as_os_str() != ":memory:" {
             for _ in 0..SQLITE_READ_CONNECTIONS {
@@ -1593,6 +1781,7 @@ impl SqliteStorage {
             checkpointer_stop: stop,
             checkpoint_backlog: backlog,
             tracked: Arc::new(RwLock::new(tracked_set)),
+            profile_index: Arc::new(RwLock::new(profile_index)),
         })
     }
 
@@ -1610,6 +1799,16 @@ impl SqliteStorage {
         Ok(*self.tracked.read().map_err(|_| StorageError::Poisoned)? == rebuilt)
     }
 
+    pub fn profile_index_matches_sqlite(&self) -> Result<bool, StorageError> {
+        let connection = self.read_conn()?;
+        let rebuilt = build_profile_index(&connection)?;
+        Ok(*self
+            .profile_index
+            .read()
+            .map_err(|_| StorageError::Poisoned)?
+            == rebuilt)
+    }
+
     fn apply_tracked_follow_deltas(
         &self,
         deltas: &HashMap<String, i64>,
@@ -1622,6 +1821,43 @@ impl SqliteStorage {
             tracked.apply_follow_delta(subject, *delta);
         }
         Ok(())
+    }
+
+    fn write_profile_index_status(
+        &self,
+        did: &str,
+        entry: ProfileIndexEntry,
+    ) -> Result<(), StorageError> {
+        self.conn()?.execute(
+            "INSERT INTO profile_index_status(did,has_profile,fetched_at_ms)
+             VALUES(?1,?2,?3)
+             ON CONFLICT(did) DO UPDATE SET
+                 has_profile=excluded.has_profile,fetched_at_ms=excluded.fetched_at_ms",
+            params![did, entry.has_profile, entry.fetched_at_ms],
+        )?;
+        self.profile_index
+            .write()
+            .map_err(|_| StorageError::Poisoned)?
+            .insert(did.to_owned(), entry);
+        Ok(())
+    }
+
+    fn refresh_profile_index_for_did(&self, did: &str) -> Result<(), StorageError> {
+        let latest_profile_us: Option<i64> = self.read_conn()?.query_row(
+            "SELECT MAX(time_us) FROM records
+             WHERE did=?1 AND collection='app.bsky.actor.profile'",
+            [did],
+            |row| row.get(0),
+        )?;
+        self.write_profile_index_status(
+            did,
+            ProfileIndexEntry {
+                has_profile: latest_profile_us.is_some(),
+                fetched_at_ms: latest_profile_us
+                    .map(|time_us| time_us / 1_000)
+                    .unwrap_or_else(epoch_millis),
+            },
+        )
     }
 
     fn conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StorageError> {
@@ -1944,6 +2180,16 @@ impl Storage for SqliteStorage {
             params![record.did, record.collection, record.rkey, record.uri, record.cid, record.time_us, record_json],
         )?;
         write_notification_events(&connection, record)?;
+        drop(connection);
+        if record.collection == "app.bsky.actor.profile" {
+            self.write_profile_index_status(
+                &record.did,
+                ProfileIndexEntry {
+                    has_profile: true,
+                    fetched_at_ms: profile_time_ms(record.time_us),
+                },
+            )?;
+        }
         Ok(())
     }
 
@@ -2062,6 +2308,31 @@ impl Storage for SqliteStorage {
         let apply = apply_started.elapsed();
         let commit_started = Instant::now();
         transaction.commit()?;
+        drop(connection);
+        for update in updates {
+            if let Some(record) = &update.upsert
+                && record.collection == "app.bsky.actor.profile"
+            {
+                self.write_profile_index_status(
+                    &record.did,
+                    ProfileIndexEntry {
+                        has_profile: true,
+                        fetched_at_ms: profile_time_ms(record.time_us),
+                    },
+                )?;
+            }
+            if let Some((did, collection, _)) = &update.delete
+                && collection == "app.bsky.actor.profile"
+            {
+                self.write_profile_index_status(
+                    did,
+                    ProfileIndexEntry {
+                        has_profile: false,
+                        fetched_at_ms: epoch_millis(),
+                    },
+                )?;
+            }
+        }
         self.apply_tracked_follow_deltas(&tracked_follow_deltas)?;
         Ok(BatchApplyTiming {
             apply,
@@ -2125,7 +2396,8 @@ impl Storage for SqliteStorage {
         records: &[IndexedRecord],
         following: &[String],
     ) -> Result<(), StorageError> {
-        self.replace_repo_snapshot_inner(did, records, following, None)
+        self.replace_repo_snapshot_inner(did, records, following, None)?;
+        self.refresh_profile_index_for_did(did)
     }
 
     fn replace_repo_snapshot_throttled(
@@ -2135,7 +2407,8 @@ impl Storage for SqliteStorage {
         following: &[String],
         records_per_second: u64,
     ) -> Result<(), StorageError> {
-        self.replace_repo_snapshot_inner(did, records, following, Some(records_per_second))
+        self.replace_repo_snapshot_inner(did, records, following, Some(records_per_second))?;
+        self.refresh_profile_index_for_did(did)
     }
 
     fn delete_record(&self, did: &str, collection: &str, rkey: &str) -> Result<(), StorageError> {
@@ -2148,6 +2421,16 @@ impl Storage for SqliteStorage {
             "DELETE FROM notification_events WHERE source_did=?1 AND source_collection=?2 AND source_rkey=?3",
             params![did, collection, rkey],
         )?;
+        drop(connection);
+        if collection == "app.bsky.actor.profile" {
+            self.write_profile_index_status(
+                did,
+                ProfileIndexEntry {
+                    has_profile: false,
+                    fetched_at_ms: epoch_millis(),
+                },
+            )?;
+        }
         Ok(())
     }
 
@@ -2268,6 +2551,53 @@ impl Storage for SqliteStorage {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         Ok((counts.0 as usize, counts.1 as usize, counts.2 as usize))
+    }
+
+    fn profile_index_snapshot(&self) -> Result<HashMap<String, ProfileIndexEntry>, StorageError> {
+        Ok(self
+            .profile_index
+            .read()
+            .map_err(|_| StorageError::Poisoned)?
+            .clone())
+    }
+
+    fn set_profile_index_entry(
+        &self,
+        did: &str,
+        entry: ProfileIndexEntry,
+    ) -> Result<(), StorageError> {
+        self.write_profile_index_status(did, entry)
+    }
+
+    fn enqueue_profile_fetches(&self, dids: &[String]) -> Result<(), StorageError> {
+        let connection = self.conn()?;
+        for did in dids {
+            connection.execute(
+                "INSERT OR IGNORE INTO profile_fetch_queue(did)
+                 SELECT ?1 WHERE (SELECT COUNT(*) FROM profile_fetch_queue) < ?2
+                    OR EXISTS(SELECT 1 FROM profile_fetch_queue WHERE did=?1)",
+                params![did, MAX_PROFILE_FETCH_QUEUE],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn pending_profile_fetches(&self, limit: usize) -> Result<Vec<String>, StorageError> {
+        let connection = self.read_conn()?;
+        let mut statement =
+            connection.prepare("SELECT did FROM profile_fetch_queue ORDER BY seq LIMIT ?1")?;
+        statement
+            .query_map([i64::try_from(limit.max(1)).unwrap_or(i64::MAX)], |row| {
+                row.get(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    fn complete_profile_fetch(&self, did: &str) -> Result<(), StorageError> {
+        self.conn()?
+            .execute("DELETE FROM profile_fetch_queue WHERE did=?1", [did])?;
+        Ok(())
     }
 
     fn notifications_for(
@@ -2894,6 +3224,46 @@ impl Storage for SqliteStorage {
         Ok(())
     }
 
+    fn queue_handle_refresh_ordered(&self, dids: &[String]) -> Result<(), StorageError> {
+        let mut connection = self.conn()?;
+        let transaction = connection.transaction()?;
+        let mut statement =
+            transaction.prepare("SELECT did FROM handle_refresh_queue ORDER BY rowid")?;
+        let existing = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        let mut seen = HashSet::new();
+        let mut ordered = dids
+            .iter()
+            .chain(existing.iter())
+            .filter(|did| seen.insert((*did).clone()))
+            .cloned()
+            .collect::<Vec<_>>();
+        {
+            let mut deferred = self
+                .deferred_handle_refreshes
+                .lock()
+                .map_err(|_| StorageError::Poisoned)?;
+            let mut rest = deferred.iter().cloned().collect::<Vec<_>>();
+            rest.sort();
+            for did in rest {
+                if seen.insert(did.clone()) {
+                    ordered.push(did);
+                }
+            }
+            for did in dids {
+                deferred.remove(did);
+            }
+        }
+        transaction.execute("DELETE FROM handle_refresh_queue", [])?;
+        for did in ordered {
+            transaction.execute("INSERT INTO handle_refresh_queue(did) VALUES(?1)", [did])?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn pending_handle_refreshes(&self, limit: usize) -> Result<Vec<String>, StorageError> {
         let limit = limit.max(1);
         let mut dids = self
@@ -2903,26 +3273,19 @@ impl Storage for SqliteStorage {
             .iter()
             .cloned()
             .collect::<Vec<_>>();
-        dids.sort();
-        dids.truncate(limit);
         let connection = self.read_conn()?;
-        let remaining = limit.saturating_sub(dids.len());
-        if remaining > 0 {
-            let mut statement = connection.prepare(
-                "SELECT did FROM handle_refresh_queue ORDER BY requested_at,did LIMIT ?1",
-            )?;
-            dids.extend(
-                statement
-                    .query_map([i64::try_from(remaining).unwrap_or(i64::MAX)], |row| {
-                        row.get(0)
-                    })?
-                    .collect::<Result<Vec<String>, _>>()?,
-            );
-        }
+        let mut prioritized = {
+            let mut statement = connection
+                .prepare("SELECT did FROM handle_refresh_queue ORDER BY rowid LIMIT ?1")?;
+            statement
+                .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| row.get(0))?
+                .collect::<Result<Vec<String>, _>>()?
+        };
         dids.sort();
-        dids.dedup();
-        dids.truncate(limit);
-        Ok(dids)
+        prioritized.append(&mut dids);
+        prioritized.dedup();
+        prioritized.truncate(limit);
+        Ok(prioritized)
     }
 
     fn complete_handle_refresh(&self, did: &str) -> Result<(), StorageError> {

@@ -8,7 +8,7 @@ use appview_rs::{
     ingest::{Ingestor, JetstreamConsumer, SqliteStorage},
     init_tracing,
     jwt::ServiceJwtVerifier,
-    oauth::{OAuthPublic, SqliteOAuthStore},
+    oauth::{OAuthPublic, ProfileRefreshWorker, SqliteOAuthStore},
     router_with_oauth_flow,
 };
 use std::{error::Error, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
@@ -37,6 +37,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let oauth_flow = oauth
         .atrium_flow(oauth_identity_resolver, oauth_store)
         .map_err(std::io::Error::other)?;
+    let profile_refresh_worker =
+        ProfileRefreshWorker::new(oauth_flow.clone(), storage.clone(), Duration::from_secs(2));
     let ingestor = Ingestor::new(storage.clone(), config.scope_mode);
     let consumer = JetstreamConsumer::new(ingestor, Duration::from_secs(1))
         .with_idle_timeout(Duration::from_secs(config.jetstream_idle_timeout_secs))
@@ -54,13 +56,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         jwt_resolver,
         config.appview_did.clone(),
     ));
-    let app_router =
-        router_with_oauth_flow(oauth, oauth_flow, storage.clone()).merge(api_router_with_https(
+    let app_router = router_with_oauth_flow(oauth, oauth_flow.clone(), storage.clone()).merge(
+        api_router_with_https(
             storage.clone(),
             jwt,
             config.appview_did.clone(),
             config.public_url.starts_with("https://"),
-        ));
+        ),
+    );
     let backfiller = RepoBackfiller::new(
         storage.clone(),
         HttpRepoSource::default(),
@@ -112,6 +115,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             error!(%error, "verified handle refresh worker stopped");
         }
     });
+    let profile_refresh_shutdown = shutdown_rx.clone();
+    let profile_refresh_task = tokio::spawn(async move {
+        if let Err(error) = profile_refresh_worker.run(profile_refresh_shutdown).await {
+            error!(%error, "author profile refresh worker stopped");
+        }
+    });
 
     info!(
         %address,
@@ -138,6 +147,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let _ = ingestion_task.await;
         let _ = backfill_task.await;
         let _ = handle_refresh_task.await;
+        let _ = profile_refresh_task.await;
     })
     .await;
     Ok(())

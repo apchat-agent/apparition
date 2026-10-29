@@ -212,6 +212,20 @@ impl OAuthFlow for FakeOAuthFlow {
         })
     }
 
+    fn resolve_author_handle<'a>(
+        &'a self,
+        did: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<String>, String>> + Send + 'a>> {
+        Box::pin(async move {
+            Ok(self
+                .author_profiles
+                .lock()
+                .unwrap()
+                .get(did)
+                .and_then(|profile| profile.verified_handle.clone()))
+        })
+    }
+
     fn pinned_feeds<'a>(
         &'a self,
         _: &'a str,
