@@ -1068,7 +1068,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
             ),
             "{path}"
         );
-        assert!(html.contains("href=\"/static/app.css?v=m17\""), "{path}");
+        assert!(html.contains("href=\"/static/app.css?v=m18\""), "{path}");
         assert!(!html.contains("style="), "{path}");
         // Both playback and interaction scripts are local, deferred, and never inline.
         assert_eq!(html.matches("<script").count(), 2, "{path}");
@@ -1082,7 +1082,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
     let stylesheet = app
         .oneshot(
             Request::builder()
-                .uri("/static/app.css?v=m17")
+                .uri("/static/app.css?v=m18")
                 .body(Body::empty())
                 .unwrap(),
         )

@@ -1517,7 +1517,13 @@ a.quoted-post-card:hover,
 }
 
 .action-confirm input {
+  width: 1rem;
+  height: 1rem;
+  min-height: 1rem;
+  flex: 0 0 1rem;
   margin: 0;
+  padding: 0;
+  accent-color: var(--accent);
 }
 
 .permission-prompt,
