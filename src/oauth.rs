@@ -74,7 +74,7 @@ const PROFILE_NEGATIVE_TTL: Duration = Duration::from_secs(60 * 60);
 const PAGE_PROFILE_BUDGET: Duration = Duration::from_millis(1500);
 const PAGE_PROFILE_CONCURRENCY: usize = 8;
 const PAGE_QUOTE_CONCURRENCY: usize = 16;
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m5";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m6";
 const WEB_SCRIPT_URL: &str = "/static/app.js?v=js4";
 const SAVED_FEED_CACHE_PREFIX: &str = "saved-feed-preferences:";
 const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=*";
@@ -2598,7 +2598,7 @@ fn icon_sprite() -> String {
         .iter()
         .map(|name| {
             format!(
-                "<symbol id=\"i-{name}\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\">{}</symbol>",
+                "<symbol id=\"i-{name}\" viewBox=\"0 0 24 24\" stroke=\"currentColor\" stroke-width=\"1.8\" stroke-linecap=\"round\" stroke-linejoin=\"round\">{}</symbol>",
                 icon_content(name)
             )
         })

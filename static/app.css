@@ -43,6 +43,10 @@
   overflow: hidden;
 }
 
+.icon {
+  fill: none;
+}
+
 html {
   min-width: 320px;
   background: var(--page);
