@@ -1228,6 +1228,20 @@ async fn post_avatars_use_thumbnail_dimensions_and_lazy_load_after_six() {
 async fn fifty_post_app_page_stays_under_the_compressed_page_weight_budget() {
     let storage = Arc::new(MemoryStorage::default());
     let did = "did:plc:alice";
+    storage
+        .put_record(&IndexedRecord {
+            did: did.into(),
+            collection: "app.bsky.actor.profile".into(),
+            rkey: "self".into(),
+            uri: format!("at://{did}/app.bsky.actor.profile/self"),
+            cid: Some("profile-cid".into()),
+            time_us: 1,
+            record: serde_json::json!({
+                "displayName":"Alice",
+                "avatar":{"$type":"blob","ref":{"$link":"avatar-cid"},"mimeType":"image/jpeg"}
+            }),
+        })
+        .unwrap();
     let body = "A representative post with a few sentences about what happened today. \
         Here are a few details, a thought, and a link to share with friends.";
     for index in 0..50 {
