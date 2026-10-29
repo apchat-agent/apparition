@@ -34,7 +34,10 @@ use atrium_xrpc::{
 };
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Form, FromRequest, Multipart, Query, Request, State},
+    body::{Body, Bytes},
+    extract::{
+        DefaultBodyLimit, Form, FromRequest, Multipart, Path as AxumPath, Query, Request, State,
+    },
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{
         Html, IntoResponse, Redirect, Response,
@@ -60,7 +63,7 @@ use std::{
     future::Future,
     io::Write,
     net::SocketAddr,
-    path::Path,
+    path::{Component, Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex},
 };
@@ -79,8 +82,10 @@ const PROFILE_NEGATIVE_TTL: Duration = Duration::from_secs(60 * 60);
 const PAGE_PROFILE_BUDGET: Duration = Duration::from_millis(1500);
 const PAGE_PROFILE_CONCURRENCY: usize = 8;
 const PAGE_QUOTE_CONCURRENCY: usize = 16;
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m7";
-const WEB_SCRIPT_URL: &str = "/static/app.js?v=js6";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m8";
+const WEB_SCRIPT_URL: &str = "/static/app.js?v=js7";
+const ALT_MODEL_DOWNLOAD_BYTES: u64 = 264_713_119;
+const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
 const SAVED_FEED_CACHE_PREFIX: &str = "saved-feed-preferences:";
 const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=*";
 const BLOB_SCOPE: &str = "blob:image/*";
@@ -376,6 +381,7 @@ pub struct OAuthWebState<F, S> {
     pub public: OAuthPublic,
     pub flow: F,
     pub storage: Arc<S>,
+    pub alt_model_dir: Option<PathBuf>,
     feed_page_cache: FeedPageCache,
     notification_streams: Arc<Mutex<HashMap<String, usize>>>,
 }
@@ -507,16 +513,33 @@ impl OAuthPublic {
         F: OAuthFlow,
         S: Storage + 'static,
     {
+        self.router_with_flow_and_alt_model_dir(flow, storage, None)
+    }
+
+    pub fn router_with_flow_and_alt_model_dir<F, S>(
+        &self,
+        flow: F,
+        storage: Arc<S>,
+        alt_model_dir: Option<PathBuf>,
+    ) -> Router
+    where
+        F: OAuthFlow,
+        S: Storage + 'static,
+    {
         Router::new()
             .route(METADATA_PATH, get(metadata::<F, S>))
             .route("/static/app.css", get(app_stylesheet))
             .route("/static/app.js", get(app_script))
+            .route("/static/alt-model-worker.js", get(alt_model_worker))
+            .route("/static/vendor/{*path}", get(vendor_asset))
+            .route("/static/models/{*path}", get(model_asset::<F, S>))
             .route("/", get(root))
             .route("/login", get(login))
             .route("/oauth/authorize", post(authorize::<F, S>))
             .route("/oauth/callback", get(callback::<F, S>))
             .route("/logout", post(logout::<F, S>))
             .route("/app", get(app_home::<F, S>))
+            .route("/alt-test", get(alt_test_page::<F, S>))
             .route("/feeds", get(feeds_page::<F, S>))
             .route("/app/feed", get(feed_timeline_page::<F, S>))
             .route("/app/thread", get(thread_page::<F, S>))
@@ -539,6 +562,7 @@ impl OAuthPublic {
                 public: self.clone(),
                 flow,
                 storage,
+                alt_model_dir,
                 feed_page_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 notification_streams: Arc::new(Mutex::new(HashMap::new())),
             }))
@@ -2014,6 +2038,35 @@ where
     Json(state.public.metadata.clone())
 }
 
+async fn alt_test_page<F, S>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    headers: HeaderMap,
+) -> Response
+where
+    F: OAuthFlow,
+    S: Storage + 'static,
+{
+    if verified_cookie_did(&state.public, &headers, state.storage.as_ref()).is_none() {
+        return Redirect::to("/login").into_response();
+    }
+    let model_status = if state.alt_model_dir.is_some() {
+        format!(
+            "Model files: {ALT_MODEL_DOWNLOAD_BYTES} bytes. The first run downloads them from this AppView; the photo stays in this browser."
+        )
+    } else {
+        "On-device captioning is not configured on this AppView.".to_owned()
+    };
+    let content = format!(
+        "<section class=\"alt-test-page\"><h1>On-device caption test</h1><p>Choose a photo and run a caption test. The image is processed in this browser and is never uploaded.</p><p data-alt-model-size>{model_status}</p><form data-alt-test><label for=\"alt-test-image\">Photo to caption</label><input id=\"alt-test-image\" type=\"file\" accept=\"image/*\" data-alt-test-image required><button type=\"submit\" data-alt-test-run{}>Run caption test</button></form><progress data-alt-test-progress max=\"{ALT_MODEL_DOWNLOAD_BYTES}\" value=\"0\" hidden></progress><p data-alt-test-status role=\"status\" aria-live=\"polite\">No image has been processed.</p><dl><dt>Backend</dt><dd data-alt-test-backend>—</dd><dt>Download bytes</dt><dd data-alt-test-bytes>—</dd><dt>Model load</dt><dd data-alt-test-load-ms>—</dd><dt>Caption time</dt><dd data-alt-test-caption-ms>—</dd><dt>Caption</dt><dd data-alt-test-caption>—</dd></dl></section>",
+        if state.alt_model_dir.is_some() {
+            ""
+        } else {
+            " disabled"
+        }
+    );
+    Html(page_shell("On-device caption test", &content, true)).into_response()
+}
+
 /// Optional progressive enhancement (like toggles in place). Every action still works as a plain form without it.
 async fn app_script() -> Response {
     let mut response = include_str!("../static/app.js").into_response();
@@ -2024,6 +2077,142 @@ async fn app_script() -> Response {
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    response
+}
+
+async fn alt_model_worker() -> Response {
+    static_asset_response(
+        include_bytes!("../static/alt-model-worker.js"),
+        "text/javascript; charset=utf-8",
+    )
+}
+
+async fn vendor_asset(AxumPath(path): AxumPath<String>) -> Response {
+    let (bytes, content_type): (&'static [u8], &'static str) = match path.as_str() {
+        "transformers-4.3.2.min.js" => (
+            include_bytes!("../static/vendor/transformers-4.3.2.min.js"),
+            "text/javascript; charset=utf-8",
+        ),
+        "ort-wasm-simd-threaded.mjs" => (
+            include_bytes!("../static/vendor/ort-wasm-simd-threaded.mjs"),
+            "text/javascript; charset=utf-8",
+        ),
+        "ort-wasm-simd-threaded.wasm" => (
+            include_bytes!("../static/vendor/ort-wasm-simd-threaded.wasm"),
+            "application/wasm",
+        ),
+        "ort-wasm-simd-threaded.asyncify.mjs" => (
+            include_bytes!("../static/vendor/ort-wasm-simd-threaded.asyncify.mjs"),
+            "text/javascript; charset=utf-8",
+        ),
+        "ort-wasm-simd-threaded.asyncify.wasm" => (
+            include_bytes!("../static/vendor/ort-wasm-simd-threaded.asyncify.wasm"),
+            "application/wasm",
+        ),
+        "ort-wasm-simd-threaded.jsep.mjs" => (
+            include_bytes!("../static/vendor/ort-wasm-simd-threaded.jsep.mjs"),
+            "text/javascript; charset=utf-8",
+        ),
+        "ort-wasm-simd-threaded.jsep.wasm" => (
+            include_bytes!("../static/vendor/ort-wasm-simd-threaded.jsep.wasm"),
+            "application/wasm",
+        ),
+        "LICENSE-transformers-js" => (
+            include_bytes!("../static/vendor/LICENSE-transformers-js"),
+            "text/plain; charset=utf-8",
+        ),
+        "LICENSE-onnxruntime-web" => (
+            include_bytes!("../static/vendor/LICENSE-onnxruntime-web"),
+            "text/plain; charset=utf-8",
+        ),
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    static_asset_response(bytes, content_type)
+}
+
+fn static_asset_response(bytes: &'static [u8], content_type: &'static str) -> Response {
+    let mut response = Response::new(Body::from(Bytes::from_static(bytes)));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response.headers_mut().insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from(bytes.len() as u64),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(IMMUTABLE_CACHE),
+    );
+    response
+}
+
+async fn model_asset<F, S>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    AxumPath(path): AxumPath<String>,
+) -> Response
+where
+    F: OAuthFlow,
+    S: Storage + 'static,
+{
+    use tokio::io::AsyncReadExt;
+
+    let Some(model_root) = state.alt_model_dir.as_deref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let relative = Path::new(&path);
+    if relative
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+        || relative.components().next() != Some(Component::Normal("alt-caption-v1".as_ref()))
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Ok(root) = tokio::fs::canonicalize(model_root).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(target) = tokio::fs::canonicalize(root.join(relative)).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !target.starts_with(&root) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Ok(metadata) = tokio::fs::metadata(&target).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !metadata.is_file() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Ok(file) = tokio::fs::File::open(&target).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let content_type = match target.extension().and_then(|value| value.to_str()) {
+        Some("json") => "application/json",
+        Some("txt") => "text/plain; charset=utf-8",
+        Some("onnx") | Some("bin") => "application/octet-stream",
+        Some("wasm") => "application/wasm",
+        _ => "application/octet-stream",
+    };
+    let body_stream = stream::try_unfold(file, |mut file| async move {
+        let mut buffer = vec![0; 64 * 1024];
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            Ok::<_, std::io::Error>(None)
+        } else {
+            buffer.truncate(read);
+            Ok(Some((Bytes::from(buffer), file)))
+        }
+    });
+    let mut response = Response::new(Body::from_stream(body_stream));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_LENGTH, HeaderValue::from(metadata.len()));
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(IMMUTABLE_CACHE),
     );
     response
 }
@@ -6737,8 +6926,45 @@ mod tests {
     use http_body_util::BodyExt;
     use std::collections::HashMap;
     use tokio::net::TcpListener;
+    use tower::ServiceExt;
     use tracing::instrument::WithSubscriber;
     use tracing_subscriber::fmt::MakeWriter;
+
+    #[tokio::test]
+    async fn alt_test_page_requires_and_accepts_a_verified_session_cookie() {
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        let storage = Arc::new(MemoryStorage::default());
+        let did = "did:plc:av27viewer";
+        let session_id = "av27-session";
+        let generation = storage.rotate_web_session(did, session_id).unwrap();
+        let token = public.issue_session_cookie(did, session_id, generation, true, true, true);
+        let app = public.router_with_flow(DisabledOAuthFlow, storage);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/alt-test")
+                    .header("cookie", format!("{SESSION_COOKIE}={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let page = String::from_utf8(body.to_vec()).unwrap();
+        for marker in [
+            "data-alt-test",
+            "data-alt-test-backend",
+            "data-alt-test-bytes",
+            "data-alt-test-load-ms",
+            "data-alt-test-caption-ms",
+            "data-alt-test-caption",
+        ] {
+            assert!(page.contains(marker), "missing measurement field {marker}");
+        }
+        assert!(page.contains("never uploaded"));
+    }
 
     const FEED_VIEWER_DID: &str = "did:plc:av23viewer";
     const FEED_CREATOR_DID: &str = "did:plc:av23creator";
@@ -6770,8 +6996,8 @@ mod tests {
         assert!(css.contains(".icon {\n  fill: none;"));
         assert!(css.contains(".post-actions .is-liked .icon {\n  fill: var(--accent);"));
         assert!(css.contains(".thread-focus-actions .is-liked .icon {\n  fill: var(--accent);"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m7"));
-        assert!(WEB_SCRIPT_URL.contains("v=js6"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m8"));
+        assert!(WEB_SCRIPT_URL.contains("v=js7"));
     }
 
     #[test]

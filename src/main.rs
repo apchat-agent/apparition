@@ -9,7 +9,7 @@ use appview_rs::{
     init_tracing,
     jwt::ServiceJwtVerifier,
     oauth::{OAuthPublic, ProfileRefreshWorker, SqliteOAuthStore},
-    router_with_oauth_flow,
+    router_with_oauth_flow_and_alt_model_dir,
 };
 use std::{error::Error, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
@@ -61,14 +61,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         jwt_resolver,
         config.appview_did.clone(),
     ));
-    let app_router = router_with_oauth_flow(oauth, oauth_flow.clone(), storage.clone()).merge(
-        api_router_with_https(
-            storage.clone(),
-            jwt,
-            config.appview_did.clone(),
-            config.public_url.starts_with("https://"),
-        ),
-    );
+    let app_router = router_with_oauth_flow_and_alt_model_dir(
+        oauth,
+        oauth_flow.clone(),
+        storage.clone(),
+        config.alt_model_dir.clone(),
+    )
+    .merge(api_router_with_https(
+        storage.clone(),
+        jwt,
+        config.appview_did.clone(),
+        config.public_url.starts_with("https://"),
+    ));
     let backfiller = RepoBackfiller::new(
         storage.clone(),
         HttpRepoSource::default(),
