@@ -594,6 +594,15 @@ type AppOAuthClient = OAuthClient<
 >;
 type SavedFeedCache =
     Arc<tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, Vec<SavedFeedPreference>)>>>;
+// Keyed by (viewer DID, feed generator service DID).
+type ServiceAuthCache =
+    Arc<tokio::sync::Mutex<HashMap<(String, String), (tokio::time::Instant, String)>>>;
+// Keyed by (viewer DID, feed URI, cursor); switching between feed tabs reuses a page for a minute.
+type FeedPageCache = Arc<
+    tokio::sync::Mutex<HashMap<(String, String, String), (tokio::time::Instant, FeedTimeline)>>,
+>;
+const SERVICE_AUTH_LIFETIME_SECS: u64 = 30 * 60;
+const FEED_PAGE_CACHE_SECS: u64 = 60;
 
 pub struct AtriumOAuthFlow<B: crate::identity::IdentityBackend = HttpIdentityBackend> {
     client: Arc<AppOAuthClient>,
@@ -602,6 +611,8 @@ pub struct AtriumOAuthFlow<B: crate::identity::IdentityBackend = HttpIdentityBac
     feed_client: Arc<FeedClient<B>>,
     http_client: SafeHttpClient,
     saved_feed_cache: SavedFeedCache,
+    service_auth_cache: ServiceAuthCache,
+    feed_page_cache: FeedPageCache,
 }
 
 impl<B: crate::identity::IdentityBackend> Clone for AtriumOAuthFlow<B> {
@@ -613,6 +624,8 @@ impl<B: crate::identity::IdentityBackend> Clone for AtriumOAuthFlow<B> {
             feed_client: self.feed_client.clone(),
             http_client: self.http_client.clone(),
             saved_feed_cache: self.saved_feed_cache.clone(),
+            service_auth_cache: self.service_auth_cache.clone(),
+            feed_page_cache: self.feed_page_cache.clone(),
         }
     }
 }
@@ -859,6 +872,8 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             feed_client,
             http_client: retained_http_client,
             saved_feed_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            service_auth_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            feed_page_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -919,6 +934,34 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         viewer_did: &str,
         service_did: &str,
     ) -> Result<String, String> {
+        let key = (viewer_did.to_owned(), service_did.to_owned());
+        if let Some((expires, token)) = self.service_auth_cache.lock().await.get(&key).cloned()
+            && expires > tokio::time::Instant::now()
+        {
+            return Ok(token);
+        }
+        let token = self.fetch_service_auth_token(viewer_did, service_did).await?;
+        let mut cache = self.service_auth_cache.lock().await;
+        cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
+        if cache.len() < 4096 {
+            // Reuse until a minute before the expiry we asked for.
+            cache.insert(
+                key,
+                (
+                    tokio::time::Instant::now()
+                        + Duration::from_secs(SERVICE_AUTH_LIFETIME_SECS - 60),
+                    token.clone(),
+                ),
+            );
+        }
+        Ok(token)
+    }
+
+    async fn fetch_service_auth_token(
+        &self,
+        viewer_did: &str,
+        service_did: &str,
+    ) -> Result<String, String> {
         let did = viewer_did
             .parse::<Did>()
             .map_err(|_| "viewer DID is invalid".to_owned())?;
@@ -927,10 +970,17 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             .restore(&did)
             .await
             .map_err(|_| "OAuth session could not be restored".to_owned())?;
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| "system clock is before the epoch".to_owned())?
+            .as_secs()
+            + SERVICE_AUTH_LIFETIME_SECS;
         let request = XrpcRequest {
             method: http::Method::GET,
             nsid: "com.atproto.server.getServiceAuth".to_owned(),
-            parameters: Some(json!({"aud":service_did,"lxm":"app.bsky.feed.getFeedSkeleton"})),
+            parameters: Some(
+                json!({"aud":service_did,"lxm":"app.bsky.feed.getFeedSkeleton","exp":exp}),
+            ),
             input: None,
             encoding: None,
         };
@@ -1407,16 +1457,25 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
         did: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<ResolvedFeed>, String>> + Send + 'a>> {
         Box::pin(async move {
+            let started = std::time::Instant::now();
             let preferences = self.saved_feed_preferences(did).await?;
-            let mut feeds = Vec::new();
-            for preference in preferences
-                .iter()
-                .filter(|item| item.feed_type == "feed" && item.pinned)
-            {
-                if let Ok(feed) = self.feed_client.resolve_feed(&preference.value).await {
-                    feeds.push(feed);
-                }
-            }
+            let preferences_ms = started.elapsed().as_millis() as u64;
+            let resolutions = futures_util::future::join_all(
+                preferences
+                    .iter()
+                    .filter(|item| item.feed_type == "feed" && item.pinned)
+                    .map(|preference| self.feed_client.resolve_feed(&preference.value)),
+            )
+            .await;
+            let requested = resolutions.len();
+            let feeds = resolutions.into_iter().flatten().collect::<Vec<_>>();
+            tracing::info!(
+                pinned = requested,
+                resolved = feeds.len(),
+                preferences_ms,
+                duration_ms = started.elapsed().as_millis() as u64,
+                "pinned feed tabs loaded"
+            );
             Ok(feeds)
         })
     }
@@ -1429,20 +1488,56 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
         storage: &'a dyn Storage,
     ) -> Pin<Box<dyn Future<Output = Result<FeedTimeline, String>> + Send + 'a>> {
         Box::pin(async move {
+            let key = (
+                did.to_owned(),
+                uri.to_owned(),
+                cursor.unwrap_or_default().to_owned(),
+            );
+            if let Some((expires, page)) = self.feed_page_cache.lock().await.get(&key).cloned()
+                && expires > tokio::time::Instant::now()
+            {
+                return Ok(page);
+            }
+            let started = std::time::Instant::now();
             let generator = self.feed_client.resolve_feed(uri).await?;
+            let resolve_ms = started.elapsed().as_millis() as u64;
             let service_jwt = self
                 .service_auth_token(did, &generator.service_did)
                 .await
                 .ok();
+            let auth_ms = started.elapsed().as_millis() as u64 - resolve_ms;
             let skeleton = self
                 .feed_client
                 .get_skeleton(&generator, cursor, service_jwt.as_deref())
                 .await?;
+            let skeleton_ms = started.elapsed().as_millis() as u64 - resolve_ms - auth_ms;
             let timeline = self.feed_client.hydrate_skeleton(skeleton, storage).await?;
-            Ok(FeedTimeline {
+            tracing::info!(
+                feed = uri,
+                resolve_ms,
+                auth_ms,
+                skeleton_ms,
+                hydrate_ms = started.elapsed().as_millis() as u64 - resolve_ms - auth_ms - skeleton_ms,
+                posts = timeline.feed.len(),
+                dropped = timeline.dropped_count,
+                "feed page loaded"
+            );
+            let page = FeedTimeline {
                 generator,
                 timeline,
-            })
+            };
+            let mut cache = self.feed_page_cache.lock().await;
+            cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
+            if cache.len() < 1024 {
+                cache.insert(
+                    key,
+                    (
+                        tokio::time::Instant::now() + Duration::from_secs(FEED_PAGE_CACHE_SECS),
+                        page.clone(),
+                    ),
+                );
+            }
+            Ok(page)
         })
     }
 }
@@ -3675,7 +3770,7 @@ where
             )
             .await
             {
-                Ok(()) => Redirect::to("/app").into_response(),
+                Ok(()) => return_to_post(&headers, &state.public.public_url, uri),
                 Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
             },
             Err(error) => oauth_error(StatusCode::BAD_GATEWAY, &error),
@@ -3686,7 +3781,7 @@ where
             match persist_created_record(state.storage.clone(), &did, "app.bsky.feed.like", created)
                 .await
             {
-                Ok(()) => Redirect::to("/app").into_response(),
+                Ok(()) => return_to_post(&headers, &state.public.public_url, uri),
                 Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
             }
         }
@@ -3727,7 +3822,7 @@ where
         )
         .await
         {
-            Ok(()) => Redirect::to("/app").into_response(),
+            Ok(()) => return_to_post(&headers, &state.public.public_url, uri),
             Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
         },
         Err(error) => oauth_error(StatusCode::BAD_GATEWAY, &error),
@@ -3773,6 +3868,39 @@ fn verified_cookie_session<S: Storage>(
         .flatten()
         == Some(generation))
     .then_some((did, session_id, generation, write_access, feed_access))
+}
+
+/// Fragment id of a post's card, so a like or repost can return to the same place on the page.
+fn post_anchor(uri: &str) -> String {
+    let id = uri
+        .trim_start_matches("at://")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>();
+    format!("post-{id}")
+}
+
+/// After a like or repost, go back to the page the form was on (same origin, under /app), scrolled to the
+/// post, instead of the top of the home timeline.
+fn return_to_post(headers: &HeaderMap, public_url: &str, uri: &str) -> Response {
+    let anchor = post_anchor(uri);
+    let back = headers
+        .get(header::REFERER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| reqwest::Url::parse(value).ok())
+        .zip(reqwest::Url::parse(public_url).ok())
+        .filter(|(referer, public)| {
+            referer.scheme() == public.scheme()
+                && referer.host_str() == public.host_str()
+                && referer.port_or_known_default() == public.port_or_known_default()
+                && referer.path().starts_with("/app")
+        })
+        .map(|(referer, _)| match referer.query() {
+            Some(query) => format!("{}?{query}", referer.path()),
+            None => referer.path().to_owned(),
+        })
+        .unwrap_or_else(|| "/app".to_owned());
+    Redirect::to(&format!("{back}#{anchor}")).into_response()
 }
 
 fn same_origin_request(headers: &HeaderMap, public_url: &str) -> bool {
@@ -4178,8 +4306,9 @@ fn render_web_post<S: Storage>(
         .get("embed")
         .map(|embed| render_web_embed(storage, &record.did, embed))
         .unwrap_or_default();
+    let anchor = post_anchor(&record.uri);
     format!(
-        "<article class=\"post-card\"><header class=\"post-header\">{author}{time}</header>{reply_context}<p class=\"post-text\">{text}</p>{embed}<div class=\"post-actions\" aria-label=\"Post actions\">{actions}</div></article>"
+        "<article class=\"post-card\" id=\"{anchor}\"><header class=\"post-header\">{author}{time}</header>{reply_context}<p class=\"post-text\">{text}</p>{embed}<div class=\"post-actions\" aria-label=\"Post actions\">{actions}</div></article>"
     )
 }
 

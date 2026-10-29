@@ -54,11 +54,17 @@ pub struct FeedTimeline {
     pub timeline: HydratedFeedPage,
 }
 
+const LIVE_POST_CACHE_ENTRIES: usize = 20_000;
+const LIVE_POST_CACHE_SECS: u64 = 6 * 60 * 60;
+
 pub struct FeedClient<B: IdentityBackend> {
     identity: Arc<IdentityResolver<B>>,
     http: SafeHttpClient,
     generator_cache: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, ResolvedFeed)>>,
     live_post_cache: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, IndexedRecord)>>,
+    // Failed resolutions are remembered too: the layout resolves every pinned feed on every page,
+    // so an uncached failure would repeat its full network cost on each request.
+    generator_failures: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, String)>>,
 }
 
 impl<B: IdentityBackend> FeedClient<B> {
@@ -68,10 +74,41 @@ impl<B: IdentityBackend> FeedClient<B> {
             http,
             generator_cache: tokio::sync::Mutex::new(HashMap::new()),
             live_post_cache: tokio::sync::Mutex::new(HashMap::new()),
+            generator_failures: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
     pub async fn resolve_feed(&self, uri: &str) -> Result<ResolvedFeed, String> {
+        if let Some((expires, error)) = self.generator_failures.lock().await.get(uri).cloned()
+            && expires > tokio::time::Instant::now()
+        {
+            return Err(error);
+        }
+        let started = std::time::Instant::now();
+        let result = self.resolve_feed_uncached(uri).await;
+        if let Err(error) = &result {
+            tracing::warn!(
+                feed = uri,
+                %error,
+                duration_ms = started.elapsed().as_millis() as u64,
+                "feed generator resolution failed"
+            );
+            let mut failures = self.generator_failures.lock().await;
+            failures.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
+            if failures.len() < 1024 {
+                failures.insert(
+                    uri.to_owned(),
+                    (
+                        tokio::time::Instant::now() + Duration::from_secs(10 * 60),
+                        error.clone(),
+                    ),
+                );
+            }
+        }
+        result
+    }
+
+    async fn resolve_feed_uncached(&self, uri: &str) -> Result<ResolvedFeed, String> {
         if let Some((expires, feed)) = self.generator_cache.lock().await.get(uri).cloned()
             && expires > tokio::time::Instant::now()
         {
@@ -238,7 +275,7 @@ impl<B: IdentityBackend> FeedClient<B> {
         skeleton: FeedSkeletonPage,
         storage: &dyn Storage,
     ) -> Result<HydratedFeedPage, String> {
-        const LIVE_FETCH_CONCURRENCY: usize = 8;
+        const LIVE_FETCH_CONCURRENCY: usize = 16;
         const PAGE_BUDGET: Duration = Duration::from_secs(8);
         let count = skeleton.feed.len();
         let cursor = skeleton.cursor;
@@ -357,9 +394,13 @@ impl<B: IdentityBackend> FeedClient<B> {
             time_us,
             record: value,
         };
+        // Kept long and large so a feed refresh only fetches posts it has not seen (feed generators have no
+        // "changes since"). Posts are immutable once written; a deletion shows for at most the TTL.
         let mut cache = self.live_post_cache.lock().await;
-        cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
-        if cache.len() >= 256
+        if cache.len() >= LIVE_POST_CACHE_ENTRIES {
+            cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
+        }
+        if cache.len() >= LIVE_POST_CACHE_ENTRIES
             && let Some(oldest) = cache.keys().next().cloned()
         {
             cache.remove(&oldest);
@@ -367,7 +408,7 @@ impl<B: IdentityBackend> FeedClient<B> {
         cache.insert(
             uri.to_owned(),
             (
-                tokio::time::Instant::now() + Duration::from_secs(10 * 60),
+                tokio::time::Instant::now() + Duration::from_secs(LIVE_POST_CACHE_SECS),
                 record.clone(),
             ),
         );

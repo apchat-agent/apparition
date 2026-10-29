@@ -1259,3 +1259,8 @@ button:hover,
     padding-inline: 0.15rem;
   }
 }
+
+/* A like or repost returns to #post-...; keep the card clear of the sticky header. */
+.post-card {
+  scroll-margin-top: 5rem;
+}
