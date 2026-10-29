@@ -92,6 +92,21 @@ fn unknown_oauth_mode_is_rejected() {
 }
 
 #[test]
+fn alt_model_directory_is_optional_and_can_be_configured_in_toml_or_environment() {
+    let default = Config::from_toml_and_env("", std::iter::empty::<(&str, &str)>()).unwrap();
+    assert!(format!("{default:?}").contains("alt_model_dir: None"));
+
+    let from_toml =
+        Config::from_toml_and_env("alt_model_dir = \"./data/models\"", std::iter::empty::<(&str, &str)>())
+            .unwrap();
+    assert!(format!("{from_toml:?}").contains("alt_model_dir: Some(\"./data/models\")"));
+
+    let from_env =
+        Config::from_toml_and_env("", [("APPVIEW_ALT_MODEL_DIR", "/srv/appview/models")]).unwrap();
+    assert!(format!("{from_env:?}").contains("alt_model_dir: Some(\"/srv/appview/models\")"));
+}
+
+#[test]
 fn server_exits_before_starting_on_a_public_address_in_loopback_mode() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_appview-rs"))
         .env_remove("APPVIEW_CONFIG")
