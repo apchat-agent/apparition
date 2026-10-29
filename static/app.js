@@ -439,13 +439,57 @@ function installInfiniteScroll({
     olderLink.remove();
   };
 
+  const postNodesIn = (root) => {
+    const found = [];
+    const visit = (node) => {
+      if (node.getAttribute?.("data-post-uri")) found.push(node);
+      for (const child of node.children || []) visit(child);
+    };
+    visit(root);
+    return found;
+  };
+
   const appendCards = (nextList) => {
-    const newCards = [...nextList.children].filter((item) => !item.className?.split(/\s+/).includes("empty-state"));
+    const existingPostNodes = new Map();
+    const existingParentNodes = new Map();
+    for (const node of postNodesIn(list)) {
+      const uri = node.getAttribute("data-post-uri");
+      const destination = node.getAttribute("data-post-kind") === "parent" ? existingParentNodes : existingPostNodes;
+      if (!destination.has(uri)) destination.set(uri, node);
+    }
     for (const empty of [...list.children].filter((item) => item.className?.split(/\s+/).includes("empty-state"))) {
       empty.remove();
     }
-    for (const card of newCards) list.append(card);
-    return newCards;
+    const appended = [];
+    const newCards = [...nextList.children].filter((item) => !item.className?.split(/\s+/).includes("empty-state"));
+    for (const card of newCards) {
+      const nodes = postNodesIn(card);
+      const posts = nodes.filter((node) => node.getAttribute("data-post-kind") !== "parent");
+      if (posts.some((node) => existingPostNodes.has(node.getAttribute("data-post-uri")))) {
+        card.remove();
+        continue;
+      }
+      for (const parent of nodes.filter((node) => node.getAttribute("data-post-kind") === "parent")) {
+        const uri = parent.getAttribute("data-post-uri");
+        if (existingPostNodes.has(uri) || existingParentNodes.has(uri)) {
+          parent.remove();
+          continue;
+        }
+        existingParentNodes.set(uri, parent);
+      }
+      for (const post of posts) {
+        const uri = post.getAttribute("data-post-uri");
+        const previousParent = existingParentNodes.get(uri);
+        if (previousParent) {
+          previousParent.remove();
+          existingParentNodes.delete(uri);
+        }
+        existingPostNodes.set(uri, post);
+      }
+      list.append(card);
+      appended.push(card);
+    }
+    return appended;
   };
 
   const loadNextPage = async (manualRetry = false) => {

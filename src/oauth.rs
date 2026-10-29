@@ -4558,7 +4558,8 @@ fn render_web_notification<S: Storage>(
         String::new()
     };
     format!(
-        "<li class=\"notification-item\"><article class=\"notification-card\"><header class=\"notification-heading\">{}<div><a class=\"author-name\" href=\"{}\">@{}</a><span class=\"notification-reason\">{reason}</span></div></header>{parent}{text}{embed}{thread_link}</article></li>",
+        "<li class=\"notification-item\" data-post-kind=\"notification\" data-post-uri=\"{}\"><article class=\"notification-card\"><header class=\"notification-heading\">{}<div><a class=\"author-name\" href=\"{}\">@{}</a><span class=\"notification-reason\">{reason}</span></div></header>{parent}{text}{embed}{thread_link}</article></li>",
+        html_escape(&record.uri),
         avatar_markup(&author, "avatar"),
         html_escape(&author_uri),
         html_escape(&handle)
@@ -6735,7 +6736,7 @@ fn render_web_post<S: Storage>(
         .unwrap_or_default();
     let anchor = post_anchor(&record.uri);
     format!(
-        "<article class=\"post-card\" id=\"{anchor}\"><header class=\"post-header\">{author}{time}</header><p class=\"post-text\">{text}</p>{embed}<div class=\"post-actions\" aria-label=\"Post actions\">{actions}</div></article>"
+        "<article class=\"post-card\" id=\"{anchor}\" data-post-kind=\"post\" data-post-uri=\"{uri}\"><header class=\"post-header\">{author}{time}</header><p class=\"post-text\">{text}</p>{embed}<div class=\"post-actions\" aria-label=\"Post actions\">{actions}</div></article>"
     )
 }
 
@@ -6774,8 +6775,9 @@ fn render_reply_parent_card<S: Storage>(storage: &S, parent: &IndexedRecord) -> 
         .get("text")
         .and_then(Value::as_str)
         .unwrap_or("");
+    let uri = html_escape(&parent.uri);
     format!(
-        "<a class=\"reply-parent-card\" href=\"{}\" aria-label=\"Open parent post by @{}\"><header class=\"reply-parent-header\">{}<span class=\"reply-parent-author\"><strong>{}</strong><span>@{}</span></span></header><p class=\"reply-parent-text\">{}</p></a>",
+        "<a class=\"reply-parent-card\" href=\"{}\" aria-label=\"Open parent post by @{}\" data-post-kind=\"parent\" data-post-uri=\"{uri}\"><header class=\"reply-parent-header\">{}<span class=\"reply-parent-author\"><strong>{}</strong><span>@{}</span></span></header><p class=\"reply-parent-text\">{}</p></a>",
         html_escape(&thread_uri),
         html_escape(&handle),
         avatar_markup(&profile, "reply-parent-avatar"),
