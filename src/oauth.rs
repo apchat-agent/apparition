@@ -2561,6 +2561,9 @@ fn icon_content(name: &str) -> &'static str {
         }
         "notifications" => "<path d=\"M18 9a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4\"/>",
         "profile" => "<circle cx=\"12\" cy=\"8\" r=\"4\"/><path d=\"M4 21a8 8 0 0 1 16 0\"/>",
+        "follow" => {
+            "<circle cx=\"9\" cy=\"8\" r=\"3.5\"/><path d=\"M2.5 20a6.5 6.5 0 0 1 13 0M19 8v8M15 12h8\"/>"
+        }
         "compose" => "<path d=\"M12 5v14M5 12h14\"/>",
         "search" => "<circle cx=\"10.8\" cy=\"10.8\" r=\"6.8\"/><path d=\"m16 16 5 5\"/>",
         "reply" => "<path d=\"M10 8 5 12l5 4\"/><path d=\"M5 12h8a6 6 0 0 1 6 6v1\"/>",
@@ -2581,11 +2584,12 @@ fn icon_content(name: &str) -> &'static str {
 }
 
 fn icon_sprite() -> String {
-    const ICONS: [&str; 11] = [
+    const ICONS: [&str; 12] = [
         "home",
         "feeds",
         "notifications",
         "profile",
+        "follow",
         "compose",
         "search",
         "reply",
@@ -3305,6 +3309,117 @@ where
     response
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct WebNotificationGroup {
+    reason: String,
+    reason_subject: Option<String>,
+    events: Vec<IndexedNotification>,
+}
+
+const NOTIFICATION_GROUP_WINDOW_US: u64 = 48 * 60 * 60 * 1_000_000;
+
+fn group_web_notifications(
+    notifications: &[IndexedNotification],
+    last_seen_us: u64,
+) -> Vec<WebNotificationGroup> {
+    let mut ordered = notifications.to_vec();
+    ordered.sort_by(|left, right| {
+        right
+            .record
+            .time_us
+            .cmp(&left.record.time_us)
+            .then_with(|| right.record.uri.cmp(&left.record.uri))
+            .then_with(|| right.reason.cmp(&left.reason))
+    });
+
+    let mut groups = Vec::<WebNotificationGroup>::new();
+    let mut active = HashMap::<(String, Option<String>, bool), usize>::new();
+    for notification in ordered {
+        let can_group = match notification.reason.as_str() {
+            "like" | "repost" => notification.reason_subject.is_some(),
+            "follow" => true,
+            _ => false,
+        };
+        if !can_group {
+            groups.push(WebNotificationGroup {
+                reason: notification.reason.clone(),
+                reason_subject: notification.reason_subject.clone(),
+                events: vec![notification],
+            });
+            continue;
+        }
+
+        let unread = notification.record.time_us > last_seen_us;
+        let key = (
+            notification.reason.clone(),
+            notification.reason_subject.clone(),
+            unread,
+        );
+        let existing = active.get(&key).copied().filter(|index| {
+            groups[*index].events.first().is_some_and(|newest| {
+                newest
+                    .record
+                    .time_us
+                    .saturating_sub(notification.record.time_us)
+                    <= NOTIFICATION_GROUP_WINDOW_US
+            })
+        });
+        if let Some(index) = existing {
+            groups[index].events.push(notification);
+        } else {
+            let index = groups.len();
+            groups.push(WebNotificationGroup {
+                reason: notification.reason.clone(),
+                reason_subject: notification.reason_subject.clone(),
+                events: vec![notification],
+            });
+            active.insert(key, index);
+        }
+    }
+    groups.sort_by(|left, right| {
+        let left = &left.events[0];
+        let right = &right.events[0];
+        right
+            .record
+            .time_us
+            .cmp(&left.record.time_us)
+            .then_with(|| right.record.uri.cmp(&left.record.uri))
+            .then_with(|| right.reason.cmp(&left.reason))
+    });
+    groups
+}
+
+fn notification_group_page<'a>(
+    groups: &'a [WebNotificationGroup],
+    before: Option<&NotificationCursor>,
+    limit: usize,
+) -> (Vec<&'a WebNotificationGroup>, bool) {
+    let matching = groups
+        .iter()
+        .filter(|group| {
+            let Some(cursor) = before else {
+                return true;
+            };
+            let newest = &group.events[0];
+            newest.record.time_us < cursor.time_us
+                || (newest.record.time_us == cursor.time_us
+                    && (newest.record.uri < cursor.uri
+                        || (newest.record.uri == cursor.uri && newest.reason < cursor.reason)))
+        })
+        .collect::<Vec<_>>();
+    let has_more = matching.len() > limit;
+    (matching.into_iter().take(limit).collect(), has_more)
+}
+
+fn notification_group_cursor(group: &WebNotificationGroup) -> NotificationCursor {
+    let newest = &group.events[0];
+    NotificationCursor {
+        time_us: newest.record.time_us,
+        uri: newest.record.uri.clone(),
+        reason: newest.reason.clone(),
+    }
+}
+
 async fn notifications_page<F, S>(
     State(state): State<Arc<OAuthWebState<F, S>>>,
     headers: HeaderMap,
@@ -3337,25 +3452,39 @@ where
         .get("cursor")
         .and_then(|cursor| NotificationCursor::parse(cursor));
     let timeline_started = std::time::Instant::now();
-    let page = match state
-        .storage
-        .notifications_for(&did, before.as_ref(), limit + 1)
-    {
-        Ok(page) => page,
+    let notices = match state.storage.notifications_for(&did, None, usize::MAX) {
+        Ok(notices) => notices,
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
     page_timing.timeline_fetch_index_ms = timeline_started.elapsed().as_millis() as u64;
-    let has_more = page.len() > limit;
-    let visible = page.iter().take(limit).collect::<Vec<_>>();
+    let groups = group_web_notifications(&notices, 0);
+    let (visible, has_more) = notification_group_page(&groups, before.as_ref(), limit);
     let notification_records = visible
         .iter()
-        .map(|notification| &notification.record)
+        .map(|group| &group.events[0].record)
         .collect::<Vec<_>>();
+    let mut leading_authors = visible
+        .iter()
+        .flat_map(|group| {
+            group
+                .events
+                .iter()
+                .take(5)
+                .map(|event| event.record.did.clone())
+        })
+        .collect::<Vec<_>>();
+    for group in &visible {
+        if let Some(uri) = group.reason_subject.as_deref()
+            && let Ok(Some(post)) = state.storage.record_by_uri("app.bsky.feed.post", uri)
+        {
+            leading_authors.push(post.did);
+        }
+    }
     let quote_index = match hydrate_page_content(
         &state.flow,
         state.storage.clone(),
         &notification_records,
-        std::iter::empty(),
+        leading_authors,
         tokio::time::Instant::now() + PAGE_PROFILE_BUDGET,
     )
     .await
@@ -3370,9 +3499,7 @@ where
     let render_started = std::time::Instant::now();
     let items = visible
         .iter()
-        .map(|notification| {
-            render_web_notification(state.storage.as_ref(), notification, &quote_index)
-        })
+        .map(|group| render_web_notification_group(state.storage.as_ref(), group, &quote_index))
         .collect::<String>();
     let items = if items.is_empty() {
         "<li class=\"empty-state\">No notifications yet.</li>".to_owned()
@@ -3380,14 +3507,8 @@ where
         items
     };
     let older = if has_more {
-        page.get(limit - 1)
-            .map(|notification| {
-                let cursor = NotificationCursor {
-                    time_us: notification.record.time_us,
-                    uri: notification.record.uri.clone(),
-                    reason: notification.reason.clone(),
-                }
-                .encode();
+        visible.last().map(|group| {
+                let cursor = notification_group_cursor(group).encode();
                 let cursor =
                     url::form_urlencoded::byte_serialize(cursor.as_bytes()).collect::<String>();
                 format!(
@@ -3412,6 +3533,93 @@ where
     .into_response();
     page_timing.render_ms = render_started.elapsed().as_millis() as u64;
     response
+}
+
+fn render_web_notification_group<S: Storage>(
+    storage: &S,
+    group: &WebNotificationGroup,
+    quote_index: &QuoteRenderIndex,
+) -> String {
+    if !matches!(group.reason.as_str(), "like" | "repost" | "follow") {
+        return render_web_notification(storage, &group.events[0], quote_index);
+    }
+
+    let newest = &group.events[0];
+    let author = profile_view_from_storage(storage, &newest.record.did)
+        .unwrap_or_else(|_| json!({"did":newest.record.did,"handle":newest.record.did}));
+    let handle = profile_handle(&author, &newest.record.did);
+    let display_name = author
+        .get("displayName")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&handle);
+    let author_uri = format!(
+        "/profile?did={}",
+        url::form_urlencoded::byte_serialize(newest.record.did.as_bytes()).collect::<String>()
+    );
+    let avatars = group
+        .events
+        .iter()
+        .take(5)
+        .map(|event| {
+            let profile = profile_view_from_storage(storage, &event.record.did)
+                .unwrap_or_else(|_| json!({"did":event.record.did,"handle":event.record.did}));
+            avatar_markup(&profile, "notification-avatar")
+        })
+        .collect::<String>();
+    let count = group.events.len().saturating_sub(1);
+    let others = if count == 0 {
+        String::new()
+    } else {
+        format!(" and {count} other{}", if count == 1 { "" } else { "s" })
+    };
+    let (icon, action) = match group.reason.as_str() {
+        "like" => ("like", "liked your post"),
+        "repost" => ("repost", "reposted your post"),
+        _ => ("follow", "started following you"),
+    };
+    let icon = icon_svg(icon).replace(
+        "class=\"icon\"",
+        &format!("class=\"icon notification-type-icon notification-{icon}-icon\""),
+    );
+    let age = notification_age(newest.record.time_us);
+    let snippet = if matches!(group.reason.as_str(), "like" | "repost") {
+        group
+            .reason_subject
+            .as_deref()
+            .and_then(|uri| storage.record_by_uri("app.bsky.feed.post", uri).ok().flatten())
+            .and_then(|post| {
+                let text = post.record.get("text").and_then(Value::as_str)?;
+                let text = text.chars().take(300).collect::<String>();
+                let target = url::form_urlencoded::byte_serialize(
+                    group.reason_subject.as_deref()?.as_bytes(),
+                )
+                .collect::<String>();
+                Some(format!(
+                    "<a class=\"notification-subject-snippet\" href=\"/app/thread?uri={target}\">{}</a>",
+                    html_escape(&text)
+                ))
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    format!(
+        "<li class=\"notification-item notification-group-item\"><article class=\"notification-group\"><div class=\"notification-group-icon\">{icon}</div><div class=\"notification-group-content\"><div class=\"notification-group-avatars\">{avatars}</div><p class=\"notification-summary\"><a class=\"notification-name\" href=\"{}\">{}</a>{others} {action} <span class=\"notification-age\">· {age}</span></p>{snippet}</div></article></li>",
+        html_escape(&author_uri),
+        html_escape(display_name)
+    )
+}
+
+fn notification_age(time_us: u64) -> String {
+    let seconds = unix_time().saturating_sub(time_us / 1_000_000);
+    match seconds {
+        0..=59 => "now".to_owned(),
+        60..=3_599 => format!("{}m", seconds / 60),
+        3_600..=86_399 => format!("{}h", seconds / 3_600),
+        _ => format!("{}d", seconds / 86_400),
+    }
 }
 
 fn render_web_notification<S: Storage>(
@@ -5775,24 +5983,46 @@ mod tests {
             web_notice("alice", "like", 200 * HOUR_US, Some("post-a")),
             web_notice("bob", "like", 199 * HOUR_US, Some("post-a")),
             web_notice("carol", "like", 152 * HOUR_US, Some("post-a")),
-            web_notice("dave", "like", 199 * HOUR_US, Some("post-b")),
+            web_notice("dave", "like", 151 * HOUR_US, Some("post-a")),
+            web_notice("ivan", "like", 199 * HOUR_US, Some("post-b")),
             web_notice("erin", "repost", 199 * HOUR_US, Some("post-a")),
             web_notice("frank", "follow", 199 * HOUR_US, None),
             web_notice("grace", "follow", 198 * HOUR_US, None),
-            web_notice("heidi", "like", 198 * HOUR_US, Some("post-a")),
+            web_notice("heidi", "like", 150 * HOUR_US, Some("post-a")),
         ];
 
-        let groups = group_web_notifications(&notices, 199 * HOUR_US);
+        let groups = group_web_notifications(&notices, 150 * HOUR_US);
         let likes_a = groups
             .iter()
-            .filter(|group| group.reason == "like" && group.reason_subject.as_deref() == Some("post-a"))
+            .filter(|group| {
+                group.reason == "like"
+                    && group
+                        .reason_subject
+                        .as_deref()
+                        .is_some_and(|subject| subject.ends_with("/post-a"))
+            })
             .collect::<Vec<_>>();
         assert_eq!(likes_a.len(), 3);
-        assert_eq!(likes_a[0].events.len(), 2);
+        assert_eq!(likes_a[0].events.len(), 3);
         assert_eq!(likes_a[1].events.len(), 1);
-        assert!(groups.iter().any(|group| group.reason == "follow" && group.events.len() == 2));
-        assert!(groups.iter().any(|group| group.reason == "repost" && group.events.len() == 1));
-        assert!(groups.iter().any(|group| group.reason == "like" && group.reason_subject.as_deref() == Some("post-b")));
+        assert_eq!(likes_a[2].events.len(), 1);
+        assert!(
+            groups
+                .iter()
+                .any(|group| group.reason == "follow" && group.events.len() == 2)
+        );
+        assert!(
+            groups
+                .iter()
+                .any(|group| group.reason == "repost" && group.events.len() == 1)
+        );
+        assert!(groups.iter().any(|group| {
+            group.reason == "like"
+                && group
+                    .reason_subject
+                    .as_deref()
+                    .is_some_and(|subject| subject.ends_with("/post-b"))
+        }));
     }
 
     #[test]
@@ -5811,7 +6041,10 @@ mod tests {
         let (second, has_more) = notification_group_page(&groups, Some(&cursor), 1);
         assert!(has_more);
         assert_eq!(second[0].events.len(), 1);
-        assert_ne!(first[0].events[0].record.uri, second[0].events[0].record.uri);
+        assert_ne!(
+            first[0].events[0].record.uri,
+            second[0].events[0].record.uri
+        );
     }
 
     const HOUR_US: u64 = 60 * 60 * 1_000_000;
@@ -5828,9 +6061,8 @@ mod tests {
             "follow" => "app.bsky.graph.follow",
             _ => "app.bsky.feed.post",
         };
-        let subject_uri = reason_subject.map(|subject| {
-            format!("at://did:plc:viewer/app.bsky.feed.post/{subject}")
-        });
+        let subject_uri = reason_subject
+            .map(|subject| format!("at://did:plc:viewer/app.bsky.feed.post/{subject}"));
         IndexedNotification {
             record: IndexedRecord {
                 did: format!("did:plc:{actor}"),

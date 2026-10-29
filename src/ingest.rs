@@ -968,7 +968,7 @@ impl Storage for MemoryStorage {
                 .then_with(|| right.record.uri.cmp(&left.record.uri))
                 .then_with(|| right.reason.cmp(&left.reason))
         });
-        notifications.truncate(limit.clamp(1, 101));
+        notifications.truncate(limit.max(1));
         Ok(notifications)
     }
 
@@ -2626,7 +2626,7 @@ impl Storage for SqliteStorage {
                     before.map(|cursor| cursor.time_us.min(i64::MAX as u64) as i64),
                     before.map(|cursor| cursor.uri.as_str()).unwrap_or(""),
                     before.map(|cursor| cursor.reason.as_str()).unwrap_or(""),
-                    limit.clamp(1, 101) as i64,
+                    i64::try_from(limit.max(1)).unwrap_or(i64::MAX),
                 ],
                 |row| {
                     Ok(IndexedNotification {
