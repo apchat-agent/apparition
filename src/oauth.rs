@@ -37,7 +37,7 @@ use axum::{
     routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use futures_util::{FutureExt, StreamExt};
+use futures_util::{FutureExt, StreamExt, stream};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use jose_jwk::{Ec, EcCurves, Jwk, Key, Parameters};
@@ -72,7 +72,8 @@ const PROFILE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const PROFILE_NEGATIVE_TTL: Duration = Duration::from_secs(60 * 60);
 const PAGE_PROFILE_BUDGET: Duration = Duration::from_millis(1500);
 const PAGE_PROFILE_CONCURRENCY: usize = 8;
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=av19";
+const PAGE_QUOTE_CONCURRENCY: usize = 16;
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=av20";
 const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=*";
 const WRITE_SCOPES: [&str; 3] = [
     "repo:app.bsky.feed.post?action=create",
@@ -940,7 +941,9 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         {
             return Ok(token);
         }
-        let token = self.fetch_service_auth_token(viewer_did, service_did).await?;
+        let token = self
+            .fetch_service_auth_token(viewer_did, service_did)
+            .await?;
         let mut cache = self.service_auth_cache.lock().await;
         cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
         if cache.len() < 4096 {
@@ -1517,7 +1520,8 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
                 resolve_ms,
                 auth_ms,
                 skeleton_ms,
-                hydrate_ms = started.elapsed().as_millis() as u64 - resolve_ms - auth_ms - skeleton_ms,
+                hydrate_ms =
+                    started.elapsed().as_millis() as u64 - resolve_ms - auth_ms - skeleton_ms,
                 posts = timeline.feed.len(),
                 dropped = timeline.dropped_count,
                 "feed page loaded"
@@ -1779,6 +1783,23 @@ struct PageProfileHydration {
     timed_out: usize,
 }
 
+#[derive(Clone, Debug)]
+enum QuoteRenderState {
+    Found(IndexedRecord),
+    NotFound,
+    Unavailable,
+    Pending,
+    Other(Option<IndexedRecord>),
+}
+
+#[derive(Clone, Debug)]
+struct QuotedRecordRef {
+    uri: String,
+    unavailable: bool,
+}
+
+type QuoteRenderIndex = HashMap<String, QuoteRenderState>;
+
 pub struct ProfileRefreshWorker<F, S> {
     flow: F,
     storage: Arc<S>,
@@ -1892,6 +1913,7 @@ async fn hydrate_page_profiles<F: OAuthFlow, S: Storage + 'static>(
     flow: &F,
     storage: Arc<S>,
     author_order: impl IntoIterator<Item = String>,
+    deadline: tokio::time::Instant,
 ) -> Result<PageProfileHydration, StorageError> {
     let mut seen = HashSet::new();
     let authors = author_order
@@ -1970,7 +1992,7 @@ async fn hydrate_page_profiles<F: OAuthFlow, S: Storage + 'static>(
     let mut completed = HashSet::new();
     let mut unresolved_handle_set = HashSet::new();
     let storage_for_fetch = storage.clone();
-    let fetch_result = tokio::time::timeout(PAGE_PROFILE_BUDGET, async {
+    let fetch_result = tokio::time::timeout_at(deadline, async {
         while let Some((did, profile_result, handle, handle_result)) = fetches.next().await {
             completed.insert(did.clone());
             if let Some(result) = profile_result {
@@ -2085,6 +2107,140 @@ fn candidates_profile_fetches(
         })
         .cloned()
         .collect()
+}
+
+async fn hydrate_page_content<F: OAuthFlow, S: Storage + 'static>(
+    flow: &F,
+    storage: Arc<S>,
+    page_records: &[&IndexedRecord],
+    leading_authors: impl IntoIterator<Item = String>,
+    deadline: tokio::time::Instant,
+) -> Result<QuoteRenderIndex, StorageError> {
+    let mut refs = Vec::new();
+    let mut seen_refs = HashSet::new();
+    for record in page_records {
+        if let Some(embed) = record.record.get("embed")
+            && let Some(reference) = quoted_record_ref(embed)
+            && seen_refs.insert(reference.uri.clone())
+        {
+            refs.push(reference);
+        }
+    }
+
+    let mut authors = leading_authors.into_iter().collect::<Vec<_>>();
+    for (record, quote_ref) in page_records.iter().zip(
+        page_records
+            .iter()
+            .map(|record| record.record.get("embed").and_then(quoted_record_ref)),
+    ) {
+        authors.push(record.did.clone());
+        if let Some(quote_ref) = quote_ref
+            && !quote_ref.unavailable
+            && let Some(did) = post_uri_did(&quote_ref.uri)
+        {
+            authors.push(did.to_owned());
+        }
+    }
+
+    let quote_storage = storage.clone();
+    let (quotes, profiles) = tokio::join!(
+        hydrate_page_quotes(flow, quote_storage.as_ref(), refs, deadline),
+        hydrate_page_profiles(flow, storage, authors, deadline)
+    );
+    profiles?;
+    quotes
+}
+
+fn quoted_record_ref(embed: &Value) -> Option<QuotedRecordRef> {
+    match embed.get("$type").and_then(Value::as_str) {
+        Some("app.bsky.embed.record") | Some("app.bsky.embed.record#view") => {}
+        Some("app.bsky.embed.recordWithMedia") | Some("app.bsky.embed.recordWithMedia#view") => {}
+        _ => return None,
+    }
+    let record = embed.get("record")?;
+    let reference = record.get("record").unwrap_or(record);
+    let uri = reference.get("uri")?.as_str()?.to_owned();
+    let type_name = reference.get("$type").and_then(Value::as_str).unwrap_or("");
+    Some(QuotedRecordRef {
+        uri,
+        unavailable: ["#viewBlocked", "#viewDetached", "#viewNotFound"]
+            .iter()
+            .any(|view| type_name.ends_with(view)),
+    })
+}
+
+fn at_uri_collection(uri: &str) -> Option<&str> {
+    let mut parts = uri.strip_prefix("at://")?.split('/');
+    let did = parts.next()?;
+    let collection = parts.next()?;
+    let rkey = parts.next()?;
+    (did.starts_with("did:")
+        && !collection.is_empty()
+        && !rkey.is_empty()
+        && parts.next().is_none())
+    .then_some(collection)
+}
+
+async fn hydrate_page_quotes<F: OAuthFlow, S: Storage>(
+    flow: &F,
+    storage: &S,
+    refs: Vec<QuotedRecordRef>,
+    deadline: tokio::time::Instant,
+) -> Result<QuoteRenderIndex, StorageError> {
+    let mut result = HashMap::new();
+    let mut missing_posts = Vec::new();
+    for reference in refs {
+        let state = if reference.unavailable {
+            QuoteRenderState::Unavailable
+        } else if let Some(collection) = at_uri_collection(&reference.uri) {
+            if collection == "app.bsky.feed.post" {
+                match storage.record_by_uri(collection, &reference.uri)? {
+                    Some(record) => QuoteRenderState::Found(record),
+                    None => {
+                        missing_posts.push(reference.uri.clone());
+                        QuoteRenderState::Pending
+                    }
+                }
+            } else {
+                QuoteRenderState::Other(storage.record_by_uri(collection, &reference.uri)?)
+            }
+        } else {
+            QuoteRenderState::NotFound
+        };
+        result.insert(reference.uri, state);
+    }
+
+    let flow = flow.clone();
+    let mut fetches = stream::iter(missing_posts.into_iter().map(|uri| {
+        let flow = flow.clone();
+        async move {
+            let fetched = flow.fetch_post(&uri).await;
+            (uri, fetched)
+        }
+    }))
+    .buffer_unordered(PAGE_QUOTE_CONCURRENCY);
+    let fetch_result = tokio::time::timeout_at(deadline, async {
+        while let Some((uri, fetched)) = fetches.next().await {
+            let state = match fetched {
+                Ok(record) if record.uri == uri && record.collection == "app.bsky.feed.post" => {
+                    QuoteRenderState::Found(record)
+                }
+                Ok(_) | Err(_) => QuoteRenderState::NotFound,
+            };
+            result.insert(uri, state);
+        }
+    })
+    .await;
+    if fetch_result.is_err() {
+        tracing::info!(
+            pending = result
+                .values()
+                .filter(|state| matches!(state, QuoteRenderState::Pending))
+                .count(),
+            "quoted post hydration reached page budget"
+        );
+    }
+    Ok(result)
 }
 
 fn icon_svg(name: &str) -> String {
@@ -2471,15 +2627,18 @@ where
     };
     let has_more = timeline_page.len() > limit;
     let timeline = timeline_page.iter().take(limit).collect::<Vec<_>>();
-    if let Err(error) = hydrate_page_profiles(
+    let quote_index = match hydrate_page_content(
         &state.flow,
         state.storage.clone(),
-        timeline.iter().map(|record| record.did.clone()),
+        &timeline,
+        std::iter::empty(),
+        tokio::time::Instant::now() + PAGE_PROFILE_BUDGET,
     )
     .await
     {
-        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
-    }
+        Ok(index) => index,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
     let write_forms_enabled =
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
     let posts = timeline
@@ -2492,7 +2651,8 @@ where
                     record,
                     &did,
                     write_forms_enabled,
-                    true
+                    true,
+                    &quote_index,
                 )
             )
         })
@@ -2639,18 +2799,24 @@ where
         Ok(page) => page,
         Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
     };
-    if let Err(error) = hydrate_page_profiles(
+    let feed_records = page
+        .timeline
+        .feed
+        .iter()
+        .map(|post| &post.record)
+        .collect::<Vec<_>>();
+    let quote_index = match hydrate_page_content(
         &state.flow,
         state.storage.clone(),
-        page.timeline
-            .feed
-            .iter()
-            .map(|post| post.record.did.clone()),
+        &feed_records,
+        std::iter::empty(),
+        tokio::time::Instant::now() + PAGE_PROFILE_BUDGET,
     )
     .await
     {
-        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
-    }
+        Ok(index) => index,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
     let write_forms_enabled =
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
     let posts = page
@@ -2676,6 +2842,7 @@ where
                     &did,
                     write_forms_enabled,
                     true,
+                    &quote_index,
                 )
             )
         })
@@ -2755,10 +2922,28 @@ where
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
     let has_more = page.len() > limit;
-    let items = page
+    let visible = page.iter().take(limit).collect::<Vec<_>>();
+    let notification_records = visible
         .iter()
-        .take(limit)
-        .map(|notification| render_web_notification(state.storage.as_ref(), notification))
+        .map(|notification| &notification.record)
+        .collect::<Vec<_>>();
+    let quote_index = match hydrate_page_content(
+        &state.flow,
+        state.storage.clone(),
+        &notification_records,
+        std::iter::empty(),
+        tokio::time::Instant::now() + PAGE_PROFILE_BUDGET,
+    )
+    .await
+    {
+        Ok(index) => index,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    let items = visible
+        .iter()
+        .map(|notification| {
+            render_web_notification(state.storage.as_ref(), notification, &quote_index)
+        })
         .collect::<String>();
     let items = if items.is_empty() {
         "<li class=\"empty-state\">No notifications yet.</li>".to_owned()
@@ -2798,7 +2983,11 @@ where
     .into_response()
 }
 
-fn render_web_notification<S: Storage>(storage: &S, notification: &IndexedNotification) -> String {
+fn render_web_notification<S: Storage>(
+    storage: &S,
+    notification: &IndexedNotification,
+    quote_index: &QuoteRenderIndex,
+) -> String {
     let record = &notification.record;
     let author = profile_view_from_storage(storage, &record.did)
         .unwrap_or_else(|_| json!({"did":record.did,"handle":record.did}));
@@ -2826,6 +3015,11 @@ fn render_web_notification<S: Storage>(storage: &S, notification: &IndexedNotifi
     } else {
         format!("<p>{}</p>", html_escape(text))
     };
+    let embed = record
+        .record
+        .get("embed")
+        .map(|embed| render_web_embed_with_quotes(storage, &record.did, embed, quote_index, 0))
+        .unwrap_or_default();
     let target_uri = notification
         .reason_subject
         .as_deref()
@@ -2841,7 +3035,7 @@ fn render_web_notification<S: Storage>(storage: &S, notification: &IndexedNotifi
         String::new()
     };
     format!(
-        "<li class=\"notification-item\"><article class=\"notification-card\"><header class=\"notification-heading\">{}<div><a class=\"author-name\" href=\"{}\">@{}</a><span class=\"notification-reason\">{reason}</span></div></header>{text}{thread_link}</article></li>",
+        "<li class=\"notification-item\"><article class=\"notification-card\"><header class=\"notification-heading\">{}<div><a class=\"author-name\" href=\"{}\">@{}</a><span class=\"notification-reason\">{reason}</span></div></header>{text}{embed}{thread_link}</article></li>",
         avatar_markup(&author, "avatar"),
         html_escape(&author_uri),
         html_escape(&handle)
@@ -2884,15 +3078,18 @@ where
     };
     let has_more = records.len() > limit;
     let records = records.iter().take(limit).collect::<Vec<_>>();
-    if let Err(error) = hydrate_page_profiles(
+    let quote_index = match hydrate_page_content(
         &state.flow,
         state.storage.clone(),
+        &records,
         std::iter::once(subject.to_owned()).chain(records.iter().map(|record| record.did.clone())),
+        tokio::time::Instant::now() + PAGE_PROFILE_BUDGET,
     )
     .await
     {
-        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
-    }
+        Ok(index) => index,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
     let profile = match profile_view_from_storage(state.storage.as_ref(), subject) {
         Ok(profile) => profile,
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
@@ -2914,7 +3111,8 @@ where
                     record,
                     &did,
                     write_forms_enabled,
-                    true
+                    true,
+                    &quote_index,
                 )
             )
         })
@@ -3016,19 +3214,23 @@ where
     ) {
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
-    if let Err(error) = hydrate_page_profiles(
+    let page_records = ancestors
+        .iter()
+        .chain(std::iter::once(&record))
+        .chain(thread_reply_records.iter())
+        .collect::<Vec<_>>();
+    let quote_index = match hydrate_page_content(
         &state.flow,
         state.storage.clone(),
-        ancestors
-            .iter()
-            .map(|ancestor| ancestor.did.clone())
-            .chain(std::iter::once(record.did.clone()))
-            .chain(thread_reply_records.iter().map(|reply| reply.did.clone())),
+        &page_records,
+        std::iter::empty(),
+        tokio::time::Instant::now() + PAGE_PROFILE_BUDGET,
     )
     .await
     {
-        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
-    }
+        Ok(index) => index,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
     let ancestors_html = ancestors
         .iter()
         .map(|ancestor| {
@@ -3040,6 +3242,7 @@ where
                     &viewer_did,
                     write_forms_enabled,
                     false,
+                    &quote_index,
                 )
             )
         })
@@ -3058,6 +3261,7 @@ where
         depth,
         &mut reply_budget,
         &thread_continuations,
+        &quote_index,
     ) {
         Ok(replies) => replies,
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
@@ -3086,7 +3290,8 @@ where
                 state.storage.as_ref(),
                 &record,
                 &viewer_did,
-                write_forms_enabled
+                write_forms_enabled,
+                &quote_index,
             )
         ),
         true,
@@ -3132,6 +3337,7 @@ where
         &state.flow,
         state.storage.clone(),
         std::iter::once(quoted.did.clone()),
+        tokio::time::Instant::now() + PAGE_PROFILE_BUDGET,
     )
     .await
     {
@@ -3295,6 +3501,7 @@ fn render_thread_focus<S: Storage>(
     record: &IndexedRecord,
     viewer_did: &str,
     write_forms_enabled: bool,
+    quote_index: &QuoteRenderIndex,
 ) -> String {
     let profile = profile_view_from_storage(storage, &record.did)
         .unwrap_or_else(|_| json!({"did":record.did,"handle":record.did}));
@@ -3408,7 +3615,7 @@ fn render_thread_focus<S: Storage>(
     let embed = record
         .record
         .get("embed")
-        .map(|embed| render_web_embed(storage, &record.did, embed))
+        .map(|embed| render_web_embed_with_quotes(storage, &record.did, embed, quote_index, 0))
         .unwrap_or_default();
     format!(
         "<article class=\"post-card thread-post-focus\"><header class=\"thread-focus-author\">{}<div class=\"thread-focus-names\"><a class=\"author-name\" href=\"{}\">{}</a><a class=\"author-handle\" href=\"{}\">@{}</a></div></header><p class=\"thread-focus-text\">{text}</p><p class=\"thread-focus-meta\">{time}{reply_policy}</p><hr><div class=\"thread-stats\" aria-label=\"Post statistics\">{stats}</div><hr><div class=\"thread-focus-actions\">{reply_action}{repost_action}{like_action}{share_action}{more_action}</div>{embed}</article>",
@@ -3467,6 +3674,7 @@ fn render_thread_replies<S: Storage>(
     depth: usize,
     budget: &mut usize,
     thread_continuations: &HashSet<String>,
+    quote_index: &QuoteRenderIndex,
 ) -> Result<String, StorageError> {
     if depth == 0 || *budget == 0 {
         return Ok(String::new());
@@ -3489,12 +3697,20 @@ fn render_thread_replies<S: Storage>(
             depth - 1,
             budget,
             thread_continuations,
+            quote_index,
         )?;
         let continues = thread_continuations.contains(&reply.uri);
         html.push_str(&format!(
             "<li class=\"post-item thread-reply-item{}\">{}{nested}</li>",
             if continues { " thread-continues" } else { "" },
-            render_web_post(storage, reply, viewer_did, write_forms_enabled, false)
+            render_web_post(
+                storage,
+                reply,
+                viewer_did,
+                write_forms_enabled,
+                false,
+                quote_index
+            )
         ));
     }
     html.push_str("</ol>");
@@ -4169,6 +4385,7 @@ fn render_web_post<S: Storage>(
     viewer_did: &str,
     write_forms_enabled: bool,
     link_text_to_thread: bool,
+    quote_index: &QuoteRenderIndex,
 ) -> String {
     let profile = profile_view_from_storage(storage, &record.did)
         .unwrap_or_else(|_| json!({"did":record.did,"handle":record.did}));
@@ -4304,7 +4521,7 @@ fn render_web_post<S: Storage>(
     let embed = record
         .record
         .get("embed")
-        .map(|embed| render_web_embed(storage, &record.did, embed))
+        .map(|embed| render_web_embed_with_quotes(storage, &record.did, embed, quote_index, 0))
         .unwrap_or_default();
     let anchor = post_anchor(&record.uri);
     format!(
@@ -4325,18 +4542,38 @@ fn post_uri_did(uri: &str) -> Option<&str> {
 }
 
 fn render_web_embed<S: Storage>(storage: &S, author_did: &str, embed: &Value) -> String {
+    render_web_embed_with_quotes(storage, author_did, embed, &QuoteRenderIndex::new(), 0)
+}
+
+fn render_web_embed_with_quotes<S: Storage>(
+    storage: &S,
+    author_did: &str,
+    embed: &Value,
+    quote_index: &QuoteRenderIndex,
+    quote_depth: usize,
+) -> String {
     match embed.get("$type").and_then(Value::as_str) {
         Some("app.bsky.embed.images") => render_web_images(author_did, embed),
         Some("app.bsky.embed.external") => render_web_external(embed),
-        Some("app.bsky.embed.record") => render_web_quote(storage, embed),
+        Some("app.bsky.embed.record") | Some("app.bsky.embed.record#view") => {
+            render_web_quote(storage, embed, quote_index, quote_depth)
+        }
         Some("app.bsky.embed.recordWithMedia") => {
             let media = embed
                 .get("media")
-                .map(|media| render_web_embed(storage, author_did, media))
+                .map(|media| {
+                    render_web_embed_with_quotes(
+                        storage,
+                        author_did,
+                        media,
+                        quote_index,
+                        quote_depth,
+                    )
+                })
                 .unwrap_or_default();
             let quote = embed
                 .get("record")
-                .map(|record| render_web_quote(storage, record))
+                .map(|record| render_web_quote(storage, record, quote_index, quote_depth))
                 .unwrap_or_default();
             format!("<section class=\"record-with-media\">{media}{quote}</section>")
         }
@@ -4404,61 +4641,139 @@ fn safe_external_url(uri: &str) -> bool {
     url::Url::parse(uri).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
 }
 
-fn render_web_quote<S: Storage>(storage: &S, embed: &Value) -> String {
-    let Some(reference) = embed
-        .pointer("/record/record")
-        .or_else(|| embed.get("record"))
-    else {
+fn render_web_quote<S: Storage>(
+    storage: &S,
+    embed: &Value,
+    quote_index: &QuoteRenderIndex,
+    quote_depth: usize,
+) -> String {
+    let Some(reference) = quoted_record_ref(embed) else {
         return String::new();
     };
-    let uri = reference.get("uri").and_then(Value::as_str).unwrap_or("");
-    let quoted = if uri.is_empty() {
-        None
-    } else {
+    let uri = reference.uri.as_str();
+    let Some(collection) = at_uri_collection(uri) else {
+        return String::new();
+    };
+    let encoded_uri = form_encoded(uri);
+    if quote_depth > 0 {
+        return format!(
+            "<a class=\"quoted-nested-link\" href=\"/app/thread?uri={encoded_uri}\">Quoted post</a>"
+        );
+    }
+    if reference.unavailable {
+        return format!(
+            "<a class=\"quoted-post-card quoted-post-status\" href=\"/app/thread?uri={encoded_uri}\">Post unavailable</a>"
+        );
+    }
+    if collection != "app.bsky.feed.post" {
+        let indexed = quote_index.get(uri).and_then(|state| match state {
+            QuoteRenderState::Other(record) => record.clone(),
+            _ => None,
+        });
+        let cached = indexed.or_else(|| storage.record_by_uri(collection, uri).ok().flatten());
+        let record_name = cached
+            .as_ref()
+            .and_then(|record| {
+                ["displayName", "name", "handle"]
+                    .iter()
+                    .find_map(|key| record.record.get(*key).and_then(Value::as_str))
+            })
+            .unwrap_or_else(|| quote_collection_name(collection));
+        return format!(
+            "<a class=\"quoted-post-card quoted-record-type\" href=\"{}\"><strong>{}</strong><span>{}</span></a>",
+            html_escape(uri),
+            html_escape(record_name),
+            html_escape(quote_collection_name(collection))
+        );
+    }
+    let state = quote_index.get(uri).cloned().unwrap_or_else(|| {
         storage
-            .record_by_uri("app.bsky.feed.post", uri)
+            .record_by_uri(collection, uri)
             .ok()
             .flatten()
-    };
-    if let Some(quoted) = quoted {
-        let profile = profile_view_from_storage(storage, &quoted.did)
-            .unwrap_or_else(|_| json!({"did":quoted.did,"handle":quoted.did}));
-        let handle = profile_handle(&profile, &quoted.did);
-        let display_name = profile
-            .get("displayName")
-            .and_then(Value::as_str)
-            .unwrap_or(&handle);
-        let text = quoted
-            .record
-            .get("text")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let profile_uri = format!(
-            "/profile?did={}",
-            url::form_urlencoded::byte_serialize(quoted.did.as_bytes()).collect::<String>()
-        );
-        format!(
-            "<blockquote class=\"quoted-post\"><p><a href=\"{}\">{} @{}</a></p><p>{}</p></blockquote>",
-            html_escape(&profile_uri),
-            html_escape(display_name),
-            html_escape(&handle),
-            html_escape(text)
-        )
-    } else {
-        let text = reference
-            .pointer("/value/text")
-            .or_else(|| reference.get("text"))
-            .and_then(Value::as_str)
-            .unwrap_or(uri);
-        if text.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "<blockquote class=\"quoted-post\"><p>{}</p></blockquote>",
-                html_escape(text)
-            )
+            .map(QuoteRenderState::Found)
+            .unwrap_or(QuoteRenderState::Pending)
+    });
+    let quoted = match state {
+        QuoteRenderState::Found(record) => record,
+        QuoteRenderState::Unavailable => {
+            return format!(
+                "<a class=\"quoted-post-card quoted-post-status\" href=\"/app/thread?uri={encoded_uri}\">Post unavailable</a>"
+            );
         }
+        QuoteRenderState::NotFound => {
+            return format!(
+                "<a class=\"quoted-post-card quoted-post-status\" href=\"/app/thread?uri={encoded_uri}\">Post not found</a>"
+            );
+        }
+        QuoteRenderState::Pending | QuoteRenderState::Other(_) => {
+            return format!(
+                "<a class=\"quoted-post-card quoted-post-status\" href=\"/app/thread?uri={encoded_uri}\">Quoted post</a>"
+            );
+        }
+    };
+    let profile = profile_view_from_storage(storage, &quoted.did)
+        .unwrap_or_else(|_| json!({"did":quoted.did,"handle":quoted.did}));
+    let handle = profile_handle(&profile, &quoted.did);
+    let display_name = profile
+        .get("displayName")
+        .and_then(Value::as_str)
+        .unwrap_or(&handle);
+    let text = quoted
+        .record
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let created_at = quoted.record.get("createdAt").and_then(Value::as_str);
+    let time = created_at
+        .map(|created_at| {
+            format!(
+                "<time datetime=\"{}\"> · {}</time>",
+                html_escape(created_at),
+                html_escape(&relative_time_short(created_at))
+            )
+        })
+        .unwrap_or_default();
+    let nested = quoted
+        .record
+        .get("embed")
+        .map(|embed| {
+            render_web_embed_with_quotes(storage, &quoted.did, embed, quote_index, quote_depth + 1)
+        })
+        .unwrap_or_default();
+    format!(
+        "<article class=\"quoted-post-card\"><a class=\"quoted-card-main\" href=\"/app/thread?uri={encoded_uri}\" aria-label=\"Open quoted post thread\">{}<div class=\"quoted-card-body\"><header><strong>{}</strong><span class=\"quoted-card-handle\">@{}</span>{time}</header><p>{}</p></div></a>{nested}</article>",
+        avatar_markup(&profile, "small-avatar"),
+        html_escape(display_name),
+        html_escape(&handle),
+        html_escape(text)
+    )
+}
+
+fn quote_collection_name(collection: &str) -> &'static str {
+    match collection {
+        "app.bsky.feed.generator" => "Feed generator",
+        "app.bsky.graph.list" => "List",
+        "app.bsky.graph.starterpack" => "Starter pack",
+        _ => "Record",
     }
+}
+
+fn relative_time_short(created_at: &str) -> String {
+    let Ok(created_at) = OffsetDateTime::parse(created_at, &Rfc3339) else {
+        return "now".to_owned();
+    };
+    let seconds = (OffsetDateTime::now_utc().unix_timestamp() - created_at.unix_timestamp()).max(0);
+    let (amount, unit) = match seconds {
+        value if value < 60 => (value, "s"),
+        value if value < 60 * 60 => (value / 60, "m"),
+        value if value < 24 * 60 * 60 => (value / (60 * 60), "h"),
+        value if value < 7 * 24 * 60 * 60 => (value / (24 * 60 * 60), "d"),
+        value if value < 30 * 24 * 60 * 60 => (value / (7 * 24 * 60 * 60), "w"),
+        value if value < 365 * 24 * 60 * 60 => (value / (30 * 24 * 60 * 60), "mo"),
+        value => (value / (365 * 24 * 60 * 60), "y"),
+    };
+    format!("{amount}{unit}")
 }
 
 fn has_atproto_scope(scope: Option<&str>) -> bool {

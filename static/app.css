@@ -717,6 +717,98 @@ button:hover,
   font-weight: 750;
 }
 
+.quoted-post-card {
+  display: grid;
+  gap: 0.55rem;
+  margin-top: 0.7rem;
+  padding: 0.75rem 0.85rem;
+  border: 1px solid var(--line);
+  border-radius: 0.85rem;
+  background: var(--surface-raised);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+a.quoted-post-card {
+  display: block;
+  color: var(--muted);
+  text-decoration: none;
+}
+
+a.quoted-post-card:hover,
+.quoted-card-main:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.quoted-card-main {
+  display: flex;
+  min-width: 0;
+  gap: 0.6rem;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.quoted-card-body {
+  min-width: 0;
+  flex: 1;
+}
+
+.quoted-card-body header {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 0.35rem;
+  white-space: nowrap;
+}
+
+.quoted-card-body header strong {
+  overflow: hidden;
+  font-weight: 800;
+  text-overflow: ellipsis;
+}
+
+.quoted-card-handle {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+}
+
+.quoted-card-body time {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+.quoted-card-body p {
+  margin: 0.35rem 0 0;
+  white-space: pre-wrap;
+}
+
+.quoted-nested-link {
+  width: fit-content;
+  color: var(--muted);
+  font-size: 0.88rem;
+  text-decoration: none;
+}
+
+.quoted-nested-link:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+.quoted-record-type {
+  display: flex !important;
+  justify-content: space-between;
+  gap: 1rem;
+  color: var(--text) !important;
+}
+
+.quoted-record-type span {
+  color: var(--muted);
+}
+
 .record-with-media {
   display: grid;
   gap: 0.5rem;
