@@ -9267,6 +9267,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timeline_group_includes_the_fetched_root_before_page_replies() {
+        let storage = Arc::new(MemoryStorage::default());
+        let viewer = "did:plc:reply-viewer";
+        let root = test_web_post("did:plc:root-author", "root", 1, "Fetched chain root", None);
+        let first_reply = test_web_post(
+            "did:plc:first-reply-author",
+            "first-reply",
+            2,
+            "Page reply first",
+            Some(&root.uri),
+        );
+        let newest_reply = test_web_post(
+            "did:plc:newest-reply-author",
+            "newest-reply",
+            3,
+            "Page reply newest",
+            Some(&first_reply.uri),
+        );
+        for record in [&root, &first_reply, &newest_reply] {
+            storage.put_record(record).unwrap();
+            storage.set_follow(viewer, &record.did, true).unwrap();
+        }
+
+        let page = request_test_timeline_at(storage, viewer, "/app?limit=2").await;
+
+        assert_eq!(
+            page.matches("class=\"post-item thread-group\"").count(),
+            1,
+            "{page}"
+        );
+        assert_eq!(page.matches("class=\"post-card\"").count(), 3, "{page}");
+        assert_eq!(
+            page.matches("class=\"reply-parent-card\"").count(),
+            0,
+            "{page}"
+        );
+        let root_position = page.find("Fetched chain root").unwrap();
+        let first_position = page.find("Page reply first").unwrap();
+        let newest_position = page.find("Page reply newest").unwrap();
+        assert!(root_position < first_position && first_position < newest_position);
+        assert!(page.contains(
+            "data-post-kind=\"post\" data-post-uri=\"at://did:plc:root-author/app.bsky.feed.post/root\""
+        ));
+    }
+
+    #[tokio::test]
     async fn timeline_caps_mixed_author_thread_and_links_to_skipped_replies() {
         let storage = Arc::new(MemoryStorage::default());
         let viewer = "did:plc:reply-viewer";
@@ -9604,9 +9650,26 @@ mod tests {
         request_test_timeline_with_flow(storage, viewer, DisabledOAuthFlow).await
     }
 
+    async fn request_test_timeline_at(
+        storage: Arc<MemoryStorage>,
+        viewer: &str,
+        uri: &str,
+    ) -> String {
+        request_test_timeline_at_with_flow(storage, viewer, uri, DisabledOAuthFlow).await
+    }
+
     async fn request_test_timeline_with_flow<F: OAuthFlow>(
         storage: Arc<MemoryStorage>,
         viewer: &str,
+        flow: F,
+    ) -> String {
+        request_test_timeline_at_with_flow(storage, viewer, "/app", flow).await
+    }
+
+    async fn request_test_timeline_at_with_flow<F: OAuthFlow>(
+        storage: Arc<MemoryStorage>,
+        viewer: &str,
+        uri: &str,
         flow: F,
     ) -> String {
         let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
@@ -9627,7 +9690,7 @@ mod tests {
         let response = app
             .oneshot(
                 axum::http::Request::builder()
-                    .uri("/app")
+                    .uri(uri)
                     .header("cookie", format!("{SESSION_COOKIE}={token}"))
                     .body(Body::empty())
                     .unwrap(),
