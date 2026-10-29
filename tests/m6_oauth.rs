@@ -25,7 +25,7 @@ use tower::ServiceExt;
 use tracing::{Event, Subscriber, field::Visit};
 use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
-const EXPECTED_OAUTH_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=*";
+const EXPECTED_OAUTH_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=*";
 
 #[derive(Clone)]
 struct ProfileHydrationTiming(Arc<Mutex<Option<u64>>>);
@@ -2032,6 +2032,35 @@ async fn old_scope_session_gets_a_friendly_feed_reauthorization_page() {
     );
     assert!(html.contains("href=\"/login\""));
     assert!(!html.contains("\"error\":\"OAuthError\""));
+}
+
+#[tokio::test]
+async fn old_scope_session_keeps_text_composer_and_shows_picture_reauthorization_hint() {
+    let old_scope = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete";
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(
+            FakeOAuthFlow::with_granted_scope(Some(old_scope)),
+            Arc::new(MemoryStorage::default()),
+        );
+    let cookie = finish_login(&app).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec())
+        .unwrap();
+    assert!(html.contains("action=\"/post\""), "{html}");
+    assert!(html.contains("Log in again to enable pictures"), "{html}");
+    assert!(html.contains("href=\"/login\""), "{html}");
+    assert!(!html.contains("type=\"file\""), "{html}");
 }
 
 #[tokio::test]
