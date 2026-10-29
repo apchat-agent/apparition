@@ -6,7 +6,22 @@ use appview_rs::{
     ingest::{IndexedRecord, SqliteStorage, Storage},
 };
 use rusqlite::Connection;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+struct TempDirGuard(PathBuf);
+
+impl TempDirGuard {
+    fn new(path: impl AsRef<Path>) -> Self {
+        Self(path.as_ref().to_owned())
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 #[test]
 fn snapshot_test_temp_directory_is_removed_during_unwind() {
@@ -26,7 +41,10 @@ fn snapshot_test_temp_directory_is_removed_during_unwind() {
     });
 
     assert!(result.is_err());
-    assert!(!dir.exists(), "snapshot test temp directory leaked on unwind");
+    assert!(
+        !dir.exists(),
+        "snapshot test temp directory leaked on unwind"
+    );
 }
 
 #[test]
@@ -40,6 +58,7 @@ fn page_reads_do_not_wait_for_a_writer_holding_the_database() {
             .as_nanos()
     ));
     std::fs::create_dir_all(&dir).unwrap();
+    let _guard = TempDirGuard::new(&dir);
     let path = dir.join("appview.db");
     let storage = SqliteStorage::open(&path).unwrap();
     let actor = "did:plc:reader";
@@ -117,7 +136,6 @@ fn page_reads_do_not_wait_for_a_writer_holding_the_database() {
         "page reads waited {elapsed:?} for a database writer"
     );
     drop(storage);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -154,6 +172,7 @@ async fn large_repo_backfill_is_spread_across_batches_by_a_record_rate_budget() 
             .as_nanos()
     ));
     std::fs::create_dir_all(&dir).unwrap();
+    let _guard = TempDirGuard::new(&dir);
     let storage = std::sync::Arc::new(SqliteStorage::open(dir.join("appview.db")).unwrap());
     let backfiller = RepoBackfiller::new(
         storage.clone(),
@@ -175,7 +194,6 @@ async fn large_repo_backfill_is_spread_across_batches_by_a_record_rate_budget() 
         started.elapsed()
     );
     drop(storage);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -189,6 +207,7 @@ fn session_writes_can_run_between_batches_while_a_snapshot_removes_old_records()
             .as_nanos()
     ));
     std::fs::create_dir_all(&dir).unwrap();
+    let _guard = TempDirGuard::new(&dir);
     let storage = SqliteStorage::open(dir.join("appview.db")).unwrap();
     let did = "did:plc:cleanup";
     let existing: Vec<IndexedRecord> = (0..60_000)
@@ -227,7 +246,6 @@ fn session_writes_can_run_between_batches_while_a_snapshot_removes_old_records()
     );
     assert!(storage.records().unwrap().is_empty());
     drop(storage);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -241,6 +259,7 @@ fn session_writes_can_run_between_batches_while_a_snapshot_rebuilds_many_follows
             .as_nanos()
     ));
     std::fs::create_dir_all(&dir).unwrap();
+    let _guard = TempDirGuard::new(&dir);
     let storage = SqliteStorage::open(dir.join("appview.db")).unwrap();
     let did = "did:plc:many-follows";
     storage.register_user(did).unwrap();
@@ -283,7 +302,6 @@ fn session_writes_can_run_between_batches_while_a_snapshot_rebuilds_many_follows
             .unwrap()
     );
     drop(storage);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // A big repository snapshot used to hold the one connection lock for its whole
@@ -350,6 +368,7 @@ fn large_snapshot_lets_other_storage_calls_in_between_batches() {
 fn record_writes_never_run_the_wal_checkpoint_under_the_lock() {
     let dir = std::env::temp_dir().join(format!("appview-ckpt-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+    let _guard = TempDirGuard::new(&dir);
     let path = dir.join("appview.db");
     let storage = SqliteStorage::open(&path).unwrap();
     assert_eq!(storage.wal_autocheckpoint().unwrap(), 0);
@@ -378,7 +397,6 @@ fn record_writes_never_run_the_wal_checkpoint_under_the_lock() {
         std::thread::sleep(Duration::from_millis(200));
     }
     drop(storage);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // The backfill must not outrun the disk: it waits while the WAL has more than
@@ -410,6 +428,7 @@ async fn backfill_waits_for_the_checkpoint_backlog_to_drain() {
 fn write_backlog_reads_as_behind_until_a_checkpoint_reports() {
     let dir = std::env::temp_dir().join(format!("appview-backlog-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+    let _guard = TempDirGuard::new(&dir);
     let storage = SqliteStorage::open(dir.join("appview.db")).unwrap();
     assert_eq!(storage.write_backlog(), u64::MAX);
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -419,5 +438,4 @@ fn write_backlog_reads_as_behind_until_a_checkpoint_reports() {
     }
     assert!(storage.write_backlog() < 100);
     drop(storage);
-    let _ = std::fs::remove_dir_all(&dir);
 }
