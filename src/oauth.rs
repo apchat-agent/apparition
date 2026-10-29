@@ -3598,9 +3598,10 @@ async fn hydrate_parent_uri_batch<F: OAuthFlow, S: Storage>(
     for uri in parent_uris {
         parents.entry(uri.clone()).or_insert(None);
     }
-    let local = storage.records_by_uri("app.bsky.feed.post", parent_uris)?;
-    for (uri, record) in local {
-        parents.insert(uri, Some(record));
+    for uri in parent_uris {
+        if let Some(record) = storage.record_by_uri("app.bsky.feed.post", uri)? {
+            parents.insert(uri.clone(), Some(record));
+        }
     }
 
     let missing = parent_uris
@@ -9460,6 +9461,52 @@ mod tests {
             "parent hydration used per-record lookups"
         );
         assert_eq!(batch_lookups, 1, "parents should load in one page lookup");
+    }
+
+    #[tokio::test]
+    async fn parent_hydration_batches_each_level_and_stops_after_two_extra_levels() {
+        let storage = MemoryStorage::default();
+        let mut leaves = Vec::new();
+        let mut fourth_level_uris = Vec::new();
+        for index in 0..25_u64 {
+            let did = format!("did:plc:chain-{index}");
+            let fourth = test_web_post(&did, "fourth", 1, "Fourth", None);
+            let third = test_web_post(&did, "third", 2, "Third", Some(&fourth.uri));
+            let second = test_web_post(&did, "second", 3, "Second", Some(&third.uri));
+            let first = test_web_post(&did, "first", 4, "First", Some(&second.uri));
+            let leaf = test_web_post(&did, "leaf", 5, "Leaf", Some(&first.uri));
+            for record in [&fourth, &third, &second, &first] {
+                storage.put_record(record).unwrap();
+            }
+            fourth_level_uris.push(fourth.uri);
+            leaves.push(leaf);
+        }
+        let page_records = leaves.iter().collect::<Vec<_>>();
+
+        let parents = hydrate_page_parents(
+            &DisabledOAuthFlow,
+            &storage,
+            &page_records,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let (single_lookups, batch_lookups) = storage.record_uri_lookup_counts();
+
+        assert_eq!(
+            single_lookups, 0,
+            "parent hydration must not look up one URI at a time"
+        );
+        assert_eq!(
+            batch_lookups, 3,
+            "one page batch plus at most two ancestor batches"
+        );
+        assert_eq!(parents.len(), 75, "three parent levels should be hydrated");
+        assert!(
+            fourth_level_uris
+                .iter()
+                .all(|uri| !parents.contains_key(uri))
+        );
     }
 
     #[tokio::test]
