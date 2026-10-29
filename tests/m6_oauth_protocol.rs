@@ -598,6 +598,33 @@ async fn fake_pds_receives_quote_post_with_record_embed_strong_ref() {
 }
 
 #[tokio::test]
+async fn live_author_profile_read_uses_the_resolved_pds_and_indexes_record_shape() {
+    let (flow, _, shared, server) = production_flow(None, None).await;
+    let fetched = flow.fetch_author_profile(DID).await.unwrap();
+    let profile = fetched
+        .profile
+        .expect("fake PDS returns the profile record");
+    assert_eq!(profile.did, DID);
+    assert_eq!(profile.collection, "app.bsky.actor.profile");
+    assert_eq!(profile.rkey, "self");
+    assert_eq!(profile.record["displayName"], "From fake PDS");
+    assert_eq!(fetched.verified_handle, None);
+
+    let request = shared
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .find(|request| request.path.starts_with("/xrpc/com.atproto.repo.getRecord"))
+        .cloned()
+        .expect("profile should be fetched from the resolved PDS");
+    assert!(request.path.contains("collection=app.bsky.actor.profile"));
+    assert!(request.path.contains("rkey=self"));
+    assert!(!request.headers.contains_key("authorization"));
+    server.abort();
+}
+
+#[tokio::test]
 async fn loopback_production_oauth_completes_a_public_client_login() {
     let (flow, _, shared, server) = production_loopback_flow().await;
     let callback_uri = "http://127.0.0.1:43123/oauth/callback";
@@ -944,6 +971,16 @@ async fn serve_one(mut stream: TcpStream, origin: &str, state: Arc<Mutex<FakeSer
                     .to_string(),
                 )
             }
+            path if path.starts_with("/xrpc/com.atproto.repo.getRecord") => (
+                200,
+                vec![],
+                json!({
+                    "uri":format!("at://{DID}/app.bsky.actor.profile/self"),
+                    "cid":"bafyreifakeprofile",
+                    "value":{"$type":"app.bsky.actor.profile","displayName":"From fake PDS"}
+                })
+                .to_string(),
+            ),
             _ => (404, vec![], json!({"error":"not_found"}).to_string()),
         }
     };

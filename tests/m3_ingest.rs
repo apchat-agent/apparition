@@ -1,6 +1,6 @@
 use appview_rs::ingest::{
     FollowUpdate, IndexedRecord, Ingestor, JetstreamConsumer, JetstreamStorageUpdate,
-    MemoryStorage, ScopeMode, SqliteStorage, Storage,
+    MemoryStorage, ProfileIndexEntry, ScopeMode, SqliteStorage, Storage,
 };
 use futures_util::{SinkExt, StreamExt};
 use rusqlite::Connection;
@@ -158,6 +158,23 @@ fn jetstream_large_database_batch_ingest_benchmark() {
             .unwrap();
         println!(
             "create_follows_active_subject_actor_ms={:.3}",
+            index_started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    if std::env::var_os("APPVIEW_BENCH_MEASURE_QUOTE_INDEX").is_some() {
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("DROP INDEX IF EXISTS records_collection_embed_record_uri;")
+            .unwrap();
+        let index_started = std::time::Instant::now();
+        connection
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS records_collection_embed_record_uri
+                 ON records(collection, json_extract(record_json, '$.embed.record.uri'), time_us DESC);",
+            )
+            .unwrap();
+        println!(
+            "create_records_collection_embed_record_uri_ms={:.3}",
             index_started.elapsed().as_secs_f64() * 1000.0
         );
     }
@@ -479,6 +496,97 @@ fn tracked_set_rebuild_matches_after_seeded_registration_follow_and_rollback_ope
 
     drop(storage);
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn profile_index_rebuild_matches_after_seeded_profile_mutations() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+        "target/av19-profile-index-{}-{}.sqlite3",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let storage = SqliteStorage::open(&path).unwrap();
+    let dids = (0..7)
+        .map(|index| format!("did:plc:profile-random-{index}"))
+        .collect::<Vec<_>>();
+    let mut random = 0x19a5_cafe_u32;
+
+    for step in 0..240_u64 {
+        random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let did = &dids[(random as usize >> 8) % dids.len()];
+        let fetched_at_ms = i64::from(random & 0x7fff_ffff);
+        let profile = IndexedRecord {
+            did: did.clone(),
+            collection: "app.bsky.actor.profile".to_owned(),
+            rkey: "self".to_owned(),
+            uri: format!("at://{did}/app.bsky.actor.profile/self"),
+            cid: Some(format!("profile-{step}")),
+            time_us: 1_800_000_000_000_000 + step,
+            record: json!({"$type":"app.bsky.actor.profile","displayName":format!("Profile {step}")}),
+        };
+        match random % 5 {
+            0 => storage
+                .set_profile_index_entry(
+                    did,
+                    ProfileIndexEntry {
+                        has_profile: random & 0x100 != 0,
+                        fetched_at_ms,
+                    },
+                )
+                .unwrap(),
+            1 => storage.put_record(&profile).unwrap(),
+            2 => storage
+                .delete_record(did, "app.bsky.actor.profile", "self")
+                .unwrap(),
+            3 if random & 0x100 != 0 => {
+                storage
+                    .apply_jetstream_batch(&[JetstreamStorageUpdate {
+                        time_us: step,
+                        upsert: Some(profile),
+                        ..JetstreamStorageUpdate::default()
+                    }])
+                    .unwrap();
+            }
+            3 => {
+                storage
+                    .apply_jetstream_batch(&[JetstreamStorageUpdate {
+                        time_us: step,
+                        delete: Some((
+                            did.clone(),
+                            "app.bsky.actor.profile".to_owned(),
+                            "self".to_owned(),
+                        )),
+                        ..JetstreamStorageUpdate::default()
+                    }])
+                    .unwrap();
+            }
+            _ => {
+                let records = if random & 0x100 != 0 {
+                    vec![profile]
+                } else {
+                    Vec::new()
+                };
+                storage.replace_repo_snapshot(did, &records, &[]).unwrap();
+            }
+        }
+        assert!(
+            storage.profile_index_matches_sqlite().unwrap(),
+            "profile index diverged from SQLite after seeded step {step}"
+        );
+    }
+
+    let expected = storage.profile_index_snapshot().unwrap();
+    drop(storage);
+    let reopened = SqliteStorage::open(&path).unwrap();
+    assert_eq!(reopened.profile_index_snapshot().unwrap(), expected);
+    assert!(reopened.profile_index_matches_sqlite().unwrap());
+    drop(reopened);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
 }
 
 #[test]
