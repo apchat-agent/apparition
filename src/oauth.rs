@@ -7968,10 +7968,7 @@ fn timeline_post_grouping(
         }
         let mut chain = vec![root];
         let mut current = root;
-        loop {
-            let Some(next) = children.get(&current).filter(|next| next.len() == 1) else {
-                break;
-            };
+        while let Some(next) = children.get(&current).filter(|next| next.len() == 1) {
             current = next[0];
             if chain.contains(&current) {
                 break;
@@ -8022,6 +8019,11 @@ fn timeline_post_grouping(
         let newest = chain
             .iter()
             .map(|index| records[*index].time_us)
+            .chain(
+                ancestors_near_to_far
+                    .iter()
+                    .map(|ancestor| ancestor.time_us),
+            )
             .max()
             .unwrap_or_default();
         if newest.saturating_sub(oldest) > MAX_THREAD_SPAN_US {
