@@ -733,6 +733,41 @@ Deno.test("infinite scroll errors wait for an explicit retry and do not storm re
   assertEquals(harness.list.children.at(-1).getAttribute("data-post-uri"), "post-3");
 });
 
+Deno.test("an incoming full post keeps an earlier reply parent card on screen", async () => {
+  const pages = {};
+  const harness = await createInfiniteScrollHarness({
+    cards: ["reply-R"],
+    responses: [{ ok: true, text: async () => "page-two" }],
+    pages,
+  });
+  const reply = harness.list.children[0];
+  reply.setAttribute("data-post-kind", "post");
+  const parent = new harness.Element("a", "post-P");
+  parent.setAttribute("data-post-kind", "parent");
+  reply.append(parent);
+
+  const nextList = new harness.Element("ol");
+  nextList.className = "post-list";
+  const fullParentPost = new harness.Element("li", "post-P");
+  fullParentPost.setAttribute("data-post-kind", "post");
+  nextList.append(fullParentPost);
+  pages["page-two"] = { list: nextList, link: new harness.Link("/older-b") };
+
+  harness.Observer.latest.target.top = -1;
+  harness.scroll();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert(!parent.removed, "the earlier reply parent card must remain on screen");
+  assertEquals(parent.parentElement, reply, "the parent card must stay attached to its original reply");
+  assertEquals(
+    harness.list.children.filter((card) =>
+      card.getAttribute("data-post-uri") === "post-P" && card.getAttribute("data-post-kind") !== "parent"
+    ).length,
+    1,
+    "the full parent post should appear once",
+  );
+});
+
 Deno.test("infinite scroll stops before retaining more than 500 cards", async () => {
   const harness = await createInfiniteScrollHarness({
     cards: Array.from({ length: 500 }, (_, index) => `post-${index}`),
