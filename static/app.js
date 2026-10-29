@@ -769,6 +769,17 @@ function installInfiniteScroll({
     return found;
   };
 
+  const hasClass = (node, name) => node.className?.split(/\s+/).includes(name);
+
+  const threadGroupFor = (node) => {
+    let current = node;
+    while (current && current !== list) {
+      if (hasClass(current, "thread-group")) return current;
+      current = current.parentElement;
+    }
+    return null;
+  };
+
   const appendCards = (nextList) => {
     const existingPostNodes = new Map();
     const existingParentNodes = new Map();
@@ -785,7 +796,28 @@ function installInfiniteScroll({
     for (const card of newCards) {
       const nodes = postNodesIn(card);
       const posts = nodes.filter((node) => node.getAttribute("data-post-kind") !== "parent");
-      if (posts.some((node) => existingPostNodes.has(node.getAttribute("data-post-uri")))) {
+      const duplicates = posts.filter((node) => existingPostNodes.has(node.getAttribute("data-post-uri")));
+      const freshPosts = posts.filter((node) => !existingPostNodes.has(node.getAttribute("data-post-uri")));
+      if (duplicates.length) {
+        const existingGroup = duplicates
+          .map((node) => threadGroupFor(existingPostNodes.get(node.getAttribute("data-post-uri"))))
+          .find(Boolean);
+        if (existingGroup && hasClass(card, "thread-group") && freshPosts.length) {
+          for (const duplicate of duplicates) duplicate.remove();
+          for (const post of freshPosts) {
+            const connector = document.createElement("span");
+            connector.className = "reply-connector thread-group-connector";
+            connector.setAttribute("aria-hidden", "true");
+            existingGroup.append(connector, post);
+            existingPostNodes.set(post.getAttribute("data-post-uri"), post);
+          }
+          card.remove();
+          if (!appended.includes(existingGroup)) appended.push(existingGroup);
+          continue;
+        }
+        for (const duplicate of duplicates) duplicate.remove();
+      }
+      if (!freshPosts.length) {
         card.remove();
         continue;
       }
@@ -797,7 +829,7 @@ function installInfiniteScroll({
         }
         existingParentNodes.set(uri, parent);
       }
-      for (const post of posts) {
+      for (const post of freshPosts) {
         const uri = post.getAttribute("data-post-uri");
         existingPostNodes.set(uri, post);
       }
