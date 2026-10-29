@@ -6,6 +6,7 @@ pub mod http_security;
 pub mod identity;
 pub mod ingest;
 pub mod jwt;
+pub mod link_card;
 pub mod net;
 pub mod oauth;
 

@@ -9,6 +9,7 @@ use crate::{
         IndexedNotification, IndexedRecord, MemoryStorage, NotificationCursor, ProfileIndexEntry,
         RecordCursor, Storage, StorageError,
     },
+    link_card::{LinkCard, LinkCardFetcher, LinkThumbnail},
     net::SafeHttpClient,
 };
 use atrium_api::{
@@ -85,8 +86,8 @@ const PROFILE_NEGATIVE_TTL: Duration = Duration::from_secs(60 * 60);
 const PAGE_PROFILE_BUDGET: Duration = Duration::from_millis(1500);
 const PAGE_PROFILE_CONCURRENCY: usize = 8;
 const PAGE_QUOTE_CONCURRENCY: usize = 16;
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m11";
-const WEB_SCRIPT_URL: &str = "/static/app.js?v=js9";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m12";
+const WEB_SCRIPT_URL: &str = "/static/app.js?v=js10";
 const ALT_MODEL_DOWNLOAD_BYTES: u64 = 264_713_119;
 const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
 const SAVED_FEED_CACHE_PREFIX: &str = "saved-feed-preferences:";
@@ -181,6 +182,14 @@ pub struct PostImage {
     pub height: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PostExternal {
+    pub uri: String,
+    pub title: String,
+    pub description: String,
+    pub thumbnail: Option<LinkThumbnail>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct FetchedAuthorProfile {
     pub profile: Option<IndexedRecord>,
@@ -240,6 +249,14 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
         Box::pin(async { Err("image post action is not available".to_owned()) })
     }
+    fn create_post_with_external<'a>(
+        &'a self,
+        _did: &'a str,
+        _text: &'a str,
+        _external: PostExternal,
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+        Box::pin(async { Err("link card post action is not available".to_owned()) })
+    }
     fn create_reply_with_images<'a>(
         &'a self,
         _did: &'a str,
@@ -250,6 +267,16 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
         Box::pin(async { Err("image reply action is not available".to_owned()) })
     }
+    fn create_reply_with_external<'a>(
+        &'a self,
+        _did: &'a str,
+        _text: &'a str,
+        _root: PostStrongRef,
+        _parent: PostStrongRef,
+        _external: PostExternal,
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+        Box::pin(async { Err("link card reply action is not available".to_owned()) })
+    }
     fn create_quote_with_images<'a>(
         &'a self,
         _did: &'a str,
@@ -258,6 +285,15 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
         _images: Vec<PostImage>,
     ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
         Box::pin(async { Err("image quote action is not available".to_owned()) })
+    }
+    fn create_quote_with_external<'a>(
+        &'a self,
+        _did: &'a str,
+        _text: &'a str,
+        _quoted: PostStrongRef,
+        _external: PostExternal,
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+        Box::pin(async { Err("link card quote action is not available".to_owned()) })
     }
     fn fetch_post<'a>(
         &'a self,
@@ -327,6 +363,7 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
             })
         })
     }
+
     fn feed_timeline<'a>(
         &'a self,
         _did: &'a str,
@@ -385,6 +422,7 @@ pub struct OAuthWebState<F, S> {
     pub flow: F,
     pub storage: Arc<S>,
     pub alt_model_dir: Option<PathBuf>,
+    link_card_fetcher: LinkCardFetcher,
     feed_page_cache: FeedPageCache,
     notification_streams: Arc<Mutex<HashMap<String, usize>>>,
     shutdown: WebShutdown,
@@ -631,6 +669,7 @@ impl OAuthPublic {
             .route("/profile", get(profile_page::<F, S>))
             .route("/thread", get(thread_page::<F, S>))
             .route("/compose", get(quote_composer::<F, S>))
+            .route("/link-preview", post(link_preview::<F, S>))
             .route("/post", post(write_post::<F, S>))
             .route("/reply", post(write_reply::<F, S>))
             .route("/quote", post(write_quote::<F, S>))
@@ -642,6 +681,7 @@ impl OAuthPublic {
                 flow,
                 storage,
                 alt_model_dir,
+                link_card_fetcher: LinkCardFetcher::new(),
                 shutdown,
                 feed_page_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 notification_streams: Arc::new(Mutex::new(HashMap::new())),
@@ -1465,6 +1505,79 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         self.create_record(did, "app.bsky.feed.post", record).await
     }
 
+    async fn create_post_with_external(
+        &self,
+        did: &str,
+        text: &str,
+        external: PostExternal,
+        reply: Option<Value>,
+        quote: Option<PostStrongRef>,
+    ) -> Result<PdsCreatedRecord, String> {
+        let uri =
+            url::Url::parse(&external.uri).map_err(|_| "link card URL is invalid".to_owned())?;
+        if !matches!(uri.scheme(), "http" | "https")
+            || !uri.username().is_empty()
+            || uri.password().is_some()
+        {
+            return Err("link card URL must use http or https".to_owned());
+        }
+
+        let parsed_did = did.parse::<Did>().map_err(|error| error.to_string())?;
+        let session = self
+            .client
+            .restore(&parsed_did)
+            .await
+            .map_err(|error| error.to_string())?;
+        let thumb = if let Some(thumbnail) = external.thumbnail.as_ref() {
+            let request = XrpcRequest {
+                method: http::Method::POST,
+                nsid: "com.atproto.repo.uploadBlob".to_owned(),
+                parameters: None,
+                input: Some(InputDataOrBytes::Bytes(thumbnail.bytes.clone())),
+                encoding: Some(thumbnail.mime_type.clone()),
+            };
+            let response: OutputDataOrBytes<Value> = session
+                .send_xrpc::<(), Vec<u8>, Value, Value>(&request)
+                .await
+                .map_err(|error| {
+                    log_pds_xrpc_failure("com.atproto.repo.uploadBlob", &error);
+                    format!("PDS uploadBlob failed: {error:?}")
+                })?;
+            Some(match response {
+                OutputDataOrBytes::Data(value) => value
+                    .get("blob")
+                    .cloned()
+                    .filter(|blob| blob.get("ref").is_some())
+                    .ok_or_else(|| "PDS uploadBlob returned no blob reference".to_owned())?,
+                OutputDataOrBytes::Bytes(_) => {
+                    return Err("PDS uploadBlob returned a non-JSON response".to_owned());
+                }
+            })
+        } else {
+            None
+        };
+        let external_embed = external_embed_value(&external, thumb);
+        let embed = if let Some(quote) = quote {
+            json!({
+                "$type":"app.bsky.embed.recordWithMedia",
+                "record":{"$type":"app.bsky.embed.record","record":quote},
+                "media":external_embed
+            })
+        } else {
+            external_embed
+        };
+        let mut record = json!({
+            "$type":"app.bsky.feed.post",
+            "text":text,
+            "createdAt":Datetime::now(),
+            "embed":embed
+        });
+        if let Some(reply) = reply {
+            record["reply"] = reply;
+        }
+        self.create_record(did, "app.bsky.feed.post", record).await
+    }
+
     async fn delete_like_record(&self, did: &str, like_uri: &str) -> Result<(), String> {
         let collection = "app.bsky.feed.like";
         let prefix = format!("at://{did}/{collection}/");
@@ -1686,6 +1799,17 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
         })
     }
 
+    fn create_post_with_external<'a>(
+        &'a self,
+        did: &'a str,
+        text: &'a str,
+        external: PostExternal,
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+        Box::pin(async move {
+            AtriumOAuthFlow::create_post_with_external(self, did, text, external, None, None).await
+        })
+    }
+
     fn create_reply_with_images<'a>(
         &'a self,
         did: &'a str,
@@ -1707,6 +1831,27 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
         })
     }
 
+    fn create_reply_with_external<'a>(
+        &'a self,
+        did: &'a str,
+        text: &'a str,
+        root: PostStrongRef,
+        parent: PostStrongRef,
+        external: PostExternal,
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+        Box::pin(async move {
+            AtriumOAuthFlow::create_post_with_external(
+                self,
+                did,
+                text,
+                external,
+                Some(json!({"root":root,"parent":parent})),
+                None,
+            )
+            .await
+        })
+    }
+
     fn create_quote_with_images<'a>(
         &'a self,
         did: &'a str,
@@ -1717,6 +1862,26 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
         Box::pin(async move {
             AtriumOAuthFlow::create_post_with_images(self, did, text, images, None, Some(quoted))
                 .await
+        })
+    }
+
+    fn create_quote_with_external<'a>(
+        &'a self,
+        did: &'a str,
+        text: &'a str,
+        quoted: PostStrongRef,
+        external: PostExternal,
+    ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+        Box::pin(async move {
+            AtriumOAuthFlow::create_post_with_external(
+                self,
+                did,
+                text,
+                external,
+                None,
+                Some(quoted),
+            )
+            .await
         })
     }
 
@@ -3713,11 +3878,12 @@ where
     };
     let post_form = if write_forms_enabled {
         format!(
-            "<form class=\"composer image-composer\" action=\"/post\" method=\"post\" enctype=\"multipart/form-data\" data-image-composer><label for=\"new-post\">Write a post</label><textarea id=\"new-post\" name=\"text\" rows=\"3\" maxlength=\"300\" required></textarea>{}<button type=\"submit\">Post</button><p class=\"composer-error\" data-composer-error role=\"alert\" hidden></p></form>",
+            "<form class=\"composer image-composer\" action=\"/post\" method=\"post\" enctype=\"multipart/form-data\" data-image-composer><label for=\"new-post\">Write a post</label><textarea id=\"new-post\" name=\"text\" rows=\"3\" maxlength=\"300\" required></textarea>{}{}<button type=\"submit\">Post</button><p class=\"composer-error\" data-composer-error role=\"alert\" hidden></p></form>",
             render_image_picker(
                 verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref()),
                 "post-images"
-            )
+            ),
+            render_link_picker("post-link")
         )
     } else {
         String::new()
@@ -4964,12 +5130,13 @@ where
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
     let composer = if write_forms_enabled {
         format!(
-            "<form class=\"composer quote-composer image-composer\" action=\"/quote\" method=\"post\" enctype=\"multipart/form-data\" data-image-composer><label for=\"quote-text\">Write a quote post</label><input type=\"hidden\" name=\"quote_uri\" value=\"{}\"><textarea id=\"quote-text\" name=\"text\" rows=\"4\" maxlength=\"300\" required></textarea>{}{}<button type=\"submit\">Post</button><p class=\"composer-error\" data-composer-error role=\"alert\" hidden></p></form>",
+            "<form class=\"composer quote-composer image-composer\" action=\"/quote\" method=\"post\" enctype=\"multipart/form-data\" data-image-composer><label for=\"quote-text\">Write a quote post</label><input type=\"hidden\" name=\"quote_uri\" value=\"{}\"><textarea id=\"quote-text\" name=\"text\" rows=\"4\" maxlength=\"300\" required></textarea>{}{}{}<button type=\"submit\">Post</button><p class=\"composer-error\" data-composer-error role=\"alert\" hidden></p></form>",
             html_escape(&quoted.uri),
             render_image_picker(
                 verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref()),
                 "quote-images"
             ),
+            render_link_picker("quote-link"),
             render_quote_preview(state.storage.as_ref(), &quoted)
         )
     } else {
@@ -5219,10 +5386,11 @@ fn render_reply_composer<S: Storage>(
         .unwrap_or_else(|_| json!({"did":parent.did,"handle":parent.did}));
     let handle = profile_handle(&profile, &parent.did);
     format!(
-        "<form id=\"reply-composer\" class=\"composer reply-composer image-composer\" action=\"/reply\" method=\"post\" enctype=\"multipart/form-data\" data-image-composer><p class=\"reply-context\">Replying to @{}</p><input type=\"hidden\" name=\"parent_uri\" value=\"{}\"><label for=\"reply-text\">Write a reply</label><textarea id=\"reply-text\" name=\"text\" rows=\"3\" maxlength=\"300\" required></textarea>{}<button type=\"submit\">Reply</button><p class=\"composer-error\" data-composer-error role=\"alert\" hidden></p></form>",
+        "<form id=\"reply-composer\" class=\"composer reply-composer image-composer\" action=\"/reply\" method=\"post\" enctype=\"multipart/form-data\" data-image-composer><p class=\"reply-context\">Replying to @{}</p><input type=\"hidden\" name=\"parent_uri\" value=\"{}\"><label for=\"reply-text\">Write a reply</label><textarea id=\"reply-text\" name=\"text\" rows=\"3\" maxlength=\"300\" required></textarea>{}{}<button type=\"submit\">Reply</button><p class=\"composer-error\" data-composer-error role=\"alert\" hidden></p></form>",
         html_escape(&handle),
         html_escape(&parent.uri),
-        render_image_picker(blob_access, "reply-images")
+        render_image_picker(blob_access, "reply-images"),
+        render_link_picker("reply-link")
     )
 }
 
@@ -5232,6 +5400,12 @@ fn render_image_picker(blob_access: bool, id: &str) -> String {
     }
     format!(
         "<fieldset class=\"image-picker\"><legend>Add pictures</legend><label for=\"{id}\">Choose up to 4 images</label><input id=\"{id}\" type=\"file\" name=\"images\" accept=\"image/*\" multiple data-image-input><div class=\"image-previews\" data-image-previews></div><p class=\"image-picker-status\" data-image-status role=\"status\"></p></fieldset>"
+    )
+}
+
+fn render_link_picker(id: &str) -> String {
+    format!(
+        "<fieldset class=\"link-picker\"><legend>Add a webpage</legend><label for=\"{id}\">Webpage URL</label><div class=\"link-picker-controls\"><input id=\"{id}\" name=\"link_url\" type=\"url\" inputmode=\"url\" placeholder=\"https://example.com/article\" data-link-input><button type=\"button\" data-link-preview>Preview link</button></div><p class=\"link-picker-status\" data-link-status role=\"status\" aria-live=\"polite\"></p><div class=\"link-preview\" data-link-preview-card hidden></div><p class=\"composer-notice\" data-link-image-note hidden>Pictures will be attached to the post; the webpage link will be omitted.</p></fieldset>"
     )
 }
 
@@ -5510,6 +5684,7 @@ struct PostSubmission {
     text: String,
     parent_uri: Option<String>,
     quote_uri: Option<String>,
+    link_url: Option<String>,
     images: Vec<PostImage>,
 }
 
@@ -5540,6 +5715,7 @@ where
         let mut text = String::new();
         let mut parent_uri = None;
         let mut quote_uri = None;
+        let mut link_url = None;
         let mut pending_images = Vec::new();
         let mut alts = Vec::new();
         let mut widths = Vec::new();
@@ -5585,6 +5761,7 @@ where
                     "text" => text = value,
                     "parent_uri" => parent_uri = Some(value),
                     "quote_uri" => quote_uri = Some(value),
+                    "link_url" => link_url = Some(value),
                     "alts" => alts.push(value),
                     "widths" => widths.push(value),
                     "heights" => heights.push(value),
@@ -5597,6 +5774,7 @@ where
             text,
             parent_uri,
             quote_uri,
+            link_url,
             images,
         })
     } else if content_type.starts_with("application/x-www-form-urlencoded") {
@@ -5612,6 +5790,7 @@ where
             text: form.get("text").cloned().unwrap_or_default(),
             parent_uri: form.get("parent_uri").cloned(),
             quote_uri: form.get("quote_uri").cloned(),
+            link_url: form.get("link_url").cloned(),
             images: Vec::new(),
         })
     } else {
@@ -5709,6 +5888,68 @@ fn image_content_type(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
+fn post_external_from_card(card: LinkCard) -> PostExternal {
+    PostExternal {
+        uri: card.uri,
+        title: card.title,
+        description: card.description,
+        thumbnail: card.thumbnail,
+    }
+}
+
+fn selected_link_url(has_images: bool, link_url: Option<&str>) -> Option<&str> {
+    if has_images {
+        None
+    } else {
+        link_url.map(str::trim).filter(|value| !value.is_empty())
+    }
+}
+
+fn external_embed_value(external: &PostExternal, thumb_blob: Option<Value>) -> Value {
+    let mut value = json!({
+        "$type":"app.bsky.embed.external#external",
+        "uri":external.uri,
+        "title":external.title,
+        "description":external.description
+    });
+    if let Some(thumb_blob) = thumb_blob {
+        value["thumb"] = thumb_blob;
+    }
+    json!({
+        "$type":"app.bsky.embed.external",
+        "external":value
+    })
+}
+
+#[derive(Deserialize)]
+struct LinkPreviewRequest {
+    url: String,
+}
+
+async fn link_preview<F, S>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    headers: HeaderMap,
+    Form(input): Form<LinkPreviewRequest>,
+) -> Response
+where
+    F: OAuthFlow,
+    S: Storage + 'static,
+{
+    if !same_origin_request(&headers, &state.public.public_url) {
+        return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
+    }
+    if verified_cookie_did(&state.public, &headers, state.storage.as_ref()).is_none() {
+        return Redirect::to("/login").into_response();
+    }
+    if !verified_cookie_write_access(&state.public, &headers, state.storage.as_ref()) {
+        return oauth_error(StatusCode::FORBIDDEN, "write permissions were not granted");
+    }
+    match state.link_card_fetcher.fetch(&input.url).await {
+        Ok(card) => Json(card.preview()).into_response(),
+        Err(error) => oauth_error(StatusCode::BAD_REQUEST, &error),
+    }
+}
+
 async fn write_post<F, S>(
     State(state): State<Arc<OAuthWebState<F, S>>>,
     request: Request,
@@ -5747,13 +5988,38 @@ where
         );
     }
     let has_images = !submission.images.is_empty();
-    let created = if !has_images {
-        state.flow.create_post(&did, text).await
-    } else {
+    let external =
+        if let Some(link_url) = selected_link_url(has_images, submission.link_url.as_deref()) {
+            match state.link_card_fetcher.fetch(link_url).await {
+                Ok(card) => Some(post_external_from_card(card)),
+                Err(error) => return oauth_error(StatusCode::BAD_REQUEST, &error),
+            }
+        } else {
+            None
+        };
+    if external
+        .as_ref()
+        .is_some_and(|link| link.thumbnail.is_some())
+        && !verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref())
+    {
+        return oauth_error(
+            StatusCode::FORBIDDEN,
+            "Log in again to enable webpage thumbnail uploads.",
+        );
+    }
+    let has_external = external.is_some();
+    let created = if has_images {
         state
             .flow
             .create_post_with_images(&did, text, submission.images)
             .await
+    } else if let Some(external) = external {
+        state
+            .flow
+            .create_post_with_external(&did, text, external)
+            .await
+    } else {
+        state.flow.create_post(&did, text).await
     };
     match created {
         Ok(created) => {
@@ -5764,20 +6030,20 @@ where
                 Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
             }
         }
-        Err(error) => image_or_text_action_error(error, has_images),
+        Err(error) => image_or_text_action_error(error, has_images || has_external),
     }
 }
 
-fn image_or_text_action_error(error: String, has_images: bool) -> Response {
-    if !has_images {
+fn image_or_text_action_error(error: String, has_media: bool) -> Response {
+    if !has_media {
         return oauth_error(StatusCode::BAD_GATEWAY, &error);
     }
-    tracing::warn!(%error, "post with image upload failed before record creation");
+    tracing::warn!(%error, "post media upload failed before record creation");
     (
         StatusCode::BAD_GATEWAY,
         Json(json!({
             "error":"ImagePostFailed",
-            "message":"The picture upload or post creation failed. No post was created. Please try again."
+            "message":"The picture or webpage card upload failed. No post was created. Please try again."
         })),
     )
         .into_response()
@@ -5840,17 +6106,42 @@ where
         cid: cid.to_owned(),
     };
     let has_images = !submission.images.is_empty();
+    let external =
+        if let Some(link_url) = selected_link_url(has_images, submission.link_url.as_deref()) {
+            match state.link_card_fetcher.fetch(link_url).await {
+                Ok(card) => Some(post_external_from_card(card)),
+                Err(error) => return oauth_error(StatusCode::BAD_REQUEST, &error),
+            }
+        } else {
+            None
+        };
+    if external
+        .as_ref()
+        .is_some_and(|link| link.thumbnail.is_some())
+        && !verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref())
+    {
+        return oauth_error(
+            StatusCode::FORBIDDEN,
+            "Log in again to enable webpage thumbnail uploads.",
+        );
+    }
+    let has_external = external.is_some();
     let created = if has_images {
         state
             .flow
             .create_quote_with_images(&did, text, quoted_ref, submission.images)
+            .await
+    } else if let Some(external) = external {
+        state
+            .flow
+            .create_quote_with_external(&did, text, quoted_ref, external)
             .await
     } else {
         state.flow.create_quote(&did, text, quoted_ref).await
     };
     let created = match created {
         Ok(created) => created,
-        Err(error) => return image_or_text_action_error(error, has_images),
+        Err(error) => return image_or_text_action_error(error, has_images || has_external),
     };
     match persist_created_record(state.storage.clone(), &did, "app.bsky.feed.post", created).await {
         Ok(()) => Redirect::to("/app").into_response(),
@@ -5942,10 +6233,35 @@ where
         parent_ref.clone()
     };
     let has_images = !submission.images.is_empty();
+    let external =
+        if let Some(link_url) = selected_link_url(has_images, submission.link_url.as_deref()) {
+            match state.link_card_fetcher.fetch(link_url).await {
+                Ok(card) => Some(post_external_from_card(card)),
+                Err(error) => return oauth_error(StatusCode::BAD_REQUEST, &error),
+            }
+        } else {
+            None
+        };
+    if external
+        .as_ref()
+        .is_some_and(|link| link.thumbnail.is_some())
+        && !verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref())
+    {
+        return oauth_error(
+            StatusCode::FORBIDDEN,
+            "Log in again to enable webpage thumbnail uploads.",
+        );
+    }
+    let has_external = external.is_some();
     let created = if has_images {
         state
             .flow
             .create_reply_with_images(&did, text, root_ref, parent_ref, submission.images)
+            .await
+    } else if let Some(external) = external {
+        state
+            .flow
+            .create_reply_with_external(&did, text, root_ref, parent_ref, external)
             .await
     } else {
         state
@@ -5955,7 +6271,7 @@ where
     };
     let created = match created {
         Ok(created) => created,
-        Err(error) => return image_or_text_action_error(error, has_images),
+        Err(error) => return image_or_text_action_error(error, has_images || has_external),
     };
     let redirect = format!("/app/thread?uri={}", form_encoded(&created.uri));
     match persist_created_record(state.storage.clone(), &did, "app.bsky.feed.post", created).await {
@@ -6898,7 +7214,7 @@ fn render_web_embed_with_quotes<S: Storage>(
     }
     match embed.get("$type").and_then(Value::as_str) {
         Some("app.bsky.embed.images") => render_web_images(author_did, embed),
-        Some("app.bsky.embed.external") => render_web_external(embed),
+        Some("app.bsky.embed.external") => render_web_external(author_did, embed),
         Some("app.bsky.embed.record") | Some("app.bsky.embed.record#view") => {
             render_web_quote(storage, embed, quote_index, quote_depth)
         }
@@ -6952,7 +7268,7 @@ fn render_web_images(author_did: &str, embed: &Value) -> String {
     }
 }
 
-fn render_web_external(embed: &Value) -> String {
+fn render_web_external(author_did: &str, embed: &Value) -> String {
     let Some(external) = embed.get("external") else {
         return String::new();
     };
@@ -6962,6 +7278,21 @@ fn render_web_external(embed: &Value) -> String {
         .get("description")
         .and_then(Value::as_str)
         .unwrap_or("");
+    let thumb_src = external.get("thumb").and_then(|thumb| {
+        if let Some(uri) = thumb.as_str() {
+            return safe_external_url(uri).then(|| uri.to_owned());
+        }
+        let cid = thumb
+            .pointer("/ref/$link")
+            .or_else(|| thumb.pointer("/ref"))
+            .and_then(Value::as_str)?;
+        (!author_did.is_empty() && !cid.is_empty()).then(|| {
+            format!(
+                "https://cdn.bsky.app/img/feed_thumbnail/plain/{}/{cid}",
+                html_escape(author_did)
+            )
+        })
+    });
     if uri.is_empty() && title.is_empty() && description.is_empty() {
         return String::new();
     }
@@ -6975,8 +7306,16 @@ fn render_web_external(embed: &Value) -> String {
     } else {
         html_escape(uri)
     };
+    let thumb_markup = thumb_src
+        .map(|src| {
+            format!(
+                "<img src=\"{}\" alt=\"\" loading=\"lazy\">",
+                html_escape(&src)
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "<aside class=\"external-card\"><p>{title}</p><p>{}</p><p>{uri_markup}</p></aside>",
+        "<aside class=\"external-card\">{thumb_markup}<p>{title}</p><p>{}</p><p>{uri_markup}</p></aside>",
         html_escape(description)
     )
 }
@@ -7304,6 +7643,42 @@ mod tests {
     use tracing::instrument::WithSubscriber;
     use tracing_subscriber::fmt::MakeWriter;
 
+    #[test]
+    fn external_post_record_has_the_atproto_shape_with_optional_thumbnail() {
+        let external = PostExternal {
+            uri: "https://example.test/article".to_owned(),
+            title: "Example title".to_owned(),
+            description: "Short description".to_owned(),
+            thumbnail: None,
+        };
+        let without_thumb = external_embed_value(&external, None);
+        assert_eq!(without_thumb["$type"], "app.bsky.embed.external");
+        assert_eq!(
+            without_thumb["external"],
+            json!({
+                "$type":"app.bsky.embed.external#external",
+                "uri":"https://example.test/article",
+                "title":"Example title",
+                "description":"Short description"
+            })
+        );
+        assert!(without_thumb["external"].get("thumb").is_none());
+
+        let blob =
+            json!({"$type":"blob","ref":{"$link":"bafk-thumb"},"mimeType":"image/png","size":3});
+        let with_thumb = external_embed_value(&external, Some(blob.clone()));
+        assert_eq!(with_thumb["external"]["thumb"], blob);
+        assert_eq!(
+            selected_link_url(true, Some("https://example.test/article")),
+            None,
+            "pictures take precedence when both are selected"
+        );
+        assert_eq!(
+            selected_link_url(false, Some(" https://example.test/article ")),
+            Some("https://example.test/article")
+        );
+    }
+
     #[tokio::test]
     async fn alt_test_page_requires_and_accepts_a_verified_session_cookie() {
         let public = OAuthPublic::new("https://appview.example").unwrap();
@@ -7372,8 +7747,8 @@ mod tests {
         assert!(css.contains(".thread-focus-actions .is-liked .icon {\n  fill: var(--accent);"));
         assert!(css.contains(".infinite-scroll-status {"));
         assert!(css.contains(".infinite-scroll-retry[hidden] {\n  display: none;"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m11"));
-        assert!(WEB_SCRIPT_URL.contains("v=js9"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m12"));
+        assert!(WEB_SCRIPT_URL.contains("v=js10"));
     }
 
     #[test]

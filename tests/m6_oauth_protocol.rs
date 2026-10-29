@@ -4,8 +4,9 @@ use appview_rs::{
         ResolutionError,
     },
     ingest::{IndexedRecord, MemoryStorage, Storage},
+    link_card::LinkThumbnail,
     net::SafeHttpClient,
-    oauth::{OAuthCallback, OAuthFlow, OAuthPublic, PostStrongRef, SqliteOAuthStore},
+    oauth::{OAuthCallback, OAuthFlow, OAuthPublic, PostExternal, PostStrongRef, SqliteOAuthStore},
 };
 use atrium_api::{
     agent::Agent,
@@ -483,6 +484,88 @@ async fn production_post_with_two_images_uploads_blobs_before_creating_record() 
         record["embed"]["images"][1]["aspectRatio"],
         json!({"width":2000,"height":1000})
     );
+    drop(state);
+    server.abort();
+}
+
+#[tokio::test]
+async fn production_link_card_uploads_og_image_blob_before_creating_record() {
+    let public = OAuthPublic::new("https://appview.example").unwrap();
+    let (flow, _, shared, server) =
+        production_flow_with_public(public.clone(), None, Some(EXPECTED_OAUTH_SCOPE)).await;
+    let write_flow = flow.clone();
+    let app = public.router_with_flow(flow, Arc::new(MemoryStorage::default()));
+    let cookie = finish_production_login(&app, &shared).await;
+    let thumbnail = b"\xff\xd8\xffog-image";
+
+    write_flow
+        .create_post_with_external(
+            DID,
+            "A link card post",
+            PostExternal {
+                uri: "https://example.test/article".to_owned(),
+                title: "Example article".to_owned(),
+                description: "A short description".to_owned(),
+                thumbnail: Some(LinkThumbnail {
+                    bytes: thumbnail.to_vec(),
+                    mime_type: "image/jpeg".to_owned(),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+    let state = shared.lock().unwrap();
+    let upload = state
+        .requests
+        .iter()
+        .find(|request| {
+            request
+                .path
+                .starts_with("/xrpc/com.atproto.repo.uploadBlob")
+        })
+        .unwrap();
+    assert_eq!(upload.method, "POST");
+    assert_eq!(
+        upload.headers.get("content-type").map(String::as_str),
+        Some("image/jpeg")
+    );
+    assert_eq!(upload.body_bytes, thumbnail);
+    let upload_index = state
+        .requests
+        .iter()
+        .position(|request| {
+            request
+                .path
+                .starts_with("/xrpc/com.atproto.repo.uploadBlob")
+        })
+        .unwrap();
+    let create_index = state
+        .requests
+        .iter()
+        .position(|request| {
+            request
+                .path
+                .starts_with("/xrpc/com.atproto.repo.createRecord")
+        })
+        .unwrap();
+    assert!(upload_index < create_index);
+    let external = &state.create_bodies[0]["record"]["embed"]["external"];
+    assert_eq!(external["uri"], "https://example.test/article");
+    assert_eq!(external["title"], "Example article");
+    assert_eq!(external["description"], "A short description");
+    assert_eq!(
+        external["thumb"],
+        json!({
+            "$type":"blob",
+            "ref":{"$link":"bafyreiedv4rjxnzxvlvlgqbi4vpqi3s4iuz4buywtkgfjpfjn2gix5cocu"},
+            "mimeType":"image/jpeg",
+            "size":thumbnail.len()
+        })
+    );
+    assert!(cookie.contains("appview_session="));
+    assert_eq!(state.upload_count, 1);
+    assert_eq!(state.create_count, 1);
     drop(state);
     server.abort();
 }

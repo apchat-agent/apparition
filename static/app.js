@@ -242,7 +242,117 @@ async function handleImageComposerSubmit(form, selected, selectionInvalid, event
   }
 }
 
+function previewImageObjectUrl(dataUrl) {
+  const match = /^data:(image\/[^;,]+);base64,([A-Za-z0-9+/]+=*)$/.exec(dataUrl || "");
+  if (!match) return "";
+  const binary = atob(match[2]);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+  return URL.createObjectURL(new Blob([bytes], { type: match[1] }));
+}
+
+function attachLinkPreview(form, helpers = {}) {
+  const input = form.querySelector("[data-link-input]");
+  const button = form.querySelector("[data-link-preview]");
+  const status = form.querySelector("[data-link-status]");
+  const preview = form.querySelector("[data-link-preview-card]");
+  const imageNote = form.querySelector("[data-link-image-note]");
+  if (!input || !button || !status || !preview) {
+    return { updateImagePrecedence() {} };
+  }
+
+  let thumbnailObjectUrl = "";
+  let selectedImageCount = 0;
+  const clearPreview = () => {
+    if (thumbnailObjectUrl) URL.revokeObjectURL(thumbnailObjectUrl);
+    thumbnailObjectUrl = "";
+    preview.replaceChildren();
+    preview.hidden = true;
+  };
+  const updateImagePrecedence = (imageCount) => {
+    selectedImageCount = imageCount;
+    if (imageNote) imageNote.hidden = !(imageCount > 0 && input.value.trim());
+  };
+  const removeLink = () => {
+    input.value = "";
+    clearPreview();
+    status.textContent = "Webpage removed.";
+    updateImagePrecedence(0);
+  };
+
+  input.addEventListener("input", () => {
+    clearPreview();
+    status.textContent = "";
+    updateImagePrecedence(selectedImageCount);
+  });
+  button.addEventListener("click", async () => {
+    const url = input.value.trim();
+    if (!url || button.disabled) return;
+    button.disabled = true;
+    status.textContent = "Loading webpage preview…";
+    clearPreview();
+    try {
+      const response = await (helpers.fetch || fetch)("/link-preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+        body: new URLSearchParams({ url }),
+        credentials: "same-origin",
+      });
+      let result;
+      try {
+        result = await response.json();
+      } catch {
+        result = {};
+      }
+      if (!response.ok) throw new Error(result.message || "The webpage preview could not be loaded.");
+
+      const card = document.createElement("article");
+      card.className = "external-card composer-link-card";
+      if (result.thumbnail) {
+        thumbnailObjectUrl = previewImageObjectUrl(result.thumbnail);
+        if (thumbnailObjectUrl) {
+          const image = document.createElement("img");
+          image.src = thumbnailObjectUrl;
+          image.alt = "";
+          image.loading = "lazy";
+          card.append(image);
+        }
+      }
+      const title = document.createElement("p");
+      title.textContent = result.title || result.uri || url;
+      card.append(title);
+      if (result.description) {
+        const description = document.createElement("p");
+        description.textContent = result.description;
+        card.append(description);
+      }
+      const link = document.createElement("a");
+      link.href = result.uri || url;
+      link.rel = "nofollow noopener noreferrer";
+      link.textContent = result.uri || url;
+      card.append(link);
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.textContent = "Remove webpage";
+      remove.addEventListener("click", removeLink);
+      card.append(remove);
+      preview.append(card);
+      preview.hidden = false;
+      status.textContent = "Webpage preview ready.";
+    } catch (reason) {
+      status.textContent = reason instanceof Error
+        ? reason.message.slice(0, 180)
+        : "The webpage preview could not be loaded.";
+    } finally {
+      button.disabled = false;
+      updateImagePrecedence(0);
+    }
+  });
+  return { updateImagePrecedence };
+}
+
 (document.querySelectorAll?.("form[data-image-composer]") || []).forEach((form) => {
+  const linkPreview = attachLinkPreview(form);
   const input = form.querySelector("[data-image-input]");
   const previews = form.querySelector("[data-image-previews]");
   const status = form.querySelector("[data-image-status]");
@@ -291,6 +401,7 @@ async function handleImageComposerSubmit(form, selected, selectionInvalid, event
         URL.revokeObjectURL(item.previewUrl);
         selected.splice(index, 1);
         status.textContent = "";
+        linkPreview.updateImagePrecedence(selected.length);
         drawPreviews();
       });
       details.append(altLabel, suggestion, suggestionProgress, suggestionStatus, remove);
@@ -302,6 +413,7 @@ async function handleImageComposerSubmit(form, selected, selectionInvalid, event
   input.addEventListener("change", () => {
     selected.forEach((item) => URL.revokeObjectURL(item.previewUrl));
     selected.length = 0;
+    linkPreview.updateImagePrecedence(0);
     const files = [...(input.files || [])];
     if (files.length > 4) {
       selectionInvalid = true;
@@ -314,6 +426,7 @@ async function handleImageComposerSubmit(form, selected, selectionInvalid, event
     for (const file of files) {
       selected.push({ file, alt: "", previewUrl: URL.createObjectURL(file) });
     }
+    linkPreview.updateImagePrecedence(selected.length);
     drawPreviews();
   });
 

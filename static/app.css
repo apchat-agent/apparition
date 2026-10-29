@@ -441,6 +441,96 @@ textarea:focus-visible {
   border-radius: 0.8rem;
 }
 
+.link-picker {
+  display: grid;
+  gap: 0.55rem;
+  margin: 0;
+  padding: 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 0.8rem;
+}
+
+.link-picker legend {
+  padding-inline: 0.3rem;
+  color: var(--muted);
+  font-size: 0.86rem;
+  font-weight: 750;
+}
+
+.link-picker > label {
+  color: var(--muted);
+  font-size: 0.9rem;
+  font-weight: 650;
+}
+
+.link-picker-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.55rem;
+}
+
+.link-picker-controls input {
+  width: 100%;
+  min-width: 0;
+  min-height: 44px;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 0.65rem;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+}
+
+.link-picker-controls button,
+.composer-link-card button {
+  min-height: 44px;
+  padding: 0.5rem 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 0.65rem;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.link-picker-controls button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.link-picker-status,
+.composer-notice {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
+.link-preview .external-card {
+  margin: 0.15rem 0 0;
+}
+
+.external-card > img {
+  display: block;
+  width: 100%;
+  max-height: 18rem;
+  margin-bottom: 0.6rem;
+  border-radius: 0.55rem;
+  object-fit: cover;
+}
+
+.composer-link-card > a {
+  display: block;
+  margin: 0.35rem 0 0.7rem;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.composer-link-card > button {
+  min-height: 38px;
+  font-size: 0.88rem;
+}
+
 .image-picker legend {
   padding-inline: 0.3rem;
   color: var(--muted);
@@ -743,7 +833,7 @@ button:hover,
   position: absolute;
   z-index: 0;
   top: 2rem;
-  bottom: -2.375rem;
+  bottom: -0.3rem;
   left: 2.625rem;
   width: 1px;
   background: var(--line);
@@ -753,7 +843,11 @@ button:hover,
 .reply-connector-previous {
   top: -2.375rem;
   bottom: auto;
-  height: 4.75rem;
+  height: 2.825rem;
+}
+
+.notification-reply-parent > .reply-connector {
+  bottom: 0.1rem;
 }
 
 .reply-with-parent > .post-card {
@@ -1778,6 +1872,10 @@ a.quoted-post-card:hover,
   .thread-focus-actions .post-action {
     min-width: 2.35rem;
     padding-inline: 0.15rem;
+  }
+
+  .link-picker-controls {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 

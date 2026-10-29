@@ -126,6 +126,7 @@ impl HostResolver for SystemResolver {
 pub struct SafeHttpClient {
     resolver: Arc<dyn HostResolver>,
     http_test_hosts: HashSet<String>,
+    allow_http: bool,
     background: bool,
     clients: Arc<Mutex<HttpClientPool>>,
 }
@@ -135,6 +136,7 @@ impl SafeHttpClient {
         Self {
             resolver: Arc::new(SystemResolver),
             http_test_hosts: HashSet::new(),
+            allow_http: false,
             background: false,
             clients: Arc::new(Mutex::new(HttpClientPool::default())),
         }
@@ -144,6 +146,7 @@ impl SafeHttpClient {
         Self {
             resolver: Arc::new(resolver),
             http_test_hosts: HashSet::new(),
+            allow_http: false,
             background: false,
             clients: Arc::new(Mutex::new(HttpClientPool::default())),
         }
@@ -163,14 +166,20 @@ impl SafeHttpClient {
         self
     }
 
+    /// Permit ordinary HTTP URLs while retaining DNS resolution and private-address checks.
+    pub fn allow_http_schemes(mut self) -> Self {
+        self.allow_http = true;
+        self
+    }
+
     pub async fn resolve_safe(&self, url: &Url) -> Result<Vec<SocketAddr>, String> {
         let host = url.host_str().ok_or_else(|| "URL has no host".to_owned())?;
         let normalized_host = host.trim_end_matches('.').to_ascii_lowercase();
-        let test_http = url.scheme() == "http" && self.http_test_hosts.contains(&normalized_host);
+        let test_host = self.http_test_hosts.contains(&normalized_host);
         if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
             return Err("URL contains forbidden components".to_owned());
         }
-        if url.scheme() != "https" && !test_http {
+        if url.scheme() != "https" && !(url.scheme() == "http" && (self.allow_http || test_host)) {
             return Err("outbound URL must use HTTPS".to_owned());
         }
         let port = url
@@ -183,7 +192,7 @@ impl SafeHttpClient {
         if addresses.is_empty() {
             return Err("host has no addresses".to_owned());
         }
-        if !test_http && addresses.iter().copied().any(is_forbidden_ip) {
+        if !test_host && addresses.iter().copied().any(is_forbidden_ip) {
             return Err("host resolved to a forbidden address".to_owned());
         }
         let mut addresses = addresses
@@ -200,6 +209,42 @@ impl SafeHttpClient {
         request: http::Request<Vec<u8>>,
         max_bytes: usize,
     ) -> Result<http::Response<Vec<u8>>, String> {
+        self.send_with_limits(request, max_bytes, MAX_REDIRECTS, REQUEST_TIMEOUT)
+            .await
+            .map(|(response, _)| response)
+    }
+
+    /// Send a GET request with an explicit redirect, response-size, and total-time budget.
+    /// The final URL is returned so callers can resolve page-relative metadata safely.
+    pub async fn get_with_limits(
+        &self,
+        url: &Url,
+        headers: http::HeaderMap,
+        max_bytes: usize,
+        max_redirects: usize,
+        request_timeout: Duration,
+    ) -> Result<(http::Response<Vec<u8>>, Url), String> {
+        let request = http::Request::get(url.as_str())
+            .body(Vec::new())
+            .map_err(|_| "outbound request is invalid".to_owned())?;
+        let (mut parts, body) = request.into_parts();
+        parts.headers = headers;
+        self.send_with_limits(
+            http::Request::from_parts(parts, body),
+            max_bytes,
+            max_redirects,
+            request_timeout,
+        )
+        .await
+    }
+
+    async fn send_with_limits(
+        &self,
+        request: http::Request<Vec<u8>>,
+        max_bytes: usize,
+        max_redirects: usize,
+        request_timeout: Duration,
+    ) -> Result<(http::Response<Vec<u8>>, Url), String> {
         if request.body().len() > MAX_REQUEST_BYTES {
             return Err("outbound request body is too large".to_owned());
         }
@@ -207,9 +252,12 @@ impl SafeHttpClient {
             .acquire_owned()
             .await
             .map_err(|_| "outbound request capacity is unavailable".to_owned())?;
-        let result = timeout(REQUEST_TIMEOUT, self.send_inner(request, max_bytes))
-            .await
-            .map_err(|_| "outbound request timed out".to_owned())?;
+        let result = timeout(
+            request_timeout,
+            self.send_inner(request, max_bytes, max_redirects),
+        )
+        .await
+        .map_err(|_| "outbound request timed out".to_owned())?;
         drop(permit);
         result
     }
@@ -233,10 +281,11 @@ impl SafeHttpClient {
         &self,
         mut request: http::Request<Vec<u8>>,
         max_bytes: usize,
-    ) -> Result<http::Response<Vec<u8>>, String> {
+        max_redirects: usize,
+    ) -> Result<(http::Response<Vec<u8>>, Url), String> {
         let mut url = Url::parse(&request.uri().to_string())
             .map_err(|_| "outbound request URL is invalid".to_owned())?;
-        for redirect_count in 0..=MAX_REDIRECTS {
+        for redirect_count in 0..=max_redirects {
             let addresses = self.resolve_safe(&url).await?;
             let host = url
                 .host_str()
@@ -255,7 +304,7 @@ impl SafeHttpClient {
             if is_redirect(response.status())
                 && let Some(location) = response.headers().get(http::header::LOCATION)
             {
-                if redirect_count == MAX_REDIRECTS {
+                if redirect_count == max_redirects {
                     return Err("outbound redirect limit exceeded".to_owned());
                 }
                 let location = location
@@ -321,9 +370,10 @@ impl SafeHttpClient {
             for (name, value) in &headers {
                 builder = builder.header(name, value);
             }
-            return builder
+            let response = builder
                 .body(body)
-                .map_err(|_| "outbound HTTP response is invalid".to_owned());
+                .map_err(|_| "outbound HTTP response is invalid".to_owned())?;
+            return Ok((response, url));
         }
         Err("outbound redirect limit exceeded".to_owned())
     }

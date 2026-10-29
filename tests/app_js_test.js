@@ -342,11 +342,22 @@ Deno.test("each selected image renders an opt-in alt suggestion button", async (
   input.files = [Object.assign(new Blob(["picture"]), { name: "cat.png" })];
   const previews = makeElement("previews");
   const status = makeElement("status");
+  const linkInput = makeElement("input");
+  linkInput.value = "https://example.test/article";
+  const linkButton = makeElement("button");
+  const linkStatus = makeElement("status");
+  const linkPreview = makeElement("preview");
+  const linkImageNote = makeElement("notice");
   const form = {
     querySelector(selector) {
       if (selector === "[data-image-input]") return input;
       if (selector === "[data-image-previews]") return previews;
       if (selector === "[data-image-status]") return status;
+      if (selector === "[data-link-input]") return linkInput;
+      if (selector === "[data-link-preview]") return linkButton;
+      if (selector === "[data-link-status]") return linkStatus;
+      if (selector === "[data-link-preview-card]") return linkPreview;
+      if (selector === "[data-link-image-note]") return linkImageNote;
       return null;
     },
     addEventListener() {},
@@ -363,11 +374,15 @@ Deno.test("each selected image renders an opt-in alt suggestion button", async (
 
   const preview = previews.children[0];
   assert(preview, "choosing a picture should create its preview");
+  assert(!linkImageNote.hidden, "pictures and a link should show the precedence notice");
   const details = preview.children[1];
   const suggestion = details.children.find((child) => child.tag === "button" && child.textContent === "Suggest alt text");
   assert(suggestion, "the alt field should have its own suggestion button");
   assertEquals(suggestion.type, "button", "suggesting must not submit the post form");
   assertEquals(typeof suggestion.listeners.get("click"), "function");
+  const remove = details.children.find((child) => child.tag === "button" && child.textContent === "Remove");
+  remove.listeners.get("click")();
+  assert(linkImageNote.hidden, "removing the last picture should clear the precedence notice");
 });
 
 Deno.test("posting completes while an alt suggestion is still running", async () => {
@@ -450,6 +465,80 @@ Deno.test("posting completes while an alt suggestion is still running", async ()
   }
   releaseModel({ caption: async () => "A photo." });
   await suggestion;
+});
+
+Deno.test("composer link preview is removable and renders metadata as text", async () => {
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  const makeElement = (tag) => ({
+    tag,
+    children: [],
+    listeners: new Map(),
+    attributes: new Map(),
+    hidden: false,
+    textContent: "",
+    addEventListener(name, listener) { this.listeners.set(name, listener); },
+    append(...nodes) { this.children.push(...nodes); },
+    replaceChildren() { this.children = []; },
+    setAttribute(name, value) { this.attributes.set(name, value); },
+    click() { return this.listeners.get("click")?.({}); },
+  });
+  globalThis.document = {
+    addEventListener() {},
+    createElement: makeElement,
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+  };
+  globalThis.window = { visualViewport: { addEventListener() {} } };
+  const attachLinkPreview = new Function(`${source}; return attachLinkPreview;`)();
+  const input = makeElement("input");
+  input.value = "https://example.test/article";
+  const button = makeElement("button");
+  const status = makeElement("status");
+  const preview = makeElement("preview");
+  const imageNote = makeElement("note");
+  const form = {
+    querySelector(selector) {
+      return ({
+        "[data-link-input]": input,
+        "[data-link-preview]": button,
+        "[data-link-status]": status,
+        "[data-link-preview-card]": preview,
+        "[data-link-image-note]": imageNote,
+      })[selector] || null;
+    },
+  };
+  let request;
+  const linkPicker = attachLinkPreview(form, {
+    fetch: async (url, options) => {
+      request = { url, options };
+      return {
+        ok: true,
+        json: async () => ({
+          uri: input.value,
+          title: "A <title> from the page",
+          description: "A useful summary",
+          thumbnail: null,
+        }),
+      };
+    },
+  });
+
+  await button.click();
+  assertEquals(request.url, "/link-preview");
+  assertEquals(new URLSearchParams(request.options.body).get("url"), input.value);
+  assertEquals(request.options.credentials, "same-origin");
+  assert(!preview.hidden);
+  const card = preview.children[0];
+  assertEquals(card.children[0].textContent, "A <title> from the page");
+  assertEquals(card.children[1].textContent, "A useful summary");
+  assertEquals(status.textContent, "Webpage preview ready.");
+
+  linkPicker.updateImagePrecedence(1);
+  assert(!imageNote.hidden, "the composer should explain that pictures take precedence");
+  await card.children[3].click();
+  assertEquals(input.value, "");
+  assert(preview.hidden);
+  assertEquals(status.textContent, "Webpage removed.");
 });
 
 Deno.test("infinite scroll loads once past the newest page midpoint in the pinned phone frame", async () => {
