@@ -13248,6 +13248,84 @@ mod tests {
         assert!(WEB_STYLESHEET_URL.contains("v=m27"));
     }
 
+    fn css_rule_bodies(css: &str, selector: &str) -> Vec<String> {
+        let mut bodies = Vec::new();
+        let mut rest = css;
+        while let Some(at) = rest.find(selector) {
+            let after = &rest[at + selector.len()..];
+            if let Some(open) = after.find('{') {
+                if after[..open].trim().is_empty() {
+                    let inside = &after[open + 1..];
+                    let close = inside.find('}').unwrap_or(inside.len());
+                    bodies.push(inside[..close].to_owned());
+                }
+            }
+            rest = after;
+        }
+        bodies
+    }
+
+    fn css_declaration(block: &str, property: &str) -> Option<String> {
+        let at = block.find(&format!("{property}:"))?;
+        let value = &block[at + property.len() + 1..];
+        let end = value.find(';').unwrap_or(value.len());
+        Some(value[..end].trim().to_owned())
+    }
+
+    #[test]
+    fn composer_avatar_keeps_one_size_before_and_after_app_js_collapses_it() {
+        let css = include_str!("../static/app.css");
+        let profile = json!({
+            "avatar": "https://cdn.bsky.app/img/avatar/plain/did:plc:av48qviewer/bafk-avatar@jpeg"
+        });
+        let markup = composer_avatar_markup(&profile);
+
+        assert!(
+            markup.contains("class=\"composer-avatar\"")
+                && markup.contains("width=\"44\" height=\"44\""),
+            "the server-rendered composer avatar must carry its 44 px size: {markup}"
+        );
+        assert!(
+            css.contains(".composer-avatar {\n  display: block;\n  width: 44px;\n  height: 44px;"),
+            "the .composer-avatar rule must keep the server-rendered 44 px size"
+        );
+        assert!(
+            css.contains(
+                ".composer-input-row {\n  display: grid;\n  grid-template-columns: 44px minmax(0, 1fr);"
+            ),
+            "the default input row must already use the size the collapsed state keeps"
+        );
+        for block in css_rule_bodies(css, ".composer.is-enhanced.is-collapsed .composer-avatar") {
+            assert!(
+                !block.contains("40px"),
+                "adding is-enhanced is-collapsed must not resize the composer avatar: {block}"
+            );
+        }
+        for block in css_rule_bodies(
+            css,
+            ".composer.is-enhanced.is-collapsed .composer-input-row",
+        ) {
+            if let Some(columns) = css_declaration(&block, "grid-template-columns") {
+                assert!(
+                    columns.starts_with("44px"),
+                    "adding is-enhanced is-collapsed must not narrow the avatar column: {columns}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn phone_frame_orders_the_early_mobile_navigation_back_to_the_bottom() {
+        let css = include_str!("../static/app.css");
+
+        assert!(
+            css_rule_bodies(css, "body:has(.mobile-nav) .mobile-nav")
+                .iter()
+                .any(|block| { block.contains("position: static") && block.contains("order: 1") }),
+            "the flex-column phone body must order the early bottom bar after the layout"
+        );
+    }
+
     #[test]
     fn notification_groups_respect_type_subject_age_and_read_boundary() {
         let notices = vec![

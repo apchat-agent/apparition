@@ -4607,6 +4607,56 @@ async fn authenticated_pages_render_unread_count_in_both_navigation_bells() {
     assert_eq!(html.matches("10 unread notifications").count(), 2);
 }
 
+#[tokio::test]
+async fn authenticated_pages_render_the_mobile_navigation_before_the_layout() {
+    let storage = Arc::new(MemoryStorage::default());
+    storage
+        .put_record(&IndexedRecord {
+            did: "did:plc:alice".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "root".into(),
+            uri: "at://did:plc:alice/app.bsky.feed.post/root".into(),
+            cid: Some("root-cid".into()),
+            time_us: 1,
+            record: serde_json::json!({"text":"A local post"}),
+        })
+        .unwrap();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage);
+    let cookie = finish_login(&app).await;
+    for path in [
+        "/app",
+        "/thread?uri=at%3A%2F%2Fdid%3Aplc%3Aalice%2Fapp.bsky.feed.post%2Froot",
+    ] {
+        let html = get_html(&app, path, &cookie).await;
+        let skip = html
+            .find("class=\"skip-link\"")
+            .expect("the shell renders the skip link");
+        let nav = html
+            .find("class=\"mobile-nav\"")
+            .expect("the shell renders the mobile nav");
+        let compose = html
+            .find("class=\"mobile-compose\"")
+            .expect("the shell renders the mobile compose link");
+        let layout = html
+            .find("class=\"app-layout")
+            .expect("the shell renders the app layout");
+        assert!(
+            skip < nav,
+            "{path}: the skip link must stay the first focusable element"
+        );
+        assert!(
+            nav < layout,
+            "{path}: the mobile nav must be parsed before the layout so an early paint shows the bar"
+        );
+        assert!(
+            compose < layout,
+            "{path}: the mobile compose link must be parsed before the layout"
+        );
+    }
+}
+
 #[test]
 fn sqlite_notification_last_seen_persists_and_filters_unread_events() {
     let path = std::path::PathBuf::from(format!(

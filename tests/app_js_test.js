@@ -136,6 +136,33 @@ Deno.test("phone navigation and post actions keep 44-pixel tap targets", async (
   assert(/body:has\(\.mobile-nav\):has\(\.reply-composer\) \.mobile-compose\s*\{\s*display:\s*none;/.test(css), "the floating post button should not cover the thread reply composer");
 });
 
+Deno.test("the composer avatar keeps one size before and after app.js collapses it", async () => {
+  const css = await Deno.readTextFile(new URL("../static/app.css", import.meta.url));
+  const source = await Deno.readTextFile(new URL("../src/oauth.rs", import.meta.url));
+  const ruleBody = (selector) => {
+    const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const rules = [...css.matchAll(new RegExp(`(?:^|\\n)[ \\t]*${escaped}[ \\t]*\\{([^}]*)\\}`, "g"))];
+    return rules.map((match) => match[1]).at(-1) || "";
+  };
+
+  assert(
+    source.includes('class=\\"composer-avatar\\"') && source.includes('width=\\"44\\" height=\\"44\\"'),
+    "the server-rendered composer avatar must carry its 44 px size",
+  );
+  const base = ruleBody(".composer-avatar");
+  assert(
+    /width:\s*44px/.test(base) && /height:\s*44px/.test(base),
+    "the .composer-avatar rule must keep the server-rendered 44 px size",
+  );
+  const collapsed = ruleBody(".composer.is-enhanced.is-collapsed .composer-avatar");
+  assert(
+    collapsed === "" || (/width:\s*44px/.test(collapsed) && /height:\s*44px/.test(collapsed)),
+    "is-enhanced is-collapsed must not resize the composer avatar",
+  );
+  const columns = /grid-template-columns:\s*([^;]+)/.exec(ruleBody(".composer.is-enhanced.is-collapsed .composer-input-row"))?.[1]?.trim() ?? "";
+  assert(columns === "" || columns.startsWith("44px"), "is-enhanced is-collapsed must not narrow the avatar column");
+});
+
 Deno.test("like handler fills the heart and clears it when unliked", async () => {
   const listeners = new Map();
   const documentMock = {
