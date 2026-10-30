@@ -13373,7 +13373,7 @@ mod tests {
         assert!(css.contains(".thread-focus-actions .is-liked .icon {\n  fill: var(--accent);"));
         assert!(css.contains(".infinite-scroll-status {"));
         assert!(css.contains(".infinite-scroll-retry[hidden] {\n  display: none;"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m32"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m33"));
         assert!(WEB_SCRIPT_URL.contains("v=js20"));
     }
 
@@ -13394,7 +13394,7 @@ mod tests {
         ));
         assert!(css.contains("bottom: var(--mobile-compose-clearance);"));
         assert!(css.contains("padding-bottom: max(4.25rem, var(--mobile-compose-clearance));"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m32"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m33"));
     }
 
     #[test]
@@ -13578,7 +13578,7 @@ mod tests {
         let head = page_shell("Write a post", "", true);
         assert!(
             head.contains(
-                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m32\"></noscript>"
+                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m33\"></noscript>"
             ),
             "the head must restore the full form for no-JS visitors: {head}"
         );
@@ -15617,14 +15617,112 @@ mod tests {
         assert!(
             css_rule_bodies(css, ".account-labels .account-label-groups")
                 .iter()
-                .any(|block| { block.contains("min(19rem") && block.contains("calc(100vw") }),
-            "the expanded panel must fit a 402 px screen without sideways scrolling"
+                .any(|block| {
+                    block.contains("min(19rem")
+                        && block.contains("var(--account-label-panel-inset")
+                        && !block.contains("100vw")
+                }),
+            "the expanded panel must be measured against its card, not the viewport"
         );
         assert!(
             css_rule_bodies(css, ".account-label-emoji.severity-alert")
                 .iter()
                 .any(|block| { block.contains("var(--label-alert-ring)") }),
             "alert icons get the red ring"
+        );
+    }
+
+    #[test]
+    fn the_open_label_panel_is_anchored_to_the_card_not_the_control() {
+        let css = include_str!("../static/app.css");
+
+        let control = css_rule_bodies(css, ".account-labels")
+            .into_iter()
+            .find(|block| block.contains("display: inline-block"))
+            .expect(
+                ".account-labels must be an inline-block so the panel's static top sits under the summary",
+            );
+        assert!(
+            css_declaration(&control, "position").is_none(),
+            "the closed control must not be the panel's containing block: {control}"
+        );
+        assert_eq!(
+            css_declaration(&control, "vertical-align").as_deref(),
+            Some("middle")
+        );
+
+        let panel = css_rule_bodies(css, ".account-labels .account-label-groups")
+            .into_iter()
+            .find(|block| block.contains("var(--account-label-panel-inset"))
+            .expect("the panel must span the card through the inset custom property");
+        assert_eq!(css_declaration(&panel, "top").as_deref(), Some("auto"));
+        assert_eq!(
+            css_declaration(&panel, "left").as_deref(),
+            Some("var(--account-label-panel-inset, 0.9rem)")
+        );
+        assert!(
+            panel.contains("width: min(19rem, calc(100% - var(--account-label-panel-inset, 0.9rem) * 2))"),
+            "the panel spans the card's inner width, capped at 19rem only when there is room: {panel}"
+        );
+        assert!(
+            !panel.contains("100vw"),
+            "the panel must be measured against the card, not the viewport: {panel}"
+        );
+
+        for (selector, inset) in [
+            (".post-card", "--account-label-panel-inset: 1.25rem;"),
+            (".quoted-post-card", "--account-label-panel-inset: 0.85rem;"),
+            (".profile-header", "--account-label-panel-inset: 0.9rem;"),
+        ] {
+            assert!(
+                css_rule_bodies(css, selector)
+                    .iter()
+                    .any(|block| { block.contains("position: relative") && block.contains(inset) }),
+                "{selector} must establish the panel's containing block and carry its inner-width inset"
+            );
+        }
+        assert!(
+            css_rule_bodies(css, ".post-card")
+                .iter()
+                .any(|block| block.contains("--account-label-panel-inset: 0.9rem;")),
+            "the phone media query must shrink the post-card inset with its 0.9rem padding"
+        );
+    }
+
+    #[test]
+    fn the_labeler_link_gets_its_own_line_inside_the_copy_column() {
+        let css = include_str!("../static/app.css");
+        for block in css_rule_bodies(css, ".account-label-by") {
+            assert!(
+                !block.contains("max-width: 40%") && !block.contains("flex: 0 0 auto"),
+                "the labeler link must stop being a squeeze-prone side column: {block}"
+            );
+        }
+
+        let definitions = cornell_fixture_definitions();
+        let subject = "did:plc:row-layout-author";
+        let mut labels_by_actor = HashMap::new();
+        labels_by_actor.insert(
+            subject.to_owned(),
+            cornell_labels(
+                &definitions,
+                subject,
+                &["made-over-hundred-posts-yesterday"],
+            ),
+        );
+
+        let rendered = render_account_label_chips(&labels_by_actor, subject);
+
+        let row = &rendered[rendered.find("<li class=\"account-label-row").unwrap()..];
+        let description = row.find("account-label-description").unwrap();
+        let by = row.find("account-label-by").unwrap();
+        assert!(
+            description < by,
+            "the link sits under the description: {row}"
+        );
+        assert!(
+            row[by..].contains("</a></span></li>"),
+            "the link is the last thing inside .account-label-copy, not a side column: {row}"
         );
     }
 
