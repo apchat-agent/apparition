@@ -2735,12 +2735,30 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             }
         }
         drop(pending);
-        let result =
-            tokio::time::timeout(PAGE_PROFILE_BUDGET, self.refresh_labeler_preferences(did))
+        // The refresh runs in a task that owns the pending-set cleanup: a caller
+        // dropped by its page deadline must not strand the DID as pending forever.
+        let (done, awaited) = oneshot::channel();
+        let flow = self.clone();
+        let refresh_did = did.to_owned();
+        let dispatcher = tracing::dispatcher::get_default(|dispatcher| dispatcher.clone());
+        tokio::spawn(async move {
+            let _dispatcher = tracing::dispatcher::set_default(&dispatcher);
+            let result = tokio::time::timeout(
+                PAGE_PROFILE_BUDGET,
+                flow.refresh_labeler_preferences(&refresh_did),
+            )
+            .await
+            .unwrap_or_else(|_| Err("PDS getPreferences request timed out".to_owned()));
+            flow.labeler_preference_refreshes
+                .lock()
                 .await
-                .unwrap_or_else(|_| Err("PDS getPreferences request timed out".to_owned()));
-        self.labeler_preference_refreshes.lock().await.remove(did);
-        result
+                .remove(&refresh_did);
+            let _ = done.send(result);
+        });
+        match awaited.await {
+            Ok(result) => result,
+            Err(_) => Err("PDS getPreferences refresh task ended without a result".to_owned()),
+        }
     }
 
     async fn schedule_labeler_preference_refresh(&self, did: &str) {
@@ -3046,18 +3064,38 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                 .collect::<Vec<_>>();
             drop(pending);
             if !refresh.is_empty() {
-                let refresh_result = match tokio::time::timeout(
-                    PAGE_PROFILE_BUDGET,
-                    self.refresh_account_actor_data(viewer_did, refresh.clone()),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => Err("Bluesky account profile request timed out".to_owned()),
-                };
-                self.clear_account_actor_refreshes(viewer_did, &refresh)
-                    .await;
-                refresh_result?;
+                // The refresh runs in a task that owns the pending-set cleanup: a
+                // page dropped by its deadline must not strand the (viewer, actor)
+                // pairs as pending forever; the task still fills the cache and the
+                // next page for the same viewer+actor shows the labels.
+                let (done, awaited) = oneshot::channel();
+                let flow = self.clone();
+                let refresh_viewer = viewer_did.to_owned();
+                let dispatcher = tracing::dispatcher::get_default(|dispatcher| dispatcher.clone());
+                tokio::spawn(async move {
+                    let _dispatcher = tracing::dispatcher::set_default(&dispatcher);
+                    let result = tokio::time::timeout(
+                        PAGE_PROFILE_BUDGET,
+                        flow.refresh_account_actor_data(&refresh_viewer, refresh.clone()),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err("Bluesky account profile request timed out".to_owned())
+                    });
+                    if let Err(error) = &result {
+                        tracing::debug!(%error, %refresh_viewer, "account labels refresh failed");
+                    }
+                    flow.clear_account_actor_refreshes(&refresh_viewer, &refresh)
+                        .await;
+                    let _ = done.send(result);
+                });
+                match awaited.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => return Err(error),
+                    Err(_) => {
+                        return Err("account labels refresh task ended without a result".to_owned());
+                    }
+                }
             }
         }
 
@@ -5325,6 +5363,7 @@ async fn hydrate_page_content<F: OAuthFlow, S: Storage + 'static>(
     };
     let account_flow = flow.clone();
     let viewer_did = viewer_did.to_owned();
+    let label_actor_count = label_actor_dids.len();
     let account_data_hydration = async move {
         let started = std::time::Instant::now();
         let data = match tokio::time::timeout_at(
@@ -5338,7 +5377,14 @@ async fn hydrate_page_content<F: OAuthFlow, S: Storage + 'static>(
                 tracing::warn!(%error, "page account profiles and labels could not be fetched");
                 PageAccountData::default()
             }
-            Err(_) => PageAccountData::default(),
+            Err(_) => {
+                tracing::warn!(
+                    viewer = %viewer_did,
+                    actors = label_actor_count,
+                    "account labels timed out before the page deadline"
+                );
+                PageAccountData::default()
+            }
         };
         (data, started.elapsed().as_millis() as u64)
     };
@@ -5348,12 +5394,12 @@ async fn hydrate_page_content<F: OAuthFlow, S: Storage + 'static>(
         let quotes = hydrate_page_quotes(flow, quote_storage.as_ref(), refs, deadline).await;
         (quotes, started.elapsed().as_millis() as u64)
     };
-    let (quote_hydration, (account_data, profile_hydration_ms)) =
+    let (quote_hydration, (account_data, account_labels_ms)) =
         tokio::join!(quote_hydration, account_data_hydration);
     let profile_write_started = std::time::Instant::now();
     let profile_result = hydrate_page_profiles(storage.as_ref(), authors, account_data.profiles);
     let profile_hydration_ms =
-        profile_hydration_ms.saturating_add(profile_write_started.elapsed().as_millis() as u64);
+        account_labels_ms.saturating_add(profile_write_started.elapsed().as_millis() as u64);
     let mut quote_index = quote_hydration.0?;
     for label in account_data.labels {
         quote_index
@@ -5369,7 +5415,7 @@ async fn hydrate_page_content<F: OAuthFlow, S: Storage + 'static>(
             profile_hydration_ms
         },
         quote_hydration_ms: quote_hydration.1,
-        account_labels_ms: 0,
+        account_labels_ms,
     })
 }
 
