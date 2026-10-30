@@ -117,6 +117,7 @@ fn fallback_feed(uri: &str) -> ResolvedFeed {
 pub struct FeedClient<B: IdentityBackend> {
     identity: Arc<IdentityResolver<B>>,
     http: SafeHttpClient,
+    public_appview_base: String,
     generator_cache: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, ResolvedFeed)>>,
     live_post_cache: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, IndexedRecord)>>,
     // Failed resolutions are remembered too: the layout resolves every pinned feed on every page,
@@ -132,6 +133,7 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
         Self {
             identity,
             http,
+            public_appview_base: crate::profile_counts::PUBLIC_APPVIEW_BASE.to_owned(),
             generator_cache: tokio::sync::Mutex::new(HashMap::new()),
             live_post_cache: tokio::sync::Mutex::new(HashMap::new()),
             generator_failures: tokio::sync::Mutex::new(HashMap::new()),
@@ -149,6 +151,12 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
         let mut client = Self::new(identity, http);
         client.cache_store = Some(store);
         client
+    }
+
+    #[cfg(test)]
+    fn with_public_appview_base(mut self, base: impl Into<String>) -> Self {
+        self.public_appview_base = base.into();
+        self
     }
 
     /// Feed tabs use persisted metadata when available and never wait for resolution I/O.
@@ -727,7 +735,8 @@ mod tests {
     };
     use axum::{
         Router,
-        http::{HeaderMap, Uri},
+        extract::State,
+        http::{HeaderMap, StatusCode, Uri},
         response::IntoResponse,
         routing::{any, get},
     };
@@ -763,6 +772,117 @@ mod tests {
     }
 
     struct TestResolver;
+
+    #[derive(Clone)]
+    struct BatchServerState {
+        posts: Arc<HashMap<String, serde_json::Value>>,
+        fallback_posts: Arc<HashMap<String, serde_json::Value>>,
+        appview_status: StatusCode,
+        appview_calls: Arc<Mutex<Vec<usize>>>,
+        pds_calls: Arc<Mutex<usize>>,
+    }
+
+    async fn batch_get_posts(
+        State(state): State<BatchServerState>,
+        uri: Uri,
+    ) -> axum::response::Response {
+        let uris = url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
+            .filter(|(name, _)| name == "uris")
+            .map(|(_, value)| value.into_owned())
+            .collect::<Vec<_>>();
+        state.appview_calls.lock().unwrap().push(uris.len());
+        if !state.appview_status.is_success() {
+            return state.appview_status.into_response();
+        }
+        let posts = uris
+            .iter()
+            .filter_map(|uri| state.posts.get(uri).cloned())
+            .collect::<Vec<_>>();
+        axum::Json(json!({"posts":posts})).into_response()
+    }
+
+    async fn batch_get_record(
+        State(state): State<BatchServerState>,
+        uri: Uri,
+    ) -> axum::response::Response {
+        *state.pds_calls.lock().unwrap() += 1;
+        let query = url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
+            .collect::<HashMap<_, _>>();
+        let record_uri = format!(
+            "at://{}/{}/{}",
+            query.get("repo").map_or("", |value| value.as_ref()),
+            query.get("collection").map_or("", |value| value.as_ref()),
+            query.get("rkey").map_or("", |value| value.as_ref())
+        );
+        match state.fallback_posts.get(&record_uri) {
+            Some(post) => axum::Json(json!({
+                "uri":record_uri,
+                "cid":post.get("cid").and_then(serde_json::Value::as_str),
+                "value":post.get("record").cloned().unwrap_or_default()
+            }))
+            .into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
+    async fn batch_server(
+        posts: HashMap<String, serde_json::Value>,
+        fallback_posts: HashMap<String, serde_json::Value>,
+        appview_status: StatusCode,
+    ) -> (String, BatchServerState, tokio::task::JoinHandle<()>) {
+        let state = BatchServerState {
+            posts: Arc::new(posts),
+            fallback_posts: Arc::new(fallback_posts),
+            appview_status,
+            appview_calls: Arc::new(Mutex::new(Vec::new())),
+            pds_calls: Arc::new(Mutex::new(0)),
+        };
+        let app = Router::new()
+            .route("/xrpc/app.bsky.feed.getPosts", get(batch_get_posts))
+            .route("/xrpc/com.atproto.repo.getRecord", get(batch_get_record))
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://localhost:{}/xrpc/", address.port()), state, task)
+    }
+
+    fn public_post(uri: &str) -> serde_json::Value {
+        let mut parts = uri.strip_prefix("at://").unwrap().split('/');
+        let did = parts.next().unwrap();
+        json!({
+            "$type":"app.bsky.feed.defs#postView",
+            "uri":uri,
+            "cid":"batch-cid",
+            "author":{"did":did,"handle":"batch.test","displayName":"Batch author","avatar":"https://cdn.bsky.app/img/avatar/plain/did:plc:batch/avatar@jpeg","labels":[]},
+            "record":{"$type":"app.bsky.feed.post","text":"batch post","createdAt":"2026-10-30T00:00:00Z"}
+        })
+    }
+
+    fn fake_batch_identity(dids: impl IntoIterator<Item = String>, pds: &str) -> Arc<IdentityResolver<FakeIdentity>> {
+        let documents = dids
+            .into_iter()
+            .map(|did| (did.clone(), document(&did, pds, vec![])))
+            .collect();
+        Arc::new(IdentityResolver::new(
+            FakeIdentity(documents),
+            Duration::from_secs(30),
+        ))
+    }
+
+    fn test_client_with_appview(
+        identity: Arc<IdentityResolver<FakeIdentity>>,
+        base: String,
+    ) -> FeedClient<FakeIdentity> {
+        FeedClient::new(
+            identity,
+            SafeHttpClient::with_resolver(TestResolver)
+                .with_http_test_hosts(["localhost".to_owned()]),
+        )
+        .with_public_appview_base(base)
+    }
 
     #[derive(Clone, Default)]
     struct LogBuffer(Arc<Mutex<Vec<u8>>>);
@@ -1082,6 +1202,77 @@ mod tests {
         );
         assert_eq!(page.dropped_count, 1);
         assert_eq!(page.cursor.as_deref(), Some("next-cursor"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn feed_hydration_batches_public_posts_in_groups_of_twenty_five() {
+        let uris = (0..51)
+            .map(|index| format!("at://did:plc:batch{index}/app.bsky.feed.post/p{index}"))
+            .collect::<Vec<_>>();
+        let posts = uris
+            .iter()
+            .map(|uri| (uri.clone(), public_post(uri)))
+            .collect::<HashMap<_, _>>();
+        let (pds, state, server) = batch_server(posts, HashMap::new(), StatusCode::OK).await;
+        let pds_endpoint = pds.trim_end_matches("/xrpc/").to_owned();
+        let identity = fake_batch_identity(
+            uris.iter()
+                .map(|uri| uri.split('/').nth(2).unwrap().to_owned()),
+            &pds_endpoint,
+        );
+        let client = test_client_with_appview(identity, pds);
+        let skeleton = super::FeedSkeletonPage {
+            feed: uris
+                .into_iter()
+                .map(|post_uri| super::FeedSkeletonEntry {
+                    post_uri,
+                    reason: None,
+                })
+                .collect(),
+            cursor: None,
+        };
+
+        let page = client
+            .hydrate_skeleton(skeleton, &crate::ingest::MemoryStorage::default())
+            .await
+            .unwrap();
+
+        assert_eq!(page.feed.len(), 51);
+        assert_eq!(*state.appview_calls.lock().unwrap(), [25, 25, 1]);
+        assert_eq!(*state.pds_calls.lock().unwrap(), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn feed_hydration_falls_back_to_author_pds_when_public_appview_is_down() {
+        use crate::ingest::MemoryStorage;
+
+        let uri = "at://did:plc:fallback/app.bsky.feed.post/p1";
+        let fallback_posts = HashMap::from([(uri.to_owned(), public_post(uri))]);
+        let (pds, state, server) =
+            batch_server(HashMap::new(), fallback_posts, StatusCode::SERVICE_UNAVAILABLE).await;
+        let pds_endpoint = pds.trim_end_matches("/xrpc/").to_owned();
+        let identity = fake_batch_identity(["did:plc:fallback".to_owned()], &pds_endpoint);
+        let client = test_client_with_appview(identity, pds);
+        let page = client
+            .hydrate_skeleton(
+                super::FeedSkeletonPage {
+                    feed: vec![super::FeedSkeletonEntry {
+                        post_uri: uri.to_owned(),
+                        reason: None,
+                    }],
+                    cursor: None,
+                },
+                &MemoryStorage::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(page.feed.len(), 1);
+        assert_eq!(page.feed[0].record.uri, uri);
+        assert_eq!(*state.appview_calls.lock().unwrap(), [1]);
+        assert_eq!(*state.pds_calls.lock().unwrap(), 1);
         server.abort();
     }
 
