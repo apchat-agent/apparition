@@ -1,10 +1,10 @@
 use appview_rs::{
     config::Config,
-    feeds::{FeedTimeline, FeedTimelineTiming, HydratedFeedPage, ResolvedFeed},
+    feeds::{FeedTimeline, FeedTimelineTiming, HydratedFeedPage, HydratedFeedPost, ResolvedFeed},
     ingest::{IndexedRecord, Ingestor, MemoryStorage, ScopeMode, SqliteStorage, Storage},
     oauth::{
-        AccountLabel, FetchedAuthorProfile, OAuthAccount, OAuthCallback, OAuthFlow, OAuthPublic,
-        PageAccountData, PdsCreatedRecord, PinnedFeedTabs, PostImage, PostStrongRef,
+        AccountLabel, BlockListDetail, FetchedAuthorProfile, OAuthAccount, OAuthCallback, OAuthFlow,
+        OAuthPublic, PageAccountData, PdsCreatedRecord, PinnedFeedTabs, PostImage, PostStrongRef,
         ProfileListChoice, ProfileRefreshWorker, SqliteOAuthStore, WebShutdown,
     },
 };
@@ -83,6 +83,59 @@ impl<S: Subscriber> Layer<S> for WarningCapture {
 }
 
 #[derive(Clone)]
+struct WebPagePhases(Arc<Mutex<Vec<(String, u64, bool)>>>);
+
+struct WebPagePhaseVisitor {
+    page: Option<String>,
+    list_blocked_posts: Option<u64>,
+    has_list_blocks_ms: bool,
+}
+
+impl Visit for WebPagePhaseVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "page" {
+            self.page = Some(value.to_owned());
+        }
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        if field.name() == "list_blocked_posts" {
+            self.list_blocked_posts = Some(value);
+        } else if field.name() == "list_blocks_ms" {
+            self.has_list_blocks_ms = true;
+        }
+    }
+
+    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+}
+
+impl<S: Subscriber> Layer<S> for WebPagePhases {
+    fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+        let mut visitor = WebPagePhaseVisitor {
+            page: None,
+            list_blocked_posts: None,
+            has_list_blocks_ms: false,
+        };
+        event.record(&mut visitor);
+        // WebPageTiming emits exactly one line per page; only it carries
+        // list_blocked_posts, so its presence identifies the timing line.
+        if let (Some(page), Some(list_blocked_posts)) = (visitor.page, visitor.list_blocked_posts) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((page, list_blocked_posts, visitor.has_list_blocks_ms));
+        }
+    }
+}
+
+#[derive(Clone)]
+struct FakeBlockList {
+    uri: String,
+    name: String,
+    members: Vec<String>,
+}
+
+#[derive(Clone)]
 struct FakeOAuthFlow {
     actions: Arc<Mutex<Vec<String>>>,
     granted_scope: Option<String>,
@@ -106,6 +159,11 @@ struct FakeOAuthFlow {
     muted_actors: Arc<Mutex<std::collections::HashSet<String>>>,
     label_requests: Arc<Mutex<Vec<Vec<String>>>>,
     account_labels: Arc<Mutex<Vec<AccountLabel>>>,
+    block_lists: Arc<Mutex<Vec<FakeBlockList>>>,
+    listblock_requests: Arc<Mutex<Vec<String>>>,
+    block_list_requests: Arc<Mutex<Vec<String>>>,
+    block_list_failure: Arc<Mutex<Option<String>>>,
+    feed_timeline_records: Arc<Mutex<Vec<IndexedRecord>>>,
 }
 
 impl Default for FakeOAuthFlow {
@@ -133,6 +191,11 @@ impl Default for FakeOAuthFlow {
             muted_actors: Arc::new(Mutex::new(std::collections::HashSet::new())),
             label_requests: Arc::new(Mutex::new(Vec::new())),
             account_labels: Arc::new(Mutex::new(Vec::new())),
+            block_lists: Arc::new(Mutex::new(Vec::new())),
+            listblock_requests: Arc::new(Mutex::new(Vec::new())),
+            block_list_requests: Arc::new(Mutex::new(Vec::new())),
+            block_list_failure: Arc::new(Mutex::new(None)),
+            feed_timeline_records: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -446,6 +509,7 @@ impl OAuthFlow for FakeOAuthFlow {
     ) -> Pin<Box<dyn Future<Output = Result<FeedTimeline, String>> + Send + 'a>> {
         let uri = uri.to_owned();
         let delay_ms = self.feed_timeline_delay_ms;
+        let records = self.feed_timeline_records.lock().unwrap().clone();
         Box::pin(async move {
             if delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -460,7 +524,13 @@ impl OAuthFlow for FakeOAuthFlow {
                     endpoint: "https://feed.example".into(),
                 },
                 timeline: HydratedFeedPage {
-                    feed: Vec::new(),
+                    feed: records
+                        .into_iter()
+                        .map(|record| HydratedFeedPost {
+                            record,
+                            reposted_by: None,
+                        })
+                        .collect(),
                     cursor: None,
                     dropped_count: 0,
                 },
@@ -620,6 +690,54 @@ impl OAuthFlow for FakeOAuthFlow {
     ) -> Pin<Box<dyn Future<Output = Result<std::collections::HashSet<String>, String>> + Send + 'a>>
     {
         Box::pin(async move { Ok(self.muted_actors.lock().unwrap().clone()) })
+    }
+
+    fn subscribed_block_list_uris<'a>(
+        &'a self,
+        did: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + 'a>> {
+        let requests = self.listblock_requests.clone();
+        let uris: Vec<String> = self
+            .block_lists
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|list| list.uri.clone())
+            .collect();
+        Box::pin(async move {
+            requests.lock().unwrap().push(did.to_owned());
+            Ok(uris)
+        })
+    }
+
+    fn block_list_detail<'a>(
+        &'a self,
+        list_uri: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<BlockListDetail, String>> + Send + 'a>> {
+        let requests = self.block_list_requests.clone();
+        let failure = self.block_list_failure.lock().unwrap().clone();
+        let found = self
+            .block_lists
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|list| list.uri == list_uri)
+            .cloned();
+        let list_uri = list_uri.to_owned();
+        Box::pin(async move {
+            requests.lock().unwrap().push(list_uri.clone());
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            match found {
+                Some(list) => Ok(BlockListDetail {
+                    uri: list.uri,
+                    name: list.name,
+                    member_dids: list.members,
+                }),
+                None => Err(format!("unknown block list {list_uri}")),
+            }
+        })
     }
 
     fn profile_list_choices<'a>(
@@ -7058,4 +7176,305 @@ async fn profile_follow_form_creates_the_follow_record_in_the_viewers_repo() {
             .iter()
             .any(|action| action.starts_with("create:app.bsky.graph.follow:"))
     );
+}
+
+fn fake_block_list(uri: &str, name: &str, members: &[&str]) -> FakeBlockList {
+    FakeBlockList {
+        uri: uri.to_owned(),
+        name: name.to_owned(),
+        members: members.iter().map(|did| (*did).to_owned()).collect(),
+    }
+}
+
+async fn get_body(app: &Router, uri: &str, cookie: &str) -> (StatusCode, String) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    (status, html)
+}
+
+#[tokio::test]
+async fn following_page_marks_block_list_member_posts_hidden_but_still_renders_them() {
+    let list_uri = "at://did:plc:list-owner/app.bsky.graph.list/spamlist";
+    let storage = Arc::new(MemoryStorage::default());
+    storage
+        .set_follow("did:plc:alice", "did:plc:list-member", true)
+        .unwrap();
+    storage
+        .set_follow("did:plc:alice", "did:plc:clear-author", true)
+        .unwrap();
+    storage
+        .put_record(&fake_feed_post(
+            "did:plc:list-member",
+            "member-post",
+            2,
+            "A post by a block list member",
+        ))
+        .unwrap();
+    storage
+        .put_record(&fake_feed_post(
+            "did:plc:clear-author",
+            "clear-post",
+            1,
+            "A post by a clear author",
+        ))
+        .unwrap();
+    let flow = FakeOAuthFlow {
+        block_lists: Arc::new(Mutex::new(vec![fake_block_list(
+            &list_uri,
+            "Spam list",
+            &["did:plc:list-member"],
+        )])),
+        ..FakeOAuthFlow::default()
+    };
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage);
+    let cookie = finish_login(&app).await;
+    let (status, html) = get_body(&app, "/app", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("A post by a block list member"),
+        "list-blocked posts are marked, never dropped: {html}"
+    );
+    assert!(
+        html.contains(&format!(
+            "<li class=\"post-item\" hidden data-list-block=\"{list_uri}\" data-list-block-name=\"Spam list\">"
+        )),
+        "the member's <li> carries hidden plus both data attributes: {html}"
+    );
+    assert!(html.contains("A post by a clear author"));
+    assert_eq!(
+        html.matches("data-list-block=\"").count(),
+        1,
+        "only the member's post carries the marker: {html}"
+    );
+}
+
+#[tokio::test]
+async fn custom_feed_page_marks_block_list_member_posts_hidden_but_still_renders_them() {
+    let list_uri = "at://did:plc:list-owner/app.bsky.graph.list/spamlist";
+    let storage = Arc::new(MemoryStorage::default());
+    let flow = FakeOAuthFlow {
+        block_lists: Arc::new(Mutex::new(vec![fake_block_list(
+            &list_uri,
+            "Spam list",
+            &["did:plc:list-member"],
+        )])),
+        feed_timeline_records: Arc::new(Mutex::new(vec![
+            fake_feed_post(
+                "did:plc:list-member",
+                "member-post",
+                2,
+                "A post by a block list member",
+            ),
+            fake_feed_post(
+                "did:plc:clear-author",
+                "clear-post",
+                1,
+                "A post by a clear author",
+            ),
+        ])),
+        ..FakeOAuthFlow::default()
+    };
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage);
+    let cookie = finish_login(&app).await;
+    let (status, html) = get_body(
+        &app,
+        "/app/feed?uri=at%3A%2F%2Fdid%3Aplc%3Acreator%2Fapp.bsky.feed.generator%2Ffocus",
+        &cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("A post by a block list member"),
+        "list-blocked posts are marked, never dropped: {html}"
+    );
+    assert!(
+        html.contains(&format!(
+            "<li class=\"post-item\" hidden data-list-block=\"{list_uri}\" data-list-block-name=\"Spam list\">"
+        )),
+        "the member's <li> carries hidden plus both data attributes: {html}"
+    );
+    assert!(html.contains("A post by a clear author"));
+    assert_eq!(
+        html.matches("data-list-block=\"").count(),
+        1,
+        "only the member's post carries the marker: {html}"
+    );
+}
+
+#[tokio::test]
+async fn a_failing_block_list_member_fetch_keeps_the_page_available_and_warns_with_the_error() {
+    let list_uri = "at://did:plc:list-owner/app.bsky.graph.list/spamlist";
+    let storage = Arc::new(MemoryStorage::default());
+    storage
+        .set_follow("did:plc:alice", "did:plc:list-member", true)
+        .unwrap();
+    storage
+        .put_record(&fake_feed_post(
+            "did:plc:list-member",
+            "member-post",
+            1,
+            "A post that stays visible because the lookup failed",
+        ))
+        .unwrap();
+    let flow = FakeOAuthFlow {
+        block_lists: Arc::new(Mutex::new(vec![fake_block_list(
+            &list_uri,
+            "Spam list",
+            &["did:plc:list-member"],
+        )])),
+        block_list_failure: Arc::new(Mutex::new(Some(
+            "PDS listRecords refused the member page".to_owned(),
+        ))),
+        ..FakeOAuthFlow::default()
+    };
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage);
+    let cookie = finish_login(&app).await;
+    let warnings = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(WarningCapture(warnings.clone()));
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let (status, html) = get_body(&app, "/app", &cookie).await;
+    drop(_guard);
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("A post that stays visible because the lookup failed"),
+        "a failed member lookup must not hide anything: {html}"
+    );
+    assert!(
+        !html.contains("data-list-block="),
+        "a failed member lookup must not mark anything: {html}"
+    );
+    let warnings = warnings.lock().unwrap();
+    assert!(
+        warnings.iter().any(|line| {
+            line.contains("PDS listRecords refused the member page")
+                && line.contains(list_uri)
+        }),
+        "the warn logs the real error text and the list uri: {warnings:?}"
+    );
+}
+
+#[tokio::test]
+async fn two_following_pages_within_the_ttl_fetch_the_block_list_once() {
+    let list_uri = "at://did:plc:list-owner/app.bsky.graph.list/spamlist";
+    let storage = Arc::new(MemoryStorage::default());
+    storage
+        .set_follow("did:plc:alice", "did:plc:list-member", true)
+        .unwrap();
+    storage
+        .put_record(&fake_feed_post(
+            "did:plc:list-member",
+            "member-post",
+            1,
+            "A cached block list member post",
+        ))
+        .unwrap();
+    let flow = FakeOAuthFlow {
+        block_lists: Arc::new(Mutex::new(vec![fake_block_list(
+            &list_uri,
+            "Spam list",
+            &["did:plc:list-member"],
+        )])),
+        ..FakeOAuthFlow::default()
+    };
+    let listblock_requests = flow.listblock_requests.clone();
+    let block_list_requests = flow.block_list_requests.clone();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage);
+    let cookie = finish_login(&app).await;
+    let (status, first) = get_body(&app, "/app", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, second) = get_body(&app, "/app", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(first.contains("data-list-block=\""));
+    assert!(second.contains("data-list-block=\""));
+    assert_eq!(
+        *listblock_requests.lock().unwrap(),
+        vec!["did:plc:alice".to_owned()],
+        "the viewer's listblock set is cached within its TTL"
+    );
+    assert_eq!(
+        *block_list_requests.lock().unwrap(),
+        vec![list_uri.clone()],
+        "the member fetch is cached within its TTL"
+    );
+}
+
+#[tokio::test]
+async fn the_following_timing_line_counts_list_blocked_posts() {
+    let list_uri = "at://did:plc:list-owner/app.bsky.graph.list/spamlist";
+    let storage = Arc::new(MemoryStorage::default());
+    storage
+        .set_follow("did:plc:alice", "did:plc:list-member", true)
+        .unwrap();
+    storage
+        .set_follow("did:plc:alice", "did:plc:clear-author", true)
+        .unwrap();
+    storage
+        .put_record(&fake_feed_post(
+            "did:plc:list-member",
+            "member-post",
+            2,
+            "A marked member post",
+        ))
+        .unwrap();
+    storage
+        .put_record(&fake_feed_post(
+            "did:plc:clear-author",
+            "clear-post",
+            1,
+            "A clear post",
+        ))
+        .unwrap();
+    let flow = FakeOAuthFlow {
+        block_lists: Arc::new(Mutex::new(vec![fake_block_list(
+            &list_uri,
+            "Spam list",
+            &["did:plc:list-member"],
+        )])),
+        ..FakeOAuthFlow::default()
+    };
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage);
+    let cookie = finish_login(&app).await;
+    let phases = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(WebPagePhases(phases.clone()));
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let (status, _html) = get_body(&app, "/app", &cookie).await;
+    drop(_guard);
+    assert_eq!(status, StatusCode::OK);
+    let phases = phases.lock().unwrap();
+    let line = phases
+        .iter()
+        .find(|(page, _, _)| page == "app")
+        .unwrap_or_else(|| panic!("no /app timing line captured: {phases:?}"));
+    assert_eq!(line.1, 1, "exactly one post was list-blocked: {phases:?}");
+    assert!(line.2, "the timing line reports list_blocks_ms: {phases:?}");
 }
