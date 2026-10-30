@@ -1202,3 +1202,184 @@ Deno.test("a like form on an appended card uses the existing delegated handler",
     globalThis.fetch = originalFetch;
   }
 });
+
+function createProfileFillHarness() {
+  const makeElement = ({ did = "", avatar = false, name = false, handle = false, tag = "SPAN" } = {}) => ({
+    tagName: tag,
+    className: avatar ? "avatar avatar-placeholder" : "",
+    dataset: {},
+    attributes: new Map([
+      ...(did ? [["data-profile-did", did]] : []),
+      ...(avatar ? [["data-profile-avatar", ""]] : []),
+      ...(name ? [["data-profile-name", ""]] : []),
+      ...(handle ? [["data-profile-handle", ""]] : []),
+    ]),
+    children: [],
+    textContent: "",
+    getAttribute(key) { return this.attributes.get(key) ?? null; },
+    setAttribute(key, value) { this.attributes.set(key, String(value)); },
+    hasAttribute(key) { return this.attributes.has(key); },
+    matches(selector) {
+      const attribute = /^\[([\w-]+)\]$/.exec(selector)?.[1];
+      return attribute ? this.attributes.has(attribute) : false;
+    },
+    querySelectorAll(selector) {
+      const attribute = /^\[([\w-]+)\]$/.exec(selector)?.[1];
+      const found = [];
+      const visit = (node) => {
+        for (const child of node.children) {
+          if (attribute && child.hasAttribute(attribute)) found.push(child);
+          visit(child);
+        }
+      };
+      visit(this);
+      return found;
+    },
+    append(...nodes) { this.children.push(...nodes); },
+    replaceWith(node) { this.replacedWith = node; },
+  });
+  const authorCard = (did) => {
+    const card = makeElement({ did });
+    card.append(makeElement({ name: true }), makeElement({ handle: true }));
+    return card;
+  };
+  return { makeElement, authorCard };
+}
+
+Deno.test("profile fill batches marked DIDs into one request and replaces every element for a DID", async () => {
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  const start = source.indexOf("function fillProfileIdentities(");
+  const end = source.indexOf("\nfillProfileIdentities();", start);
+  assert(start >= 0 && end > start, "app.js should install background profile fills");
+  const fillProfileIdentities = new Function(`${source.slice(start, end)}; return fillProfileIdentities;`)();
+  const { makeElement, authorCard } = createProfileFillHarness();
+
+  const sharedFirst = authorCard("did:plc:sharedauthor");
+  const sharedSecond = authorCard("did:plc:sharedauthor");
+  const sharedAvatar = makeElement({ did: "did:plc:sharedauthor", avatar: true });
+  const other = authorCard("did:plc:otherauthor");
+  const otherAvatar = makeElement({ did: "did:plc:otherauthor", avatar: true });
+  const marked = [sharedFirst, sharedAvatar, sharedSecond, other, otherAvatar];
+  const root = {
+    matches() { return false; },
+    querySelectorAll(selector) { return selector === "[data-profile-did]" ? marked : []; },
+  };
+
+  const requests = [];
+  const originalFetch = globalThis.fetch;
+  const originalDocument = globalThis.document;
+  globalThis.document = { createElement: (tag) => makeElement({ tag }) };
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url, options });
+    return {
+      ok: true,
+      json: async () => ({
+        profiles: {
+          "did:plc:sharedauthor": { handle: "shared.example", displayName: "Shared Author", avatar: "https://cdn.bsky.app/img/avatar_thumbnail/plain/did:plc:sharedauthor/bafk@jpeg" },
+          "did:plc:otherauthor": { handle: "other.example", displayName: "Other Author", avatar: "https://cdn.bsky.app/img/avatar_thumbnail/plain/did:plc:otherauthor/bafk@jpeg" },
+        },
+      }),
+    };
+  };
+  try {
+    fillProfileIdentities(root);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEquals(requests.length, 1, "duplicate DIDs across cards must collapse into one batched request");
+    assert(requests[0].url.startsWith("/profile-fragment?"), requests[0].url);
+    assert(requests[0].url.includes("did=did%3Aplc%3Asharedauthor"), requests[0].url);
+    assert(requests[0].url.includes("did=did%3Aplc%3Aotherauthor"), requests[0].url);
+    assertEquals(requests[0].options.credentials, "same-origin");
+    assertEquals(requests[0].options.headers.Accept, "application/json");
+    for (const card of [sharedFirst, sharedSecond]) {
+      assertEquals(card.children[0].textContent, "Shared Author");
+      assertEquals(card.children[1].textContent, "@shared.example");
+    }
+    assertEquals(other.children[0].textContent, "Other Author");
+    assertEquals(other.children[1].textContent, "@other.example");
+    for (const avatar of [sharedAvatar, otherAvatar]) {
+      assert(avatar.replacedWith, "the placeholder avatar should be replaced");
+      assertEquals(avatar.replacedWith.tagName, "IMG");
+      assert(avatar.replacedWith.getAttribute("src").startsWith("https://cdn.bsky.app/img/"), avatar.replacedWith.getAttribute("src"));
+      assert(!avatar.replacedWith.className.includes("avatar-placeholder"), avatar.replacedWith.className);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.document = originalDocument;
+  }
+});
+
+Deno.test("profile fill sends at most 25 DIDs in one request", async () => {
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  const start = source.indexOf("function fillProfileIdentities(");
+  const end = source.indexOf("\nfillProfileIdentities();", start);
+  const fillProfileIdentities = new Function(`${source.slice(start, end)}; return fillProfileIdentities;`)();
+  const { authorCard } = createProfileFillHarness();
+  const marked = Array.from({ length: 30 }, (_, index) => authorCard(`did:plc:batchauthor${index}`));
+  const root = {
+    matches() { return false; },
+    querySelectorAll(selector) { return selector === "[data-profile-did]" ? marked : []; },
+  };
+  const requests = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url, options });
+    return { ok: true, json: async () => ({ profiles: {} }) };
+  };
+  try {
+    fillProfileIdentities(root);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEquals(requests.length, 2, "30 DIDs must split into two public-batch-sized requests");
+    assertEquals(requests[0].url.split("did=").length - 1, 25);
+    assertEquals(requests[1].url.split("did=").length - 1, 5);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+Deno.test("profile fill runs on cards appended by infinite scroll", async () => {
+  const pages = {};
+  const harness = await createInfiniteScrollHarness({
+    responses: [{ ok: true, text: async () => "page-two" }],
+    pages,
+  });
+  const card = new harness.Element("li", "post-late");
+  card.setAttribute("data-post-kind", "post");
+  const author = new harness.Element("div");
+  author.setAttribute("data-profile-did", "did:plc:lateauthor");
+  const name = new harness.Element("a");
+  name.setAttribute("data-profile-name", "");
+  const handle = new harness.Element("a");
+  handle.setAttribute("data-profile-handle", "");
+  author.append(name, handle);
+  card.append(author);
+  const nextList = new harness.Element("ol");
+  nextList.className = "post-list";
+  nextList.append(card);
+  pages["page-two"] = { list: nextList, link: null };
+
+  const requests = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url, options });
+    return {
+      ok: true,
+      json: async () => ({
+        profiles: { "did:plc:lateauthor": { handle: "late.example", displayName: "Late Author" } },
+      }),
+    };
+  };
+  try {
+    harness.Observer.latest.target.top = -1;
+    harness.scroll();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert(
+      requests.some((request) => request.url.startsWith("/profile-fragment?") && request.url.includes("did=did%3Aplc%3Alateauthor")),
+      `appended cards should trigger the profile fill: ${JSON.stringify(requests.map((request) => request.url))}`,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEquals(name.textContent, "Late Author");
+    assertEquals(handle.textContent, "@late.example");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
