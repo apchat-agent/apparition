@@ -114,12 +114,17 @@ fn login_allowlist_is_disabled_by_default_and_can_be_configured() {
         std::iter::empty::<(&str, &str)>(),
     )
     .unwrap();
-    assert!(format!("{from_toml:?}").contains("login_allowlist: [\"did:plc:alice\", \"alice.example\"]"));
+    assert!(
+        format!("{from_toml:?}")
+            .contains("login_allowlist: [\"did:plc:alice\", \"alice.example\"]")
+    );
 
     let from_env = Config::from_toml_and_env(
         "",
         [("APPVIEW_LOGIN_ALLOWLIST", "did:plc:alice, alice.example")],
     )
     .unwrap();
-    assert!(format!("{from_env:?}").contains("login_allowlist: [\"did:plc:alice\", \"alice.example\"]"));
+    assert!(
+        format!("{from_env:?}").contains("login_allowlist: [\"did:plc:alice\", \"alice.example\"]")
+    );
 }

@@ -4,7 +4,10 @@ use appview_rs::{
         AtriumRepoVerifier, BackfillWorker, HostRateLimiter, HttpRepoSource, RepoBackfiller,
     },
     config::{Config, OAuthMode, identity_cache_path},
-    identity::{HandleRefreshWorker, HttpIdentityBackend, IdentityResolver, SqliteIdentityCache},
+    identity::{
+        HandleRefreshWorker, HttpIdentityBackend, IdentityResolver, SqliteIdentityCache,
+        resolve_login_allowlist,
+    },
     ingest::{Ingestor, JetstreamConsumer, SqliteStorage},
     init_tracing,
     jwt::ServiceJwtVerifier,
@@ -40,8 +43,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         IdentityResolver::new(HttpIdentityBackend::default(), Duration::from_secs(1800))
             .with_persistent_cache(identity_cache.clone()),
     );
+    let allowed_dids = resolve_login_allowlist(&config.login_allowlist, &oauth_identity_resolver)
+        .await
+        .map_err(|error| {
+            std::io::Error::other(format!("could not resolve login allowlist: {error}"))
+        })?;
+    let oauth = oauth.with_login_allowlist(allowed_dids);
     let oauth_flow = oauth
-        .atrium_flow(oauth_identity_resolver, oauth_store)
+        .atrium_flow(oauth_identity_resolver.clone(), oauth_store)
         .map_err(std::io::Error::other)?;
     let profile_refresh_worker =
         ProfileRefreshWorker::new(oauth_flow.clone(), storage.clone(), Duration::from_secs(2));

@@ -11,9 +11,9 @@ use appview_rs::{
 use appview_rs::{router, router_with_oauth_flow};
 use atrium_api::types::string::Did;
 use atrium_common::store::Store;
-use base64::Engine as _;
 use atrium_oauth::store::{session::Session, state::InternalStateData};
 use axum::{Router, body::Body, http::Request, http::StatusCode};
+use base64::Engine as _;
 use http_body_util::BodyExt;
 use rusqlite::Connection;
 use serde_json::Value;
@@ -86,6 +86,7 @@ impl<S: Subscriber> Layer<S> for WarningCapture {
 struct FakeOAuthFlow {
     actions: Arc<Mutex<Vec<String>>>,
     granted_scope: Option<String>,
+    callback_did: Option<String>,
     browser_binding: Arc<Mutex<Option<String>>>,
     callback_failure: Option<String>,
     action_failure: Option<String>,
@@ -112,6 +113,7 @@ impl Default for FakeOAuthFlow {
         Self {
             actions: Arc::new(Mutex::new(Vec::new())),
             granted_scope: Some(EXPECTED_OAUTH_SCOPE.to_owned()),
+            callback_did: None,
             browser_binding: Arc::new(Mutex::new(None)),
             callback_failure: None,
             action_failure: None,
@@ -136,6 +138,11 @@ impl Default for FakeOAuthFlow {
 }
 
 impl FakeOAuthFlow {
+    fn with_callback_did(mut self, did: &str) -> Self {
+        self.callback_did = Some(did.to_owned());
+        self
+    }
+
     fn with_granted_scope(scope: Option<&str>) -> Self {
         Self {
             granted_scope: scope.map(str::to_owned),
@@ -206,7 +213,10 @@ impl OAuthFlow for FakeOAuthFlow {
                 return Err("invalid OAuth state or code".to_owned());
             }
             Ok(OAuthAccount {
-                did: "did:plc:alice".to_owned(),
+                did: self
+                    .callback_did
+                    .clone()
+                    .unwrap_or_else(|| "did:plc:alice".to_owned()),
                 verified_handle: Some("alice.test".to_owned()),
                 granted_scope: self.granted_scope.clone(),
             })
@@ -782,12 +792,17 @@ async fn finish_login(app: &Router) -> String {
 }
 
 #[tokio::test]
-async fn login_allowlist_rejects_the_callback_did_before_creating_a_web_session() {
+async fn login_allowlist_rejects_an_allowed_typed_handle_when_the_callback_did_differs() {
     let storage = Arc::new(MemoryStorage::default());
     let app = OAuthPublic::new("https://appview.example")
         .unwrap()
-        .with_login_allowlist(["did:plc:somebody-else"])
-        .router_with_flow(FakeOAuthFlow::default(), storage.clone());
+        // alice.test resolves to did:plc:alice in production; include the raw
+        // handle here too so a callback check against the typed handle is caught.
+        .with_login_allowlist(["did:plc:alice", "alice.test"])
+        .router_with_flow(
+            FakeOAuthFlow::default().with_callback_did("did:plc:somebody-else"),
+            storage.clone(),
+        );
     let login_cookie = prelogin_cookie(&app).await;
     let response = app
         .clone()
@@ -802,9 +817,33 @@ async fn login_allowlist_rejects_the_callback_did_before_creating_a_web_session(
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        !response
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .any(|value| value
+                .to_str()
+                .is_ok_and(|value| value.starts_with("appview_session=")))
+    );
     let body = response.into_body().collect().await.unwrap().to_bytes();
     assert!(String::from_utf8_lossy(&body).contains("This appview is invite-only"));
     assert!(!storage.is_registered("did:plc:alice").unwrap());
+    assert!(!storage.is_registered("did:plc:somebody-else").unwrap());
+}
+
+#[tokio::test]
+async fn an_explicitly_empty_login_allowlist_keeps_sign_in_open() {
+    let storage = Arc::new(MemoryStorage::default());
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .with_login_allowlist(Vec::<String>::new())
+        .router_with_flow(FakeOAuthFlow::default(), storage.clone());
+
+    let cookie = finish_login(&app).await;
+
+    assert!(cookie.starts_with("appview_session="));
+    assert!(storage.is_registered("did:plc:alice").unwrap());
 }
 
 #[tokio::test]

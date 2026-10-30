@@ -938,7 +938,10 @@ impl OAuthPublic {
         I: IntoIterator<Item = D>,
         D: Into<String>,
     {
-        let allowed_dids = allowed_dids.into_iter().map(Into::into).collect::<HashSet<_>>();
+        let allowed_dids = allowed_dids
+            .into_iter()
+            .map(Into::into)
+            .collect::<HashSet<_>>();
         self.login_allowlist = (!allowed_dids.is_empty()).then(|| Arc::new(allowed_dids));
         self
     }
@@ -5806,6 +5809,13 @@ where
             return login_retry_page();
         }
     };
+    if !state.public.login_is_allowed(&account.did) {
+        tracing::info!(did = %account.did, "OAuth account is not in the login allowlist");
+        if let Err(error) = state.flow.logout(&account.did).await {
+            tracing::warn!(%error, did = %account.did, "could not revoke a disallowed OAuth session");
+        }
+        return oauth_error_page(StatusCode::FORBIDDEN, "This appview is invite-only.");
+    }
     if !has_atproto_scope(account.granted_scope.as_deref()) {
         tracing::warn!(scope = ?account.granted_scope, "oauth callback without atproto scope");
         return oauth_error(
@@ -10292,6 +10302,12 @@ fn verified_cookie_session<S: Storage>(
 ) -> Option<(String, String, u64, SessionPermissions)> {
     let (did, session_id, generation, permissions) =
         cookie_value(headers).and_then(|value| public.verify_session_cookie(value))?;
+    if !public.login_is_allowed(&did) {
+        if let Err(error) = storage.delete_web_session(&did, &session_id) {
+            tracing::warn!(%error, did = %did, "could not remove a disallowed web session");
+        }
+        return None;
+    }
     (storage
         .web_session_generation(&did, &session_id)
         .ok()

@@ -6,7 +6,7 @@ use http::{HeaderMap, HeaderValue, header};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     path::{Path, PathBuf},
     sync::{
@@ -752,6 +752,30 @@ impl<B: IdentityBackend> IdentityResolver<B> {
             },
         );
     }
+}
+
+/// Resolve configured login allowlist entries to canonical DIDs. DID entries
+/// are syntax checked directly; handle entries must pass both the handle
+/// assertion and DID document alias checks performed by `resolve_handle`.
+pub async fn resolve_login_allowlist<B: IdentityBackend>(
+    entries: &[String],
+    resolver: &IdentityResolver<B>,
+) -> Result<HashSet<String>, ResolutionError> {
+    let mut allowed_dids = HashSet::new();
+    for entry in entries
+        .iter()
+        .map(|entry| entry.trim())
+        .filter(|entry| !entry.is_empty())
+    {
+        let entry = entry.strip_prefix('@').unwrap_or(entry);
+        if entry.starts_with("did:") {
+            validate_did(entry)?;
+            allowed_dids.insert(entry.to_owned());
+        } else {
+            allowed_dids.insert(resolver.resolve_handle(entry).await?.did);
+        }
+    }
+    Ok(allowed_dids)
 }
 
 const HANDLE_REFRESH_INTERVAL: Duration = Duration::from_millis(100);

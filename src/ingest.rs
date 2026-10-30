@@ -476,6 +476,7 @@ pub trait Storage: Send + Sync {
         did: &str,
         session_id: &str,
     ) -> Result<Option<u64>, StorageError>;
+    fn delete_web_session(&self, did: &str, session_id: &str) -> Result<(), StorageError>;
     fn set_follow(&self, actor: &str, subject: &str, following: bool) -> Result<(), StorageError>;
     fn is_following(&self, actor: &str, subject: &str) -> Result<bool, StorageError>;
     fn tracked_follow_count(&self, did: &str) -> Result<u32, StorageError>;
@@ -1445,6 +1446,15 @@ impl Storage for MemoryStorage {
             .web_session_generations
             .get(&(did.to_owned(), session_id.to_owned()))
             .copied())
+    }
+
+    fn delete_web_session(&self, did: &str, session_id: &str) -> Result<(), StorageError> {
+        self.inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .web_session_generations
+            .remove(&(did.to_owned(), session_id.to_owned()));
+        Ok(())
     }
 
     fn unregister_user(&self, did: &str) -> Result<(), StorageError> {
@@ -3970,6 +3980,18 @@ impl Storage for SqliteStorage {
             .map(|generation| u64::try_from(generation).map_err(|_| rusqlite::Error::InvalidQuery))
             .transpose()
             .map_err(Into::into)
+    }
+
+    fn delete_web_session(&self, did: &str, session_id: &str) -> Result<(), StorageError> {
+        let did = did.to_owned();
+        let session_id = session_id.to_owned();
+        self.writer.call(move |connection| {
+            connection.execute(
+                "DELETE FROM web_sessions WHERE did=?1 AND session_id=?2",
+                params![did, session_id],
+            )?;
+            Ok(())
+        })
     }
 
     fn did_by_verified_handle(&self, handle: &str) -> Result<Option<String>, StorageError> {

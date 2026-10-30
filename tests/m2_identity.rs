@@ -1,5 +1,6 @@
 use appview_rs::identity::{
     DidDocument, HttpIdentityBackend, Identity, IdentityBackend, IdentityResolver, ResolutionError,
+    resolve_login_allowlist,
 };
 use appview_rs::net::SafeHttpClient;
 use std::{
@@ -103,6 +104,39 @@ async fn a_handle_that_does_not_match_the_did_document_is_rejected() {
 
     assert!(matches!(
         resolver.resolve_handle("alice.test").await,
+        Err(ResolutionError::UnverifiedHandle(_))
+    ));
+}
+
+#[tokio::test]
+async fn login_allowlist_handles_resolve_to_verified_dids() {
+    let backend = FakeIdentityBackend {
+        dns: HashMap::from([("alice.test".into(), "did:plc:alice".into())]),
+        ..Default::default()
+    }
+    .with_document(document("did:plc:alice", &["alice.test"]));
+    let resolver = IdentityResolver::new(backend, Duration::from_secs(30));
+    let entries = vec![" @ALICE.test ".to_owned(), "did:plc:bob".to_owned()];
+
+    let allowed = resolve_login_allowlist(&entries, &resolver).await.unwrap();
+
+    assert_eq!(
+        allowed,
+        std::collections::HashSet::from(["did:plc:alice".to_owned(), "did:plc:bob".to_owned()])
+    );
+}
+
+#[tokio::test]
+async fn login_allowlist_rejects_a_handle_without_bidirectional_verification() {
+    let backend = FakeIdentityBackend {
+        dns: HashMap::from([("alice.test".into(), "did:plc:alice".into())]),
+        ..Default::default()
+    }
+    .with_document(document("did:plc:alice", &["other.test"]));
+    let resolver = IdentityResolver::new(backend, Duration::from_secs(30));
+
+    assert!(matches!(
+        resolve_login_allowlist(&["alice.test".to_owned()], &resolver).await,
         Err(ResolutionError::UnverifiedHandle(_))
     ));
 }
