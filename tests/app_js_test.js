@@ -8,6 +8,14 @@ function assertEquals(actual, expected) {
   assert(actual === expected, `expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
 }
 
+Deno.test("empty composer status messages do not render status bars", async () => {
+  const css = await Deno.readTextFile(new URL("../static/app.css", import.meta.url));
+  assert(
+    /\.composer\s+\[role="status"\]:empty\s*\{\s*display:\s*none;\s*\}/.test(css),
+    "empty status elements inside the composer should be hidden",
+  );
+});
+
 Deno.test("like handler fills the heart and clears it when unliked", async () => {
   const listeners = new Map();
   const documentMock = {
