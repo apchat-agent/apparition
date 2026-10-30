@@ -2103,6 +2103,10 @@ a.quoted-post-card:hover,
     display: none;
   }
 
+  body:has(.mobile-nav):has(.reply-composer) .mobile-compose {
+    display: none;
+  }
+
   body:has(.mobile-nav) .reply-composer {
     position: fixed;
     z-index: 6;
