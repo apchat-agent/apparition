@@ -87,7 +87,7 @@ const PROFILE_NEGATIVE_TTL: Duration = Duration::from_secs(60 * 60);
 const PAGE_PROFILE_BUDGET: Duration = Duration::from_millis(1500);
 const PAGE_PROFILE_CONCURRENCY: usize = 8;
 const PAGE_QUOTE_CONCURRENCY: usize = 16;
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m20";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m21";
 const WEB_SCRIPT_URL: &str = "/static/app.js?v=js16";
 const HLS_SCRIPT_URL: &str = "/static/vendor/hls.min.js?v=1.7.3";
 const ALT_MODEL_DOWNLOAD_BYTES: u64 = 264_713_119;
@@ -6467,18 +6467,18 @@ where
     } else {
         String::new()
     };
-    let content = render_profile_page_content(
-        &profile,
+    let content = render_profile_page_content(ProfilePageContent {
+        profile: &profile,
         display_name,
-        &handle,
-        &follows_you,
-        &label_chips,
-        &action_html,
-        &description,
-        &stats,
-        &posts,
-        &older,
-    );
+        handle: &handle,
+        follows_you,
+        label_chips: &label_chips,
+        action_html: &action_html,
+        description: &description,
+        stats: &stats,
+        posts: &posts,
+        older: &older,
+    });
     let response = Html(page_shell_with_feeds_and_badge(
         display_name,
         &content,
@@ -6493,21 +6493,35 @@ where
     response
 }
 
-fn render_profile_page_content(
-    profile: &Value,
-    display_name: &str,
-    handle: &str,
-    follows_you: &str,
-    label_chips: &str,
-    action_html: &str,
-    description: &str,
-    stats: &str,
-    posts: &str,
-    older: &str,
-) -> String {
+struct ProfilePageContent<'a> {
+    profile: &'a Value,
+    display_name: &'a str,
+    handle: &'a str,
+    follows_you: &'a str,
+    label_chips: &'a str,
+    action_html: &'a str,
+    description: &'a str,
+    stats: &'a str,
+    posts: &'a str,
+    older: &'a str,
+}
+
+fn render_profile_page_content(page: ProfilePageContent<'_>) -> String {
+    let ProfilePageContent {
+        profile,
+        display_name,
+        handle,
+        follows_you,
+        label_chips,
+        action_html,
+        description,
+        stats,
+        posts,
+        older,
+    } = page;
     let banner = profile_banner_markup(profile);
     format!(
-        "<section class=\"profile-header\">{banner}<div class=\"profile-card\"><div class=\"profile-heading-row\"><div class=\"profile-identity\">{}<div class=\"profile-identity-copy\"><h1>{}</h1><p class=\"profile-handle\">@{}</p>{follows_you}<div class=\"profile-labels\">{label_chips}</div></div></div>{action_html}</div><div class=\"profile-description-stats\">{description}<div class=\"profile-stats\">{stats}</div></div></div></section><header class=\"section-heading\"><h2>Posts</h2></header><ol class=\"post-list\">{posts}</ol>{older}",
+        "<section class=\"profile-header\">{banner}<div class=\"profile-avatar-row\">{}</div><div class=\"profile-card\"><div class=\"profile-identity-copy\"><h1>{}</h1><p class=\"profile-handle\">@{}</p>{follows_you}<div class=\"profile-labels\">{label_chips}</div></div><div class=\"profile-description-stats\">{description}<div class=\"profile-stats\">{stats}</div></div>{action_html}</div></section><header class=\"section-heading\"><h2>Posts</h2></header><ol class=\"post-list\">{posts}</ol>{older}",
         avatar_markup(profile, "profile-avatar"),
         html_escape(display_name),
         html_escape(handle),
@@ -10790,18 +10804,18 @@ mod tests {
             .into_iter()
             .flatten()
             .collect::<String>();
-            let content = render_profile_page_content(
-                &profile,
+            let content = render_profile_page_content(ProfilePageContent {
+                profile: &profile,
                 display_name,
                 handle,
-                "<span class=\"follows-you-pill\">Follows you</span>",
-                &labels,
-                &actions,
-                &description,
-                &stats,
-                "<li class=\"empty-state\">No indexed posts yet.</li>",
-                "",
-            );
+                follows_you: "<span class=\"follows-you-pill\">Follows you</span>",
+                label_chips: &labels,
+                action_html: &actions,
+                description: &description,
+                stats: &stats,
+                posts: "<li class=\"empty-state\">No indexed posts yet.</li>",
+                older: "",
+            });
             let html =
                 page_shell_with_feeds_and_badge(display_name, &content, true, &[], None, false, 0)
                     // Keep all browser-fixture traffic local while exercising production markup.
@@ -11425,7 +11439,7 @@ mod tests {
         assert!(css.contains(".thread-focus-actions .is-liked .icon {\n  fill: var(--accent);"));
         assert!(css.contains(".infinite-scroll-status {"));
         assert!(css.contains(".infinite-scroll-retry[hidden] {\n  display: none;"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m20"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m21"));
         assert!(WEB_SCRIPT_URL.contains("v=js16"));
     }
 
@@ -11444,7 +11458,7 @@ mod tests {
         ));
         assert!(css.contains("bottom: var(--mobile-compose-clearance);"));
         assert!(css.contains("padding-bottom: max(4.25rem, var(--mobile-compose-clearance));"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m20"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m21"));
     }
 
     #[test]
