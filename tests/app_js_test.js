@@ -123,6 +123,18 @@ Deno.test("composer expands, opens link entry, grows its text area, and warns ne
   }
 });
 
+Deno.test("phone navigation and post actions keep 44-pixel tap targets", async () => {
+  const css = await Deno.readTextFile(new URL("../static/app.css", import.meta.url));
+  const declarations = (selector) => {
+    const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return [...css.matchAll(new RegExp(`${escaped}\\s*\\{([^}]*)\\}`, "g"))].map((match) => match[1]).at(-1) || "";
+  };
+  assert(/min-height:\s*44px/.test(declarations(".post-action")), "post action buttons should be at least 44 pixels tall");
+  assert(css.includes(".feed-tabs,\n.feed-tab {\n  min-height: 2.75rem;"), "feed tabs should meet the 44-pixel target");
+  assert(css.includes("body:has(.mobile-nav) .mobile-nav a,\nbody:has(.mobile-nav) .mobile-nav button {\n    min-height: 44px;"));
+  assert(/width:\s*44px;[\s\S]*?height:\s*44px;/.test(declarations(".profile-overflow-trigger")));
+});
+
 Deno.test("like handler fills the heart and clears it when unliked", async () => {
   const listeners = new Map();
   const documentMock = {
