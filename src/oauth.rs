@@ -111,9 +111,9 @@ const OAUTH_STORE_WRITER_BATCH_SIZE: usize = 64;
 const OAUTH_STORE_WRITER_BATCH_DELAY: Duration = Duration::from_millis(5);
 const OAUTH_STORE_WRITER_METRICS_INTERVAL: Duration = Duration::from_secs(60);
 static NEXT_OAUTH_MEMORY_DATABASE_ID: AtomicUsize = AtomicUsize::new(1);
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m37";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m38";
 const WEB_SCRIPT_URL: &str = "/static/app.js?v=js22";
-const WEB_NOJS_STYLESHEET_URL: &str = "/static/nojs.css?v=m37";
+const WEB_NOJS_STYLESHEET_URL: &str = "/static/nojs.css?v=m38";
 const HLS_SCRIPT_URL: &str = "/static/vendor/hls.min.js?v=1.7.3";
 const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
 const SAVED_FEED_CACHE_PREFIX: &str = "saved-feed-preferences:";
@@ -14592,7 +14592,7 @@ mod tests {
         assert!(css.contains(".thread-focus-actions .is-liked .icon {\n  fill: var(--accent);"));
         assert!(css.contains(".infinite-scroll-status {"));
         assert!(css.contains(".infinite-scroll-retry[hidden] {\n  display: none;"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m37"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m38"));
         assert!(WEB_SCRIPT_URL.contains("v=js22"));
     }
 
@@ -14600,7 +14600,9 @@ mod tests {
     fn profile_block_lists_link_icon_has_a_size() {
         // Without one the inline SVG takes the 300x150 default and the button is huge (owner, 2026-10-30).
         let css = include_str!("../static/app.css");
-        assert!(css.contains(".profile-block-lists-link .icon {\n  width: 1.1rem;\n  height: 1.1rem;"));
+        assert!(
+            css.contains(".profile-block-lists-link .icon {\n  width: 1.1rem;\n  height: 1.1rem;")
+        );
     }
 
     #[test]
@@ -14620,7 +14622,7 @@ mod tests {
         ));
         assert!(css.contains("bottom: var(--mobile-compose-clearance);"));
         assert!(css.contains("padding-bottom: max(4.25rem, var(--mobile-compose-clearance));"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m37"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m38"));
     }
 
     #[test]
@@ -14804,7 +14806,7 @@ mod tests {
         let head = page_shell("Write a post", "", true);
         assert!(
             head.contains(
-                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m37\"></noscript>"
+                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m38\"></noscript>"
             ),
             "the head must restore the full form for no-JS visitors: {head}"
         );
@@ -17703,8 +17705,8 @@ mod tests {
             css_declaration(body, "color").as_deref(),
             Some("var(--muted)")
         );
-        assert!(WEB_STYLESHEET_URL.contains("v=m37"));
-        assert!(WEB_NOJS_STYLESHEET_URL.contains("v=m37"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m38"));
+        assert!(WEB_NOJS_STYLESHEET_URL.contains("v=m38"));
     }
 
     #[test]
@@ -17736,7 +17738,7 @@ mod tests {
             css.find(".post-text a.post-text-link {") > css.find(".post-text a {"),
             "the accent rule must come after `.post-text a {{` so it wins the cascade"
         );
-        assert!(WEB_STYLESHEET_URL.contains("v=m37"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m38"));
     }
 }
 

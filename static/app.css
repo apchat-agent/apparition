@@ -1755,6 +1755,12 @@ a.quoted-post-card:hover,
   white-space: nowrap;
 }
 
+.profile-block-lists-link .icon {
+  width: 1.1rem;
+  height: 1.1rem;
+  flex: none;
+}
+
 .profile-overflow-trigger {
   display: grid;
   width: 44px;
