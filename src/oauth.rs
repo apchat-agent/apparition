@@ -111,9 +111,9 @@ const OAUTH_STORE_WRITER_BATCH_SIZE: usize = 64;
 const OAUTH_STORE_WRITER_BATCH_DELAY: Duration = Duration::from_millis(5);
 const OAUTH_STORE_WRITER_METRICS_INTERVAL: Duration = Duration::from_secs(60);
 static NEXT_OAUTH_MEMORY_DATABASE_ID: AtomicUsize = AtomicUsize::new(1);
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m36";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m37";
 const WEB_SCRIPT_URL: &str = "/static/app.js?v=js22";
-const WEB_NOJS_STYLESHEET_URL: &str = "/static/nojs.css?v=m36";
+const WEB_NOJS_STYLESHEET_URL: &str = "/static/nojs.css?v=m37";
 const HLS_SCRIPT_URL: &str = "/static/vendor/hls.min.js?v=1.7.3";
 const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
 const SAVED_FEED_CACHE_PREFIX: &str = "saved-feed-preferences:";
@@ -8332,7 +8332,8 @@ where
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
     };
     let action_html = if subject == did {
-        String::new()
+        // The mobile nav has no room for a fifth link; the owner asked for it here (2026-10-30).
+        "<section class=\"profile-self-links\" aria-label=\"Your settings\"><div class=\"profile-control-row\"><a class=\"profile-block-lists-link\" href=\"/app/block-lists\"><svg class=\"icon\" aria-hidden=\"true\" focusable=\"false\"><use href=\"#i-block-lists\"></use></svg><span>Block lists</span></a></div></section>".to_owned()
     } else {
         let mut action_timing = ProfileActionTiming::default();
         let action_started = std::time::Instant::now();
@@ -14591,7 +14592,7 @@ mod tests {
         assert!(css.contains(".thread-focus-actions .is-liked .icon {\n  fill: var(--accent);"));
         assert!(css.contains(".infinite-scroll-status {"));
         assert!(css.contains(".infinite-scroll-retry[hidden] {\n  display: none;"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m36"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m37"));
         assert!(WEB_SCRIPT_URL.contains("v=js22"));
     }
 
@@ -14612,7 +14613,7 @@ mod tests {
         ));
         assert!(css.contains("bottom: var(--mobile-compose-clearance);"));
         assert!(css.contains("padding-bottom: max(4.25rem, var(--mobile-compose-clearance));"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m36"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m37"));
     }
 
     #[test]
@@ -14796,7 +14797,7 @@ mod tests {
         let head = page_shell("Write a post", "", true);
         assert!(
             head.contains(
-                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m36\"></noscript>"
+                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m37\"></noscript>"
             ),
             "the head must restore the full form for no-JS visitors: {head}"
         );
@@ -17695,8 +17696,8 @@ mod tests {
             css_declaration(body, "color").as_deref(),
             Some("var(--muted)")
         );
-        assert!(WEB_STYLESHEET_URL.contains("v=m36"));
-        assert!(WEB_NOJS_STYLESHEET_URL.contains("v=m36"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m37"));
+        assert!(WEB_NOJS_STYLESHEET_URL.contains("v=m37"));
     }
 
     #[test]
@@ -17728,7 +17729,7 @@ mod tests {
             css.find(".post-text a.post-text-link {") > css.find(".post-text a {"),
             "the accent rule must come after `.post-text a {{` so it wins the cascade"
         );
-        assert!(WEB_STYLESHEET_URL.contains("v=m36"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m37"));
     }
 }
 
