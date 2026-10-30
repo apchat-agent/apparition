@@ -214,6 +214,247 @@ impl ProfileCountsClient {
     }
 }
 
+/// How long a `web_cache` relationship confirmation stays authoritative before
+/// a profile page may serve the stored rows again and refresh in the
+/// background.
+pub const RELATIONSHIP_CONFIRMATION_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const MAX_RELATIONSHIP_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_RELATIONSHIP_RESPONSE_BYTES: usize = 1024 * 1024;
+
+pub fn relationship_cache_key(viewer: &str, subject: &str) -> String {
+    format!("rel:{viewer}:{subject}")
+}
+
+pub(crate) fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or_default()
+}
+
+/// What one `app.bsky.graph.getRelationships` response says about a
+/// `(viewer, subject)` pair, read from `relationships[0]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RelationshipState {
+    /// `true` when `followedBy` is a non-null object (the subject follows the viewer).
+    pub followed_by: bool,
+    /// `Some(true)`/`Some(false)` when the response answers whether the viewer
+    /// follows the subject; `None` when the `follows` field is absent.
+    pub following: Option<bool>,
+}
+
+#[derive(Clone)]
+pub struct RelationshipClient {
+    http: SafeHttpClient,
+    public_appview_base: String,
+    timeout: Duration,
+    enabled: bool,
+    in_progress: Arc<Mutex<HashSet<String>>>,
+    persistence: Option<crate::oauth::SqliteOAuthStore>,
+}
+
+/// Clears the client's in-progress marker for one pair when dropped, so a
+/// refresh whose caller or task died mid-flight cannot strand the key.
+pub struct RelationshipRefreshGuard {
+    in_progress: Arc<Mutex<HashSet<String>>>,
+    key: String,
+}
+
+impl Drop for RelationshipRefreshGuard {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.in_progress.lock() {
+            pending.remove(&self.key);
+        }
+    }
+}
+
+impl RelationshipClient {
+    pub fn new(http: SafeHttpClient, public_appview_base: impl Into<String>) -> Self {
+        Self {
+            http,
+            public_appview_base: format!("{}/", public_appview_base.into().trim_end_matches('/')),
+            timeout: Duration::from_millis(1500),
+            enabled: true,
+            in_progress: Arc::new(Mutex::new(HashSet::new())),
+            persistence: None,
+        }
+    }
+
+    /// Set the wait budget for an unconfirmed pair. Requests always stay under 3 s.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout.min(MAX_RELATIONSHIP_TIMEOUT);
+        self
+    }
+
+    /// Never ask the public appview: profile pages answer from their own rows.
+    pub fn local_only() -> Self {
+        Self {
+            http: SafeHttpClient::new(),
+            public_appview_base: PUBLIC_APPVIEW_BASE.to_owned(),
+            timeout: Duration::from_millis(1500),
+            enabled: false,
+            in_progress: Arc::new(Mutex::new(HashSet::new())),
+            persistence: None,
+        }
+    }
+
+    /// Keep confirmations in the OAuth `web_cache` table so they survive restarts.
+    pub fn with_store(mut self, store: crate::oauth::SqliteOAuthStore) -> Self {
+        self.persistence = Some(store);
+        self
+    }
+
+    pub fn relationships_available(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    pub fn begin_refresh(&self, key: &str) -> bool {
+        let Ok(mut pending) = self.in_progress.lock() else {
+            return false;
+        };
+        pending.insert(key.to_owned())
+    }
+
+    pub fn refresh_guard(&self, key: &str) -> RelationshipRefreshGuard {
+        RelationshipRefreshGuard {
+            in_progress: self.in_progress.clone(),
+            key: key.to_owned(),
+        }
+    }
+
+    /// The `web_cache` confirmation timestamp for this pair, if any.
+    pub async fn load_confirmation(
+        &self,
+        viewer: &str,
+        subject: &str,
+    ) -> Result<Option<i64>, String> {
+        let Some(store) = &self.persistence else {
+            return Ok(None);
+        };
+        let key = relationship_cache_key(viewer, subject);
+        let entry = match store.web_cache_get(&key).await? {
+            Some(entry) => entry,
+            None => return Ok(None),
+        };
+        let parsed: Value = serde_json::from_str(&entry.0).map_err(|error| error.to_string())?;
+        if parsed.get("followedBy").and_then(Value::as_bool).is_none() {
+            return Ok(None);
+        }
+        Ok(Some(entry.1))
+    }
+
+    pub fn record_confirmation(&self, viewer: &str, subject: &str, followed_by: bool) {
+        let Some(store) = &self.persistence else {
+            return;
+        };
+        let key = relationship_cache_key(viewer, subject);
+        let value = serde_json::json!({"followedBy": followed_by}).to_string();
+        if let Err(error) = store.web_cache_set(&key, &value) {
+            tracing::debug!(
+                viewer,
+                subject,
+                error = %error,
+                "could not persist the follows-you relationship confirmation"
+            );
+        }
+    }
+
+    pub async fn fetch_relationship(
+        &self,
+        viewer: &str,
+        subject: &str,
+    ) -> Result<RelationshipState, String> {
+        if !self.enabled {
+            return Err("relationship confirmation is not configured".to_owned());
+        }
+        let mut url = url::Url::parse(&format!(
+            "{}app.bsky.graph.getRelationships",
+            self.public_appview_base
+        ))
+        .map_err(|error| error.to_string())?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("actor", viewer);
+            query.append_pair("others", subject);
+        }
+        let response = tokio::time::timeout(
+            self.timeout,
+            self.http.get_with_limits(
+                &url,
+                HeaderMap::new(),
+                MAX_RELATIONSHIP_RESPONSE_BYTES,
+                0,
+                self.timeout,
+            ),
+        )
+        .await
+        .map_err(|_| "getRelationships request timed out".to_owned())?
+        .map_err(|error| format!("getRelationships request failed: {error}"))?
+        .0;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("app.bsky.graph.getRelationships returned {status}"));
+        }
+        let body: Value = serde_json::from_slice(response.body())
+            .map_err(|error| format!("getRelationships response was not valid JSON: {error}"))?;
+        let relationship = body
+            .get("relationships")
+            .and_then(Value::as_array)
+            .and_then(|relationships| relationships.first())
+            .ok_or_else(|| "getRelationships response had no relationships entry".to_owned())?;
+        Ok(RelationshipState {
+            followed_by: relationship
+                .get("followedBy")
+                .map(|value| !value.is_null())
+                .unwrap_or(false),
+            following: match relationship.get("follows") {
+                None => None,
+                Some(Value::Null) => Some(false),
+                Some(_) => Some(true),
+            },
+        })
+    }
+
+    /// Write what a confirmed relationship says into the viewer's own rows:
+    /// the follower row (actor=subject) always, and the viewer's own row only
+    /// when the response contradicts it. Returns the rows written.
+    pub fn apply_relationship<S: crate::ingest::Storage>(
+        &self,
+        storage: &S,
+        viewer: &str,
+        subject: &str,
+        state: RelationshipState,
+    ) -> Result<u32, String> {
+        let mut rows_written = 0_u32;
+        storage
+            .set_follow(subject, viewer, state.followed_by)
+            .map_err(|error| error.to_string())?;
+        rows_written += 1;
+        if let Some(following) = state.following {
+            let current = storage
+                .is_following(viewer, subject)
+                .map_err(|error| error.to_string())?;
+            if current != following {
+                storage
+                    .set_follow(viewer, subject, following)
+                    .map_err(|error| error.to_string())?;
+                rows_written += 1;
+                tracing::debug!(
+                    viewer,
+                    subject,
+                    following,
+                    "corrected the viewer's own follow row from the relationship response"
+                );
+            }
+        }
+        Ok(rows_written)
+    }
+}
+
 pub fn apply_profile_counts(profile: &mut Value, counts: ProfileCounts) {
     profile["followersCount"] = Value::from(counts.followers);
     profile["followsCount"] = Value::from(counts.following);

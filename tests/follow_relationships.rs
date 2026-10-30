@@ -71,10 +71,12 @@ enum GraphReply {
     DelayNotFollowed(Duration),
 }
 
+type RelationshipQueries = Arc<Mutex<Vec<(String, Vec<String>)>>>;
+
 #[derive(Clone)]
 struct FakeGraph {
     calls: Arc<AtomicUsize>,
-    queries: Arc<Mutex<Vec<(String, Vec<String>)>>>,
+    queries: RelationshipQueries,
     reply: Arc<Mutex<GraphReply>>,
 }
 

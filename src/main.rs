@@ -13,7 +13,7 @@ use appview_rs::{
     jwt::ServiceJwtVerifier,
     net::SafeHttpClient,
     oauth::{OAuthPublic, ProfileRefreshWorker, SqliteOAuthStore, WebShutdown},
-    profile_counts::{PUBLIC_APPVIEW_BASE, ProfileCountsClient},
+    profile_counts::{PUBLIC_APPVIEW_BASE, ProfileCountsClient, RelationshipClient},
 };
 use std::{
     error::Error, future::IntoFuture, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration,
@@ -50,7 +50,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         })?;
     let oauth = oauth.with_login_allowlist(allowed_dids);
     let oauth_flow = oauth
-        .atrium_flow(oauth_identity_resolver.clone(), oauth_store)
+        .atrium_flow(oauth_identity_resolver.clone(), oauth_store.clone())
         .map_err(std::io::Error::other)?;
     let profile_refresh_worker =
         ProfileRefreshWorker::new(oauth_flow.clone(), storage.clone(), Duration::from_secs(2));
@@ -82,12 +82,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         PUBLIC_APPVIEW_BASE,
         Duration::from_secs(config.profile_counts_cache_ttl_secs),
     );
+    let relationships =
+        RelationshipClient::new(SafeHttpClient::new(), PUBLIC_APPVIEW_BASE).with_store(oauth_store);
     let app_router = oauth
-        .router_with_flow_and_shutdown_and_profile_counts(
+        .router_with_flow_and_shutdown_and_profile_counts_and_relationships(
             oauth_flow.clone(),
             storage.clone(),
             web_shutdown.clone(),
             profile_counts.clone(),
+            relationships,
         )
         .merge(api_router_with_https_and_profile_counts(
             storage.clone(),

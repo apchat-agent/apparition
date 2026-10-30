@@ -15,7 +15,9 @@ use crate::{
         current_outbound_call_snapshot, with_request_outbound_accounting,
     },
     profile_counts::{
-        LABELLED_APPVIEW_BASE, PUBLIC_APPVIEW_BASE, ProfileCountsClient, apply_profile_counts,
+        LABELLED_APPVIEW_BASE, PUBLIC_APPVIEW_BASE, ProfileCountsClient,
+        RELATIONSHIP_CONFIRMATION_TTL, RelationshipClient, apply_profile_counts, now_millis,
+        relationship_cache_key,
     },
 };
 use atrium_api::{
@@ -848,6 +850,7 @@ pub struct OAuthWebState<F, S> {
     pub flow: F,
     pub storage: Arc<S>,
     profile_counts: ProfileCountsClient,
+    relationships: RelationshipClient,
     link_card_fetcher: LinkCardFetcher,
     feed_page_cache: FeedPageCache,
     block_lists: Arc<BlockListCache>,
@@ -1078,11 +1081,33 @@ impl OAuthPublic {
         F: OAuthFlow,
         S: Storage + 'static,
     {
+        self.router_with_flow_and_shutdown_and_profile_counts_and_relationships(
+            flow,
+            storage,
+            shutdown,
+            profile_counts,
+            RelationshipClient::local_only(),
+        )
+    }
+
+    pub fn router_with_flow_and_shutdown_and_profile_counts_and_relationships<F, S>(
+        &self,
+        flow: F,
+        storage: Arc<S>,
+        shutdown: WebShutdown,
+        profile_counts: ProfileCountsClient,
+        relationships: RelationshipClient,
+    ) -> Router
+    where
+        F: OAuthFlow,
+        S: Storage + 'static,
+    {
         let state = Arc::new(OAuthWebState {
             public: self.clone(),
             flow,
             storage,
             profile_counts,
+            relationships,
             link_card_fetcher: LinkCardFetcher::new(),
             shutdown,
             feed_page_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -5229,6 +5254,10 @@ struct WebPageTiming {
     quote_hydration_ms: u64,
     account_labels_ms: u64,
     profile_counts_ms: u64,
+    relationship_ms: u64,
+    relationship_requests: u32,
+    relationship_rows_written: u32,
+    relationship_answer: &'static str,
     profile_action_panel_ms: u64,
     profile_action_mutes_ms: u64,
     profile_list_choices_ms: u64,
@@ -5259,6 +5288,10 @@ impl WebPageTiming {
             quote_hydration_ms: 0,
             account_labels_ms: 0,
             profile_counts_ms: 0,
+            relationship_ms: 0,
+            relationship_requests: 0,
+            relationship_rows_written: 0,
+            relationship_answer: "none",
             profile_action_panel_ms: 0,
             profile_action_mutes_ms: 0,
             profile_list_choices_ms: 0,
@@ -5296,6 +5329,7 @@ impl Drop for WebPageTiming {
             .saturating_add(self.parent_hydration_ms)
             .saturating_add(self.content_hydration_ms)
             .saturating_add(self.profile_counts_ms)
+            .saturating_add(self.relationship_ms)
             .saturating_add(self.profile_action_panel_ms)
             .saturating_add(self.render_ms);
         let phase_gap_ms = total_ms as i64 - phase_sum_ms as i64;
@@ -5318,6 +5352,10 @@ impl Drop for WebPageTiming {
             quote_hydration_ms = self.quote_hydration_ms,
             account_labels_ms = self.account_labels_ms,
             profile_counts_ms = self.profile_counts_ms,
+            relationship_ms = self.relationship_ms,
+            relationship_requests = self.relationship_requests,
+            relationship_rows_written = self.relationship_rows_written,
+            relationship_answer = self.relationship_answer,
             profile_action_panel_ms = self.profile_action_panel_ms,
             profile_action_mutes_ms = self.profile_action_mutes_ms,
             profile_list_choices_ms = self.profile_list_choices_ms,
@@ -8231,6 +8269,147 @@ fn profile_action_form(
     )
 }
 
+/// Decide whether a profile shows "Follows you" from the viewer's own
+/// `follows` rows, confirmed by `app.bsky.graph.getRelationships` before the
+/// first render for a pair. The stored rows drive every fallback path: a
+/// confirmed pair answers from them, a stale confirmation serves them and
+/// refreshes once in the background, and any fetch failure keeps them and only
+/// warns. Confirmations live in the persistent `web_cache` keyed per pair so a
+/// restart cannot make the user re-confirm.
+async fn confirm_follows_you<S>(
+    relationships: &RelationshipClient,
+    storage: Arc<S>,
+    viewer: &str,
+    subject: &str,
+    timing: &mut WebPageTiming,
+) -> Result<bool, String>
+where
+    S: Storage + 'static,
+{
+    let started = std::time::Instant::now();
+    let stored = storage
+        .is_following(subject, viewer)
+        .map_err(|error| error.to_string())?;
+    let mut answer = stored;
+    let mut label = "none";
+    if relationships.relationships_available() {
+        let key = relationship_cache_key(viewer, subject);
+        let confirmed_at_ms = relationships.load_confirmation(viewer, subject).await?;
+        let ttl_ms = RELATIONSHIP_CONFIRMATION_TTL.as_millis() as i64;
+        let stale = confirmed_at_ms
+            .map(|at_ms| now_millis().saturating_sub(at_ms) >= ttl_ms)
+            .unwrap_or(false);
+        match confirmed_at_ms {
+            Some(_) if stale => {
+                label = "stale";
+                if relationships.begin_refresh(&key) {
+                    let relationships = relationships.clone();
+                    let storage = storage.clone();
+                    let viewer = viewer.to_owned();
+                    let subject = subject.to_owned();
+                    let dispatcher =
+                        tracing::dispatcher::get_default(|dispatcher| dispatcher.clone());
+                    // The task owns the in-progress cleanup through the guard, so a
+                    // refresh interrupted mid-flight cannot strand the pair.
+                    tokio::spawn(
+                        async move {
+                            let _guard = relationships.refresh_guard(&key);
+                            match tokio::time::timeout(
+                                relationships.timeout(),
+                                relationships.fetch_relationship(&viewer, &subject),
+                            )
+                            .await
+                            {
+                                Ok(Ok(state)) => {
+                                    match relationships.apply_relationship(
+                                        storage.as_ref(),
+                                        &viewer,
+                                        &subject,
+                                        state,
+                                    ) {
+                                        Ok(rows) => {
+                                            relationships
+                                                .record_confirmation(&viewer, &subject, state.followed_by);
+                                            tracing::debug!(
+                                                viewer = %viewer,
+                                                subject = %subject,
+                                                relationship_rows_written = rows,
+                                                "follows-you relationship refreshed in the background"
+                                            );
+                                        }
+                                        Err(error) => tracing::warn!(
+                                            viewer = %viewer,
+                                            subject = %subject,
+                                            error = %error,
+                                            "follows-you background relationship rows failed; keeping the stored answer"
+                                        ),
+                                    }
+                                }
+                                Ok(Err(error)) => tracing::warn!(
+                                    viewer = %viewer,
+                                    subject = %subject,
+                                    error = %error,
+                                    "follows-you background relationship refresh failed; keeping the stored answer"
+                                ),
+                                Err(_) => tracing::warn!(
+                                    viewer = %viewer,
+                                    subject = %subject,
+                                    "follows-you background relationship refresh timed out; keeping the stored answer"
+                                ),
+                            }
+                        }
+                        .with_subscriber(dispatcher),
+                    );
+                }
+            }
+            Some(_) => label = "fresh",
+            None => {
+                timing.relationship_requests += 1;
+                match tokio::time::timeout(
+                    relationships.timeout(),
+                    relationships.fetch_relationship(viewer, subject),
+                )
+                .await
+                {
+                    Ok(Ok(state)) => {
+                        let rows = relationships.apply_relationship(
+                            storage.as_ref(),
+                            viewer,
+                            subject,
+                            state,
+                        )?;
+                        relationships.record_confirmation(viewer, subject, state.followed_by);
+                        timing.relationship_rows_written += rows;
+                        label = "confirmed";
+                        answer = state.followed_by;
+                    }
+                    Ok(Err(error)) => {
+                        label = "failed";
+                        tracing::warn!(
+                            viewer = %viewer,
+                            subject = %subject,
+                            error = %error,
+                            "follows-you relationship confirmation failed; serving the stored answer"
+                        );
+                    }
+                    Err(_) => {
+                        label = "failed";
+                        tracing::warn!(
+                            viewer = %viewer,
+                            subject = %subject,
+                            error = "getRelationships request timed out",
+                            "follows-you relationship confirmation timed out; serving the stored answer"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    timing.relationship_answer = label;
+    timing.relationship_ms = started.elapsed().as_millis() as u64;
+    Ok(answer)
+}
+
 async fn profile_page<F, S>(
     State(state): State<Arc<OAuthWebState<F, S>>>,
     headers: HeaderMap,
@@ -8332,10 +8511,14 @@ where
         .unwrap_or(&handle);
     let label_chips = render_account_label_chips(&quote_index.account_labels, subject);
     let follows_you = if subject != did {
-        state
-            .storage
-            .is_following(subject, &did)
-            .map_err(|error| error.to_string())
+        confirm_follows_you(
+            &state.relationships,
+            state.storage.clone(),
+            &did,
+            subject,
+            &mut page_timing,
+        )
+        .await
     } else {
         Ok(false)
     };
