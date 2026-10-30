@@ -568,16 +568,8 @@ textarea:focus-visible {
   display: none;
 }
 
-.composer.is-enhanced.is-collapsed .composer-input-row {
-  grid-template-columns: 40px minmax(0, 1fr);
-  gap: 0.65rem;
-}
-
-.composer.is-enhanced.is-collapsed .composer-avatar {
-  width: 40px;
-  height: 40px;
-}
-
+/* The collapsed start state keeps the server-rendered avatar size and input-row column (owner,
+   2026-10-30: the avatar must not resize when app.js adds is-enhanced is-collapsed). */
 .composer.is-enhanced.is-collapsed .composer-input-row textarea {
   min-height: 44px;
   padding-block: 0.45rem;
@@ -2482,8 +2474,11 @@ a.quoted-post-card:hover,
     padding-bottom: 5.5rem;
   }
 
+  /* The bar arrives early in <body> (so an early paint already shows it) and is ordered back to the
+     bottom of this flex column; the layout keeps the default order 0. */
   body:has(.mobile-nav) .mobile-nav {
     position: static;
+    order: 1;
     flex: 0 0 auto;
   }
 

@@ -104,7 +104,7 @@ const OAUTH_STORE_WRITER_BATCH_SIZE: usize = 64;
 const OAUTH_STORE_WRITER_BATCH_DELAY: Duration = Duration::from_millis(5);
 const OAUTH_STORE_WRITER_METRICS_INTERVAL: Duration = Duration::from_secs(60);
 static NEXT_OAUTH_MEMORY_DATABASE_ID: AtomicUsize = AtomicUsize::new(1);
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m27";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m28";
 const WEB_SCRIPT_URL: &str = "/static/app.js?v=js19";
 const HLS_SCRIPT_URL: &str = "/static/vendor/hls.min.js?v=1.7.3";
 const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
@@ -4656,7 +4656,7 @@ fn page_shell_with_options(
         "app-layout guest-layout"
     };
     format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\"><title>{}</title><link rel=\"stylesheet\" href=\"{}\"><script src=\"{}\" defer></script><script src=\"{}\" defer></script></head><body>{}<a class=\"skip-link\" href=\"#main-content\">Skip to content</a><div class=\"{layout}\"><aside class=\"left-sidebar\"><a class=\"brand\" href=\"/app\">AppView</a>{navigation}</aside><div class=\"center-column\"><header class=\"center-sticky\">{tabs}</header><main id=\"main-content\" class=\"page-content\">{content}</main></div>{right_sidebar}</div>{mobile_navigation}</body></html>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\"><title>{}</title><link rel=\"stylesheet\" href=\"{}\"><script src=\"{}\" defer></script><script src=\"{}\" defer></script></head><body>{}<a class=\"skip-link\" href=\"#main-content\">Skip to content</a>{mobile_navigation}<div class=\"{layout}\"><aside class=\"left-sidebar\"><a class=\"brand\" href=\"/app\">AppView</a>{navigation}</aside><div class=\"center-column\"><header class=\"center-sticky\">{tabs}</header><main id=\"main-content\" class=\"page-content\">{content}</main></div>{right_sidebar}</div></body></html>",
         html_escape(title),
         WEB_STYLESHEET_URL,
         HLS_SCRIPT_URL,
@@ -13224,7 +13224,7 @@ mod tests {
         assert!(css.contains(".thread-focus-actions .is-liked .icon {\n  fill: var(--accent);"));
         assert!(css.contains(".infinite-scroll-status {"));
         assert!(css.contains(".infinite-scroll-retry[hidden] {\n  display: none;"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m27"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m28"));
         assert!(WEB_SCRIPT_URL.contains("v=js19"));
     }
 
@@ -13245,7 +13245,7 @@ mod tests {
         ));
         assert!(css.contains("bottom: var(--mobile-compose-clearance);"));
         assert!(css.contains("padding-bottom: max(4.25rem, var(--mobile-compose-clearance));"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m27"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m28"));
     }
 
     fn css_rule_bodies(css: &str, selector: &str) -> Vec<String> {
@@ -13253,12 +13253,12 @@ mod tests {
         let mut rest = css;
         while let Some(at) = rest.find(selector) {
             let after = &rest[at + selector.len()..];
-            if let Some(open) = after.find('{') {
-                if after[..open].trim().is_empty() {
-                    let inside = &after[open + 1..];
-                    let close = inside.find('}').unwrap_or(inside.len());
-                    bodies.push(inside[..close].to_owned());
-                }
+            if let Some(open) = after.find('{')
+                && after[..open].trim().is_empty()
+            {
+                let inside = &after[open + 1..];
+                let close = inside.find('}').unwrap_or(inside.len());
+                bodies.push(inside[..close].to_owned());
             }
             rest = after;
         }
