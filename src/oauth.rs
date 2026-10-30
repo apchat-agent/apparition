@@ -104,9 +104,9 @@ const OAUTH_STORE_WRITER_BATCH_SIZE: usize = 64;
 const OAUTH_STORE_WRITER_BATCH_DELAY: Duration = Duration::from_millis(5);
 const OAUTH_STORE_WRITER_METRICS_INTERVAL: Duration = Duration::from_secs(60);
 static NEXT_OAUTH_MEMORY_DATABASE_ID: AtomicUsize = AtomicUsize::new(1);
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m29";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m30";
 const WEB_SCRIPT_URL: &str = "/static/app.js?v=js20";
-const WEB_NOJS_STYLESHEET_URL: &str = "/static/nojs.css?v=m29";
+const WEB_NOJS_STYLESHEET_URL: &str = "/static/nojs.css?v=m30";
 const HLS_SCRIPT_URL: &str = "/static/vendor/hls.min.js?v=1.7.3";
 const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
 const SAVED_FEED_CACHE_PREFIX: &str = "saved-feed-preferences:";
@@ -13241,7 +13241,7 @@ mod tests {
         assert!(css.contains(".thread-focus-actions .is-liked .icon {\n  fill: var(--accent);"));
         assert!(css.contains(".infinite-scroll-status {"));
         assert!(css.contains(".infinite-scroll-retry[hidden] {\n  display: none;"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m29"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m30"));
         assert!(WEB_SCRIPT_URL.contains("v=js20"));
     }
 
@@ -13262,7 +13262,7 @@ mod tests {
         ));
         assert!(css.contains("bottom: var(--mobile-compose-clearance);"));
         assert!(css.contains("padding-bottom: max(4.25rem, var(--mobile-compose-clearance));"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m29"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m30"));
     }
 
     #[test]
@@ -13418,7 +13418,7 @@ mod tests {
         let head = page_shell("Write a post", "", true);
         assert!(
             head.contains(
-                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m29\"></noscript>"
+                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m30\"></noscript>"
             ),
             "the head must restore the full form for no-JS visitors: {head}"
         );
