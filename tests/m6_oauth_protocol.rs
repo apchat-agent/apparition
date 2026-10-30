@@ -99,6 +99,21 @@ struct FakeServerState {
     upload_fail_on: Option<usize>,
     upload_missing_ref_on: Option<usize>,
     create_bodies: Vec<Value>,
+    // Feed-page wiring: when set, com.atproto.repo.getRecord answers for
+    // app.bsky.feed.generator records with this service DID.
+    feed_generator_service_did: Option<String>,
+    // When set, com.atproto.server.getServiceAuth only accepts these access tokens and answers
+    // DPoP error="invalid_token" to every other one.
+    service_auth_valid_access_tokens: Option<Vec<String>>,
+    // When set, app.bsky.feed.getFeedSkeleton only answers when it carries this bearer token.
+    skeleton_required_jwt: Option<String>,
+    // Access token issued by the first (authorization-code) token exchange; defaults to
+    // "access-expired".
+    initial_access_token: Option<String>,
+    // expires_in for the first token exchange; defaults to 0.
+    initial_expires_in: Option<u32>,
+    // Successive access tokens handed out by refresh_token exchanges; "access-fresh" when empty.
+    refresh_access_tokens: std::collections::VecDeque<String>,
 }
 
 #[derive(Clone)]
@@ -1646,19 +1661,83 @@ async fn serve_one(mut stream: TcpStream, origin: &str, state: Arc<Mutex<FakeSer
             }
             "/token" => {
                 state.token_count += 1;
-                let sub = state.token_sub.as_deref().unwrap_or(DID);
-                let scope = state.token_scope.as_deref().unwrap_or("atproto");
+                let sub = state
+                    .token_sub
+                    .as_deref()
+                    .unwrap_or(DID)
+                    .to_owned();
+                let scope = state
+                    .token_scope
+                    .as_deref()
+                    .unwrap_or("atproto")
+                    .to_owned();
                 if request.body.contains("grant_type=refresh_token") {
+                    let access = state
+                        .refresh_access_tokens
+                        .pop_front()
+                        .unwrap_or_else(|| "access-fresh".to_owned());
                     (
                         200,
                         vec![],
-                        json!({"access_token":"access-fresh","refresh_token":"refresh-fresh","token_type":"DPoP","expires_in":3600,"scope":scope,"sub":sub}).to_string(),
+                        json!({"access_token":access,"refresh_token":"refresh-fresh","token_type":"DPoP","expires_in":3600,"scope":scope,"sub":sub}).to_string(),
                     )
                 } else {
+                    let access = state
+                        .initial_access_token
+                        .clone()
+                        .unwrap_or_else(|| "access-expired".to_owned());
+                    let expires_in = state.initial_expires_in.unwrap_or(0);
                     (
                         200,
                         vec![],
-                        json!({"access_token":"access-expired","refresh_token":"refresh-initial","token_type":"DPoP","expires_in":0,"scope":scope,"sub":sub}).to_string(),
+                        json!({"access_token":access,"refresh_token":"refresh-initial","token_type":"DPoP","expires_in":expires_in,"scope":scope,"sub":sub}).to_string(),
+                    )
+                }
+            }
+            path
+                if path.starts_with("/xrpc/com.atproto.server.getServiceAuth")
+                    && state.service_auth_valid_access_tokens.is_some() =>
+            {
+                let valid = state
+                    .service_auth_valid_access_tokens
+                    .clone()
+                    .unwrap_or_default();
+                let authorization = request
+                    .headers
+                    .get("authorization")
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                let token = authorization.trim_start_matches("DPoP ").trim();
+                if valid.iter().any(|valid| valid == token) {
+                    (200, vec![], json!({"token":"for-you-service-jwt"}).to_string())
+                } else {
+                    (
+                        401,
+                        vec![("WWW-Authenticate", "DPoP error=\"invalid_token\"")],
+                        json!({"error":"invalid_token"}).to_string(),
+                    )
+                }
+            }
+            path
+                if path.starts_with("/xrpc/app.bsky.feed.getFeedSkeleton")
+                    && state.skeleton_required_jwt.is_some() =>
+            {
+                let required = state
+                    .skeleton_required_jwt
+                    .clone()
+                    .unwrap_or_default();
+                let authorization = request
+                    .headers
+                    .get("authorization")
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                if authorization == format!("Bearer {required}") {
+                    (200, vec![], json!({"feed":[]}).to_string())
+                } else {
+                    (
+                        403,
+                        vec![],
+                        json!({"error":"AuthenticationRequired","message":"this feed requires service auth"}).to_string(),
                     )
                 }
             }
@@ -1758,7 +1837,24 @@ async fn serve_one(mut stream: TcpStream, origin: &str, state: Arc<Mutex<FakeSer
                 )
             }
             path if path.starts_with("/xrpc/app.bsky.graph.getMutes") => {
-                (200, vec![], json!({"mutes":[]}).to_string())
+                let revoked = state.service_auth_valid_access_tokens.clone().is_some_and(|valid| {
+                    let authorization = request
+                        .headers
+                        .get("authorization")
+                        .map(String::as_str)
+                        .unwrap_or_default();
+                    let token = authorization.trim_start_matches("DPoP ").trim();
+                    !valid.iter().any(|valid| valid == token)
+                });
+                if revoked {
+                    (
+                        401,
+                        vec![("WWW-Authenticate", "DPoP error=\"invalid_token\"")],
+                        json!({"error":"invalid_token"}).to_string(),
+                    )
+                } else {
+                    (200, vec![], json!({"mutes":[]}).to_string())
+                }
             }
             path if path.starts_with("/xrpc/app.bsky.graph.muteActor")
                 || path.starts_with("/xrpc/app.bsky.graph.unmuteActor") =>
@@ -1769,16 +1865,37 @@ async fn serve_one(mut stream: TcpStream, origin: &str, state: Arc<Mutex<FakeSer
                     String::new(),
                 )
             }
-            path if path.starts_with("/xrpc/com.atproto.repo.getRecord") => (
-                200,
-                vec![],
-                json!({
-                    "uri":format!("at://{DID}/app.bsky.actor.profile/self"),
-                    "cid":"bafyreifakeprofile",
-                    "value":{"$type":"app.bsky.actor.profile","displayName":"From fake PDS"}
-                })
-                .to_string(),
-            ),
+            path if path.starts_with("/xrpc/com.atproto.repo.getRecord") => {
+                if state.feed_generator_service_did.is_some()
+                    && path.contains("collection=app.bsky.feed.generator")
+                {
+                    let service_did = state
+                        .feed_generator_service_did
+                        .clone()
+                        .unwrap_or_default();
+                    (
+                        200,
+                        vec![],
+                        json!({
+                            "uri":format!("at://{DID}/app.bsky.feed.generator/for-you"),
+                            "cid":"bafyreifakegenerator",
+                            "value":{"$type":"app.bsky.feed.generator","did":service_did,"displayName":"For you"}
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    (
+                        200,
+                        vec![],
+                        json!({
+                            "uri":format!("at://{DID}/app.bsky.actor.profile/self"),
+                            "cid":"bafyreifakeprofile",
+                            "value":{"$type":"app.bsky.actor.profile","displayName":"From fake PDS"}
+                        })
+                        .to_string(),
+                    )
+                }
+            }
             _ => (404, vec![], json!({"error":"not_found"}).to_string()),
         }
     };
@@ -1935,6 +2052,232 @@ async fn production_post_with_an_empty_video_input_is_accepted() {
             .path
             .starts_with("/xrpc/com.atproto.repo.createRecord")
     }));
+    drop(state);
+    server.abort();
+}
+
+#[derive(Clone)]
+struct MultiDocumentIdentity {
+    documents: Vec<AppDidDocument>,
+}
+
+impl IdentityBackend for MultiDocumentIdentity {
+    async fn did_document(&self, did: &str) -> Result<Option<AppDidDocument>, ResolutionError> {
+        Ok(self
+            .documents
+            .iter()
+            .find(|document| document.id == did)
+            .cloned())
+    }
+
+    async fn dns_txt_did(&self, _: &str) -> Result<Option<String>, ResolutionError> {
+        Ok(None)
+    }
+
+    async fn well_known_did(&self, _: &str) -> Result<Option<String>, ResolutionError> {
+        Ok(None)
+    }
+}
+
+const FEEDGEN_SERVICE_DID: &str = "did:web:feed.bsky.app";
+const FEED_PAGE_URI: &str = "at://did:plc:abcdefghijklmnopqrstuvwx/app.bsky.feed.generator/for-you";
+
+fn encoded_feed_page_uri() -> String {
+    url::form_urlencoded::byte_serialize(FEED_PAGE_URI.as_bytes()).collect()
+}
+
+fn feed_page_request(cookie: &str, cursor: &str) -> Request<Body> {
+    let mut uri = format!("/app/feed?uri={}", encoded_feed_page_uri());
+    if !cursor.is_empty() {
+        uri.push_str(&format!("&cursor={cursor}"));
+    }
+    Request::builder()
+        .uri(uri)
+        .header("cookie", cookie.to_owned())
+        .body(Body::empty())
+        .unwrap()
+}
+
+async fn production_feed_flow(
+    public: OAuthPublic,
+) -> (
+    appview_rs::oauth::AtriumOAuthFlow<MultiDocumentIdentity>,
+    SqliteOAuthStore,
+    Arc<Mutex<FakeServerState>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let origin = format!("http://{address}");
+    let shared = Arc::new(Mutex::new(FakeServerState {
+        token_scope: Some(EXPECTED_OAUTH_SCOPE.to_owned()),
+        initial_access_token: Some("access-initial".to_owned()),
+        initial_expires_in: Some(3600),
+        feed_generator_service_did: Some(FEEDGEN_SERVICE_DID.to_owned()),
+        skeleton_required_jwt: Some("for-you-service-jwt".to_owned()),
+        service_auth_valid_access_tokens: Some(vec![
+            "access-initial".to_owned(),
+            "access-second".to_owned(),
+            "access-third".to_owned(),
+        ]),
+        ..FakeServerState::default()
+    }));
+    let server_state = shared.clone();
+    let server_origin = origin.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let state = server_state.clone();
+            let origin = server_origin.clone();
+            tokio::spawn(async move {
+                serve_one(stream, &origin, state).await;
+            });
+        }
+    });
+
+    let identity = MultiDocumentIdentity {
+        documents: vec![
+            AppDidDocument {
+                id: DID.to_owned(),
+                also_known_as: vec![],
+                verification_method: vec![],
+                service: vec![DidService {
+                    id: "#atproto_pds".to_owned(),
+                    type_name: "AtprotoPersonalDataServer".to_owned(),
+                    service_endpoint: origin.clone(),
+                }],
+            },
+            AppDidDocument {
+                id: FEEDGEN_SERVICE_DID.to_owned(),
+                also_known_as: vec![],
+                verification_method: vec![],
+                service: vec![DidService {
+                    id: "#bsky_fg".to_owned(),
+                    type_name: "BskyFeedGenerator".to_owned(),
+                    service_endpoint: origin.clone(),
+                }],
+            },
+        ],
+    };
+    let resolver = Arc::new(IdentityResolver::new(identity, Duration::from_secs(30)));
+    let store = SqliteOAuthStore::open(":memory:").unwrap();
+    let flow = public
+        .atrium_flow_with_plc_directory(resolver, store.clone(), &format!("{origin}/"))
+        .unwrap();
+    (flow, store, shared, server)
+}
+
+#[tokio::test]
+async fn feed_page_after_the_pds_revokes_the_stored_access_token_refreshes_on_first_load() {
+    let public = OAuthPublic::new("https://appview.example").unwrap();
+    let (flow, _store, shared, server) = production_feed_flow(public.clone()).await;
+    let app = public.router_with_flow(flow, Arc::new(MemoryStorage::default()));
+    let cookie = finish_production_login(&app, &shared).await;
+    assert_eq!(shared.lock().unwrap().token_count, 1);
+
+    // Overnight the PDS started answering invalid_token for the session's stored access token.
+    // The local expires_at is still in the future, so only a forced refresh can recover.
+    shared.lock().unwrap().service_auth_valid_access_tokens =
+        Some(vec!["access-second".to_owned()]);
+    shared
+        .lock()
+        .unwrap()
+        .refresh_access_tokens
+        .push_back("access-second".to_owned());
+
+    let response = app
+        .clone()
+        .oneshot(feed_page_request(&cookie, ""))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the first feed page load after the PDS started answering invalid_token must refresh and succeed with the new token"
+    );
+
+    let state = shared.lock().unwrap();
+    assert_eq!(
+        state.token_count, 2,
+        "the recovery must POST grant_type=refresh_token exactly once"
+    );
+    let service_auth_requests = state
+        .requests
+        .iter()
+        .filter(|request| {
+            request
+                .path
+                .starts_with("/xrpc/com.atproto.server.getServiceAuth")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        service_auth_requests.iter().any(|request| request
+            .headers
+            .get("authorization")
+            .is_some_and(|value| value.as_str() == "DPoP access-second")),
+        "getServiceAuth must be retried with the refreshed access token"
+    );
+    let skeleton = state
+        .requests
+        .iter()
+        .find(|request| {
+            request
+                .path
+                .starts_with("/xrpc/app.bsky.feed.getFeedSkeleton")
+        })
+        .expect("the feed skeleton must be requested");
+    assert_eq!(
+        skeleton.headers.get("authorization").map(String::as_str),
+        Some("Bearer for-you-service-jwt"),
+        "the auth-required feed must not be requested anonymously"
+    );
+    drop(state);
+    server.abort();
+}
+
+#[tokio::test]
+async fn session_cache_never_hands_out_a_pre_refresh_access_token() {
+    let public = OAuthPublic::new("https://appview.example").unwrap();
+    let (flow, _store, shared, server) = production_feed_flow(public.clone()).await;
+    let app = public.router_with_flow(flow, Arc::new(MemoryStorage::default()));
+    let cookie = finish_production_login(&app, &shared).await;
+
+    shared.lock().unwrap().service_auth_valid_access_tokens =
+        Some(vec!["access-second".to_owned()]);
+    shared
+        .lock()
+        .unwrap()
+        .refresh_access_tokens
+        .push_back("access-second".to_owned());
+
+    let response = app
+        .clone()
+        .oneshot(feed_page_request(&cookie, ""))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // The same page load then calls getMutes through restored_session, which reuses the session
+    // cache. After the refresh the cache must hand out the NEW token, never the pre-refresh one.
+    let state = shared.lock().unwrap();
+    let mute_requests = state
+        .requests
+        .iter()
+        .filter(|request| request.path.starts_with("/xrpc/app.bsky.graph.getMutes"))
+        .collect::<Vec<_>>();
+    assert!(
+        !mute_requests.is_empty(),
+        "the feed page must still load the mute list"
+    );
+    for request in &mute_requests {
+        assert_eq!(
+            request.headers.get("authorization").map(String::as_str),
+            Some("DPoP access-second"),
+            "no request after the refresh may replay the revoked access token"
+        );
+    }
     drop(state);
     server.abort();
 }
