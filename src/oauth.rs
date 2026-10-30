@@ -14,7 +14,9 @@ use crate::{
         OutboundCallSnapshot, OutboundCallTimer, RequestOutboundAccounting, SafeHttpClient,
         current_outbound_call_snapshot, with_request_outbound_accounting,
     },
-    profile_counts::{PUBLIC_APPVIEW_BASE, ProfileCountsClient, apply_profile_counts},
+    profile_counts::{
+        LABELLED_APPVIEW_BASE, PUBLIC_APPVIEW_BASE, ProfileCountsClient, apply_profile_counts,
+    },
 };
 use atrium_api::{
     agent::{Agent, CloneWithProxy, Configure, SessionManager},
@@ -1612,6 +1614,8 @@ pub struct AtriumOAuthFlow<B: crate::identity::IdentityBackend = HttpIdentityBac
     feed_client: Arc<FeedClient<B>>,
     http_client: SafeHttpClient,
     public_appview_base: String,
+    /// Base for `refresh_account_actor_data`'s getProfiles only; see LABELLED_APPVIEW_BASE.
+    labelled_appview_base: String,
     video_http_client: reqwest::Client,
     video_service_url: String,
     session_cache: OAuthSessionCache,
@@ -1639,6 +1643,7 @@ impl<B: crate::identity::IdentityBackend> Clone for AtriumOAuthFlow<B> {
             feed_client: self.feed_client.clone(),
             http_client: self.http_client.clone(),
             public_appview_base: self.public_appview_base.clone(),
+            labelled_appview_base: self.labelled_appview_base.clone(),
             video_http_client: self.video_http_client.clone(),
             video_service_url: self.video_service_url.clone(),
             session_cache: self.session_cache.clone(),
@@ -2265,6 +2270,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             feed_client,
             http_client: retained_http_client,
             public_appview_base: public_appview_base.to_owned(),
+            labelled_appview_base: LABELLED_APPVIEW_BASE.to_owned(),
             video_http_client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
@@ -2285,6 +2291,14 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             account_label_refreshes: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             labeler_presentation_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Point the labelled getProfiles request at a fake server (tests only).
+    /// Production always uses LABELLED_APPVIEW_BASE; see its comment for why.
+    #[cfg(test)]
+    fn with_labelled_appview_base(mut self, base: impl Into<String>) -> Self {
+        self.labelled_appview_base = base.into();
+        self
     }
 
     async fn restored_session(&self, did: &Did) -> Result<SharedOAuthSession, String> {
@@ -2812,11 +2826,13 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         Ok(labelers)
     }
 
+    /// Fetch a public AppView JSON document, also returning the raw
+    /// `atproto-content-labelers` response header when present.
     async fn public_appview_json(
         &self,
         url: url::Url,
         headers: HeaderMap,
-    ) -> Result<Value, String> {
+    ) -> Result<(Value, Option<String>), String> {
         let response = self.http_client.get(&url, headers, 2 * 1024 * 1024).await?;
         if !response.status().is_success() {
             return Err(format!(
@@ -2824,8 +2840,14 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                 response.status()
             ));
         }
-        serde_json::from_slice(response.body())
-            .map_err(|_| "Bluesky AppView returned invalid JSON".to_owned())
+        let applied_labelers = response
+            .headers()
+            .get("atproto-content-labelers")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = serde_json::from_slice(response.body())
+            .map_err(|_| "Bluesky AppView returned invalid JSON".to_owned())?;
+        Ok((body, applied_labelers))
     }
 
     async fn labeler_presentations(
@@ -2863,7 +2885,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                 }
                 query.append_pair("detailed", "true");
             }
-            let response = self.public_appview_json(url, HeaderMap::new()).await?;
+            let (response, _) = self.public_appview_json(url, HeaderMap::new()).await?;
             let views = response
                 .get("views")
                 .and_then(Value::as_array)
@@ -3086,6 +3108,22 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         }
     }
 
+    /// Requested labeler DIDs missing from an `atproto-content-labelers` response
+    /// header. Entries look like `did:plc:x;redact,did:plc:y`; the DID is what counts.
+    fn requested_labelers_not_applied(requested: &[String], applied: Option<&str>) -> Vec<String> {
+        let applied_dids: HashSet<&str> = applied
+            .unwrap_or_default()
+            .split(',')
+            .map(|entry| entry.split(';').next().unwrap_or_default().trim())
+            .filter(|did| !did.is_empty())
+            .collect();
+        requested
+            .iter()
+            .filter(|did| !applied_dids.contains(did.as_str()))
+            .cloned()
+            .collect()
+    }
+
     async fn refresh_account_actor_data(
         &self,
         viewer_did: &str,
@@ -3095,9 +3133,11 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         let accepted_labelers = labeler_dids.join(",");
         let mut requests = Vec::new();
         for batch in actors.chunks(ACCOUNT_LABEL_PROFILE_BATCH_SIZE) {
+            // Not public_appview_base: public.api.bsky.app ignores third-party
+            // labelers in atproto-accept-labelers. See LABELLED_APPVIEW_BASE.
             let mut url = url::Url::parse(&format!(
                 "{}app.bsky.actor.getProfiles",
-                self.public_appview_base
+                self.labelled_appview_base
             ))
             .map_err(|_| "Bluesky AppView URL is invalid".to_owned())?;
             {
@@ -3118,7 +3158,17 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         let mut profiles = HashMap::new();
         let mut account_raw_labels = HashMap::<String, Vec<(String, String)>>::new();
         for response in responses {
-            let response = response?;
+            let (response, applied_labelers) = response?;
+            let unapplied =
+                Self::requested_labelers_not_applied(&labeler_dids, applied_labelers.as_deref());
+            if !unapplied.is_empty() {
+                tracing::warn!(
+                    requested_labelers = %accepted_labelers,
+                    applied_labelers = applied_labelers.as_deref().unwrap_or("<missing>"),
+                    unapplied_labelers = %unapplied.join(","),
+                    "Bluesky getProfiles did not apply every requested labeler"
+                );
+            }
             if let Some(profile_values) = response.get("profiles").and_then(Value::as_array) {
                 for profile in profile_values {
                     let Some(subject_did) = profile.get("did").and_then(Value::as_str) else {
@@ -12417,7 +12467,10 @@ mod tests {
             SafeHttpClient::new().with_http_test_hosts(["127.0.0.1".to_owned()]),
             &appview_base,
         )
-        .unwrap();
+        .unwrap()
+        // Setup only: this fake server stands in for both appview bases so the
+        // labelled getProfiles lands on it too; expectations are unchanged.
+        .with_labelled_appview_base(appview_base.clone());
         let viewer = "did:plc:viewer";
         let accepted_labelers = vec![
             BSKY_MODERATION_LABELER_DID.to_owned(),
@@ -12587,7 +12640,11 @@ mod tests {
             get(move |uri: Uri, headers: axum::http::HeaderMap| {
                 let requests = labelled_profiles.clone();
                 async move {
-                    let query = uri.query().unwrap_or_default();
+                    let actors =
+                        url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
+                            .filter(|(name, _)| name == "actors")
+                            .map(|(_, value)| value.into_owned())
+                            .collect::<Vec<_>>();
                     requests.lock().unwrap().push((
                         uri.to_string(),
                         headers
@@ -12595,20 +12652,22 @@ mod tests {
                             .and_then(|value| value.to_str().ok())
                             .map(str::to_owned),
                     ));
-                    let mut profiles = Vec::new();
-                    for actor in ["did:plc:labelled-author", "did:plc:dropped-label-author"] {
-                        if query.contains(&format!("actors={actor}")) {
-                            profiles.push(json!({
+                    let profiles = actors
+                        .iter()
+                        .map(|actor| {
+                            json!({
                                 "did": actor,
                                 "labels": [{
                                     "src": "did:plc:customlabeler",
                                     "uri": actor,
                                     "val": "spider",
                                 }]
-                            }));
-                        }
-                    }
-                    let applied_labelers = if query.contains("actors=did:plc:dropped-label-author")
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let applied_labelers = if actors
+                        .iter()
+                        .any(|actor| actor == "did:plc:dropped-label-author")
                     {
                         "did:plc:ar7c4by46qjdydhdevvrndac;redact"
                     } else {
@@ -15154,7 +15213,10 @@ mod tests {
             SafeHttpClient::new().with_http_test_hosts(["127.0.0.1".to_owned()]),
             &public_appview_base,
         )
-        .unwrap();
+        .unwrap()
+        // Setup only: this fake server serves every xrpc route these tests use,
+        // so the labelled getProfiles must land here too; expectations unchanged.
+        .with_labelled_appview_base(public_appview_base.clone());
         (flow, state, server)
     }
 

@@ -9,6 +9,16 @@ use std::{
 use tokio::time::Instant;
 
 pub const PUBLIC_APPVIEW_BASE: &str = "https://public.api.bsky.app/xrpc/";
+/// Base for the one `app.bsky.actor.getProfiles` request that carries
+/// `atproto-accept-labelers` (`refresh_account_actor_data` in `oauth.rs`).
+/// It deliberately differs from [`PUBLIC_APPVIEW_BASE`]: measured 2026-10-30,
+/// public.api.bsky.app IGNORES `atproto-accept-labelers` for third-party
+/// labelers (its `atproto-content-labelers` response header always names only
+/// `did:plc:ar7c4by46qjdydhdevvrndac;redact`, Bluesky's own moderation), while
+/// api.bsky.app honours the header and returns the requested labels without
+/// login. Do NOT "simplify" this back onto [`PUBLIC_APPVIEW_BASE`]: the public
+/// host silently drops third-party labels, so viewers would see none.
+pub const LABELLED_APPVIEW_BASE: &str = "https://api.bsky.app/xrpc/";
 const MAX_PROFILE_COUNT_BATCH_SIZE: usize = 25;
 const MAX_PROFILE_COUNT_CACHE_SIZE: usize = 4096;
 const MAX_PROFILE_COUNT_RESPONSE_BYTES: usize = 1024 * 1024;
