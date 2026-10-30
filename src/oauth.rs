@@ -13235,6 +13235,12 @@ mod tests {
         fail_auth: bool,
         mutes_calls: usize,
         mutes_delay: Duration,
+        preferences_calls: usize,
+        preferences_delay: Duration,
+        preferences_response: Option<Value>,
+        profiles_calls: usize,
+        profiles_delay: Duration,
+        profiles_response: Option<Value>,
     }
 
     #[derive(Clone, Default)]
@@ -13290,6 +13296,8 @@ mod tests {
         let video_upload_state = state.clone();
         let video_status_state = state.clone();
         let mutes_state = state.clone();
+        let preferences_state = state.clone();
+        let profiles_state = state.clone();
         let app = Router::new()
             .route(
                 "/.well-known/oauth-authorization-server",
@@ -13404,6 +13412,50 @@ mod tests {
                 }),
             )
             .route(
+                "/xrpc/app.bsky.actor.getPreferences",
+                get(move || {
+                    let state = preferences_state.clone();
+                    async move {
+                        let (delay, response) = {
+                            let mut state = state.lock().unwrap();
+                            state.preferences_calls += 1;
+                            (state.preferences_delay, state.preferences_response.clone())
+                        };
+                        tokio::time::sleep(delay).await;
+                        Json(response.unwrap_or_else(|| json!({"preferences":[]})))
+                    }
+                }),
+            )
+            .route(
+                "/xrpc/app.bsky.actor.getProfiles",
+                get(move || {
+                    let state = profiles_state.clone();
+                    async move {
+                        let (delay, response) = {
+                            let mut state = state.lock().unwrap();
+                            state.profiles_calls += 1;
+                            (state.profiles_delay, state.profiles_response.clone())
+                        };
+                        tokio::time::sleep(delay).await;
+                        Json(response.unwrap_or_else(|| json!({"profiles":[]})))
+                    }
+                }),
+            )
+            .route(
+                "/xrpc/app.bsky.labeler.getServices",
+                get(|| async {
+                    Json(json!({"views":[{
+                        "creator":{"did":"did:plc:stale-cache-labeler","displayName":"Fresh labeler"},
+                        "policies":{"labelValueDefinitions":[{
+                            "identifier":"spider",
+                            "severity":"alert",
+                            "blurs":"media",
+                            "locales":[{"lang":"en","name":"Fresh spider label"}]
+                        }]}
+                    }]}))
+                }),
+            )
+            .route(
                 "/xrpc/com.atproto.repo.getRecord",
                 get(|uri: Uri| async move {
                     let query = uri.query().unwrap_or_default();
@@ -13508,12 +13560,14 @@ mod tests {
             )
             .await
             .unwrap();
-        let flow = AtriumOAuthFlow::new(
+        let public_appview_base = format!("{pds}/xrpc/");
+        let flow = AtriumOAuthFlow::new_with_public_appview_base(
             &public,
             identity_resolver,
             store,
             &pds,
             SafeHttpClient::new().with_http_test_hosts(["127.0.0.1".to_owned()]),
+            &public_appview_base,
         )
         .unwrap();
         (flow, state, server)
@@ -13524,7 +13578,7 @@ mod tests {
         let (flow, state, server) = feed_test_flow(false).await;
         let did = FEED_VIEWER_DID.to_owned();
         let stale = HashSet::from(["did:plc:previously-muted".to_owned()]);
-        state.lock().unwrap().mutes_delay = Duration::from_millis(120);
+        state.lock().unwrap().mutes_delay = Duration::from_millis(180);
         flow.muted_actor_cache.lock().await.insert(
             did.clone(),
             (
@@ -13533,18 +13587,164 @@ mod tests {
             ),
         );
 
-        let first =
-            tokio::time::timeout(Duration::from_millis(40), flow.fetch_muted_actor_dids(&did))
+        let responses = futures_util::future::join_all((0..4).map(|_| async {
+            tokio::time::timeout(Duration::from_millis(60), flow.fetch_muted_actor_dids(&did))
                 .await
                 .expect("stale mutes should not wait for the upstream")
-                .unwrap();
-        assert_eq!(first, stale);
-        let second = flow.fetch_muted_actor_dids(&did).await.unwrap();
-        assert_eq!(second, stale);
+                .unwrap()
+        }))
+        .await;
+        assert!(responses.iter().all(|actors| actors == &stale));
 
-        tokio::time::sleep(Duration::from_millis(180)).await;
+        tokio::time::sleep(Duration::from_millis(240)).await;
         assert_eq!(state.lock().unwrap().mutes_calls, 1);
         assert!(flow.fetch_muted_actor_dids(&did).await.unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stale_saved_feed_preferences_return_immediately_and_refresh_once_in_background() {
+        let (flow, state, server) = feed_test_flow(false).await;
+        let did = FEED_VIEWER_DID.to_owned();
+        let stale = SavedFeedPreference {
+            id: "old-feed".to_owned(),
+            feed_type: "feed".to_owned(),
+            value: "at://did:plc:old/app.bsky.feed.generator/old".to_owned(),
+            pinned: true,
+        };
+        let refreshed = SavedFeedPreference {
+            id: "new-feed".to_owned(),
+            feed_type: "feed".to_owned(),
+            value: "at://did:plc:new/app.bsky.feed.generator/new".to_owned(),
+            pinned: false,
+        };
+        {
+            let mut state = state.lock().unwrap();
+            state.preferences_delay = Duration::from_millis(180);
+            state.preferences_response = Some(json!({"preferences":[{
+                "$type":"app.bsky.actor.defs#savedFeedsPrefV2",
+                "items":[{
+                    "id":refreshed.id,
+                    "type":refreshed.feed_type,
+                    "value":refreshed.value,
+                    "pinned":refreshed.pinned
+                }]
+            }]}));
+        }
+        flow.saved_feed_cache.lock().await.insert(
+            did.clone(),
+            (
+                tokio::time::Instant::now() - Duration::from_secs(1),
+                vec![stale.clone()],
+            ),
+        );
+
+        let responses = futures_util::future::join_all((0..4).map(|_| async {
+            tokio::time::timeout(Duration::from_millis(60), flow.saved_feed_preferences(&did))
+                .await
+                .expect("stale saved feeds should not wait for the upstream")
+                .unwrap()
+        }))
+        .await;
+        assert!(
+            responses
+                .iter()
+                .all(|preferences| preferences == std::slice::from_ref(&stale))
+        );
+
+        tokio::time::sleep(Duration::from_millis(240)).await;
+        assert_eq!(state.lock().unwrap().preferences_calls, 1);
+        assert_eq!(
+            flow.saved_feed_preferences(&did).await.unwrap(),
+            [refreshed]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stale_account_labels_return_immediately_and_refresh_once_in_background() {
+        let (flow, state, server) = feed_test_flow(false).await;
+        let viewer_did = FEED_VIEWER_DID.to_owned();
+        let actor_did = "did:plc:stale-cache-actor";
+        let labeler_did = "did:plc:stale-cache-labeler";
+        let stale_label = AccountLabel {
+            subject_did: actor_did.to_owned(),
+            labeler_did: labeler_did.to_owned(),
+            labeler_name: "Old labeler".to_owned(),
+            value: "old".to_owned(),
+            display_name: "Old account label".to_owned(),
+            severity: "none".to_owned(),
+            blurs: "none".to_owned(),
+        };
+        let fresh_label = AccountLabel {
+            subject_did: actor_did.to_owned(),
+            labeler_did: labeler_did.to_owned(),
+            labeler_name: "Fresh labeler".to_owned(),
+            value: "spider".to_owned(),
+            display_name: "Fresh spider label".to_owned(),
+            severity: "alert".to_owned(),
+            blurs: "media".to_owned(),
+        };
+        {
+            let mut state = state.lock().unwrap();
+            state.profiles_delay = Duration::from_millis(180);
+            state.profiles_response = Some(json!({"profiles":[{
+                "did":actor_did,
+                "handle":"fresh.actor.test",
+                "displayName":"Fresh actor",
+                "labels":[{"src":labeler_did,"uri":actor_did,"val":"spider"}]
+            }]}));
+        }
+        flow.labeler_preference_cache.lock().await.insert(
+            viewer_did.clone(),
+            (
+                tokio::time::Instant::now() + Duration::from_secs(60),
+                vec![labeler_did.to_owned()],
+            ),
+        );
+        flow.account_label_actor_cache.lock().await.insert(
+            (viewer_did.clone(), actor_did.to_owned()),
+            (
+                tokio::time::Instant::now() - Duration::from_secs(1),
+                AccountActorData {
+                    labels: vec![stale_label.clone()],
+                    profile: Some(crate::feeds::PublicProfileView {
+                        did: actor_did.to_owned(),
+                        handle: Some("stale.actor.test".to_owned()),
+                        display_name: Some("Stale actor".to_owned()),
+                        avatar: None,
+                        labels: Vec::new(),
+                    }),
+                },
+            ),
+        );
+
+        let responses = futures_util::future::join_all((0..4).map(|_| async {
+            tokio::time::timeout(
+                Duration::from_millis(60),
+                flow.fetch_page_account_data_for_page(&viewer_did, vec![actor_did.to_owned()]),
+            )
+            .await
+            .expect("stale account labels should not wait for the upstream")
+            .unwrap()
+        }))
+        .await;
+        assert!(responses.iter().all(|data| {
+            data.labels == [stale_label.clone()]
+                && data.profiles[0].display_name.as_deref() == Some("Stale actor")
+        }));
+
+        tokio::time::sleep(Duration::from_millis(240)).await;
+        assert_eq!(state.lock().unwrap().profiles_calls, 1);
+        let refreshed = flow
+            .fetch_page_account_data_for_page(&viewer_did, vec![actor_did.to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(refreshed.labels, [fresh_label]);
+        assert_eq!(
+            refreshed.profiles[0].display_name.as_deref(),
+            Some("Fresh actor")
+        );
         server.abort();
     }
 
