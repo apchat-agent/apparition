@@ -1108,6 +1108,12 @@ button:hover,
   background: transparent;
 }
 
+/* The open account-label panel anchors here, so its edges sit on the card's content edges. */
+.post-card {
+  position: relative;
+  --account-label-panel-inset: 1.25rem;
+}
+
 .post-header,
 .notification-heading {
   display: flex;
@@ -1378,6 +1384,8 @@ button:hover,
 }
 
 .quoted-post-card {
+  position: relative;
+  --account-label-panel-inset: 0.85rem;
   display: grid;
   gap: 0.55rem;
   margin-top: 0.7rem;
@@ -1575,6 +1583,7 @@ a.quoted-post-card:hover,
 
 .profile-header {
   position: relative;
+  --account-label-panel-inset: 0.9rem;
   container-type: inline-size;
   margin-bottom: 1rem;
   border-bottom: 1px solid var(--line);
@@ -2416,6 +2425,10 @@ a.quoted-post-card:hover,
     padding-inline: 0.9rem;
   }
 
+  .post-card {
+    --account-label-panel-inset: 0.9rem;
+  }
+
   .post-header time,
   .relative-time {
     font-size: 0.76rem;
@@ -2718,9 +2731,11 @@ body {
   overflow: visible;
 }
 
+/* Not positioned: the open panel anchors to the card (post, quote or profile header) so it can span the
+   card's inner width wherever the control sits on the line. inline-block keeps the panel's static top,
+   which it uses, directly under the summary. */
 .account-labels {
-  position: relative;
-  display: inline-flex;
+  display: inline-block;
   flex: 0 0 auto;
   vertical-align: middle;
 }
@@ -2767,14 +2782,17 @@ body {
   font-weight: 750;
 }
 
+/* top: auto keeps the static position (just under the summary); left/width come from the card through
+   the inset custom property, so both edges land on the card's content edges on a phone and the 19rem
+   cap only binds on screens wide enough for it. */
 .account-labels .account-label-groups {
   position: absolute;
   z-index: 5;
-  top: calc(100% + 0.25rem);
-  left: 0;
-  width: min(19rem, calc(100vw - 1.5rem));
+  top: auto;
+  left: var(--account-label-panel-inset, 0.9rem);
+  width: min(19rem, calc(100% - var(--account-label-panel-inset, 0.9rem) * 2));
   max-height: 60vh;
-  margin: 0;
+  margin: 0.25rem 0 0;
   padding: 0.55rem 0.7rem;
   overflow-y: auto;
   border: 1px solid var(--line);
@@ -2830,8 +2848,6 @@ body {
 }
 
 .account-label-by {
-  flex: 0 0 auto;
-  max-width: 40%;
   overflow-wrap: anywhere;
   color: var(--accent);
   font-size: 0.68rem;

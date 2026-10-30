@@ -104,9 +104,9 @@ const OAUTH_STORE_WRITER_BATCH_SIZE: usize = 64;
 const OAUTH_STORE_WRITER_BATCH_DELAY: Duration = Duration::from_millis(5);
 const OAUTH_STORE_WRITER_METRICS_INTERVAL: Duration = Duration::from_secs(60);
 static NEXT_OAUTH_MEMORY_DATABASE_ID: AtomicUsize = AtomicUsize::new(1);
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m32";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m33";
 const WEB_SCRIPT_URL: &str = "/static/app.js?v=js20";
-const WEB_NOJS_STYLESHEET_URL: &str = "/static/nojs.css?v=m32";
+const WEB_NOJS_STYLESHEET_URL: &str = "/static/nojs.css?v=m33";
 const HLS_SCRIPT_URL: &str = "/static/vendor/hls.min.js?v=1.7.3";
 const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
 const SAVED_FEED_CACHE_PREFIX: &str = "saved-feed-preferences:";
@@ -7256,7 +7256,7 @@ fn render_account_label_chips(
                             .collect::<String>()
                     );
                     format!(
-                        "<li class=\"account-label-row {severity}\"><span class=\"account-label-emoji {severity}\" aria-hidden=\"true\">{}</span><span class=\"account-label-copy\"><span class=\"account-label-name\">{}</span>{description}</span><a class=\"account-label-by\" href=\"{labeler_uri}\" title=\"@{}\">by {}</a></li>",
+                        "<li class=\"account-label-row {severity}\"><span class=\"account-label-emoji {severity}\" aria-hidden=\"true\">{}</span><span class=\"account-label-copy\"><span class=\"account-label-name\">{}</span>{description}<a class=\"account-label-by\" href=\"{labeler_uri}\" title=\"@{}\">by {}</a></span></li>",
                         label_emoji(&label.value),
                         html_escape(&label.display_name),
                         html_escape(&label.labeler_handle),
@@ -15661,7 +15661,9 @@ mod tests {
             Some("var(--account-label-panel-inset, 0.9rem)")
         );
         assert!(
-            panel.contains("width: min(19rem, calc(100% - var(--account-label-panel-inset, 0.9rem) * 2))"),
+            panel.contains(
+                "width: min(19rem, calc(100% - var(--account-label-panel-inset, 0.9rem) * 2))"
+            ),
             "the panel spans the card's inner width, capped at 19rem only when there is room: {panel}"
         );
         assert!(
