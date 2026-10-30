@@ -100,6 +100,10 @@ const MAX_RENDERED_REMOTE_CHARS: usize = 4096;
 const PROFILE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const PROFILE_NEGATIVE_TTL: Duration = Duration::from_secs(60 * 60);
 const PAGE_PROFILE_BUDGET: Duration = Duration::from_millis(1500);
+/// How long a spawned block-list refresh may run. The page waits only PAGE_PROFILE_BUDGET for it,
+/// but the refresh itself must be allowed to finish: a 742-member list is ~8 getList pages (~4 s),
+/// and cutting it at the page budget meant it never filled the cache (2026-10-30).
+const BLOCK_LIST_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 const PAGE_PROFILE_CONCURRENCY: usize = 8;
 const PAGE_QUOTE_CONCURRENCY: usize = 16;
 const OAUTH_STORE_WRITER_QUEUE: usize = 128;
@@ -6391,10 +6395,12 @@ fn spawn_listblock_refresh<F: OAuthFlow>(
     let dispatcher = tracing::dispatcher::get_default(|dispatcher| dispatcher.clone());
     tokio::spawn(
         async move {
-            let result =
-                tokio::time::timeout(PAGE_PROFILE_BUDGET, flow.subscribed_block_list_uris(&did))
-                    .await
-                    .unwrap_or_else(|_| Err("block list lookup timed out".to_owned()));
+            let result = tokio::time::timeout(
+                BLOCK_LIST_FETCH_TIMEOUT,
+                flow.subscribed_block_list_uris(&did),
+            )
+            .await
+            .unwrap_or_else(|_| Err("block list lookup timed out".to_owned()));
             match &result {
                 Ok(uris) => {
                     if let Some(store) = flow.web_cache_store()
@@ -6508,7 +6514,7 @@ fn spawn_members_refresh<F: OAuthFlow>(
     tokio::spawn(
         async move {
             let result =
-                tokio::time::timeout(PAGE_PROFILE_BUDGET, flow.block_list_detail(&list_uri))
+                tokio::time::timeout(BLOCK_LIST_FETCH_TIMEOUT, flow.block_list_detail(&list_uri))
                     .await
                     .unwrap_or_else(|_| Err("block list member fetch timed out".to_owned()));
             match &result {
