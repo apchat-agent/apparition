@@ -63,7 +63,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Sha256;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -72,14 +72,19 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     pin::Pin,
+    sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
+    thread::JoinHandle,
 };
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::{io::AsyncWriteExt, sync::OnceCell};
+use tokio::{
+    io::AsyncWriteExt,
+    sync::{OnceCell, oneshot},
+};
 
 const METADATA_PATH: &str = "/.well-known/oauth-client-metadata.json";
 const CALLBACK_PATH: &str = "/oauth/callback";
@@ -93,6 +98,11 @@ const PROFILE_NEGATIVE_TTL: Duration = Duration::from_secs(60 * 60);
 const PAGE_PROFILE_BUDGET: Duration = Duration::from_millis(1500);
 const PAGE_PROFILE_CONCURRENCY: usize = 8;
 const PAGE_QUOTE_CONCURRENCY: usize = 16;
+const OAUTH_STORE_WRITER_QUEUE: usize = 128;
+const OAUTH_STORE_WRITER_BATCH_SIZE: usize = 64;
+const OAUTH_STORE_WRITER_BATCH_DELAY: Duration = Duration::from_millis(5);
+const OAUTH_STORE_WRITER_METRICS_INTERVAL: Duration = Duration::from_secs(60);
+static NEXT_OAUTH_MEMORY_DATABASE_ID: AtomicUsize = AtomicUsize::new(1);
 const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m23";
 const WEB_SCRIPT_URL: &str = "/static/app.js?v=js17";
 const HLS_SCRIPT_URL: &str = "/static/vendor/hls.min.js?v=1.7.3";
@@ -1598,21 +1608,290 @@ pub enum OAuthStoreError {
     Poisoned,
     #[error("OAuth session database I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("OAuth session database writer stopped before replying")]
+    WriterStopped,
+}
+
+struct EphemeralOAuthDatabase(PathBuf);
+
+impl Drop for EphemeralOAuthDatabase {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+        let _ = fs::remove_file(format!("{}-wal", self.0.display()));
+        let _ = fs::remove_file(format!("{}-shm", self.0.display()));
+    }
+}
+
+type OAuthFireWrite = Box<dyn FnOnce(&Connection) -> Result<(), OAuthStoreError> + Send>;
+type OAuthBlockingWrite = Box<dyn FnOnce(&mut Connection) + Send>;
+
+enum OAuthWriterMessage {
+    Fire(OAuthFireWrite),
+    Blocking(OAuthBlockingWrite),
+}
+
+#[derive(Default)]
+struct OAuthWriterMetrics {
+    queue_depth: AtomicU64,
+    queue_depth_max: AtomicU64,
+    dropped: AtomicU64,
+    batch_count: AtomicU64,
+    transaction_count: AtomicU64,
+    transaction_total_ns: AtomicU64,
+    transaction_max_ns: AtomicU64,
+}
+
+impl OAuthWriterMetrics {
+    fn queued(&self) {
+        let depth = self.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+        self.queue_depth_max.fetch_max(depth, Ordering::Relaxed);
+    }
+
+    fn dequeued(&self) {
+        self.queue_depth.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn record_batch(&self, elapsed: Duration) {
+        let elapsed_ns = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
+        self.batch_count.fetch_add(1, Ordering::Relaxed);
+        self.transaction_count.fetch_add(1, Ordering::Relaxed);
+        self.transaction_total_ns
+            .fetch_add(elapsed_ns, Ordering::Relaxed);
+        self.transaction_max_ns
+            .fetch_max(elapsed_ns, Ordering::Relaxed);
+    }
+
+    fn report(&self) {
+        let count = self.transaction_count.swap(0, Ordering::Relaxed);
+        let total_ns = self.transaction_total_ns.swap(0, Ordering::Relaxed);
+        let max_ns = self.transaction_max_ns.swap(0, Ordering::Relaxed);
+        tracing::info!(
+            oauth_writer_queue_depth_max = self
+                .queue_depth_max
+                .swap(self.queue_depth.load(Ordering::Relaxed), Ordering::Relaxed),
+            oauth_writer_batch_count = self.batch_count.swap(0, Ordering::Relaxed),
+            oauth_writer_transaction_mean_ms = if count == 0 {
+                0.0
+            } else {
+                total_ns as f64 / count as f64 / 1_000_000.0
+            },
+            oauth_writer_transaction_max_ms = max_ns as f64 / 1_000_000.0,
+            oauth_writer_dropped_count = self.dropped.swap(0, Ordering::Relaxed),
+            "OAuth SQLite writer minute metrics"
+        );
+    }
+}
+
+struct OAuthStoreWriter {
+    sender: Mutex<Option<SyncSender<OAuthWriterMessage>>>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+    metrics: Arc<OAuthWriterMetrics>,
+}
+
+impl OAuthStoreWriter {
+    fn new(connection: Connection) -> Result<Self, OAuthStoreError> {
+        let (sender, receiver) = mpsc::sync_channel(OAUTH_STORE_WRITER_QUEUE);
+        let metrics = Arc::new(OAuthWriterMetrics::default());
+        let worker_metrics = Arc::clone(&metrics);
+        let worker = std::thread::Builder::new()
+            .name("oauth-sqlite-writer".to_owned())
+            .spawn(move || oauth_store_writer_loop(connection, receiver, worker_metrics))?;
+        Ok(Self {
+            sender: Mutex::new(Some(sender)),
+            worker: Mutex::new(Some(worker)),
+            metrics,
+        })
+    }
+
+    async fn call<R: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&mut Connection) -> Result<R, OAuthStoreError> + Send + 'static,
+    ) -> Result<R, OAuthStoreError> {
+        let (reply, result) = oneshot::channel();
+        let message = OAuthWriterMessage::Blocking(Box::new(move |connection| {
+            let _ = reply.send(operation(connection));
+        }));
+        let sender = self
+            .sender
+            .lock()
+            .map_err(|_| OAuthStoreError::Poisoned)?
+            .as_ref()
+            .cloned()
+            .ok_or(OAuthStoreError::WriterStopped)?;
+        self.metrics.queued();
+        tokio::task::spawn_blocking(move || sender.send(message))
+            .await
+            .map_err(|_| OAuthStoreError::WriterStopped)?
+            .map_err(|_| OAuthStoreError::WriterStopped)?;
+        result.await.map_err(|_| OAuthStoreError::WriterStopped)?
+    }
+
+    fn fire(
+        &self,
+        operation: impl FnOnce(&Connection) -> Result<(), OAuthStoreError> + Send + 'static,
+    ) {
+        let sender = self
+            .sender
+            .lock()
+            .ok()
+            .and_then(|sender| sender.as_ref().cloned());
+        let Some(sender) = sender else {
+            self.metrics.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        self.metrics.queued();
+        if let Err(error) = sender.try_send(OAuthWriterMessage::Fire(Box::new(operation))) {
+            self.metrics.dequeued();
+            self.metrics.dropped.fetch_add(1, Ordering::Relaxed);
+            match error {
+                mpsc::TrySendError::Full(_) => {
+                    tracing::debug!("OAuth SQLite writer queue full; dropped cache write");
+                }
+                mpsc::TrySendError::Disconnected(_) => {
+                    tracing::warn!("OAuth SQLite writer stopped; dropped cache write");
+                }
+            }
+        }
+    }
+
+    async fn flush(&self) -> Result<(), OAuthStoreError> {
+        self.call(|_| Ok(())).await
+    }
+
+    fn shutdown(&self) {
+        if let Ok(mut sender) = self.sender.lock() {
+            drop(sender.take());
+        }
+        if let Ok(mut worker) = self.worker.lock()
+            && let Some(worker) = worker.take()
+            && worker.join().is_err()
+        {
+            tracing::error!("OAuth SQLite writer thread panicked during shutdown");
+        }
+    }
+}
+
+impl Drop for OAuthStoreWriter {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn oauth_store_writer_loop(
+    mut connection: Connection,
+    receiver: Receiver<OAuthWriterMessage>,
+    metrics: Arc<OAuthWriterMetrics>,
+) {
+    let mut next_metrics = Instant::now() + OAUTH_STORE_WRITER_METRICS_INTERVAL;
+    let mut pending = None;
+    loop {
+        let message = if let Some(message) = pending.take() {
+            Some(message)
+        } else {
+            match receiver.recv_timeout(next_metrics.saturating_duration_since(Instant::now())) {
+                Ok(message) => Some(message),
+                Err(RecvTimeoutError::Timeout) => {
+                    metrics.report();
+                    next_metrics = Instant::now() + OAUTH_STORE_WRITER_METRICS_INTERVAL;
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => None,
+            }
+        };
+        let Some(message) = message else {
+            break;
+        };
+        metrics.dequeued();
+        match message {
+            OAuthWriterMessage::Blocking(operation) => {
+                let started = Instant::now();
+                operation(&mut connection);
+                metrics.record_batch(started.elapsed());
+            }
+            OAuthWriterMessage::Fire(first) => {
+                let mut writes = vec![first];
+                let deadline = Instant::now() + OAUTH_STORE_WRITER_BATCH_DELAY;
+                while writes.len() < OAUTH_STORE_WRITER_BATCH_SIZE {
+                    match receiver.try_recv() {
+                        Ok(OAuthWriterMessage::Fire(write)) => {
+                            metrics.dequeued();
+                            writes.push(write);
+                        }
+                        Ok(blocking @ OAuthWriterMessage::Blocking(_)) => {
+                            pending = Some(blocking);
+                            break;
+                        }
+                        Err(TryRecvError::Empty) if Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_micros(100));
+                        }
+                        Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                    }
+                }
+                let started = Instant::now();
+                let mut completions = 0_u64;
+                let mut first_error = None;
+                match connection.transaction() {
+                    Ok(transaction) => {
+                        for write in writes {
+                            match write(&transaction) {
+                                Ok(()) => completions += 1,
+                                Err(error) if first_error.is_none() => first_error = Some(error),
+                                Err(_) => {}
+                            }
+                        }
+                        if first_error.is_none()
+                            && let Err(error) = transaction.commit()
+                        {
+                            first_error = Some(OAuthStoreError::Sqlite(error));
+                        }
+                    }
+                    Err(error) => first_error = Some(OAuthStoreError::Sqlite(error)),
+                }
+                if let Some(error) = first_error {
+                    tracing::warn!(%error, "OAuth SQLite cache write batch rolled back");
+                } else {
+                    tracing::trace!(
+                        cache_writes = completions,
+                        "OAuth SQLite cache writes committed"
+                    );
+                }
+                metrics.record_batch(started.elapsed());
+            }
+        }
+        if Instant::now() >= next_metrics {
+            metrics.report();
+            next_metrics = Instant::now() + OAUTH_STORE_WRITER_METRICS_INTERVAL;
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct SqliteOAuthStore {
-    connection: Arc<Mutex<Connection>>,
+    read_connection: Arc<Mutex<Connection>>,
+    writer: Arc<OAuthStoreWriter>,
+    _ephemeral_database: Option<Arc<EphemeralOAuthDatabase>>,
 }
 
 impl SqliteOAuthStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, OAuthStoreError> {
         let path = path.as_ref();
-        if let Some(parent) = path.parent() {
+        let is_memory = path == Path::new(":memory:");
+        if !is_memory && let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        crate::ingest::ensure_private_database_file(path)?;
-        let connection = Connection::open(path)?;
+        let ephemeral_database = is_memory.then(|| {
+            Arc::new(EphemeralOAuthDatabase(std::env::temp_dir().join(format!(
+                "appview-rs-oauth-memory-{}-{}.sqlite3",
+                std::process::id(),
+                NEXT_OAUTH_MEMORY_DATABASE_ID.fetch_add(1, Ordering::Relaxed)
+            ))))
+        });
+        let database_path = ephemeral_database
+            .as_ref()
+            .map(|database| database.0.as_path())
+            .unwrap_or(path);
+        crate::ingest::ensure_private_database_file(database_path)?;
+        let connection = Connection::open(database_path)?;
         let migration_started = std::time::Instant::now();
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -1635,13 +1914,21 @@ impl SqliteOAuthStore {
             elapsed_ms = migration_started.elapsed().as_millis() as u64,
             "OAuth cache schema migration complete"
         );
+        let reader = Connection::open(database_path)?;
+        reader.execute_batch("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON;")?;
         Ok(Self {
-            connection: Arc::new(Mutex::new(connection)),
+            read_connection: Arc::new(Mutex::new(reader)),
+            writer: Arc::new(OAuthStoreWriter::new(connection)?),
+            _ephemeral_database: ephemeral_database,
         })
     }
 
-    pub(crate) fn web_cache_get(&self, key: &str) -> Result<Option<(String, i64)>, String> {
-        self.connection
+    pub(crate) async fn web_cache_get(&self, key: &str) -> Result<Option<(String, i64)>, String> {
+        self.writer
+            .flush()
+            .await
+            .map_err(|error| error.to_string())?;
+        self.read_connection
             .lock()
             .map_err(|_| "OAuth cache database lock is poisoned".to_owned())?
             .query_row(
@@ -1658,25 +1945,28 @@ impl SqliteOAuthStore {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
             .unwrap_or_default();
-        self.connection
-            .lock()
-            .map_err(|_| "OAuth cache database lock is poisoned".to_owned())?
-            .execute(
+        let writer_key = key.to_owned();
+        let writer_value = value_json.to_owned();
+        self.writer.fire(move |connection| {
+            connection.execute(
                 "INSERT INTO web_cache(cache_key,value_json,stored_at_ms) VALUES(?1,?2,?3)
                  ON CONFLICT(cache_key) DO UPDATE SET value_json=excluded.value_json,stored_at_ms=excluded.stored_at_ms",
-                params![key, value_json, stored_at_ms],
-            )
-            .map_err(|error| error.to_string())?;
+                params![writer_key, writer_value, stored_at_ms],
+            )?;
+            Ok(())
+        });
         Ok(())
     }
 
-    pub(crate) fn web_cache_delete(&self, key: &str) -> Result<(), String> {
-        self.connection
-            .lock()
-            .map_err(|_| "OAuth cache database lock is poisoned".to_owned())?
-            .execute("DELETE FROM web_cache WHERE cache_key=?1", [key])
-            .map_err(|error| error.to_string())?;
-        Ok(())
+    pub(crate) async fn web_cache_delete(&self, key: &str) -> Result<(), String> {
+        let writer_key = key.to_owned();
+        self.writer
+            .call(move |connection| {
+                connection.execute("DELETE FROM web_cache WHERE cache_key=?1", [writer_key])?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| error.to_string())
     }
 
     fn get_json<T: for<'de> Deserialize<'de>>(
@@ -1687,7 +1977,7 @@ impl SqliteOAuthStore {
         state_ttl: bool,
     ) -> Result<Option<T>, OAuthStoreError> {
         let connection = self
-            .connection
+            .read_connection
             .lock()
             .map_err(|_| OAuthStoreError::Poisoned)?;
         let sql = if state_ttl {
@@ -1704,7 +1994,7 @@ impl SqliteOAuthStore {
             .transpose()
     }
 
-    fn set_json<T: serde::Serialize>(
+    async fn set_json<T: serde::Serialize>(
         &self,
         table: &'static str,
         key_column: &'static str,
@@ -1722,33 +2012,38 @@ impl SqliteOAuthStore {
                 "INSERT INTO {table}({key_column},value_json) VALUES(?1,?2) ON CONFLICT({key_column}) DO UPDATE SET value_json=excluded.value_json"
             )
         };
-        self.connection
-            .lock()
-            .map_err(|_| OAuthStoreError::Poisoned)?
-            .execute(&sql, params![key, value_json])?;
-        Ok(())
+        let writer_key = key.to_owned();
+        self.writer
+            .call(move |connection| {
+                connection.execute(&sql, params![writer_key, value_json])?;
+                Ok(())
+            })
+            .await
     }
 
-    fn delete_key(
+    async fn delete_key(
         &self,
         table: &'static str,
         key_column: &'static str,
         key: &str,
     ) -> Result<(), OAuthStoreError> {
         let sql = format!("DELETE FROM {table} WHERE {key_column}=?1");
-        self.connection
-            .lock()
-            .map_err(|_| OAuthStoreError::Poisoned)?
-            .execute(&sql, [key])?;
-        Ok(())
+        let writer_key = key.to_owned();
+        self.writer
+            .call(move |connection| {
+                connection.execute(&sql, [writer_key])?;
+                Ok(())
+            })
+            .await
     }
 
-    fn clear_table(&self, table: &'static str) -> Result<(), OAuthStoreError> {
-        self.connection
-            .lock()
-            .map_err(|_| OAuthStoreError::Poisoned)?
-            .execute(&format!("DELETE FROM {table}"), [])?;
-        Ok(())
+    async fn clear_table(&self, table: &'static str) -> Result<(), OAuthStoreError> {
+        self.writer
+            .call(move |connection| {
+                connection.execute(&format!("DELETE FROM {table}"), [])?;
+                Ok(())
+            })
+            .await
     }
 }
 
@@ -1761,14 +2056,15 @@ impl Store<String, InternalStateData> for SqliteOAuthStore {
 
     async fn set(&self, key: String, value: InternalStateData) -> Result<(), Self::Error> {
         self.set_json("oauth_states", "state", &key, &value, true)
+            .await
     }
 
     async fn del(&self, key: &String) -> Result<(), Self::Error> {
-        self.delete_key("oauth_states", "state", key)
+        self.delete_key("oauth_states", "state", key).await
     }
 
     async fn clear(&self) -> Result<(), Self::Error> {
-        self.clear_table("oauth_states")
+        self.clear_table("oauth_states").await
     }
 }
 
@@ -1783,14 +2079,15 @@ impl Store<Did, Session> for SqliteOAuthStore {
 
     async fn set(&self, key: Did, value: Session) -> Result<(), Self::Error> {
         self.set_json("oauth_sessions", "did", key.as_ref(), &value, false)
+            .await
     }
 
     async fn del(&self, key: &Did) -> Result<(), Self::Error> {
-        self.delete_key("oauth_sessions", "did", key.as_ref())
+        self.delete_key("oauth_sessions", "did", key.as_ref()).await
     }
 
     async fn clear(&self) -> Result<(), Self::Error> {
-        self.clear_table("oauth_sessions")
+        self.clear_table("oauth_sessions").await
     }
 }
 
@@ -2002,7 +2299,8 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         if let Some((expires, preferences)) = self.saved_feed_cache.lock().await.get(did).cloned() {
             return Some((preferences, expires <= now));
         }
-        let Ok(Some((json, stored_at_ms))) = self.store.web_cache_get(&saved_feed_cache_key(did))
+        let Ok(Some((json, stored_at_ms))) =
+            self.store.web_cache_get(&saved_feed_cache_key(did)).await
         else {
             return None;
         };
@@ -2198,7 +2496,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             return Ok(actors);
         }
         if let Ok(Some((json, stored_at_ms))) =
-            self.store.web_cache_get(&muted_actor_cache_key(did))
+            self.store.web_cache_get(&muted_actor_cache_key(did)).await
             && let Ok(actor_list) = serde_json::from_str::<Vec<String>>(&json)
         {
             let actors = actor_list.into_iter().collect::<HashSet<_>>();
@@ -2854,7 +3152,11 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                 .map_err(|error| format!("Bluesky unmute request failed: {error:?}"))?;
         }
         self.muted_actor_cache.lock().await.remove(did);
-        if let Err(error) = self.store.web_cache_delete(&muted_actor_cache_key(did)) {
+        if let Err(error) = self
+            .store
+            .web_cache_delete(&muted_actor_cache_key(did))
+            .await
+        {
             tracing::warn!(%error, "could not invalidate persisted muted actor list");
         }
         Ok(())
@@ -11382,6 +11684,39 @@ fn create_key_file(path: &Path) -> Result<fs::File, std::io::Error> {
 }
 
 #[cfg(test)]
+mod oauth_store_writer_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn oauth_cache_writer_flushes_pending_writes_when_store_drops() {
+        let path = std::env::temp_dir().join(format!(
+            "appview-rs-oauth-writer-{}-{}.sqlite3",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = SqliteOAuthStore::open(&path).unwrap();
+        store
+            .web_cache_set("shutdown-cache", r#"{"queued":true}"#)
+            .unwrap();
+        drop(store);
+
+        let reopened = SqliteOAuthStore::open(&path).unwrap();
+        let cached = reopened.web_cache_get("shutdown-cache").await.unwrap();
+        assert_eq!(
+            cached.as_ref().map(|(value, _)| value.as_str()),
+            Some(r#"{"queued":true}"#)
+        );
+        drop(reopened);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{}-wal", path.display()));
+        let _ = fs::remove_file(format!("{}-shm", path.display()));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::identity::{DidDocument, DidService, IdentityBackend, ResolutionError};
@@ -13616,17 +13951,17 @@ mod tests {
         flow.store
             .web_cache_set(&cache_key, &serde_json::to_string(&stale).unwrap())
             .unwrap();
+        let stale_at_ms = unix_time_ms() - MUTED_ACTOR_CACHE_TTL.as_millis() as i64 - 1;
         flow.store
-            .connection
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE web_cache SET stored_at_ms=?1 WHERE cache_key=?2",
-                params![
-                    unix_time_ms() - MUTED_ACTOR_CACHE_TTL.as_millis() as i64 - 1,
-                    cache_key
-                ],
-            )
+            .writer
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE web_cache SET stored_at_ms=?1 WHERE cache_key=?2",
+                    params![stale_at_ms, cache_key],
+                )?;
+                Ok(())
+            })
+            .await
             .unwrap();
         state.lock().unwrap().mutes_delay = Duration::from_millis(180);
 
@@ -13739,17 +14074,17 @@ mod tests {
                 &serde_json::to_string(&[stale.clone()]).unwrap(),
             )
             .unwrap();
+        let stale_at_ms = unix_time_ms() - SAVED_FEED_PREFERENCE_CACHE_TTL.as_millis() as i64 - 1;
         flow.store
-            .connection
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE web_cache SET stored_at_ms=?1 WHERE cache_key=?2",
-                params![
-                    unix_time_ms() - SAVED_FEED_PREFERENCE_CACHE_TTL.as_millis() as i64 - 1,
-                    cache_key
-                ],
-            )
+            .writer
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE web_cache SET stored_at_ms=?1 WHERE cache_key=?2",
+                    params![stale_at_ms, cache_key],
+                )?;
+                Ok(())
+            })
+            .await
             .unwrap();
 
         let preferences =

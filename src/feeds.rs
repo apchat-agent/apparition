@@ -385,7 +385,8 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
     pub async fn feed_for_tab(self: &Arc<Self>, uri: &str) -> ResolvedFeed {
         let now_ms = unix_time_ms();
         if let Some(store) = &self.cache_store
-            && let Ok(Some((json, stored_at_ms))) = store.web_cache_get(&generator_cache_key(uri))
+            && let Ok(Some((json, stored_at_ms))) =
+                store.web_cache_get(&generator_cache_key(uri)).await
             && let Ok(cached) = serde_json::from_str::<CachedGeneratorResolution>(&json)
         {
             let age_ms = now_ms.saturating_sub(stored_at_ms).max(0) as u64;
@@ -431,7 +432,8 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
 
     pub async fn resolve_feed(&self, uri: &str) -> Result<ResolvedFeed, String> {
         if let Some(store) = &self.cache_store
-            && let Ok(Some((json, stored_at_ms))) = store.web_cache_get(&generator_cache_key(uri))
+            && let Ok(Some((json, stored_at_ms))) =
+                store.web_cache_get(&generator_cache_key(uri)).await
             && let Ok(cached) = serde_json::from_str::<CachedGeneratorResolution>(&json)
         {
             let age_ms = unix_time_ms().saturating_sub(stored_at_ms).max(0) as u64;
