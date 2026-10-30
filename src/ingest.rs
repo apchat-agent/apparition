@@ -1778,6 +1778,7 @@ struct SqliteWriterMetrics {
     queue_depth: AtomicU64,
     queue_depth_max: AtomicU64,
     dropped: AtomicU64,
+    failed_writes: AtomicU64,
     batch_count: AtomicU64,
     transaction_count: AtomicU64,
     transaction_total_ns: AtomicU64,
@@ -1815,6 +1816,10 @@ impl SqliteWriterMetrics {
             .fetch_max(elapsed_ns, Ordering::Relaxed);
     }
 
+    fn record_failed_write(&self) {
+        self.failed_writes.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn report(&self) {
         let count = self.transaction_count.swap(0, Ordering::Relaxed);
         let total_ns = self.transaction_total_ns.swap(0, Ordering::Relaxed);
@@ -1831,6 +1836,7 @@ impl SqliteWriterMetrics {
             },
             transaction_max_ms = max_ns as f64 / 1_000_000.0,
             dropped_count = self.dropped.swap(0, Ordering::Relaxed),
+            failed_write_count = self.failed_writes.swap(0, Ordering::Relaxed),
             "SQLite writer minute metrics"
         );
     }
@@ -1975,34 +1981,59 @@ fn sqlite_writer_loop(
                 }
                 let started = Instant::now();
                 let mut completions = Vec::new();
-                let mut first_error = None;
+                let mut batch_error = None;
                 match connection.transaction() {
                     Ok(transaction) => {
                         for write in writes {
+                            if let Err(error) = transaction.execute_batch("SAVEPOINT queued_write")
+                            {
+                                metrics.record_failed_write();
+                                batch_error = Some(StorageError::Sqlite(error));
+                                break;
+                            }
                             match write(&transaction) {
-                                Ok(Some(completion)) => completions.push(completion),
-                                Ok(None) => {}
-                                Err(error) if first_error.is_none() => first_error = Some(error),
-                                Err(_) => {}
+                                Ok(completion) => {
+                                    if let Err(error) =
+                                        transaction.execute_batch("RELEASE SAVEPOINT queued_write")
+                                    {
+                                        metrics.record_failed_write();
+                                        batch_error = Some(StorageError::Sqlite(error));
+                                        break;
+                                    }
+                                    if let Some(completion) = completion {
+                                        completions.push(completion);
+                                    }
+                                }
+                                Err(error) => {
+                                    metrics.record_failed_write();
+                                    tracing::warn!(%error, "SQLite queued write failed");
+                                    if let Err(rollback_error) = transaction.execute_batch(
+                                        "ROLLBACK TO SAVEPOINT queued_write;
+                                         RELEASE SAVEPOINT queued_write;",
+                                    ) {
+                                        batch_error = Some(StorageError::Sqlite(rollback_error));
+                                        break;
+                                    }
+                                }
                             }
                         }
-                        if first_error.is_none()
-                            && let Err(error) = transaction.commit()
-                        {
-                            tracing::warn!(%error, "SQLite queued write batch commit failed");
-                            first_error = Some(StorageError::Sqlite(error));
+                        if batch_error.is_none() {
+                            if let Err(error) = transaction.commit() {
+                                tracing::warn!(%error, "SQLite queued write batch commit failed");
+                                batch_error = Some(StorageError::Sqlite(error));
+                            }
                         }
                     }
                     Err(error) => {
                         tracing::warn!(%error, "SQLite queued write batch could not start");
-                        first_error = Some(StorageError::Sqlite(error));
+                        batch_error = Some(StorageError::Sqlite(error));
                     }
                 }
-                if first_error.is_none() {
+                if batch_error.is_none() {
                     for completion in completions {
                         completion();
                     }
-                } else if let Some(error) = first_error {
+                } else if let Some(error) = batch_error {
                     tracing::warn!(%error, "SQLite queued write batch rolled back");
                 }
                 metrics.record_batch(started.elapsed());
@@ -5203,10 +5234,7 @@ mod sqlite_writer_tests {
         let writer = SqliteWriter::new(connection).unwrap();
         writer.fire(|connection| {
             std::thread::sleep(Duration::from_millis(200));
-            connection.execute(
-                "INSERT INTO shutdown_write(value) VALUES('flushed')",
-                [],
-            )?;
+            connection.execute("INSERT INTO shutdown_write(value) VALUES('flushed')", [])?;
             Ok(None)
         });
 
@@ -5243,10 +5271,12 @@ mod sqlite_writer_tests {
             Ok(None)
         });
         writer.flush().unwrap();
+        assert_eq!(writer.metrics.failed_writes.load(Ordering::Relaxed), 1);
 
         let values = writer
             .call(|connection| {
-                let mut statement = connection.prepare("SELECT value FROM batch_write ORDER BY value")?;
+                let mut statement =
+                    connection.prepare("SELECT value FROM batch_write ORDER BY value")?;
                 let values = statement
                     .query_map([], |row| row.get::<_, String>(0))?
                     .collect::<Result<Vec<_>, _>>()?;
