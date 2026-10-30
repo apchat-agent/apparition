@@ -9,6 +9,7 @@ pub mod jwt;
 pub mod link_card;
 pub mod net;
 pub mod oauth;
+pub mod profile_counts;
 
 use axum::{Json, Router, routing::get};
 use serde::Serialize;

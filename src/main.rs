@@ -1,5 +1,5 @@
 use appview_rs::{
-    api::api_router_with_https,
+    api::api_router_with_https_and_profile_counts,
     backfill::{
         AtriumRepoVerifier, BackfillWorker, HostRateLimiter, HttpRepoSource, RepoBackfiller,
     },
@@ -8,8 +8,9 @@ use appview_rs::{
     ingest::{Ingestor, JetstreamConsumer, SqliteStorage},
     init_tracing,
     jwt::ServiceJwtVerifier,
+    net::SafeHttpClient,
     oauth::{OAuthPublic, ProfileRefreshWorker, SqliteOAuthStore, WebShutdown},
-    router_with_oauth_flow_and_shutdown,
+    profile_counts::{PUBLIC_APPVIEW_BASE, ProfileCountsClient},
 };
 use std::{
     error::Error, future::IntoFuture, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration,
@@ -64,18 +65,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
         config.appview_did.clone(),
     ));
     let web_shutdown = WebShutdown::new();
-    let app_router = router_with_oauth_flow_and_shutdown(
-        oauth,
-        oauth_flow.clone(),
-        storage.clone(),
-        web_shutdown.clone(),
-    )
-    .merge(api_router_with_https(
-        storage.clone(),
-        jwt,
-        config.appview_did.clone(),
-        config.public_url.starts_with("https://"),
-    ));
+    let profile_counts = ProfileCountsClient::new(
+        SafeHttpClient::new(),
+        PUBLIC_APPVIEW_BASE,
+        Duration::from_secs(config.profile_counts_cache_ttl_secs),
+    );
+    let app_router = oauth
+        .router_with_flow_and_shutdown_and_profile_counts(
+            oauth_flow.clone(),
+            storage.clone(),
+            web_shutdown.clone(),
+            profile_counts.clone(),
+        )
+        .merge(api_router_with_https_and_profile_counts(
+            storage.clone(),
+            jwt,
+            config.appview_did.clone(),
+            config.public_url.starts_with("https://"),
+            profile_counts,
+        ));
     let backfiller = RepoBackfiller::new(
         storage.clone(),
         HttpRepoSource::default(),

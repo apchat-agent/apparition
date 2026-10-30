@@ -3,6 +3,7 @@ use crate::{
     identity::IdentityBackend,
     ingest::{IndexedRecord, NotificationCursor, RecordCursor, Storage, StorageError},
     jwt::{ServiceClaims, ServiceJwtVerifier},
+    profile_counts::{ProfileCountsClient, apply_profile_counts},
 };
 use axum::{
     Json, Router,
@@ -29,6 +30,7 @@ struct ApiState<S: Storage, B: IdentityBackend> {
     storage: Arc<S>,
     jwt: Arc<ServiceJwtVerifier<B>>,
     appview_did: String,
+    profile_counts: ProfileCountsClient,
 }
 
 impl<S: Storage, B: IdentityBackend> Clone for ApiState<S, B> {
@@ -37,6 +39,7 @@ impl<S: Storage, B: IdentityBackend> Clone for ApiState<S, B> {
             storage: self.storage.clone(),
             jwt: self.jwt.clone(),
             appview_did: self.appview_did.clone(),
+            profile_counts: self.profile_counts.clone(),
         }
     }
 }
@@ -99,7 +102,13 @@ where
     S: Storage + 'static,
     B: IdentityBackend + 'static,
 {
-    api_router_with_https(storage, jwt, appview_did, false)
+    api_router_with_https_and_profile_counts(
+        storage,
+        jwt,
+        appview_did,
+        false,
+        ProfileCountsClient::local_only(),
+    )
 }
 
 pub fn api_router_with_https<S, B>(
@@ -112,10 +121,44 @@ where
     S: Storage + 'static,
     B: IdentityBackend + 'static,
 {
+    api_router_with_https_and_profile_counts(
+        storage,
+        jwt,
+        appview_did,
+        public_https,
+        ProfileCountsClient::local_only(),
+    )
+}
+
+pub fn api_router_with_profile_counts<S, B>(
+    storage: Arc<S>,
+    jwt: Arc<ServiceJwtVerifier<B>>,
+    appview_did: impl Into<String>,
+    profile_counts: ProfileCountsClient,
+) -> Router
+where
+    S: Storage + 'static,
+    B: IdentityBackend + 'static,
+{
+    api_router_with_https_and_profile_counts(storage, jwt, appview_did, false, profile_counts)
+}
+
+pub fn api_router_with_https_and_profile_counts<S, B>(
+    storage: Arc<S>,
+    jwt: Arc<ServiceJwtVerifier<B>>,
+    appview_did: impl Into<String>,
+    public_https: bool,
+    profile_counts: ProfileCountsClient,
+) -> Router
+where
+    S: Storage + 'static,
+    B: IdentityBackend + 'static,
+{
     let state = ApiState {
         storage,
         jwt,
         appview_did: appview_did.into(),
+        profile_counts,
     };
     let router = Router::new()
         .route("/.well-known/did.json", get(did_document::<S, B>))
@@ -180,7 +223,11 @@ async fn get_profile<S: Storage, B: IdentityBackend>(
     let _ = authorize(&state, &headers, "app.bsky.actor.getProfile", false).await?;
     let actor = required(&query, "actor")?;
     let did = actor_to_did(&state, actor)?;
-    Ok(Json(profile_view(&state, &did)?))
+    let mut profile = profile_view(&state, &did)?;
+    if let Some(counts) = state.profile_counts.get_counts(&did).await {
+        apply_profile_counts(&mut profile, counts);
+    }
+    Ok(Json(profile))
 }
 
 async fn get_profiles<S: Storage, B: IdentityBackend>(
@@ -193,10 +240,18 @@ async fn get_profiles<S: Storage, B: IdentityBackend>(
     if actors.is_empty() {
         return Err(ApiError::bad_request("missing query parameter actors"));
     }
+    let mut profile_dids = Vec::new();
     let mut profiles = Vec::new();
     for actor in actors.iter().take(25) {
         if let Ok(did) = actor_to_did(&state, actor) {
             profiles.push(profile_view(&state, &did)?);
+            profile_dids.push(did);
+        }
+    }
+    let remote_counts = state.profile_counts.get_counts_many(&profile_dids).await;
+    for (did, profile) in profile_dids.iter().zip(&mut profiles) {
+        if let Some(counts) = remote_counts.get(did) {
+            apply_profile_counts(profile, *counts);
         }
     }
     Ok(Json(json!({"profiles":profiles})))

@@ -11,6 +11,7 @@ use crate::{
     },
     link_card::{LinkCard, LinkCardFetcher, LinkThumbnail},
     net::SafeHttpClient,
+    profile_counts::{PUBLIC_APPVIEW_BASE, ProfileCountsClient, apply_profile_counts},
 };
 use atrium_api::{
     agent::{Agent, SessionManager},
@@ -93,7 +94,6 @@ const HLS_SCRIPT_URL: &str = "/static/vendor/hls.min.js?v=1.7.3";
 const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
 const SAVED_FEED_CACHE_PREFIX: &str = "saved-feed-preferences:";
 const BSKY_MODERATION_LABELER_DID: &str = "did:plc:ar7c4by46qjdydhdevvrndac";
-const PUBLIC_APPVIEW_BASE: &str = "https://public.api.bsky.app/xrpc/";
 const ACCOUNT_LABEL_PROFILE_BATCH_SIZE: usize = 25;
 const ACCOUNT_LABEL_CACHE_TTL: Duration = Duration::from_secs(60);
 const LABELER_PREFERENCE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -730,6 +730,7 @@ pub struct OAuthWebState<F, S> {
     pub public: OAuthPublic,
     pub flow: F,
     pub storage: Arc<S>,
+    profile_counts: ProfileCountsClient,
     link_card_fetcher: LinkCardFetcher,
     feed_page_cache: FeedPageCache,
     notification_streams: Arc<Mutex<HashMap<String, usize>>>,
@@ -919,10 +920,30 @@ impl OAuthPublic {
         F: OAuthFlow,
         S: Storage + 'static,
     {
+        self.router_with_flow_and_shutdown_and_profile_counts(
+            flow,
+            storage,
+            shutdown,
+            ProfileCountsClient::local_only(),
+        )
+    }
+
+    pub fn router_with_flow_and_shutdown_and_profile_counts<F, S>(
+        &self,
+        flow: F,
+        storage: Arc<S>,
+        shutdown: WebShutdown,
+        profile_counts: ProfileCountsClient,
+    ) -> Router
+    where
+        F: OAuthFlow,
+        S: Storage + 'static,
+    {
         let state = Arc::new(OAuthWebState {
             public: self.clone(),
             flow,
             storage,
+            profile_counts,
             link_card_fetcher: LinkCardFetcher::new(),
             shutdown,
             feed_page_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -6191,10 +6212,13 @@ where
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
     let render_started = std::time::Instant::now();
-    let profile = match profile_view_from_storage(state.storage.as_ref(), subject) {
+    let mut profile = match profile_view_from_storage(state.storage.as_ref(), subject) {
         Ok(profile) => profile,
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
+    if let Some(counts) = state.profile_counts.get_counts(subject).await {
+        apply_profile_counts(&mut profile, counts);
+    }
     let handle = profile_handle(&profile, subject);
     let display_name = profile
         .get("displayName")
