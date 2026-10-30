@@ -12553,6 +12553,253 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn unresolved_parent_author_is_marked_for_the_background_profile_fill() {
+        let storage = Arc::new(MemoryStorage::default());
+        let viewer = "did:plc:profile-fill-viewer";
+        let parent_did = "did:plc:verylongparentidentifier";
+        let reply_did = "did:plc:reply-author";
+        let parent = test_web_post(parent_did, "original", 1, "Original text", None);
+        let reply = test_web_post(reply_did, "reply", 2, "Reply text", Some(&parent.uri));
+        storage.put_record(&parent).unwrap();
+        storage.put_record(&reply).unwrap();
+        storage.set_follow(viewer, reply_did, true).unwrap();
+        storage
+            .set_verified_handle(reply_did, "reply.test")
+            .unwrap();
+        put_test_profile(&storage, reply_did, "Reply Author");
+
+        let page = request_test_timeline(storage.clone(), viewer).await;
+
+        assert!(page.contains("class=\"reply-parent-card\""), "{page}");
+        assert!(
+            page.contains(&format!("data-profile-did=\"{parent_did}\"")),
+            "a reply-parent author without a stored profile must be marked for the background fill: {page}"
+        );
+        assert!(
+            !page.contains(&format!("data-profile-did=\"{reply_did}\"")),
+            "a post author whose profile is stored must not be marked: {page}"
+        );
+
+        let thread = request_test_timeline_at_with_flow(
+            storage,
+            viewer,
+            &format!("/app/thread?uri={}", form_encoded(&reply.uri)),
+            DisabledOAuthFlow,
+        )
+        .await;
+        assert!(
+            thread.contains(&format!("data-profile-did=\"{parent_did}\"")),
+            "the thread page must mark the same unresolved ancestor author: {thread}"
+        );
+    }
+
+    #[derive(Clone)]
+    struct ProfileFragmentTestFlow {
+        profiles: Arc<HashMap<String, crate::feeds::PublicProfileView>>,
+        actor_batches: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl ProfileFragmentTestFlow {
+        fn new(profiles: impl IntoIterator<Item = crate::feeds::PublicProfileView>) -> Self {
+            Self {
+                profiles: Arc::new(
+                    profiles
+                        .into_iter()
+                        .map(|profile| (profile.did.clone(), profile))
+                        .collect(),
+                ),
+                actor_batches: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl OAuthFlow for ProfileFragmentTestFlow {
+        fn authorize<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async { Err("test flow does not authorize".to_owned()) })
+        }
+
+        fn callback<'a>(
+            &'a self,
+            _: OAuthCallback,
+        ) -> Pin<Box<dyn Future<Output = Result<OAuthAccount, String>> + Send + 'a>> {
+            Box::pin(async { Err("test flow does not callback".to_owned()) })
+        }
+
+        fn logout<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn page_account_data_for_page<'a>(
+            &'a self,
+            _: &'a str,
+            actor_dids: Vec<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<PageAccountData, String>> + Send + 'a>> {
+            let batches = self.actor_batches.clone();
+            let profiles = self.profiles.clone();
+            Box::pin(async move {
+                let data = PageAccountData {
+                    labels: Vec::new(),
+                    profiles: actor_dids
+                        .iter()
+                        .filter_map(|did| profiles.get(did))
+                        .cloned()
+                        .collect(),
+                };
+                batches.lock().unwrap().push(actor_dids);
+                Ok(data)
+            })
+        }
+    }
+
+    fn public_profile_fixture(
+        did: &str,
+        handle: &str,
+        display_name: &str,
+    ) -> crate::feeds::PublicProfileView {
+        crate::feeds::PublicProfileView {
+            did: did.to_owned(),
+            handle: Some(handle.to_owned()),
+            display_name: Some(display_name.to_owned()),
+            avatar: Some(format!(
+                "https://cdn.bsky.app/img/avatar/plain/{did}/bafk-avatar@jpeg"
+            )),
+            labels: Vec::new(),
+        }
+    }
+
+    async fn request_test_profile_fragment(
+        storage: Arc<MemoryStorage>,
+        viewer: &str,
+        query: &str,
+        flow: ProfileFragmentTestFlow,
+    ) -> (StatusCode, Value) {
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let session_id = "profile-fragment-session";
+        let generation = storage.rotate_web_session(viewer, session_id).unwrap();
+        let token = public.issue_session_cookie(
+            viewer,
+            session_id,
+            generation,
+            SessionPermissions {
+                write: false,
+                feed: false,
+                blob: false,
+                video: false,
+                follow: false,
+                block: false,
+                mute: false,
+                list: false,
+            },
+        );
+        let app = public.router_with_flow(flow, storage);
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/profile-fragment?{query}"))
+                    .header("cookie", format!("{SESSION_COOKIE}={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        (status, parsed)
+    }
+
+    #[tokio::test]
+    async fn profile_fragment_fills_missing_authors_in_one_batch_and_stores_them() {
+        let storage = Arc::new(MemoryStorage::default());
+        let viewer = "did:plc:profile-fragment-viewer";
+        let known = "did:plc:fillauthorone";
+        let unknown = "did:plc:fillghostauthor";
+        let flow = ProfileFragmentTestFlow::new([public_profile_fixture(
+            known,
+            "fill.example",
+            "Fill Example Author",
+        )]);
+
+        let query = format!("did={}&did={}", form_encoded(known), form_encoded(unknown));
+        let (status, body) =
+            request_test_profile_fragment(storage.clone(), viewer, &query, flow.clone()).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let profiles = body
+            .get("profiles")
+            .and_then(Value::as_object)
+            .unwrap_or_else(|| panic!("the response must carry a profiles object: {body}"));
+        let filled = profiles
+            .get(known)
+            .unwrap_or_else(|| panic!("the known author must be returned: {body}"));
+        assert_eq!(filled["displayName"], json!("Fill Example Author"));
+        assert_eq!(filled["handle"], json!("fill.example"));
+        assert!(
+            filled["avatar"]
+                .as_str()
+                .is_some_and(|avatar| avatar.starts_with("https://cdn.bsky.app/img/")),
+            "{filled}"
+        );
+        assert!(
+            !profiles.contains_key(unknown),
+            "an unknown DID must be skipped without failing the others: {body}"
+        );
+        let stored = storage
+            .get_record(known, "app.bsky.actor.profile", "self")
+            .unwrap()
+            .unwrap_or_else(|| panic!("the fetched profile must be stored for the next page load"));
+        assert_eq!(stored.record["displayName"], json!("Fill Example Author"));
+        assert_eq!(stored.record["publicHandle"], json!("fill.example"));
+        let batches = flow.actor_batches.lock().unwrap().clone();
+        assert_eq!(
+            batches,
+            vec![vec![known.to_owned(), unknown.to_owned()]],
+            "one public batch per fragment request"
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_fragment_caps_each_request_at_the_public_batch_size() {
+        let storage = Arc::new(MemoryStorage::default());
+        let viewer = "did:plc:profile-fragment-viewer";
+        let dids = (0..30)
+            .map(|index| format!("did:plc:fillbatch{index}"))
+            .collect::<Vec<_>>();
+        let flow = ProfileFragmentTestFlow::new(
+            dids.iter()
+                .map(|did| public_profile_fixture(did, "batch.example", "Batch Author")),
+        );
+        let query = dids
+            .iter()
+            .map(|did| format!("did={}", form_encoded(did)))
+            .collect::<Vec<_>>()
+            .join("&");
+
+        let (status, body) =
+            request_test_profile_fragment(storage, viewer, &query, flow.clone()).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let profiles = body
+            .get("profiles")
+            .and_then(Value::as_object)
+            .unwrap_or_else(|| panic!("the response must carry a profiles object: {body}"));
+        assert_eq!(
+            profiles.len(),
+            25,
+            "one public getProfiles batch per request"
+        );
+        let batches = flow.actor_batches.lock().unwrap().clone();
+        assert_eq!(batches, vec![dids[..25].to_vec()]);
+    }
+
     #[test]
     fn video_oauth_scopes_are_explicit_and_old_scopes_do_not_enable_video() {
         for scope in [
