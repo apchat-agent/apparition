@@ -7477,3 +7477,65 @@ async fn the_following_timing_line_counts_list_blocked_posts() {
     assert_eq!(line.1, 1, "exactly one post was list-blocked: {phases:?}");
     assert!(line.2, "the timing line reports list_blocks_ms: {phases:?}");
 }
+
+#[tokio::test]
+async fn block_lists_page_shows_each_subscribed_list_with_a_leak_slider() {
+    let first_uri = "at://did:plc:list-owner/app.bsky.graph.list/spamlist";
+    let second_uri = "at://did:plc:other-owner/app.bsky.graph.list/spamlist";
+    let storage = Arc::new(MemoryStorage::default());
+    let flow = FakeOAuthFlow {
+        block_lists: Arc::new(Mutex::new(vec![
+            fake_block_list(
+                first_uri,
+                "Spam &<> noise",
+                &["did:plc:one", "did:plc:two", "did:plc:three"],
+            ),
+            fake_block_list(second_uri, "Quiet", &["did:plc:one"]),
+        ])),
+        ..FakeOAuthFlow::default()
+    };
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage);
+    let cookie = finish_login(&app).await;
+    let (status, html) = get_body(&app, "/app/block-lists", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("Spam &amp;&lt;&gt; noise"),
+        "the list name is escaped: {html}"
+    );
+    assert!(html.contains("Quiet"));
+    assert!(
+        html.matches("type=\"range\"").count() == 2,
+        "one range slider per list: {html}"
+    );
+    assert!(
+        html.contains(&format!(
+            "type=\"range\" min=\"0\" max=\"100\" step=\"1\" value=\"0\" data-list-block-uri=\"{first_uri}\""
+        )),
+        "the slider carries the list uri and starts at 0: {html}"
+    );
+    assert!(html.contains(&format!(
+        "data-list-block-uri=\"{second_uri}\""
+    )));
+    assert!(
+        html.matches("% of posts let through").count() == 2,
+        "each slider is labelled: {html}"
+    );
+    assert!(html.contains("3 members"), "member counts render: {html}");
+    assert!(html.contains("href=\"/app/block-lists\""), "linked from the app navigation: {html}");
+    assert!(!html.contains("style="), "no inline style attributes: {html}");
+    assert_eq!(html.matches("<script").count(), 2, "CSP unchanged: {html}");
+    let anonymous = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/app/block-lists")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::SEE_OTHER);
+    assert_eq!(anonymous.headers()["location"], "/login");
+}
