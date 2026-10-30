@@ -88,6 +88,7 @@ use tokio::{
     io::AsyncWriteExt,
     sync::{OnceCell, oneshot},
 };
+use tracing::instrument::WithSubscriber;
 
 const METADATA_PATH: &str = "/.well-known/oauth-client-metadata.json";
 const CALLBACK_PATH: &str = "/oauth/callback";
@@ -2741,20 +2742,22 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         let flow = self.clone();
         let refresh_did = did.to_owned();
         let dispatcher = tracing::dispatcher::get_default(|dispatcher| dispatcher.clone());
-        tokio::spawn(async move {
-            let _dispatcher = tracing::dispatcher::set_default(&dispatcher);
-            let result = tokio::time::timeout(
-                PAGE_PROFILE_BUDGET,
-                flow.refresh_labeler_preferences(&refresh_did),
-            )
-            .await
-            .unwrap_or_else(|_| Err("PDS getPreferences request timed out".to_owned()));
-            flow.labeler_preference_refreshes
-                .lock()
+        tokio::spawn(
+            async move {
+                let result = tokio::time::timeout(
+                    PAGE_PROFILE_BUDGET,
+                    flow.refresh_labeler_preferences(&refresh_did),
+                )
                 .await
-                .remove(&refresh_did);
-            let _ = done.send(result);
-        });
+                .unwrap_or_else(|_| Err("PDS getPreferences request timed out".to_owned()));
+                flow.labeler_preference_refreshes
+                    .lock()
+                    .await
+                    .remove(&refresh_did);
+                let _ = done.send(result);
+            }
+            .with_subscriber(dispatcher),
+        );
         match awaited.await {
             Ok(result) => result,
             Err(_) => Err("PDS getPreferences refresh task ended without a result".to_owned()),
@@ -3073,8 +3076,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                 let refresh_viewer = viewer_did.to_owned();
                 let dispatcher = tracing::dispatcher::get_default(|dispatcher| dispatcher.clone());
                 tokio::spawn(async move {
-                    let _dispatcher = tracing::dispatcher::set_default(&dispatcher);
-                    let result = tokio::time::timeout(
+                            let result = tokio::time::timeout(
                         PAGE_PROFILE_BUDGET,
                         flow.refresh_account_actor_data(&refresh_viewer, refresh.clone()),
                     )
@@ -3088,7 +3090,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                     flow.clear_account_actor_refreshes(&refresh_viewer, &refresh)
                         .await;
                     let _ = done.send(result);
-                });
+                }.with_subscriber(dispatcher));
                 match awaited.await {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => return Err(error),
