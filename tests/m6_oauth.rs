@@ -1422,7 +1422,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
             ),
             "{path}"
         );
-        assert!(html.contains("href=\"/static/app.css?v=m30\""), "{path}");
+        assert!(html.contains("href=\"/static/app.css?v=m31\""), "{path}");
         assert!(!html.contains("style="), "{path}");
         // Both playback and interaction scripts are local, deferred, and never inline.
         assert_eq!(html.matches("<script").count(), 2, "{path}");
@@ -1436,7 +1436,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
     let stylesheet = app
         .oneshot(
             Request::builder()
-                .uri("/static/app.css?v=m30")
+                .uri("/static/app.css?v=m31")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1483,7 +1483,7 @@ async fn no_js_stylesheet_is_served_same_origin_and_linked_from_every_page_head(
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/static/nojs.css?v=m30")
+                .uri("/static/nojs.css?v=m31")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1534,7 +1534,7 @@ async fn no_js_stylesheet_is_served_same_origin_and_linked_from_every_page_head(
         .unwrap();
         assert!(
             html.contains(
-                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m30\"></noscript>"
+                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m31\"></noscript>"
             ),
             "{path}"
         );
@@ -1848,7 +1848,7 @@ async fn sign_in_error_page_uses_the_shared_mobile_document_shell() {
     );
     assert!(html.contains("Login failed, try again"));
     assert!(html.contains("href=\"/login\""));
-    assert!(html.contains("href=\"/static/app.css?v=m30\""));
+    assert!(html.contains("href=\"/static/app.css?v=m31\""));
     assert!(!html.contains("style="));
     // The shared shell loads both local deferred scripts, never inline code.
     assert_eq!(html.matches("<script").count(), 2);
@@ -6780,7 +6780,7 @@ async fn old_scope_profile_shows_per_action_reauthorization_messages() {
 }
 
 #[tokio::test]
-async fn profile_labels_are_fetched_once_and_render_as_chips_with_labeler_details() {
+async fn profile_labels_are_fetched_once_and_render_as_one_expanded_icon_control() {
     let storage = Arc::new(MemoryStorage::default());
     storage
         .put_record(&fake_feed_post(
@@ -6790,16 +6790,88 @@ async fn profile_labels_are_fetched_once_and_render_as_chips_with_labeler_detail
             "labelled account post",
         ))
         .unwrap();
+    let raw = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/inputs/cornell-labeler-getServices.json"
+    ))
+    .unwrap();
+    let parsed: Value = serde_json::from_str(&raw).unwrap();
+    let definitions = parsed["views"][0]["policies"]["labelValueDefinitions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|definition| {
+            let locales = definition["locales"].as_array().unwrap();
+            let locale = locales
+                .iter()
+                .find(|locale| locale["lang"].as_str() == Some("en"))
+                .or_else(|| locales.first())
+                .unwrap();
+            (
+                definition["identifier"].as_str().unwrap().to_owned(),
+                locale["name"].as_str().unwrap().to_owned(),
+                locale["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                definition["severity"].as_str().unwrap_or("none").to_owned(),
+                definition["blurs"].as_str().unwrap_or("none").to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let fixture_label = |subject: &str,
+                         labeler_did: &str,
+                         labeler_name: &str,
+                         labeler_handle: &str,
+                         identifier: &str| {
+        let (_, name, description, severity, blurs) = definitions
+            .iter()
+            .find(|(value, ..)| value == identifier)
+            .unwrap_or_else(|| panic!("missing fixture definition for {identifier}"))
+            .clone();
+        AccountLabel {
+            subject_did: subject.to_owned(),
+            labeler_did: labeler_did.to_owned(),
+            labeler_name: labeler_name.to_owned(),
+            labeler_handle: labeler_handle.to_owned(),
+            value: identifier.to_owned(),
+            display_name: name,
+            description,
+            severity,
+            blurs,
+        }
+    };
     let flow = FakeOAuthFlow::default();
-    flow.account_labels.lock().unwrap().push(AccountLabel {
-        subject_did: "did:plc:friend".to_owned(),
-        labeler_did: "did:plc:labeler".to_owned(),
-        labeler_name: "Careful Labeler".to_owned(),
-        value: "spider".to_owned(),
-        display_name: "Spider Warning".to_owned(),
-        severity: "alert".to_owned(),
-        blurs: "media".to_owned(),
-    });
+    flow.account_labels.lock().unwrap().extend([
+        fixture_label(
+            "did:plc:friend",
+            "did:plc:oubsyca6hhgqhmbbk27lvs7c",
+            "Account Activity Labeler",
+            "stechlab-labels.bsky.social",
+            "made-over-hundred-posts-yesterday",
+        ),
+        fixture_label(
+            "did:plc:friend",
+            "did:plc:oubsyca6hhgqhmbbk27lvs7c",
+            "Account Activity Labeler",
+            "stechlab-labels.bsky.social",
+            "posted-same-url-high",
+        ),
+        fixture_label(
+            "did:plc:friend",
+            "did:plc:oubsyca6hhgqhmbbk27lvs7c",
+            "Account Activity Labeler",
+            "stechlab-labels.bsky.social",
+            "no-gap-more-than-one-hours",
+        ),
+        fixture_label(
+            "did:plc:friend",
+            "did:plc:second-labeler",
+            "Steady Watcher",
+            "steady.watch",
+            "high-follow-churn-fifty",
+        ),
+    ]);
     let label_requests = flow.label_requests.clone();
     let app = OAuthPublic::new("https://appview.example")
         .unwrap()
@@ -6808,12 +6880,40 @@ async fn profile_labels_are_fetched_once_and_render_as_chips_with_labeler_detail
 
     let html = get_html(&app, "/profile?did=did%3Aplc%3Afriend", &cookie).await;
     assert!(html.contains("profile-actions"), "{html}");
-    assert!(html.contains("Spider Warning"), "{html}");
-    assert!(html.contains("Careful Labeler"), "{html}");
-    assert!(html.contains("severity: alert"), "{html}");
-    assert!(html.contains("blurs: media"), "{html}");
-    assert!(html.contains("account-label-chip severity-alert"), "{html}");
-    assert!(html.matches("account-label-chip").count() >= 2, "{html}");
+    assert!(
+        html.contains("<details class=\"account-labels\">"),
+        "the profile header carries one compact control: {html}"
+    );
+    assert!(
+        html.matches("<details class=\"account-labels\">").count() >= 2,
+        "the post card below carries one too: {html}"
+    );
+    assert!(!html.contains("account-label-chip"), "{html}");
+    assert!(html.contains("aria-label=\"4 account labels\""), "{html}");
+    for icon in ["📝", "🔗", "⏱️", "👥"] {
+        assert!(html.contains(icon), "{html}");
+    }
+    assert!(html.contains("Made over 100 posts yesterday"), "{html}");
+    assert!(
+        html.contains(
+            "In the last 24 hrs this account made more than 100 original posts or quotes."
+        ),
+        "the expanded row keeps the definition description: {html}"
+    );
+    assert!(html.contains("by Account Activity Labeler"), "{html}");
+    assert!(
+        html.contains("href=\"/profile?did=did%3Aplc%3Aoubsyca6hhgqhmbbk27lvs7c\""),
+        "{html}"
+    );
+    assert!(
+        html.contains("<p class=\"account-label-group-name\">Account Activity Labeler</p>"),
+        "rows are grouped under the Cornell labeler: {html}"
+    );
+    assert!(
+        html.contains("<p class=\"account-label-group-name\">Steady Watcher</p>"),
+        "and under the second labeler: {html}"
+    );
+    assert!(html.contains("Unfollowed 50+ yesterday"), "{html}");
     let requests = label_requests.lock().unwrap();
     assert_eq!(requests.len(), 1, "label lookup should be batched per page");
     assert_eq!(

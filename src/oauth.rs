@@ -13241,7 +13241,7 @@ mod tests {
         assert!(css.contains(".thread-focus-actions .is-liked .icon {\n  fill: var(--accent);"));
         assert!(css.contains(".infinite-scroll-status {"));
         assert!(css.contains(".infinite-scroll-retry[hidden] {\n  display: none;"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m30"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m31"));
         assert!(WEB_SCRIPT_URL.contains("v=js20"));
     }
 
@@ -13262,7 +13262,7 @@ mod tests {
         ));
         assert!(css.contains("bottom: var(--mobile-compose-clearance);"));
         assert!(css.contains("padding-bottom: max(4.25rem, var(--mobile-compose-clearance));"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m30"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m31"));
     }
 
     #[test]
@@ -13418,7 +13418,7 @@ mod tests {
         let head = page_shell("Write a post", "", true);
         assert!(
             head.contains(
-                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m30\"></noscript>"
+                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m31\"></noscript>"
             ),
             "the head must restore the full form for no-JS visitors: {head}"
         );
@@ -14984,6 +14984,477 @@ mod tests {
             Some("Fresh actor")
         );
         server.abort();
+    }
+
+    const CORNELL_FIXTURE_DID: &str = "did:plc:oubsyca6hhgqhmbbk27lvs7c";
+    const CORNELL_FIXTURE_NAME: &str = "Account Activity Labeler";
+
+    type CornellFixtureDefinition = (String, String, String, String, String);
+
+    fn cornell_fixture_definitions() -> Vec<CornellFixtureDefinition> {
+        let raw = fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/inputs/cornell-labeler-getServices.json"
+        ))
+        .expect("Cornell labeler getServices fixture");
+        let parsed: Value = serde_json::from_str(&raw).unwrap();
+        parsed["views"][0]["policies"]["labelValueDefinitions"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|definition| {
+                let identifier = definition.get("identifier")?.as_str()?.to_owned();
+                let locales = definition
+                    .get("locales")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let locale = locales
+                    .iter()
+                    .find(|locale| locale.get("lang").and_then(Value::as_str) == Some("en"))
+                    .or_else(|| locales.first());
+                Some((
+                    identifier,
+                    locale
+                        .and_then(|locale| locale.get("name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    locale
+                        .and_then(|locale| locale.get("description"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    definition
+                        .get("severity")
+                        .and_then(Value::as_str)
+                        .unwrap_or("none")
+                        .to_owned(),
+                    definition
+                        .get("blurs")
+                        .and_then(Value::as_str)
+                        .unwrap_or("none")
+                        .to_owned(),
+                ))
+            })
+            .collect()
+    }
+
+    fn fixture_account_label(
+        definitions: &[CornellFixtureDefinition],
+        subject_did: &str,
+        labeler_did: &str,
+        labeler_name: &str,
+        identifier: &str,
+    ) -> AccountLabel {
+        let definition = definitions
+            .iter()
+            .find(|(value, ..)| value == identifier)
+            .unwrap_or_else(|| panic!("missing fixture definition for {identifier}"))
+            .clone();
+        AccountLabel {
+            subject_did: subject_did.to_owned(),
+            labeler_did: labeler_did.to_owned(),
+            labeler_name: labeler_name.to_owned(),
+            value: identifier.to_owned(),
+            display_name: definition.1,
+            severity: definition.3,
+            blurs: definition.4,
+        }
+    }
+
+    fn cornell_labels(
+        definitions: &[CornellFixtureDefinition],
+        subject_did: &str,
+        identifiers: &[&str],
+    ) -> Vec<AccountLabel> {
+        identifiers
+            .iter()
+            .map(|identifier| {
+                fixture_account_label(
+                    definitions,
+                    subject_did,
+                    CORNELL_FIXTURE_DID,
+                    CORNELL_FIXTURE_NAME,
+                    identifier,
+                )
+            })
+            .collect()
+    }
+
+    fn fixture_summary(rendered: &str) -> &str {
+        &rendered[rendered.find("<summary").unwrap()..rendered.find("</summary>").unwrap()]
+    }
+
+    #[test]
+    fn three_cornell_labels_render_one_control_with_the_ordered_icon_summary() {
+        let definitions = cornell_fixture_definitions();
+        let subject = "did:plc:labelled-author";
+        let mut labels_by_actor = HashMap::new();
+        labels_by_actor.insert(
+            subject.to_owned(),
+            cornell_labels(
+                &definitions,
+                subject,
+                &[
+                    "made-over-hundred-posts-yesterday",
+                    "posted-same-url-high",
+                    "no-gap-more-than-one-hours",
+                ],
+            ),
+        );
+
+        let rendered = render_account_label_chips(&labels_by_actor, subject);
+
+        assert_eq!(
+            rendered
+                .matches("<details class=\"account-labels\">")
+                .count(),
+            1,
+            "one compact control per account: {rendered}"
+        );
+        assert!(!rendered.contains("account-label-chip"), "{rendered}");
+        let summary = fixture_summary(&rendered);
+        let posts = summary
+            .find("📝")
+            .expect("a posting-volume label shows the memo icon");
+        let url = summary
+            .find("🔗")
+            .expect("a same-url label shows the link icon");
+        let gap = summary
+            .find("⏱️")
+            .expect("a no-gap label shows the stopwatch icon");
+        assert!(
+            posts < url && url < gap,
+            "summary icons follow label order: {summary}"
+        );
+        assert_eq!(
+            summary.matches("account-label-emoji").count(),
+            3,
+            "one small icon per label: {summary}"
+        );
+        assert_eq!(
+            summary.matches("severity-inform").count(),
+            3,
+            "inform icons carry the neutral ring class: {summary}"
+        );
+        assert!(
+            rendered.contains("aria-label=\"3 account labels\""),
+            "the control is named by its label count: {rendered}"
+        );
+        for name in [
+            "Made over 100 posts yesterday",
+            "Posted same url 15+ times yesterday",
+            "No break greater than 1 hr yesterday",
+        ] {
+            assert!(rendered.contains(name), "{rendered}");
+        }
+        assert_eq!(
+            rendered
+                .matches("<li class=\"account-label-row severity-inform\">")
+                .count(),
+            3,
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("by Account Activity Labeler</a>").count(),
+            3,
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered
+                .matches("href=\"/profile?did=did%3Aplc%3Aoubsyca6hhgqhmbbk27lvs7c\"")
+                .count(),
+            3,
+            "every row links to the labeler's profile: {rendered}"
+        );
+        let unlabelled = render_account_label_chips(&HashMap::new(), "did:plc:plain");
+        let empty_list = render_account_label_chips(
+            &HashMap::from([("did:plc:plain".to_owned(), Vec::new())]),
+            "did:plc:plain",
+        );
+        assert!(
+            unlabelled.is_empty() && empty_list.is_empty(),
+            "accounts without labels render nothing"
+        );
+    }
+
+    #[test]
+    fn six_labels_show_four_icons_and_the_overflow_count_in_order() {
+        let definitions = cornell_fixture_definitions();
+        let subject = "did:plc:busy-author";
+        let mut labels_by_actor = HashMap::new();
+        labels_by_actor.insert(
+            subject.to_owned(),
+            cornell_labels(
+                &definitions,
+                subject,
+                &[
+                    "made-over-hundred-posts-yesterday",
+                    "made-over-hundred-replies-yesterday",
+                    "no-gap-more-than-two-hours",
+                    "posted-same-url-mid",
+                    "metadata-monthly-changes-low",
+                    "high-follow-churn-one-hundred",
+                ],
+            ),
+        );
+
+        let rendered = render_account_label_chips(&labels_by_actor, subject);
+        let summary = fixture_summary(&rendered);
+
+        assert_eq!(
+            summary.matches("account-label-emoji").count(),
+            4,
+            "{summary}"
+        );
+        for emoji in ["📝", "💬", "⏱️", "🔗"] {
+            assert!(summary.contains(emoji), "{summary}");
+        }
+        assert!(
+            !summary.contains("🪪") && !summary.contains("👥"),
+            "icons past the fourth collapse into the overflow count: {summary}"
+        );
+        assert!(
+            summary.contains("<span class=\"account-label-more\">+2</span>"),
+            "{summary}"
+        );
+        assert!(
+            rendered.contains("aria-label=\"6 account labels\""),
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered.matches("<li class=\"account-label-row").count(),
+            6,
+            "all six labels stay in the expanded list: {rendered}"
+        );
+        assert_eq!(
+            rendered.matches("🪪").count(),
+            1,
+            "the profile-changes label keeps its icon in the list: {rendered}"
+        );
+        assert_eq!(
+            rendered.matches("👥").count(),
+            1,
+            "the follow-churn label keeps its icon in the list: {rendered}"
+        );
+        assert!(
+            rendered.contains("Profile changes often: more than 3 days in last 30 days"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Unfollowed 100+ yesterday"), "{rendered}");
+    }
+
+    #[test]
+    fn labels_from_two_labelers_expand_into_rows_grouped_by_labeler() {
+        let definitions = cornell_fixture_definitions();
+        let subject = "did:plc:multi-labelled";
+        let mut labels = cornell_labels(
+            &definitions,
+            subject,
+            &[
+                "made-over-hundred-posts-yesterday",
+                "no-gap-more-than-one-hours",
+            ],
+        );
+        labels.push(fixture_account_label(
+            &definitions,
+            subject,
+            "did:plc:second-labeler",
+            "Steady Watcher",
+            "high-follow-churn-fifty",
+        ));
+        let mut labels_by_actor = HashMap::new();
+        labels_by_actor.insert(subject.to_owned(), labels);
+
+        let rendered = render_account_label_chips(&labels_by_actor, subject);
+
+        assert_eq!(
+            rendered
+                .matches("<li class=\"account-label-group\">")
+                .count(),
+            2,
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("<p class=\"account-label-group-name\">Account Activity Labeler</p>"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("<p class=\"account-label-group-name\">Steady Watcher</p>"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.find("Account Activity Labeler</p>") < rendered.find("Steady Watcher</p>"),
+            "groups keep the order their labelers first appear: {rendered}"
+        );
+        let groups = rendered
+            .split("<li class=\"account-label-group\">")
+            .collect::<Vec<_>>();
+        assert_eq!(groups.len(), 3, "{rendered}");
+        assert_eq!(
+            groups[1].matches("by Account Activity Labeler</a>").count(),
+            2,
+            "{rendered}"
+        );
+        assert!(!groups[1].contains("Steady Watcher"), "{rendered}");
+        assert_eq!(
+            groups[2].matches("by Steady Watcher</a>").count(),
+            1,
+            "{rendered}"
+        );
+        assert!(
+            groups[1].find("Made over 100 posts yesterday") < groups[1].find("No break greater"),
+            "rows keep label order inside a group: {rendered}"
+        );
+        assert!(
+            rendered.contains("href=\"/profile?did=did%3Aplc%3Asecond-labeler\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("aria-label=\"3 account labels\""),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn alert_severity_rings_its_icon_and_unknown_values_fall_back_to_the_label_tag() {
+        let subject = "did:plc:alert-author";
+        let mut labels_by_actor = HashMap::new();
+        labels_by_actor.insert(
+            subject.to_owned(),
+            vec![AccountLabel {
+                subject_did: subject.to_owned(),
+                labeler_did: "did:plc:careful-labeler".to_owned(),
+                labeler_name: "Careful Labeler".to_owned(),
+                value: "spider".to_owned(),
+                display_name: "Spider Warning".to_owned(),
+                severity: "alert".to_owned(),
+                blurs: "content".to_owned(),
+            }],
+        );
+
+        let rendered = render_account_label_chips(&labels_by_actor, subject);
+
+        assert!(
+            rendered.contains(
+                "<span class=\"account-label-emoji severity-alert\" aria-hidden=\"true\">🏷️</span>"
+            ),
+            "alert labels ring their icon red and unknown values fall back to the tag icon: {rendered}"
+        );
+        assert!(
+            rendered.contains("<li class=\"account-label-row severity-alert\">"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Spider Warning"), "{rendered}");
+        assert!(
+            rendered.contains("aria-label=\"1 account label\""),
+            "the accessible count stays singular: {rendered}"
+        );
+    }
+
+    #[test]
+    fn post_card_authors_show_the_compact_control_next_to_the_author_name() {
+        let storage = MemoryStorage::default();
+        let subject = "did:plc:labelled-poster";
+        let post = test_web_post(subject, "labelled-post", 1, "Labelled author post", None);
+        storage.put_record(&post).unwrap();
+        let definitions = cornell_fixture_definitions();
+        let mut index = QuoteRenderIndex::default();
+        index.account_labels.insert(
+            subject.to_owned(),
+            cornell_labels(
+                &definitions,
+                subject,
+                &[
+                    "made-over-hundred-posts-yesterday",
+                    "posted-same-url-high",
+                    "no-gap-more-than-one-hours",
+                ],
+            ),
+        );
+
+        let rendered = render_web_post(
+            &storage,
+            &post,
+            "did:plc:viewer",
+            false,
+            false,
+            false,
+            &index,
+        );
+
+        assert!(
+            rendered.contains("<details class=\"account-labels\">"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("account-label-chip"), "{rendered}");
+        let name = rendered.find("class=\"author-name\"").unwrap();
+        let control = rendered.find("<details class=\"account-labels\">").unwrap();
+        let handle = rendered.find("class=\"author-handle\"").unwrap();
+        assert!(
+            name < control && control < handle,
+            "the control sits between the author name and handle: {rendered}"
+        );
+    }
+
+    #[test]
+    fn quote_cards_show_the_compact_control_for_the_quoted_author() {
+        let storage = MemoryStorage::default();
+        let quoted_author = "did:plc:quoted-labelled-author";
+        let quoted = test_web_post(
+            quoted_author,
+            "quoted-labels",
+            1,
+            "Quoted body under test",
+            None,
+        );
+        let embed = quote_embed(&quoted.uri);
+        let mut index = QuoteRenderIndex::default();
+        index.insert(quoted.uri.clone(), QuoteRenderState::Found(quoted));
+        let definitions = cornell_fixture_definitions();
+        index.account_labels.insert(
+            quoted_author.to_owned(),
+            cornell_labels(
+                &definitions,
+                quoted_author,
+                &["made-over-hundred-posts-yesterday"],
+            ),
+        );
+
+        let rendered = render_web_quote(&storage, &embed, &index, 0);
+
+        assert!(
+            rendered.contains("<details class=\"account-labels\">"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("aria-label=\"1 account label\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Made over 100 posts yesterday"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn the_expanded_label_panel_stays_inside_a_phone_screen_and_rings_alerts_red() {
+        let css = include_str!("../static/app.css");
+
+        assert!(
+            css_rule_bodies(css, ".account-labels .account-label-groups")
+                .iter()
+                .any(|block| { block.contains("min(19rem") && block.contains("calc(100vw") }),
+            "the expanded panel must fit a 402 px screen without sideways scrolling"
+        );
+        assert!(
+            css_rule_bodies(css, ".account-label-emoji.severity-alert")
+                .iter()
+                .any(|block| { block.contains("var(--label-alert-ring)") }),
+            "alert icons get the red ring"
+        );
     }
 
     #[tokio::test]
