@@ -13879,7 +13879,7 @@ mod tests {
         assert!(css.contains(".thread-focus-actions .is-liked .icon {\n  fill: var(--accent);"));
         assert!(css.contains(".infinite-scroll-status {"));
         assert!(css.contains(".infinite-scroll-retry[hidden] {\n  display: none;"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m34"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m35"));
         assert!(WEB_SCRIPT_URL.contains("v=js21"));
     }
 
@@ -13900,7 +13900,7 @@ mod tests {
         ));
         assert!(css.contains("bottom: var(--mobile-compose-clearance);"));
         assert!(css.contains("padding-bottom: max(4.25rem, var(--mobile-compose-clearance));"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m34"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m35"));
     }
 
     #[test]
@@ -14084,7 +14084,7 @@ mod tests {
         let head = page_shell("Write a post", "", true);
         assert!(
             head.contains(
-                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m34\"></noscript>"
+                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m35\"></noscript>"
             ),
             "the head must restore the full form for no-JS visitors: {head}"
         );
@@ -16787,8 +16787,40 @@ mod tests {
             css_declaration(body, "color").as_deref(),
             Some("var(--muted)")
         );
-        assert!(WEB_STYLESHEET_URL.contains("v=m34"));
-        assert!(WEB_NOJS_STYLESHEET_URL.contains("v=m34"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m35"));
+        assert!(WEB_NOJS_STYLESHEET_URL.contains("v=m35"));
+    }
+
+    #[test]
+    fn post_text_links_are_accent_coloured_after_the_whole_text_link_rule() {
+        let css = include_str!("../static/app.css");
+        let whole_text = css_rule_bodies(css, ".post-text a")
+            .first()
+            .expect("the .post-text a rule for the whole-text thread link must stay")
+            .clone();
+        assert_eq!(
+            css_declaration(&whole_text, "color").as_deref(),
+            Some("inherit"),
+            "the whole-text thread link must keep looking like body text"
+        );
+        assert_eq!(
+            css_declaration(&whole_text, "text-decoration").as_deref(),
+            Some("none")
+        );
+        let facet = css_rule_bodies(css, ".post-text a.post-text-link")
+            .into_iter()
+            .last()
+            .expect("link facets need their own rule so they look like links");
+        assert_eq!(
+            css_declaration(&facet, "color").as_deref(),
+            Some("var(--accent)"),
+            "a link facet must render in the accent colour, not the body-text colour"
+        );
+        assert!(
+            css.find(".post-text a.post-text-link {") > css.find(".post-text a {"),
+            "the accent rule must come after `.post-text a {{` so it wins the cascade"
+        );
+        assert!(WEB_STYLESHEET_URL.contains("v=m35"));
     }
 }
 
