@@ -12231,11 +12231,14 @@ fn log_pds_xrpc_failure(method: &'static str, error: &XrpcClientError<Value>) {
         }
         _ => (None, None, None),
     };
+    // `error` carries the transport failure text (size limit, read failure, timeout...), which status/code/message
+    // leave as None for anything that is not an XRPC error response (2026-10-30: getPreferences failed with all three None).
     tracing::warn!(
         method,
         status = ?status,
         error_code = ?error_code,
         error_message = ?error_message,
+        error = %error,
         "PDS XRPC request failed"
     );
 }
