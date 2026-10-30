@@ -1684,7 +1684,7 @@ async fn authorization_and_callback_reject_missing_protocol_parameters() {
 
 #[tokio::test]
 async fn authorize_normalizes_the_typed_handle_but_not_a_did() {
-    // A phone keyboard sent "Ayourtch.bsky.social"; atproto handles are case-insensitive but the
+    // A phone keyboard sent "Owner.Example.Test"; atproto handles are case-insensitive but the
     // DID-document check downstream compares them exactly, so sign-in failed (2026-10-28).
     let app = OAuthPublic::new("https://appview.example")
         .unwrap()
