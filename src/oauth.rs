@@ -104,8 +104,9 @@ const OAUTH_STORE_WRITER_BATCH_SIZE: usize = 64;
 const OAUTH_STORE_WRITER_BATCH_DELAY: Duration = Duration::from_millis(5);
 const OAUTH_STORE_WRITER_METRICS_INTERVAL: Duration = Duration::from_secs(60);
 static NEXT_OAUTH_MEMORY_DATABASE_ID: AtomicUsize = AtomicUsize::new(1);
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m28";
-const WEB_SCRIPT_URL: &str = "/static/app.js?v=js19";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m29";
+const WEB_SCRIPT_URL: &str = "/static/app.js?v=js20";
+const WEB_NOJS_STYLESHEET_URL: &str = "/static/nojs.css?v=m29";
 const HLS_SCRIPT_URL: &str = "/static/vendor/hls.min.js?v=1.7.3";
 const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
 const SAVED_FEED_CACHE_PREFIX: &str = "saved-feed-preferences:";
@@ -1044,6 +1045,7 @@ impl OAuthPublic {
         let regular_routes = Router::new()
             .route(METADATA_PATH, get(metadata::<F, S>))
             .route("/static/app.css", get(app_stylesheet))
+            .route("/static/nojs.css", get(nojs_stylesheet))
             .route("/static/app.js", get(app_script))
             .route("/static/vendor/{*path}", get(vendor_asset))
             .route("/", get(root))
@@ -4540,6 +4542,20 @@ async fn app_stylesheet() -> Response {
     response
 }
 
+/// Linked from a `<noscript>` tag in the page head; restores the full composer form to visitors without JavaScript.
+async fn nojs_stylesheet() -> Response {
+    let mut response = include_str!("../static/nojs.css").into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/css; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    response
+}
+
 fn page_shell(title: &str, content: &str, authenticated: bool) -> String {
     page_shell_with_feeds(title, content, authenticated, &[], None, false)
 }
@@ -4656,9 +4672,10 @@ fn page_shell_with_options(
         "app-layout guest-layout"
     };
     format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\"><title>{}</title><link rel=\"stylesheet\" href=\"{}\"><script src=\"{}\" defer></script><script src=\"{}\" defer></script></head><body>{}<a class=\"skip-link\" href=\"#main-content\">Skip to content</a>{mobile_navigation}<div class=\"{layout}\"><aside class=\"left-sidebar\"><a class=\"brand\" href=\"/app\">AppView</a>{navigation}</aside><div class=\"center-column\"><header class=\"center-sticky\">{tabs}</header><main id=\"main-content\" class=\"page-content\">{content}</main></div>{right_sidebar}</div></body></html>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\"><title>{}</title><link rel=\"stylesheet\" href=\"{}\"><noscript><link rel=\"stylesheet\" href=\"{}\"></noscript><script src=\"{}\" defer></script><script src=\"{}\" defer></script></head><body>{}<a class=\"skip-link\" href=\"#main-content\">Skip to content</a>{mobile_navigation}<div class=\"{layout}\"><aside class=\"left-sidebar\"><a class=\"brand\" href=\"/app\">AppView</a>{navigation}</aside><div class=\"center-column\"><header class=\"center-sticky\">{tabs}</header><main id=\"main-content\" class=\"page-content\">{content}</main></div>{right_sidebar}</div></body></html>",
         html_escape(title),
         WEB_STYLESHEET_URL,
+        WEB_NOJS_STYLESHEET_URL,
         HLS_SCRIPT_URL,
         WEB_SCRIPT_URL,
         icon_sprite()
@@ -13224,8 +13241,8 @@ mod tests {
         assert!(css.contains(".thread-focus-actions .is-liked .icon {\n  fill: var(--accent);"));
         assert!(css.contains(".infinite-scroll-status {"));
         assert!(css.contains(".infinite-scroll-retry[hidden] {\n  display: none;"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m28"));
-        assert!(WEB_SCRIPT_URL.contains("v=js19"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m29"));
+        assert!(WEB_SCRIPT_URL.contains("v=js20"));
     }
 
     #[test]
@@ -13245,7 +13262,7 @@ mod tests {
         ));
         assert!(css.contains("bottom: var(--mobile-compose-clearance);"));
         assert!(css.contains("padding-bottom: max(4.25rem, var(--mobile-compose-clearance));"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m28"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m29"));
     }
 
     fn css_rule_bodies(css: &str, selector: &str) -> Vec<String> {
@@ -13319,7 +13336,7 @@ mod tests {
         let css = include_str!("../static/app.css");
         let nojs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/static/nojs.css"))
             .expect("static/nojs.css must exist for visitors without JavaScript");
-        let gate = ".composer[data-compact-composer]:not(.is-expanded):not(:has(.reply-context, .quoted-post-preview)):not(:has(textarea:not(:placeholder-shown)))";
+        let gate = ".composer[data-compact-composer]:not(.is-expanded):not(:has(.reply-context, .quoted-post-preview)):not(:has([data-compose-input]:not(:placeholder-shown)))";
 
         let default_textarea =
             css_rule_bodies(css, &format!("{gate} .composer-input-row textarea"))

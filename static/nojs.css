@@ -1,0 +1,17 @@
+/* Restores the full composer form for visitors without JavaScript. app.js collapses an empty composer by default and
+   hides its toolbar and fields so the page does not jump when it enhances (see the matching block in app.css). A no-JS
+   browser never adds is-enhanced, so it would be stuck with the collapsed look; this same-origin stylesheet, linked from
+   a <noscript> tag in the page head after app.css, hands the tall textarea, the control row and the media/link fields
+   back. It targets the exact same gate selector so it only re-opens an empty composer that has no context. */
+.composer[data-compact-composer]:not(.is-expanded):not(:has(.reply-context, .quoted-post-preview)):not(:has([data-compose-input]:not(:placeholder-shown))) .composer-input-row textarea {
+  min-height: 3rem;
+  padding-block: 0.55rem;
+}
+
+.composer[data-compact-composer]:not(.is-expanded):not(:has(.reply-context, .quoted-post-preview)):not(:has([data-compose-input]:not(:placeholder-shown))) .composer-toolbar {
+  display: flex;
+}
+
+.composer[data-compact-composer]:not(.is-expanded):not(:has(.reply-context, .quoted-post-preview)):not(:has([data-compose-input]:not(:placeholder-shown))) .composer-fields {
+  display: grid;
+}

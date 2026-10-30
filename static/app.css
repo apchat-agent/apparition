@@ -580,6 +580,23 @@ textarea:focus-visible {
   display: none;
 }
 
+/* The empty composer's collapsed look is the FIRST-PAINT default (owner, 2026-10-30: the composer must look the same
+   before and after app.js runs, so it already renders at the 44 px collapsed size with the toolbar and fields hidden).
+   Composers WITH context (reply/quote) or pre-filled text keep their full form, and /static/nojs.css restores the full
+   form for visitors without JavaScript. Expanding on focus still works: is-expanded drops this whole block. */
+.composer[data-compact-composer]:not(.is-expanded):not(:has(.reply-context, .quoted-post-preview)):not(:has([data-compose-input]:not(:placeholder-shown))) .composer-input-row textarea {
+  min-height: 44px;
+  padding-block: 0.45rem;
+}
+
+.composer[data-compact-composer]:not(.is-expanded):not(:has(.reply-context, .quoted-post-preview)):not(:has([data-compose-input]:not(:placeholder-shown))) .composer-toolbar {
+  display: none;
+}
+
+.composer[data-compact-composer]:not(.is-expanded):not(:has(.reply-context, .quoted-post-preview)):not(:has([data-compose-input]:not(:placeholder-shown))) .composer-fields {
+  display: none;
+}
+
 .composer label,
 .login-form label {
   color: var(--muted);
@@ -2746,4 +2763,31 @@ body {
 
 .account-label-chip[open] {
   z-index: 6;
+}
+
+/* The ?bar-debug=1 measuring overlay (app.js): a small readout fixed at the TOP of the screen so it never covers the
+   bottom bar; the probe only exists to read env(safe-area-inset-*) through getComputedStyle. */
+.bar-debug-box {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 60;
+  max-width: 100%;
+  padding: 0.4rem 0.55rem;
+  background: rgb(12 12 12 / 90%);
+  color: #f6f6f6;
+  font: 0.78rem/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre;
+}
+
+.bar-debug-probe {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 1px;
+  height: 1px;
+  visibility: hidden;
+  pointer-events: none;
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
 }

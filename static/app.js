@@ -1200,3 +1200,75 @@ function fillDeferredQuotes(root = document) {
 
 fillDeferredQuotes();
 fillProfileIdentities();
+
+// Measuring overlay for the phone bottom bar (owner, 2026-10-30): open any page with ?bar-debug=1 and a small box at the
+// TOP of the screen reports why the bar sits too high on a phone we cannot measure. Without the parameter nothing here
+// runs: no probe element, no listeners, no DOM.
+function installBarDebugOverlay(host = window, pageDocument = document) {
+  let params;
+  try {
+    params = new URLSearchParams(host?.location?.search || "");
+  } catch {
+    return null;
+  }
+  if (params.get("bar-debug") !== "1") return null;
+
+  const probe = pageDocument.createElement("div");
+  probe.className = "bar-debug-probe";
+  pageDocument.body.append(probe);
+  const box = pageDocument.createElement("div");
+  box.className = "bar-debug-box";
+  box.setAttribute("aria-hidden", "true");
+  pageDocument.body.append(box);
+
+  const rounded = (value) => {
+    const number = Number(value);
+    return Number.isFinite(number) ? Math.round(number * 100) / 100 : "n/a";
+  };
+  const px = (value) => {
+    const number = Number.parseFloat(value);
+    return Number.isFinite(number) ? `${Math.round(number * 100) / 100}px` : "n/a";
+  };
+  const refresh = () => {
+    const probeStyle = host.getComputedStyle?.(probe);
+    const viewport = host.visualViewport;
+    const nav = pageDocument.querySelector(".mobile-nav");
+    const bar = nav?.getBoundingClientRect?.();
+    const icon = nav?.querySelector?.(".icon")?.getBoundingClientRect?.();
+    const lines = [
+      `innerHeight: ${rounded(host.innerHeight)}`,
+      `vv.height: ${rounded(viewport?.height)}`,
+      `vv.offsetTop: ${rounded(viewport?.offsetTop)}`,
+      `clientHeight: ${rounded(pageDocument.documentElement?.clientHeight)}`,
+      `screen.height: ${rounded(host.screen?.height)}`,
+      `devicePixelRatio: ${rounded(host.devicePixelRatio)}`,
+      `standalone: ${host.matchMedia?.("(display-mode: standalone)")?.matches ? "yes" : "no"}`,
+      `safe-area-inset-top: ${px(probeStyle?.paddingTop)}`,
+      `safe-area-inset-bottom: ${px(probeStyle?.paddingBottom)}`,
+    ];
+    if (bar) {
+      lines.push(
+        `bar.top: ${rounded(bar.top)}`,
+        `bar.bottom: ${rounded(bar.bottom)}`,
+        `bar.height: ${rounded(bar.height)}`,
+      );
+      if (icon) {
+        lines.push(
+          `icon.top: ${rounded(icon.top)}`,
+          `icon.bottom: ${rounded(icon.bottom)}`,
+          `icon.height: ${rounded(icon.height)}`,
+          `gap bar.top->icon.top: ${rounded(icon.top - bar.top)}`,
+          `gap icon.bottom->bar.bottom: ${rounded(bar.bottom - icon.bottom)}`,
+        );
+      }
+      lines.push(`gap bar.bottom->innerHeight: ${rounded(host.innerHeight - bar.bottom)}`);
+    }
+    box.textContent = lines.join("\n");
+  };
+  refresh();
+  host.addEventListener("resize", refresh);
+  host.addEventListener("scroll", refresh, { passive: true });
+  host.visualViewport?.addEventListener("resize", refresh);
+  return { box, probe, refresh };
+}
+installBarDebugOverlay();
