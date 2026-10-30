@@ -446,6 +446,15 @@ mod tests {
                 "<meta property='og:image' content='/large.png'>",
             )
         }
+        async fn missing_thumbnail_page() -> impl IntoResponse {
+            (
+                [(header::CONTENT_TYPE, "text/html")],
+                "<meta property='og:title' content='Card without image'><meta property='og:image' content='/missing.png'>",
+            )
+        }
+        async fn missing_image() -> impl IntoResponse {
+            axum::http::StatusCode::NOT_FOUND
+        }
         async fn image() -> impl IntoResponse {
             ([(header::CONTENT_TYPE, "image/png")], vec![1, 2, 3])
         }
@@ -487,6 +496,8 @@ mod tests {
             .route("/dir/page", get(page))
             .route("/bad-thumbnail-page", get(bad_thumbnail_page))
             .route("/large-thumbnail-page", get(large_thumbnail_page))
+            .route("/missing-thumbnail-page", get(missing_thumbnail_page))
+            .route("/missing.png", get(missing_image))
             .route("/thumb.png", get(image))
             .route("/text.png", get(text_image))
             .route("/large.png", get(large_image))
@@ -560,6 +571,29 @@ mod tests {
         );
         assert!(fetcher.fetch(&format!("{base}/redirect-1")).await.is_err());
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn thumbnail_http_404_keeps_link_card_without_thumbnail() {
+        let (port, server, _) = test_server().await;
+        let fetcher = local_fetcher();
+        let card = fetcher
+            .fetch(&format!("http://site.test:{port}/missing-thumbnail-page"))
+            .await
+            .expect("a missing thumbnail must not discard valid page metadata");
+
+        assert_eq!(card.title, "Card without image");
+        assert!(card.thumbnail.is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live public internet"]
+    async fn live_github_link_preview_fetches() {
+        let result = LinkCardFetcher::new()
+            .fetch("https://github.com/apchat-agent/apparition")
+            .await;
+        assert!(result.is_ok(), "GitHub preview fetch failed: {result:?}");
     }
 
     #[tokio::test]
