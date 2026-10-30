@@ -464,6 +464,10 @@ textarea:focus-visible {
   font-size: 0.84rem;
 }
 
+.composer [role="status"]:empty {
+  display: none;
+}
+
 .media-picker-status:not(:empty) {
   color: #b42318;
   font-weight: 700;
