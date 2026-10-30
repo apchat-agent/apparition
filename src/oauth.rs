@@ -42,7 +42,8 @@ use axum::{
     Json, Router,
     body::{Body, Bytes},
     extract::{
-        DefaultBodyLimit, Form, FromRequest, Multipart, Path as AxumPath, Query, Request, State,
+        DefaultBodyLimit, Form, FromRequest, Multipart, OriginalUri, Path as AxumPath, Query,
+        Request, State,
     },
     http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{Next, from_fn},
@@ -1055,6 +1056,7 @@ impl OAuthPublic {
             .route("/app/feed", get(feed_timeline_page::<F, S>))
             .route("/app/thread", get(thread_page::<F, S>))
             .route("/quote-fragment", get(quote_fragment::<F, S>))
+            .route("/profile-fragment", get(profile_fragment::<F, S>))
             .route("/notifications", get(notifications_page::<F, S>))
             .route(
                 "/notifications/unread-count",
@@ -6933,7 +6935,13 @@ fn render_web_notification_group<S: Storage>(
         .map(|event| {
             let profile = profile_view_from_storage(storage, &event.record.did)
                 .unwrap_or_else(|_| json!({"did":event.record.did,"handle":event.record.did}));
-            avatar_markup(&profile, "notification-avatar")
+            let fill = author_fill(&profile, &event.record.did);
+            avatar_markup_with_priority_and_attrs(
+                &profile,
+                "notification-avatar",
+                false,
+                &fill.avatar_attrs,
+            )
         })
         .collect::<String>();
     let count = group.events.len().saturating_sub(1);
@@ -6974,9 +6982,12 @@ fn render_web_notification_group<S: Storage>(
         String::new()
     };
 
+    let name_fill = author_fill(&author, &newest.record.did);
+    let name_attrs = format!("{}{}", name_fill.container, name_fill.name);
     format!(
-        "<li class=\"notification-item notification-group-item\"><article class=\"notification-group\"><div class=\"notification-group-icon\">{icon}</div><div class=\"notification-group-content\"><div class=\"notification-group-avatars\">{avatars}</div><p class=\"notification-summary\"><a class=\"notification-name\" href=\"{}\">{}</a>{others} {action} <span class=\"notification-age\">· {age}</span></p>{snippet}</div></article></li>",
+        "<li class=\"notification-item notification-group-item\"><article class=\"notification-group\"><div class=\"notification-group-icon\">{icon}</div><div class=\"notification-group-content\"><div class=\"notification-group-avatars\">{avatars}</div><p class=\"notification-summary\"><a class=\"notification-name\" href=\"{}\"{}>{}</a>{others} {action} <span class=\"notification-age\">· {age}</span></p>{snippet}</div></article></li>",
         html_escape(&author_uri),
+        name_attrs,
         html_escape(display_name)
     )
 }
@@ -7044,11 +7055,14 @@ fn render_web_notification<S: Storage>(
     } else {
         String::new()
     };
+    let fill = author_fill(&author, &record.did);
+    let author_attrs = format!("{}{}", fill.container, fill.handle);
     format!(
-        "<li class=\"notification-item\" data-post-kind=\"notification\" data-post-uri=\"{}\"><article class=\"notification-card\"><header class=\"notification-heading\">{}<div><a class=\"author-name\" href=\"{}\">@{}</a><span class=\"notification-reason\">{reason}</span></div></header>{parent}{text}{embed}{thread_link}</article></li>",
+        "<li class=\"notification-item\" data-post-kind=\"notification\" data-post-uri=\"{}\"><article class=\"notification-card\"><header class=\"notification-heading\">{}<div><a class=\"author-name\" href=\"{}\"{}>@{}</a><span class=\"notification-reason\">{reason}</span></div></header>{parent}{text}{embed}{thread_link}</article></li>",
         html_escape(&record.uri),
-        avatar_markup(&author, "avatar"),
+        avatar_markup_with_priority_and_attrs(&author, "avatar", false, &fill.avatar_attrs),
         html_escape(&author_uri),
+        author_attrs,
         html_escape(&handle)
     )
 }
@@ -8434,6 +8448,89 @@ where
     Html(render_web_quote(state.storage.as_ref(), &embed, &index, 0)).into_response()
 }
 
+async fn profile_fragment<F, S>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+) -> Response
+where
+    F: OAuthFlow,
+    S: Storage + 'static,
+{
+    let Some(viewer_did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref())
+    else {
+        return (StatusCode::UNAUTHORIZED, "sign in to load these profiles").into_response();
+    };
+    let mut dids = Vec::new();
+    let mut seen = HashSet::new();
+    for (key, value) in url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes()) {
+        if key != "did" {
+            continue;
+        }
+        let value = value.into_owned();
+        if !seen.insert(value.clone()) {
+            continue;
+        }
+        if value.parse::<Did>().is_ok() {
+            dids.push(value);
+            if dids.len() >= ACCOUNT_LABEL_PROFILE_BATCH_SIZE {
+                break;
+            }
+        }
+    }
+    if dids.is_empty() {
+        return Json(json!({"profiles": {}})).into_response();
+    }
+    let account_data = match state
+        .flow
+        .page_account_data_for_page(&viewer_did, dids.clone())
+        .await
+    {
+        Ok(data) => data,
+        Err(error) => {
+            tracing::debug!(%error, "profile fragment account data could not be fetched");
+            PageAccountData::default()
+        }
+    };
+    if let Err(error) = hydrate_page_profiles(
+        state.storage.as_ref(),
+        dids.iter().cloned(),
+        account_data.profiles,
+    ) {
+        tracing::debug!(%error, "profile fragment could not store the fetched profiles");
+    }
+    let mut profiles = serde_json::Map::new();
+    for did in dids {
+        let Ok(profile) = profile_view_from_storage(state.storage.as_ref(), &did) else {
+            continue;
+        };
+        let handle = profile_handle(&profile, &did);
+        let display_name = profile
+            .get("displayName")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty());
+        let avatar = safe_avatar_url(&profile).and_then(avatar_thumbnail_url);
+        if handle == did && display_name.is_none() && avatar.is_none() {
+            continue;
+        }
+        let mut entry = serde_json::Map::new();
+        if handle != did {
+            entry.insert("handle".to_owned(), Value::String(handle));
+        }
+        if let Some(display_name) = display_name {
+            entry.insert(
+                "displayName".to_owned(),
+                Value::String(display_name.to_owned()),
+            );
+        }
+        if let Some(avatar) = avatar {
+            entry.insert("avatar".to_owned(), Value::String(avatar));
+        }
+        profiles.insert(did, Value::Object(entry));
+    }
+    Json(json!({"profiles": Value::Object(profiles)})).into_response()
+}
+
 fn render_quote_preview<S: Storage>(storage: &S, quoted: &IndexedRecord) -> String {
     let profile = profile_view_from_storage(storage, &quoted.did)
         .unwrap_or_else(|_| json!({"did":quoted.did,"handle":quoted.did}));
@@ -8673,10 +8770,20 @@ fn render_reply_composer<S: Storage>(
             "<input type=\"hidden\" name=\"parent_uri\" value=\"{}\">",
             html_escape(&parent.uri)
         ),
-        context: &format!(
-            "<p class=\"reply-context\">Replying to @{}</p>",
-            html_escape(&handle)
-        ),
+        context: &if author_identity_is_unresolved(&profile, &parent.did) {
+            let fill = author_fill(&profile, &parent.did);
+            format!(
+                "<p class=\"reply-context\"{}>Replying to <span{}>@{}</span></p>",
+                fill.container,
+                fill.handle,
+                html_escape(&handle)
+            )
+        } else {
+            format!(
+                "<p class=\"reply-context\">Replying to @{}</p>",
+                html_escape(&handle)
+            )
+        },
         media_picker: render_media_picker(blob_access, video_access, "reply-media"),
         link_picker: render_link_picker("reply-text-link"),
         trailing: "",
@@ -8906,12 +9013,21 @@ fn render_thread_focus<S: Storage>(
         .get("embed")
         .map(|embed| render_web_embed_with_quotes(storage, &record.did, embed, quote_index, 0))
         .unwrap_or_default();
+    let fill = author_fill(&profile, &record.did);
     format!(
-        "<article class=\"post-card thread-post-focus\"><header class=\"thread-focus-author\">{}<div class=\"thread-focus-names\"><a class=\"author-name\" href=\"{}\">{}</a><a class=\"author-handle\" href=\"{}\">@{}</a></div></header><p class=\"thread-focus-text\">{text}</p><p class=\"thread-focus-meta\">{time}{reply_policy}</p><hr><div class=\"thread-stats\" aria-label=\"Post statistics\">{stats}</div><hr><div class=\"thread-focus-actions\">{reply_action}{repost_action}{like_action}{share_action}{more_action}</div>{embed}</article>",
-        avatar_markup_with_priority(&profile, "focus-avatar", eager_avatar),
+        "<article class=\"post-card thread-post-focus\"><header class=\"thread-focus-author\">{}<div class=\"thread-focus-names\"{}><a class=\"author-name\" href=\"{}\"{}>{}</a><a class=\"author-handle\" href=\"{}\"{}>@{}</a></div></header><p class=\"thread-focus-text\">{text}</p><p class=\"thread-focus-meta\">{time}{reply_policy}</p><hr><div class=\"thread-stats\" aria-label=\"Post statistics\">{stats}</div><hr><div class=\"thread-focus-actions\">{reply_action}{repost_action}{like_action}{share_action}{more_action}</div>{embed}</article>",
+        avatar_markup_with_priority_and_attrs(
+            &profile,
+            "focus-avatar",
+            eager_avatar,
+            &fill.avatar_attrs,
+        ),
+        fill.container,
         html_escape(&profile_uri),
+        fill.name,
         html_escape(display_name),
         html_escape(&profile_uri),
+        fill.handle,
         html_escape(&handle)
     )
 }
@@ -10640,6 +10756,34 @@ fn profile_handle(profile: &Value, did: &str) -> String {
         .to_owned()
 }
 
+fn author_identity_is_unresolved(profile: &Value, did: &str) -> bool {
+    profile_handle(profile, did) == did
+}
+
+const PROFILE_NAME_FILL: &str = " data-profile-name";
+const PROFILE_HANDLE_FILL: &str = " data-profile-handle";
+
+#[derive(Default)]
+struct AuthorFill {
+    container: String,
+    name: &'static str,
+    handle: &'static str,
+    avatar_attrs: String,
+}
+
+fn author_fill(profile: &Value, did: &str) -> AuthorFill {
+    if !author_identity_is_unresolved(profile, did) {
+        return AuthorFill::default();
+    }
+    let container = format!(" data-profile-did=\"{}\"", html_escape(did));
+    AuthorFill {
+        avatar_attrs: format!("{container} data-profile-avatar"),
+        container,
+        name: PROFILE_NAME_FILL,
+        handle: PROFILE_HANDLE_FILL,
+    }
+}
+
 fn safe_avatar_url(profile: &Value) -> Option<&str> {
     let avatar = profile.get("avatar").and_then(Value::as_str)?;
     let url = url::Url::parse(avatar).ok()?;
@@ -10693,15 +10837,26 @@ fn avatar_markup(profile: &Value, class_name: &str) -> String {
 }
 
 fn avatar_markup_with_priority(profile: &Value, class_name: &str, eager: bool) -> String {
+    avatar_markup_with_priority_and_attrs(profile, class_name, eager, "")
+}
+
+fn avatar_markup_with_priority_and_attrs(
+    profile: &Value,
+    class_name: &str,
+    eager: bool,
+    extra_attrs: &str,
+) -> String {
     if let Some(avatar) = safe_avatar_url(profile).and_then(avatar_thumbnail_url) {
         let (width, height) = avatar_dimensions(class_name);
         let loading = if eager { "eager" } else { "lazy" };
         format!(
-            "<img class=\"{class_name}\" src=\"{}\" alt=\"\" width=\"{width}\" height=\"{height}\" loading=\"{loading}\" decoding=\"async\">",
+            "<img class=\"{class_name}\" src=\"{}\" alt=\"\" width=\"{width}\" height=\"{height}\" loading=\"{loading}\" decoding=\"async\"{extra_attrs}>",
             html_escape(&avatar)
         )
     } else {
-        format!("<span class=\"{class_name} avatar-placeholder\" aria-hidden=\"true\"></span>")
+        format!(
+            "<span class=\"{class_name} avatar-placeholder\" aria-hidden=\"true\"{extra_attrs}></span>"
+        )
     }
 }
 
@@ -10815,12 +10970,16 @@ fn render_web_post<S: Storage>(
         url::form_urlencoded::byte_serialize(record.did.as_bytes()).collect::<String>()
     );
     let label_chips = render_account_label_chips(&quote_index.account_labels, &record.did);
+    let fill = author_fill(&profile, &record.did);
     let author = format!(
-        "{}<div class=\"post-author\"><a class=\"author-name\" href=\"{}\">{}</a>{label_chips}<a class=\"author-handle\" href=\"{}\">@{}</a></div>",
-        avatar_markup_with_priority(&profile, "avatar", eager_avatar),
+        "{}<div class=\"post-author\"{}><a class=\"author-name\" href=\"{}\"{}>{}</a>{label_chips}<a class=\"author-handle\" href=\"{}\"{}>@{}</a></div>",
+        avatar_markup_with_priority_and_attrs(&profile, "avatar", eager_avatar, &fill.avatar_attrs,),
+        fill.container,
         html_escape(&profile_uri),
+        fill.name,
         html_escape(display_name),
         html_escape(&profile_uri),
+        fill.handle,
         html_escape(&handle),
     );
     let time = record
@@ -10983,12 +11142,21 @@ fn render_reply_parent_card<S: Storage>(storage: &S, parent: &IndexedRecord) -> 
         .and_then(Value::as_str)
         .unwrap_or("");
     let uri = html_escape(&parent.uri);
+    let fill = author_fill(&profile, &parent.did);
     format!(
-        "<a class=\"reply-parent-card\" href=\"{}\" aria-label=\"Open parent post by @{}\" data-post-kind=\"parent\" data-post-uri=\"{uri}\"><header class=\"reply-parent-header\">{}<span class=\"reply-parent-author\"><strong>{}</strong><span>@{}</span></span></header><p class=\"reply-parent-text\">{}</p></a>",
+        "<a class=\"reply-parent-card\" href=\"{}\" aria-label=\"Open parent post by @{}\" data-post-kind=\"parent\" data-post-uri=\"{uri}\"><header class=\"reply-parent-header\">{}<span class=\"reply-parent-author\"{}><strong{}>{}</strong><span{}>@{}</span></span></header><p class=\"reply-parent-text\">{}</p></a>",
         html_escape(&thread_uri),
         html_escape(&handle),
-        avatar_markup(&profile, "reply-parent-avatar"),
+        avatar_markup_with_priority_and_attrs(
+            &profile,
+            "reply-parent-avatar",
+            false,
+            &fill.avatar_attrs,
+        ),
+        fill.container,
+        fill.name,
         html_escape(&display_name),
+        fill.handle,
         html_escape(&handle),
         render_post_text(text),
     )
@@ -10999,10 +11167,13 @@ fn render_reply_parent_fallback<S: Storage>(storage: &S, parent_uri: &str) -> St
     let Some(did) = post_uri_did(parent_uri) else {
         return "<p class=\"reply-parent-fallback\">Reply to a deleted post</p>".to_owned();
     };
-    let (_, handle, _) = parent_display_identity(storage, did);
+    let (profile, handle, _) = parent_display_identity(storage, did);
+    let fill = author_fill(&profile, did);
+    let link_attrs = format!("{}{}", fill.container, fill.handle);
     format!(
-        "<p class=\"reply-parent-fallback\">Reply to <a href=\"{}\">@{}</a></p>",
+        "<p class=\"reply-parent-fallback\">Reply to <a href=\"{}\"{}>@{}</a></p>",
         html_escape(&thread_uri),
+        link_attrs,
         html_escape(&handle)
     )
 }
@@ -11603,10 +11774,14 @@ fn render_web_quote<S: Storage>(
             render_web_embed_with_quotes(storage, &quoted.did, embed, quote_index, quote_depth + 1)
         })
         .unwrap_or_default();
+    let fill = author_fill(&profile, &quoted.did);
     format!(
-        "<article class=\"quoted-post-card\"><a class=\"quoted-card-main\" href=\"/app/thread?uri={encoded_uri}\" aria-label=\"Open quoted post thread\">{}<div class=\"quoted-card-body\"><header><strong>{}</strong><span class=\"quoted-card-handle\">@{}</span>{time}</header><p>{}</p></div></a>{nested}</article>",
-        avatar_markup(&profile, "small-avatar"),
+        "<article class=\"quoted-post-card\"><a class=\"quoted-card-main\" href=\"/app/thread?uri={encoded_uri}\" aria-label=\"Open quoted post thread\">{}<div class=\"quoted-card-body\"><header{}><strong{}>{}</strong><span class=\"quoted-card-handle\"{}>@{}</span>{time}</header><p>{}</p></div></a>{nested}</article>",
+        avatar_markup_with_priority_and_attrs(&profile, "small-avatar", false, &fill.avatar_attrs),
+        fill.container,
+        fill.name,
         html_escape(display_name),
+        fill.handle,
         html_escape(&handle),
         render_post_text(text)
     )
