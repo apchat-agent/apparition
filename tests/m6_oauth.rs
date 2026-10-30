@@ -11,6 +11,7 @@ use appview_rs::{
 use appview_rs::{router, router_with_oauth_flow};
 use atrium_api::types::string::Did;
 use atrium_common::store::Store;
+use base64::Engine as _;
 use atrium_oauth::store::{session::Session, state::InternalStateData};
 use axum::{Router, body::Body, http::Request, http::StatusCode};
 use http_body_util::BodyExt;
@@ -778,6 +779,81 @@ async fn finish_login(app: &Router) -> String {
                 .then(|| value.split(';').next().unwrap().to_owned())
         })
         .unwrap()
+}
+
+#[tokio::test]
+async fn login_allowlist_rejects_the_callback_did_before_creating_a_web_session() {
+    let storage = Arc::new(MemoryStorage::default());
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .with_login_allowlist(["did:plc:somebody-else"])
+        .router_with_flow(FakeOAuthFlow::default(), storage.clone());
+    let login_cookie = prelogin_cookie(&app).await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?code=valid-code&state=valid-state&scope=atproto")
+                .header("cookie", login_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(String::from_utf8_lossy(&body).contains("This appview is invite-only"));
+    assert!(!storage.is_registered("did:plc:alice").unwrap());
+}
+
+#[tokio::test]
+async fn login_allowlist_removes_an_existing_disallowed_session_on_its_next_request() {
+    let storage = Arc::new(MemoryStorage::default());
+    let public = OAuthPublic::new("https://appview.example").unwrap();
+    let open_app = public
+        .clone()
+        .router_with_flow(FakeOAuthFlow::default(), storage.clone());
+    let cookie = finish_login(&open_app).await;
+    let token = cookie.split_once('=').unwrap().1;
+    let payload = token.split_once('.').unwrap().0;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .unwrap();
+    let session_id = String::from_utf8(decoded)
+        .unwrap()
+        .split('\n')
+        .nth(2)
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        storage
+            .web_session_generation("did:plc:alice", &session_id)
+            .unwrap(),
+        Some(1)
+    );
+
+    let restricted_app = public
+        .with_login_allowlist(["did:plc:somebody-else"])
+        .router_with_flow(FakeOAuthFlow::default(), storage.clone());
+    let response = restricted_app
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        storage
+            .web_session_generation("did:plc:alice", &session_id)
+            .unwrap(),
+        None
+    );
 }
 
 fn multipart_post_body(

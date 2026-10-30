@@ -194,6 +194,7 @@ pub struct OAuthPublic {
     private_key: Jwk,
     metadata: Value,
     mode: OAuthClientMode,
+    login_allowlist: Option<Arc<HashSet<String>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -930,6 +931,24 @@ impl OAuthPublic {
         &self.public_url
     }
 
+    /// Limit sign-in to these already-resolved account DIDs. An empty set keeps
+    /// the default open sign-in behavior.
+    pub fn with_login_allowlist<I, D>(mut self, allowed_dids: I) -> Self
+    where
+        I: IntoIterator<Item = D>,
+        D: Into<String>,
+    {
+        let allowed_dids = allowed_dids.into_iter().map(Into::into).collect::<HashSet<_>>();
+        self.login_allowlist = (!allowed_dids.is_empty()).then(|| Arc::new(allowed_dids));
+        self
+    }
+
+    fn login_is_allowed(&self, did: &str) -> bool {
+        self.login_allowlist
+            .as_ref()
+            .is_none_or(|allowed_dids| allowed_dids.contains(did))
+    }
+
     pub fn atrium_flow(
         &self,
         identity_resolver: Arc<IdentityResolver<HttpIdentityBackend>>,
@@ -1087,6 +1106,7 @@ impl OAuthPublic {
             private_key,
             metadata,
             mode: OAuthClientMode::Confidential,
+            login_allowlist: None,
         })
     }
 
@@ -1118,6 +1138,7 @@ impl OAuthPublic {
             private_key,
             metadata,
             mode: OAuthClientMode::Loopback,
+            login_allowlist: None,
         })
     }
 
