@@ -133,6 +133,7 @@ Deno.test("phone navigation and post actions keep 44-pixel tap targets", async (
   assert(css.includes(".feed-tabs,\n.feed-tab {\n  min-height: 2.75rem;"), "feed tabs should meet the 44-pixel target");
   assert(/body:has\(\.mobile-nav\) \.mobile-nav a,\s*body:has\(\.mobile-nav\) \.mobile-nav button\s*\{\s*min-height:\s*44px;/.test(css));
   assert(/width:\s*44px;[\s\S]*?height:\s*44px;/.test(declarations(".profile-overflow-trigger")));
+  assert(/body:has\(\.mobile-nav\):has\(\.reply-composer\) \.mobile-compose\s*\{\s*display:\s*none;/.test(css), "the floating post button should not cover the thread reply composer");
 });
 
 Deno.test("like handler fills the heart and clears it when unliked", async () => {
