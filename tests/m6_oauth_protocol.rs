@@ -383,6 +383,7 @@ async fn production_post_with_two_images_uploads_blobs_before_creating_record() 
         ],
     );
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -511,13 +512,14 @@ async fn write_timing_line_counts_a_fake_pds_dpop_nonce_retry() {
     let boundary = "nonce-write";
     let body = picture_multipart(boundary, "nonce accounting", None, None, &[]);
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/post")
                 .header("origin", "https://appview.example")
                 .header("sec-fetch-site", "same-origin")
-                .header("cookie", cookie)
+                .header("cookie", cookie.clone())
                 .header(
                     "content-type",
                     format!("multipart/form-data; boundary={boundary}"),
@@ -530,8 +532,41 @@ async fn write_timing_line_counts_a_fake_pds_dpop_nonce_retry() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
 
+    let first_write_end = shared.lock().unwrap().requests.len();
+    let second_output = Arc::new(Mutex::new(Vec::new()));
+    let second_subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(CapturedMakeWriter(second_output.clone()))
+        .finish();
+    let second_before = first_write_end;
+    let second_boundary = "nonce-write-second";
+    let second_body =
+        picture_multipart(second_boundary, "nonce accounting second", None, None, &[]);
+    let second_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/post")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", cookie)
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={second_boundary}"),
+                )
+                .body(Body::from(second_body))
+                .unwrap(),
+        )
+        .with_subscriber(second_subscriber)
+        .await
+        .unwrap();
+    assert_eq!(second_response.status(), StatusCode::SEE_OTHER);
+
     let requests = shared.lock().unwrap().requests.clone();
-    let write_requests = &requests[before..];
+    let write_requests = &requests[before..first_write_end];
     let create_requests = write_requests
         .iter()
         .filter(|request| {
@@ -554,6 +589,29 @@ async fn write_timing_line_counts_a_fake_pds_dpop_nonce_retry() {
         Some("write-nonce")
     );
 
+    let second_write_requests = &requests[second_before..];
+    let second_create_requests = second_write_requests
+        .iter()
+        .filter(|request| {
+            request
+                .path
+                .starts_with("/xrpc/com.atproto.repo.createRecord")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        second_create_requests.len(),
+        1,
+        "a later write by the same user reuses the resource-server DPoP nonce"
+    );
+    assert_eq!(
+        second_create_requests[0]
+            .headers
+            .get("dpop")
+            .and_then(|proof| jwt_claim(proof, "nonce"))
+            .as_deref(),
+        Some("write-nonce")
+    );
+
     let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
     let lines = logs
         .lines()
@@ -567,6 +625,19 @@ async fn write_timing_line_counts_a_fake_pds_dpop_nonce_retry() {
     assert!(
         line.contains(&format!("outbound_call_count={}", write_requests.len())),
         "{line}"
+    );
+    let second_logs = String::from_utf8(second_output.lock().unwrap().clone()).unwrap();
+    let second_line = second_logs
+        .lines()
+        .find(|line| line.contains("web write"))
+        .expect("second write timing line");
+    assert!(
+        second_line.contains("dpop_nonce_retries=0"),
+        "{second_line}"
+    );
+    assert!(
+        second_line.contains("dpop_nonce_retry=false"),
+        "{second_line}"
     );
     server.abort();
 }
@@ -1647,7 +1718,11 @@ async fn serve_one(mut stream: TcpStream, origin: &str, state: Arc<Mutex<FakeSer
                 }
             }
             path if path.starts_with("/xrpc/com.atproto.repo.createRecord") => {
-                if state.create_nonce_required && state.create_nonce_challenges == 0 {
+                let nonce = request
+                    .headers
+                    .get("dpop")
+                    .and_then(|proof| jwt_claim(proof, "nonce"));
+                if state.create_nonce_required && nonce.as_deref() != Some("write-nonce") {
                     state.create_nonce_challenges += 1;
                     (
                         401,

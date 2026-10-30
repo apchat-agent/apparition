@@ -11013,6 +11013,16 @@ mod tests {
                 && label.blurs == "media"
         }));
 
+        let overlapping = flow
+            .fetch_page_account_data_for_page(
+                viewer,
+                vec!["did:plc:authorb".to_owned(), "did:plc:authorc".to_owned()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(overlapping.profiles.len(), 2);
+        assert_eq!(overlapping.labels.len(), 2);
+
         let requests = requests.lock().unwrap();
         let profile_calls = requests
             .iter()
@@ -11030,6 +11040,15 @@ mod tests {
         assert_eq!(
             actors,
             ["did:plc:authora", "did:plc:authorb", "did:plc:authorc"]
+        );
+        let overlap_query = profile_calls[1].0.split_once('?').unwrap().1;
+        let overlap_actors = url::form_urlencoded::parse(overlap_query.as_bytes())
+            .filter_map(|(name, value)| (name == "actors").then(|| value.into_owned()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            overlap_actors,
+            ["did:plc:authorc"],
+            "the shared author should come from its per-DID cache"
         );
         let accepted = profile_calls[0].1.as_deref().unwrap();
         assert!(accepted.contains(BSKY_MODERATION_LABELER_DID), "{accepted}");
@@ -12634,6 +12653,8 @@ mod tests {
         video_requests: Vec<(String, String)>,
         pds_url: String,
         fail_auth: bool,
+        mutes_calls: usize,
+        mutes_delay: Duration,
     }
 
     #[derive(Clone, Default)]
@@ -12688,6 +12709,7 @@ mod tests {
         let video_limits_state = state.clone();
         let video_upload_state = state.clone();
         let video_status_state = state.clone();
+        let mutes_state = state.clone();
         let app = Router::new()
             .route(
                 "/.well-known/oauth-authorization-server",
@@ -12783,6 +12805,21 @@ mod tests {
                                 "blob":{"ref":{"$link":"bafk-video"},"mimeType":"video/mp4","size":99}
                             }
                         }))
+                    }
+                }),
+            )
+            .route(
+                "/xrpc/app.bsky.graph.getMutes",
+                get(move || {
+                    let state = mutes_state.clone();
+                    async move {
+                        let delay = {
+                            let mut state = state.lock().unwrap();
+                            state.mutes_calls += 1;
+                            state.mutes_delay
+                        };
+                        tokio::time::sleep(delay).await;
+                        Json(json!({"mutes":[]}))
                     }
                 }),
             )
@@ -12900,6 +12937,35 @@ mod tests {
         )
         .unwrap();
         (flow, state, server)
+    }
+
+    #[tokio::test]
+    async fn stale_mutes_return_immediately_and_refresh_once_in_background() {
+        let (flow, state, server) = feed_test_flow(false).await;
+        let did = FEED_VIEWER_DID.to_owned();
+        let stale = HashSet::from(["did:plc:previously-muted".to_owned()]);
+        state.lock().unwrap().mutes_delay = Duration::from_millis(120);
+        flow.muted_actor_cache.lock().await.insert(
+            did.clone(),
+            (
+                tokio::time::Instant::now() - Duration::from_secs(1),
+                stale.clone(),
+            ),
+        );
+
+        let first =
+            tokio::time::timeout(Duration::from_millis(40), flow.fetch_muted_actor_dids(&did))
+                .await
+                .expect("stale mutes should not wait for the upstream")
+                .unwrap();
+        assert_eq!(first, stale);
+        let second = flow.fetch_muted_actor_dids(&did).await.unwrap();
+        assert_eq!(second, stale);
+
+        tokio::time::sleep(Duration::from_millis(180)).await;
+        assert_eq!(state.lock().unwrap().mutes_calls, 1);
+        assert!(flow.fetch_muted_actor_dids(&did).await.unwrap().is_empty());
+        server.abort();
     }
 
     fn feed_test_storage() -> MemoryStorage {
