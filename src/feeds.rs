@@ -211,7 +211,7 @@ async fn fetch_public_posts_batch(
     Ok(result)
 }
 
-fn parse_public_profile_view(value: &Value) -> Option<PublicProfileView> {
+pub(crate) fn parse_public_profile_view(value: &Value) -> Option<PublicProfileView> {
     let did = value.get("did")?.as_str()?.to_owned();
     if !did.starts_with("did:") {
         return None;
@@ -249,7 +249,7 @@ pub(crate) fn persist_public_profiles(
         if !seen.insert(profile.did.clone()) {
             continue;
         }
-        storage.put_record(&profile.indexed_record())?;
+        storage.put_record(&merged_public_profile(storage, &profile)?)?;
         if profile.handle.is_some()
             && storage.verified_handle(&profile.did)?.is_none()
             && !storage.handle_is_invalid(&profile.did)?
@@ -261,6 +261,34 @@ pub(crate) fn persist_public_profiles(
         storage.queue_handle_refresh_ordered(&handles)?;
     }
     Ok(())
+}
+
+pub(crate) fn merged_public_profile(
+    storage: &dyn Storage,
+    profile: &PublicProfileView,
+) -> Result<IndexedRecord, crate::ingest::StorageError> {
+    let uri = format!("at://{}/app.bsky.actor.profile/self", profile.did);
+    let existing = storage.get_record(&profile.did, "app.bsky.actor.profile", "self")?;
+    let mut indexed = existing.unwrap_or_else(|| profile.indexed_record());
+    indexed.did = profile.did.clone();
+    indexed.collection = "app.bsky.actor.profile".to_owned();
+    indexed.rkey = "self".to_owned();
+    indexed.uri = uri;
+    if !indexed.record.is_object() {
+        indexed.record = Value::Object(serde_json::Map::new());
+    }
+    if let Some(handle) = &profile.handle {
+        indexed.record["publicHandle"] = Value::String(handle.clone());
+    }
+    if let Some(display_name) = &profile.display_name {
+        indexed.record["displayName"] = Value::String(display_name.clone());
+    }
+    if let Some(avatar) = &profile.avatar {
+        indexed.record["publicAvatar"] = Value::String(avatar.clone());
+    }
+    indexed.record["labels"] = Value::Array(profile.labels.clone());
+    indexed.time_us = unix_time_us();
+    Ok(indexed)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -641,10 +669,9 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
             .filter(|uri| !local.contains_key(*uri))
             .cloned()
             .collect::<Vec<_>>();
-        let fetched = match tokio::time::timeout_at(deadline, self.fetch_posts(&missing)).await {
-            Ok(fetched) => fetched,
-            Err(_) => HashMap::new(),
-        };
+        let fetched = tokio::time::timeout_at(deadline, self.fetch_posts(&missing))
+            .await
+            .unwrap_or_default();
 
         let mut authors = Vec::new();
         let mut feed = Vec::with_capacity(count);

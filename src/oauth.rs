@@ -12,8 +12,7 @@ use crate::{
     link_card::{LinkCard, LinkCardFetcher, LinkThumbnail},
     net::{
         OutboundCallSnapshot, OutboundCallTimer, RequestOutboundAccounting, SafeHttpClient,
-        current_outbound_call_snapshot, current_request_outbound_accounting,
-        with_request_outbound_accounting,
+        current_outbound_call_snapshot, with_request_outbound_accounting,
     },
     profile_counts::{PUBLIC_APPVIEW_BASE, ProfileCountsClient, apply_profile_counts},
 };
@@ -583,7 +582,7 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = HashMap<String, crate::feeds::FetchedPublicPost>> + Send + 'a>>
     {
         Box::pin(async move {
-            let posts = futures_util::stream::iter(uris.iter().cloned().map(|uri| async move {
+            futures_util::stream::iter(uris.iter().cloned().map(|uri| async move {
                 self.fetch_post(&uri).await.ok().map(|record| {
                     (
                         uri,
@@ -597,8 +596,7 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
             .buffer_unordered(PAGE_QUOTE_CONCURRENCY)
             .filter_map(|post| async move { post })
             .collect::<HashMap<_, _>>()
-            .await;
-            posts
+            .await
         })
     }
     fn supports_public_post_batching(&self) -> bool {
@@ -1033,6 +1031,7 @@ impl OAuthPublic {
             .route("/like", post(write_like::<F, S>))
             .route("/repost", post(write_repost::<F, S>))
             .layer(DefaultBodyLimit::max(MAX_POST_BODY_BYTES))
+            .layer(from_fn(log_web_post_client_errors))
             .layer(from_fn(account_web_outbound_calls))
             .with_state(state.clone());
         let video_routes = Router::new()
@@ -1257,7 +1256,7 @@ type MutedActorCache =
 type LabelerPreferenceCache =
     Arc<tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, Vec<String>)>>>;
 type AccountLabelPageCache =
-    Arc<tokio::sync::Mutex<HashMap<(String, String), (tokio::time::Instant, Vec<AccountLabel>)>>>;
+    Arc<tokio::sync::Mutex<HashMap<(String, String), (tokio::time::Instant, PageAccountData)>>>;
 type LabelerPresentationCache =
     Arc<tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, LabelerPresentation)>>>;
 
@@ -2062,6 +2061,17 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         viewer_did: &str,
         actor_dids: Vec<String>,
     ) -> Result<Vec<AccountLabel>, String> {
+        Ok(self
+            .fetch_page_account_data_for_page(viewer_did, actor_dids)
+            .await?
+            .labels)
+    }
+
+    async fn fetch_page_account_data_for_page(
+        &self,
+        viewer_did: &str,
+        actor_dids: Vec<String>,
+    ) -> Result<PageAccountData, String> {
         let mut actors = actor_dids
             .into_iter()
             .filter(|did| did.parse::<Did>().is_ok())
@@ -2070,10 +2080,10 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         actors.dedup();
         actors.truncate(100);
         if actors.is_empty() {
-            return Ok(Vec::new());
+            return Ok(PageAccountData::default());
         }
         let cache_key = (viewer_did.to_owned(), actors.join(","));
-        if let Some((expires, labels)) = self
+        if let Some((expires, data)) = self
             .account_label_page_cache
             .lock()
             .await
@@ -2081,11 +2091,12 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             .cloned()
             && expires > tokio::time::Instant::now()
         {
-            return Ok(labels);
+            return Ok(data);
         }
         let labeler_dids = self.labeler_dids_for_viewer(viewer_did).await?;
         let accepted_labelers = labeler_dids.join(",");
         let mut account_raw_labels = Vec::new();
+        let mut profile_views = Vec::new();
         for batch in actors.chunks(ACCOUNT_LABEL_PROFILE_BATCH_SIZE) {
             let mut url = url::Url::parse(&format!(
                 "{}app.bsky.actor.getProfiles",
@@ -2110,6 +2121,11 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                     let Some(subject_did) = profile.get("did").and_then(Value::as_str) else {
                         continue;
                     };
+                    if actors.iter().any(|actor| actor == subject_did)
+                        && let Some(profile_view) = crate::feeds::parse_public_profile_view(profile)
+                    {
+                        profile_views.push(profile_view);
+                    }
                     for label in profile
                         .get("labels")
                         .and_then(Value::as_array)
@@ -2164,6 +2180,10 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                 }
             })
             .collect::<Vec<_>>();
+        let data = PageAccountData {
+            labels,
+            profiles: profile_views,
+        };
         let mut cache = self.account_label_page_cache.lock().await;
         cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
         if cache.len() >= 4096
@@ -2175,10 +2195,10 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             cache_key,
             (
                 tokio::time::Instant::now() + ACCOUNT_LABEL_CACHE_TTL,
-                labels.clone(),
+                data.clone(),
             ),
         );
-        Ok(labels)
+        Ok(data)
     }
 
     async fn set_muted_actor(&self, did: &str, subject: &str, muted: bool) -> Result<(), String> {
@@ -3246,6 +3266,17 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
         })
     }
 
+    fn page_account_data_for_page<'a>(
+        &'a self,
+        viewer_did: &'a str,
+        actor_dids: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<PageAccountData, String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.fetch_page_account_data_for_page(viewer_did, actor_dids)
+                .await
+        })
+    }
+
     fn timeline<'a>(
         &'a self,
         did: &'a str,
@@ -3770,7 +3801,6 @@ struct PageProfileHydration {
     authors_needed: usize,
     from_index: usize,
     fetched_live: usize,
-    timed_out: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -3862,6 +3892,27 @@ async fn account_web_outbound_calls(request: Request, next: Next) -> Response {
             dpop_nonce_retry = calls.dpop_nonce_retries > 0,
             outbound_calls = %format_outbound_calls(&calls),
             "web write"
+        );
+    }
+    response
+}
+
+async fn log_web_post_client_errors(request: Request, next: Next) -> Response {
+    let route = match request.uri().path() {
+        "/link-preview" => Some("/link-preview"),
+        "/post" => Some("/post"),
+        _ => None,
+    };
+    let response = next.run(request).await;
+    if let Some(route) = route
+        && response.status().is_client_error()
+    {
+        let status = response.status();
+        tracing::warn!(
+            route,
+            status = status.as_u16(),
+            reason = status.canonical_reason().unwrap_or("client error"),
+            "web post request rejected"
         );
     }
     response
@@ -4108,11 +4159,10 @@ impl<F: OAuthFlow, S: Storage + 'static> ProfileRefreshWorker<F, S> {
     }
 }
 
-async fn hydrate_page_profiles<F: OAuthFlow, S: Storage + 'static>(
-    flow: &F,
-    storage: Arc<S>,
+fn hydrate_page_profiles<S: Storage>(
+    storage: &S,
     author_order: impl IntoIterator<Item = String>,
-    deadline: tokio::time::Instant,
+    public_profiles: Vec<crate::feeds::PublicProfileView>,
 ) -> Result<PageProfileHydration, StorageError> {
     let mut seen = HashSet::new();
     let authors = author_order
@@ -4129,7 +4179,13 @@ async fn hydrate_page_profiles<F: OAuthFlow, S: Storage + 'static>(
         authors_needed: authors.len(),
         ..PageProfileHydration::default()
     };
-    let mut candidates = Vec::new();
+    let mut profiles = public_profiles
+        .into_iter()
+        .filter(|profile| seen.contains(&profile.did))
+        .map(|profile| (profile.did.clone(), profile))
+        .collect::<HashMap<_, _>>();
+    let mut profile_fetches = Vec::new();
+    let mut handle_refreshes = Vec::new();
     for did in &authors {
         let status = index.get(did);
         let age_ms = status.map_or(i64::MAX, |entry| {
@@ -4143,169 +4199,30 @@ async fn hydrate_page_profiles<F: OAuthFlow, S: Storage + 'static>(
         if profile_is_fresh {
             hydration.from_index += 1;
         }
-        let profile_needs_fetch = !profile_is_fresh && !profile_is_negative_cached;
-        let has_handle = storage.verified_handle(did)?.is_some();
-        let handle_is_invalid = storage.handle_is_invalid(did)?;
-        let handle_needs_fetch = !has_handle && !handle_is_invalid;
-        if profile_needs_fetch || handle_needs_fetch {
-            candidates.push((did.clone(), profile_needs_fetch, handle_needs_fetch));
+        if let Some(profile) = profiles.remove(did) {
+            if !profile_is_fresh {
+                storage.put_record(&crate::feeds::merged_public_profile(storage, &profile)?)?;
+                hydration.fetched_live += 1;
+            }
+        } else if !profile_is_fresh && !profile_is_negative_cached {
+            profile_fetches.push(did.clone());
+        }
+        if storage.verified_handle(did)?.is_none() && !storage.handle_is_invalid(did)? {
+            handle_refreshes.push(did.clone());
         }
     }
-
-    let candidate_dids = candidates
-        .iter()
-        .map(|(did, _, _)| did.clone())
-        .collect::<Vec<_>>();
-    let handle_candidate_dids = candidates
-        .iter()
-        .filter(|(_, _, needs_handle)| *needs_handle)
-        .map(|(did, _, _)| did.clone())
-        .collect::<HashSet<_>>();
-    let flow = flow.clone();
-    let mut fetches = futures_util::stream::iter(candidates.into_iter().map(
-        move |(did, profile_needs_fetch, handle_needs_fetch)| {
-            let flow = flow.clone();
-            async move {
-                let profile = if profile_needs_fetch {
-                    Some(flow.fetch_author_profile(&did).await)
-                } else {
-                    None
-                };
-                let mut handle = profile
-                    .as_ref()
-                    .and_then(|result| result.as_ref().ok())
-                    .and_then(|fetched| fetched.verified_handle.clone());
-                let handle_result = if handle_needs_fetch && handle.is_none() {
-                    Some(flow.resolve_author_handle(&did).await)
-                } else {
-                    None
-                };
-                if let Some(Ok(resolved)) = &handle_result {
-                    handle = resolved.clone();
-                }
-                (did, profile, handle, handle_result)
-            }
-        },
-    ))
-    .buffer_unordered(PAGE_PROFILE_CONCURRENCY);
-    let mut completed = HashSet::new();
-    let mut unresolved_handle_set = HashSet::new();
-    let storage_for_fetch = storage.clone();
-    let fetch_result = tokio::time::timeout_at(deadline, async {
-        while let Some((did, profile_result, handle, handle_result)) = fetches.next().await {
-            completed.insert(did.clone());
-            if let Some(result) = profile_result {
-                match result {
-                    Ok(fetched) => {
-                        hydration.fetched_live += 1;
-                        if let Some(profile) = fetched.profile {
-                            let expected_uri = format!("at://{did}/app.bsky.actor.profile/self");
-                            if profile.did != did
-                                || profile.collection != "app.bsky.actor.profile"
-                                || profile.rkey != "self"
-                                || profile.uri != expected_uri
-                            {
-                                storage_for_fetch.set_profile_index_entry(
-                                    &did,
-                                    ProfileIndexEntry {
-                                        has_profile: false,
-                                        fetched_at_ms: now_ms,
-                                    },
-                                )?;
-                            } else {
-                                storage_for_fetch.put_record(&profile)?;
-                            }
-                        } else {
-                            storage_for_fetch.set_profile_index_entry(
-                                &did,
-                                ProfileIndexEntry {
-                                    has_profile: false,
-                                    fetched_at_ms: now_ms,
-                                },
-                            )?;
-                        }
-                    }
-                    Err(error) => {
-                        tracing::debug!(%did, %error, "live author profile fetch failed");
-                        storage_for_fetch.set_profile_index_entry(
-                            &did,
-                            ProfileIndexEntry {
-                                has_profile: false,
-                                fetched_at_ms: now_ms,
-                            },
-                        )?;
-                    }
-                }
-            }
-            if let Some(handle) = handle {
-                storage_for_fetch.set_verified_handle(&did, &handle)?;
-            } else if handle_result.is_some() && !storage_for_fetch.handle_is_invalid(&did)? {
-                unresolved_handle_set.insert(did.clone());
-            }
-        }
-        Ok::<(), StorageError>(())
-    })
-    .await;
-    match fetch_result {
-        Ok(result) => result?,
-        Err(_) => {
-            hydration.timed_out = candidate_dids
-                .iter()
-                .filter(|did| !completed.contains(*did))
-                .count();
-            let timed_out_authors = candidate_dids
-                .iter()
-                .filter(|did| !completed.contains(*did))
-                .cloned()
-                .collect::<Vec<_>>();
-            let timed_out_profiles = candidates_profile_fetches(&authors, &index, now_ms);
-            let timed_out_profiles = timed_out_profiles
-                .into_iter()
-                .filter(|did| timed_out_authors.contains(did))
-                .collect::<Vec<_>>();
-            storage.enqueue_profile_fetches(&timed_out_profiles)?;
-            unresolved_handle_set.extend(
-                timed_out_authors
-                    .into_iter()
-                    .filter(|did| handle_candidate_dids.contains(did)),
-            );
-        }
+    if !profile_fetches.is_empty() {
+        storage.enqueue_profile_fetches(&profile_fetches)?;
     }
-    let unresolved_handles = authors
-        .iter()
-        .filter(|did| unresolved_handle_set.contains(*did))
-        .cloned()
-        .collect::<Vec<_>>();
-    storage.queue_handle_refresh_ordered(&unresolved_handles)?;
+    storage.queue_handle_refresh_ordered(&handle_refreshes)?;
     tracing::debug!(
         authors_needed = hydration.authors_needed,
         from_index = hydration.from_index,
         fetched_live = hydration.fetched_live,
-        timed_out = hydration.timed_out,
+        queued_background = profile_fetches.len(),
         "hydrated page author profiles"
     );
     Ok(hydration)
-}
-
-fn candidates_profile_fetches(
-    authors: &[String],
-    index: &HashMap<String, ProfileIndexEntry>,
-    now_ms: i64,
-) -> Vec<String> {
-    authors
-        .iter()
-        .filter(|did| {
-            let status = index.get(*did);
-            let age_ms = status.map_or(i64::MAX, |entry| {
-                now_ms.saturating_sub(entry.fetched_at_ms).max(0)
-            });
-            !status.is_some_and(|entry| {
-                (entry.has_profile && age_ms < PROFILE_MAX_AGE.as_millis() as i64)
-                    || (!entry.has_profile && age_ms < PROFILE_NEGATIVE_TTL.as_millis() as i64)
-            })
-        })
-        .cloned()
-        .collect()
 }
 
 async fn hydrate_page_content<F: OAuthFlow, S: Storage + 'static>(
@@ -4350,59 +4267,39 @@ async fn hydrate_page_content<F: OAuthFlow, S: Storage + 'static>(
         actors.truncate(100);
         actors
     };
-    let label_flow = flow.clone();
+    let account_flow = flow.clone();
     let viewer_did = viewer_did.to_owned();
-    let label_hydration = async move {
+    let account_data_hydration = async move {
         let started = std::time::Instant::now();
-        let labels = match tokio::time::timeout_at(
+        let data = match tokio::time::timeout_at(
             deadline,
-            label_flow.account_labels_for_page(&viewer_did, label_actor_dids),
+            account_flow.page_account_data_for_page(&viewer_did, label_actor_dids),
         )
         .await
         {
-            Ok(Ok(labels)) => labels,
+            Ok(Ok(data)) => data,
             Ok(Err(error)) => {
-                tracing::warn!(%error, "page account labels could not be fetched");
-                Vec::new()
+                tracing::warn!(%error, "page account profiles and labels could not be fetched");
+                PageAccountData::default()
             }
-            Err(_) => Vec::new(),
+            Err(_) => PageAccountData::default(),
         };
-        (labels, started.elapsed().as_millis() as u64)
+        (data, started.elapsed().as_millis() as u64)
     };
     let quote_storage = storage.clone();
-    let profile_flow = flow.clone();
-    let profile_started = std::time::Instant::now();
-    let profile_accounting = current_request_outbound_accounting().unwrap_or_default();
-    let profile_task = tokio::spawn(with_request_outbound_accounting(
-        profile_accounting,
-        async move {
-            let result = hydrate_page_profiles(&profile_flow, storage, authors, deadline).await;
-            if let Err(error) = &result {
-                tracing::warn!(%error, "background page profile hydration failed");
-            }
-            result
-        },
-    ));
-    tokio::task::yield_now().await;
-    let profile_fast_path = async move {
-        let result = match profile_task.await {
-            Ok(result) => result.map(|_| ()),
-            Err(error) => {
-                tracing::warn!(%error, "page profile hydration task failed");
-                Ok(())
-            }
-        };
-        (result, profile_started.elapsed().as_millis() as u64)
-    };
     let quote_hydration = async {
         let started = std::time::Instant::now();
         let quotes = hydrate_page_quotes(flow, quote_storage.as_ref(), refs, deadline).await;
         (quotes, started.elapsed().as_millis() as u64)
     };
-    let (quote_hydration, (profile_result, profile_hydration_ms), (labels, account_labels_ms)) =
-        tokio::join!(quote_hydration, profile_fast_path, label_hydration);
+    let (quote_hydration, (account_data, profile_hydration_ms)) =
+        tokio::join!(quote_hydration, account_data_hydration);
+    let profile_write_started = std::time::Instant::now();
+    let profile_result = hydrate_page_profiles(storage.as_ref(), authors, account_data.profiles);
+    let profile_hydration_ms =
+        profile_hydration_ms.saturating_add(profile_write_started.elapsed().as_millis() as u64);
     let mut quote_index = quote_hydration.0?;
-    for label in labels {
+    for label in account_data.labels {
         quote_index
             .account_labels
             .entry(label.subject_did.clone())
@@ -4416,7 +4313,7 @@ async fn hydrate_page_content<F: OAuthFlow, S: Storage + 'static>(
             profile_hydration_ms
         },
         quote_hydration_ms: quote_hydration.1,
-        account_labels_ms,
+        account_labels_ms: 0,
     })
 }
 
@@ -7447,14 +7344,26 @@ where
     if quoted.cid.as_deref().is_none_or(str::is_empty) {
         return oauth_error(StatusCode::BAD_REQUEST, "quoted post has no CID");
     }
-    if let Err(error) = hydrate_page_profiles(
-        &state.flow,
-        state.storage.clone(),
-        std::iter::once(quoted.did.clone()),
-        tokio::time::Instant::now() + PAGE_PROFILE_BUDGET,
+    let profile_data = match tokio::time::timeout(
+        PAGE_PROFILE_BUDGET,
+        state
+            .flow
+            .page_account_data_for_page(&viewer_did, vec![quoted.did.clone()]),
     )
     .await
     {
+        Ok(Ok(data)) => data,
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "quoted author profile batch failed");
+            PageAccountData::default()
+        }
+        Err(_) => PageAccountData::default(),
+    };
+    if let Err(error) = hydrate_page_profiles(
+        state.storage.as_ref(),
+        std::iter::once(quoted.did.clone()),
+        profile_data.profiles,
+    ) {
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
     let write_forms_enabled =

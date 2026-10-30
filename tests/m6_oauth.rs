@@ -95,6 +95,7 @@ struct FakeOAuthFlow {
     profile_requests: Arc<Mutex<Vec<String>>>,
     profile_batch_requests: Arc<Mutex<Vec<Vec<String>>>>,
     handle_resolution_requests: Arc<Mutex<Vec<String>>>,
+    page_account_cache: Arc<Mutex<std::collections::HashMap<(String, String), PageAccountData>>>,
     profile_delays_ms: Arc<Mutex<std::collections::HashMap<String, u64>>>,
     live_posts: Arc<Mutex<std::collections::HashMap<String, IndexedRecord>>>,
     post_requests: Arc<Mutex<Vec<String>>>,
@@ -120,6 +121,7 @@ impl Default for FakeOAuthFlow {
             profile_requests: Arc::new(Mutex::new(Vec::new())),
             profile_batch_requests: Arc::new(Mutex::new(Vec::new())),
             handle_resolution_requests: Arc::new(Mutex::new(Vec::new())),
+            page_account_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
             profile_delays_ms: Arc::new(Mutex::new(std::collections::HashMap::new())),
             live_posts: Arc::new(Mutex::new(std::collections::HashMap::new())),
             post_requests: Arc::new(Mutex::new(Vec::new())),
@@ -644,12 +646,23 @@ impl OAuthFlow for FakeOAuthFlow {
     ) -> Pin<Box<dyn Future<Output = Result<PageAccountData, String>> + Send + 'a>> {
         actor_dids.sort();
         actor_dids.dedup();
+        let cache_key = (viewer_did.to_owned(), actor_dids.join(","));
+        if let Some(data) = self
+            .page_account_cache
+            .lock()
+            .unwrap()
+            .get(&cache_key)
+            .cloned()
+        {
+            return Box::pin(async move { Ok(data) });
+        }
         self.profile_batch_requests
             .lock()
             .unwrap()
             .push(actor_dids.clone());
         let records = self.author_profiles.lock().unwrap().clone();
         let delays = self.profile_delays_ms.lock().unwrap().clone();
+        let cache = self.page_account_cache.clone();
         let viewer_did = viewer_did.to_owned();
         Box::pin(async move {
             if let Some(delay_ms) = actor_dids
@@ -689,7 +702,9 @@ impl OAuthFlow for FakeOAuthFlow {
             let labels = self
                 .account_labels_for_page(&viewer_did, actor_dids)
                 .await?;
-            Ok(PageAccountData { labels, profiles })
+            let data = PageAccountData { labels, profiles };
+            cache.lock().unwrap().insert(cache_key, data.clone());
+            Ok(data)
         })
     }
 
@@ -4598,7 +4613,12 @@ async fn app_timeline_waits_for_new_author_profiles_before_rendering() {
         assert!(html.contains(&format!("Hydrated author {index}")), "{html}");
         assert!(html.contains(&format!("visible post {index}")), "{html}");
     }
-    assert_eq!(flow.profile_requests.lock().unwrap().len(), authors.len());
+    assert!(flow.profile_requests.lock().unwrap().is_empty());
+    assert!(flow.handle_resolution_requests.lock().unwrap().is_empty());
+    assert_eq!(
+        flow.profile_batch_requests.lock().unwrap().as_slice(),
+        [authors.to_vec()]
+    );
     let profile_hydration_ms = timing
         .lock()
         .unwrap()
@@ -4663,7 +4683,7 @@ async fn app_timeline_skips_fresh_indexed_profiles_without_fetching() {
 }
 
 #[tokio::test]
-async fn profile_fetch_order_deduplicates_page_authors_and_negative_caches_failures() {
+async fn public_profile_batch_deduplicates_authors_and_queues_background_fallbacks() {
     let storage = Arc::new(MemoryStorage::default());
     let first = "did:plc:first";
     let second = "did:plc:second";
@@ -4689,9 +4709,15 @@ async fn profile_fetch_order_deduplicates_page_authors_and_negative_caches_failu
     assert!(
         first_html.find("top from first").unwrap() < first_html.find("middle from second").unwrap()
     );
+    assert!(flow.profile_requests.lock().unwrap().is_empty());
+    assert!(flow.handle_resolution_requests.lock().unwrap().is_empty());
     assert_eq!(
-        flow.profile_requests.lock().unwrap().as_slice(),
-        [first, second]
+        flow.profile_batch_requests.lock().unwrap().as_slice(),
+        [vec![first.to_owned(), second.to_owned()]]
+    );
+    assert_eq!(
+        storage.pending_profile_fetches(10).unwrap(),
+        [first.to_owned(), second.to_owned()]
     );
     assert_eq!(
         storage.pending_handle_refreshes(10).unwrap(),
@@ -4700,14 +4726,12 @@ async fn profile_fetch_order_deduplicates_page_authors_and_negative_caches_failu
 
     let second_html = get_html(&app, "/app", &cookie).await;
     assert!(second_html.contains("top from first"));
+    assert!(flow.profile_requests.lock().unwrap().is_empty());
     assert_eq!(
-        flow.profile_requests.lock().unwrap().as_slice(),
-        [first, second],
-        "the fresh negative cache should prevent another PDS read"
+        flow.profile_batch_requests.lock().unwrap().as_slice(),
+        [vec![first.to_owned(), second.to_owned()]],
+        "the cached public profile batch should prevent another AppView read"
     );
-    let status = storage.profile_index_snapshot().unwrap();
-    assert!(!status[first].has_profile);
-    assert!(!status[second].has_profile);
 }
 
 #[tokio::test]
@@ -4770,7 +4794,12 @@ async fn profile_budget_keeps_page_rendering_and_queues_timed_out_authors_in_ord
         );
         assert!(!html.contains("Background hydrated"), "{html}");
     }
-    assert_eq!(flow.profile_requests.lock().unwrap().as_slice(), authors);
+    assert!(flow.profile_requests.lock().unwrap().is_empty());
+    assert!(flow.handle_resolution_requests.lock().unwrap().is_empty());
+    assert_eq!(
+        flow.profile_batch_requests.lock().unwrap().as_slice(),
+        [authors.map(str::to_owned)]
+    );
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if storage.pending_profile_fetches(10).unwrap().len() == authors.len() {
@@ -5306,15 +5335,15 @@ async fn quote_hydration_keeps_page_order_deduplicates_and_skips_other_record_fe
     .unwrap();
 
     assert_eq!(*flow.post_requests.lock().unwrap(), expected_uris);
-    let requested_profiles = flow.profile_requests.lock().unwrap().clone();
+    assert!(flow.profile_requests.lock().unwrap().is_empty());
+    assert!(flow.handle_resolution_requests.lock().unwrap().is_empty());
+    let mut expected_profile_batch = std::iter::once("did:plc:alice".to_owned())
+        .chain((0..18).map(|index| format!("did:plc:quoted{index}")))
+        .collect::<Vec<_>>();
+    expected_profile_batch.sort();
     assert_eq!(
-        &requested_profiles[..4],
-        [
-            "did:plc:alice",
-            "did:plc:quoted0",
-            "did:plc:quoted1",
-            "did:plc:quoted2"
-        ]
+        flow.profile_batch_requests.lock().unwrap().as_slice(),
+        [expected_profile_batch]
     );
     assert!(html.contains("A curated feed"), "{html}");
     assert_eq!(html.matches("quoted-record-type").count(), 1, "{html}");
