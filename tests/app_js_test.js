@@ -16,6 +16,20 @@ Deno.test("empty composer status messages do not render status bars", async () =
   );
 });
 
+Deno.test("composer markup provides a compact control row and an icon-only link reveal", async () => {
+  const source = await Deno.readTextFile(new URL("../src/oauth.rs", import.meta.url));
+  const reply = source.slice(source.indexOf("fn render_reply_composer"), source.indexOf("fn render_media_picker"));
+  assert(reply.includes("data-compose-input"), "reply text input should participate in compact composition");
+  assert(reply.includes("data-compose-toolbar"), "reply composer should have a dedicated toolbar");
+  assert(reply.includes("data-link-toggle"), "link entry should be opened from its toolbar icon");
+  assert(reply.includes("data-character-count"), "reply composer should expose its character count");
+  assert(reply.includes("What's up?"), "the compact text field should use the short placeholder");
+
+  const css = await Deno.readTextFile(new URL("../static/app.css", import.meta.url));
+  assert(css.includes(".composer.is-collapsed .composer-toolbar"));
+  assert(css.includes(".composer.is-enhanced .link-picker:not(.is-open)"));
+});
+
 Deno.test("like handler fills the heart and clears it when unliked", async () => {
   const listeners = new Map();
   const documentMock = {
