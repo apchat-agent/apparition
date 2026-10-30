@@ -2658,6 +2658,18 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                 .get(&page_url, HeaderMap::new(), 2 * 1024 * 1024)
                 .await
                 .map_err(|error| format!("block list getList request failed: {error}"))?;
+            if response.status() == StatusCode::BAD_REQUEST
+                && String::from_utf8_lossy(response.body()).contains("List not found")
+            {
+                // A subscription can outlive its list (the owner deleted it). bsky.app
+                // ignores it; cache it as empty so every page does not retry and warn.
+                tracing::info!(list = %list_uri, "subscribed block list no longer exists; treating it as empty");
+                return Ok(BlockListDetail {
+                    uri: list_uri.to_owned(),
+                    name: "Deleted list".to_owned(),
+                    member_dids: Vec::new(),
+                });
+            }
             if !response.status().is_success() {
                 return Err(format!(
                     "block list getList returned status {}: {}",
