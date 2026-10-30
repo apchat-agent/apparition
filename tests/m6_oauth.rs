@@ -7590,3 +7590,22 @@ async fn a_block_list_slower_than_the_page_budget_is_still_applied_on_a_later_pa
         "the slow refresh started by the first page must have finished and been cached: {html}"
     );
 }
+
+#[tokio::test]
+async fn own_profile_links_to_the_block_list_settings_and_other_profiles_do_not() {
+    // The mobile nav has no room for a fifth link; the owner asked for it on his own profile.
+    let storage = Arc::new(MemoryStorage::default());
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage);
+    let cookie = finish_login(&app).await;
+    let (status, own) = get_body(&app, "/profile?did=did%3Aplc%3Aalice", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        own.contains("<a class=\"profile-block-lists-link\" href=\"/app/block-lists\">"),
+        "own profile links to the block list settings: {own}"
+    );
+    let (status, other) = get_body(&app, "/profile?did=did%3Aplc%3Afriend", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!other.contains("profile-block-lists-link"), "only on your own profile");
+}
