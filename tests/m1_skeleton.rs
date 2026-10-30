@@ -40,11 +40,11 @@ async fn health_endpoint_returns_json_ok() {
         let csp = response.headers()["content-security-policy"]
             .to_str()
             .unwrap();
-        // Scripts only from our own origin; wasm-unsafe-eval is the narrow token needed by ORT.
-        assert!(
-            csp.contains("script-src 'self' 'wasm-unsafe-eval';"),
-            "{csp}"
-        );
+        // On-device model execution is gone, so scripts need no WebAssembly exception.
+        assert!(csp.contains("script-src 'self';"), "{csp}");
+        assert!(!csp.contains("wasm-unsafe-eval"), "{csp}");
+        assert!(!csp.contains("worker-src"), "{csp}");
+        assert!(!csp.contains("huggingface.co"), "{csp}");
         assert!(
             !csp.contains("'unsafe-inline'") && !csp.contains("'unsafe-eval'"),
             "{csp}"
