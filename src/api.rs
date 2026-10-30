@@ -733,6 +733,10 @@ pub(crate) fn profile_view_from_storage<S: Storage>(
     let profile = storage.get_record(did, ACTOR_PROFILE, "self")?;
     let record = profile.as_ref().map(|profile| &profile.record);
     let (follows, followers, posts) = storage.profile_counts(did)?;
+    let public_handle = record
+        .and_then(|record| record.get("publicHandle"))
+        .and_then(Value::as_str)
+        .filter(|handle| !handle.trim().is_empty() && *handle != "handle.invalid");
     let handle = if let Some(handle) = storage.verified_handle(did)? {
         handle
     } else if storage.handle_is_invalid(did)? {
@@ -741,7 +745,7 @@ pub(crate) fn profile_view_from_storage<S: Storage>(
         if storage.is_tracked_did(did)? || storage.is_displayed_did(did)? {
             storage.queue_handle_refresh(did)?;
         }
-        did.to_owned()
+        public_handle.unwrap_or(did).to_owned()
     };
     let mut view = json!({
         "did":did,
@@ -753,6 +757,22 @@ pub(crate) fn profile_view_from_storage<S: Storage>(
         "verification":{"verifications":[],"verifiedStatus":"none","trustedVerifierStatus":"none"}
     });
     if let Some(record) = record {
+        if let Some(labels) = record.get("labels").filter(|labels| labels.is_array()) {
+            view["labels"] = labels.clone();
+        }
+        if let Some(avatar) = record
+            .get("publicAvatar")
+            .and_then(Value::as_str)
+            .and_then(|avatar| url::Url::parse(avatar).ok())
+            .filter(|avatar| {
+                avatar.scheme() == "https"
+                    && avatar.host_str() == Some("cdn.bsky.app")
+                    && avatar.username().is_empty()
+                    && avatar.password().is_none()
+            })
+        {
+            view["avatar"] = json!(avatar.as_str());
+        }
         for field in [
             "displayName",
             "description",

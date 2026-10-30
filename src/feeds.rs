@@ -50,6 +50,49 @@ pub struct HydratedFeedPage {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct PublicProfileView {
+    pub did: String,
+    pub handle: Option<String>,
+    pub display_name: Option<String>,
+    pub avatar: Option<String>,
+    pub labels: Vec<Value>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FetchedPublicPost {
+    pub record: IndexedRecord,
+    pub author: Option<PublicProfileView>,
+}
+
+impl PublicProfileView {
+    pub fn indexed_record(&self) -> IndexedRecord {
+        let mut record = serde_json::Map::new();
+        if let Some(handle) = &self.handle {
+            record.insert("publicHandle".to_owned(), Value::String(handle.clone()));
+        }
+        if let Some(display_name) = &self.display_name {
+            record.insert(
+                "displayName".to_owned(),
+                Value::String(display_name.clone()),
+            );
+        }
+        if let Some(avatar) = &self.avatar {
+            record.insert("publicAvatar".to_owned(), Value::String(avatar.clone()));
+        }
+        record.insert("labels".to_owned(), Value::Array(self.labels.clone()));
+        IndexedRecord {
+            did: self.did.clone(),
+            collection: "app.bsky.actor.profile".to_owned(),
+            rkey: "self".to_owned(),
+            uri: format!("at://{}/app.bsky.actor.profile/self", self.did),
+            cid: None,
+            time_us: unix_time_us(),
+            record: Value::Object(record),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct FeedTimeline {
     pub generator: ResolvedFeed,
     pub timeline: HydratedFeedPage,
@@ -67,7 +110,158 @@ pub struct FeedTimelineTiming {
 
 const LIVE_POST_CACHE_ENTRIES: usize = 20_000;
 const LIVE_POST_CACHE_SECS: u64 = 6 * 60 * 60;
+const PUBLIC_POST_BATCH_SIZE: usize = 25;
+const PUBLIC_POST_BATCH_CONCURRENCY: usize = 4;
+const MAX_PUBLIC_POST_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const FEED_GENERATOR_CACHE_PREFIX: &str = "feed-generator:";
+
+fn unix_time_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
+        .min(u64::MAX as u128) as u64
+}
+
+async fn cache_live_post(
+    cache: &tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, FetchedPublicPost)>>,
+    uri: &str,
+    post: FetchedPublicPost,
+) {
+    let mut cache = cache.lock().await;
+    if cache.len() >= LIVE_POST_CACHE_ENTRIES {
+        cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
+    }
+    if cache.len() >= LIVE_POST_CACHE_ENTRIES
+        && let Some(oldest) = cache.keys().next().cloned()
+    {
+        cache.remove(&oldest);
+    }
+    cache.insert(
+        uri.to_owned(),
+        (
+            tokio::time::Instant::now() + Duration::from_secs(LIVE_POST_CACHE_SECS),
+            post,
+        ),
+    );
+}
+
+async fn fetch_public_posts_batch(
+    http: &SafeHttpClient,
+    public_appview_base: &str,
+    uris: &[String],
+) -> Result<Vec<FetchedPublicPost>, String> {
+    let mut url = Url::parse(&format!("{}app.bsky.feed.getPosts", public_appview_base))
+        .map_err(|_| "Bluesky AppView URL is invalid".to_owned())?;
+    for uri in uris {
+        url.query_pairs_mut().append_pair("uris", uri);
+    }
+    let response = http
+        .get(&url, HeaderMap::new(), MAX_PUBLIC_POST_RESPONSE_BYTES)
+        .await?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Bluesky AppView getPosts failed with status {}",
+            response.status()
+        ));
+    }
+    let body: Value = serde_json::from_slice(response.body())
+        .map_err(|_| "Bluesky AppView getPosts returned invalid JSON".to_owned())?;
+    let posts = body
+        .get("posts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Bluesky AppView getPosts response has no posts list".to_owned())?;
+    let requested = uris.iter().map(String::as_str).collect::<HashSet<_>>();
+    let mut result = Vec::new();
+    for view in posts {
+        let Some(uri) = view.get("uri").and_then(Value::as_str) else {
+            continue;
+        };
+        if !requested.contains(uri) {
+            continue;
+        }
+        let (did, collection, rkey) = match parse_post_uri(uri) {
+            Ok(parts) => parts,
+            Err(_) => continue,
+        };
+        let Some(record) = view
+            .get("record")
+            .filter(|record| record.is_object())
+            .cloned()
+        else {
+            continue;
+        };
+        let author = view
+            .get("author")
+            .and_then(parse_public_profile_view)
+            .filter(|author| author.did == did);
+        result.push(FetchedPublicPost {
+            record: IndexedRecord {
+                did,
+                collection,
+                rkey,
+                uri: uri.to_owned(),
+                cid: view.get("cid").and_then(Value::as_str).map(str::to_owned),
+                time_us: unix_time_us(),
+                record,
+            },
+            author,
+        });
+    }
+    Ok(result)
+}
+
+fn parse_public_profile_view(value: &Value) -> Option<PublicProfileView> {
+    let did = value.get("did")?.as_str()?.to_owned();
+    if !did.starts_with("did:") {
+        return None;
+    }
+    Some(PublicProfileView {
+        did,
+        handle: value
+            .get("handle")
+            .and_then(Value::as_str)
+            .filter(|handle| !handle.is_empty() && *handle != "handle.invalid")
+            .map(str::to_owned),
+        display_name: value
+            .get("displayName")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        avatar: value
+            .get("avatar")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        labels: value
+            .get("labels")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+    })
+}
+
+pub(crate) fn persist_public_profiles(
+    storage: &dyn Storage,
+    profiles: impl IntoIterator<Item = PublicProfileView>,
+) -> Result<(), crate::ingest::StorageError> {
+    let mut seen = HashSet::new();
+    let mut handles = Vec::new();
+    for profile in profiles {
+        if !seen.insert(profile.did.clone()) {
+            continue;
+        }
+        storage.put_record(&profile.indexed_record())?;
+        if profile.handle.is_some()
+            && storage.verified_handle(&profile.did)?.is_none()
+            && !storage.handle_is_invalid(&profile.did)?
+        {
+            handles.push(profile.did);
+        }
+    }
+    if !handles.is_empty() {
+        storage.queue_handle_refresh_ordered(&handles)?;
+    }
+    Ok(())
+}
 
 #[derive(Serialize, Deserialize)]
 enum CachedGeneratorResolution {
@@ -119,7 +313,7 @@ pub struct FeedClient<B: IdentityBackend> {
     http: SafeHttpClient,
     public_appview_base: String,
     generator_cache: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, ResolvedFeed)>>,
-    live_post_cache: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, IndexedRecord)>>,
+    live_post_cache: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, FetchedPublicPost)>>,
     // Failed resolutions are remembered too: the layout resolves every pinned feed on every page,
     // so an uncached failure would repeat its full network cost on each request.
     generator_failures: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, String)>>,
@@ -430,27 +624,62 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
         skeleton: FeedSkeletonPage,
         storage: &dyn Storage,
     ) -> Result<HydratedFeedPage, String> {
-        const LIVE_FETCH_CONCURRENCY: usize = 16;
         const PAGE_BUDGET: Duration = Duration::from_secs(8);
         let count = skeleton.feed.len();
         let cursor = skeleton.cursor;
         let deadline = tokio::time::Instant::now() + PAGE_BUDGET;
-        let mut pending = stream::iter(skeleton.feed.into_iter().enumerate())
-            .map(|(index, item)| async move { self.hydrate_one(index, item, storage).await })
-            .buffer_unordered(LIVE_FETCH_CONCURRENCY);
-        let mut hydrated = Vec::with_capacity(count);
-        loop {
-            match tokio::time::timeout_at(deadline, pending.next()).await {
-                Ok(Some(Some(item))) => hydrated.push(item),
-                Ok(Some(None)) => {}
-                Ok(None) | Err(_) => break,
-            }
-        }
-        hydrated.sort_by_key(|(index, _)| *index);
-        let feed = hydrated
-            .into_iter()
-            .map(|(_, post)| post)
+        let skeleton_items = skeleton.feed;
+        let uris = skeleton_items
+            .iter()
+            .map(|item| item.post_uri.clone())
             .collect::<Vec<_>>();
+        let local = storage
+            .records_by_uri("app.bsky.feed.post", &uris)
+            .unwrap_or_default();
+        let missing = uris
+            .iter()
+            .filter(|uri| !local.contains_key(*uri))
+            .cloned()
+            .collect::<Vec<_>>();
+        let fetched = match tokio::time::timeout_at(deadline, self.fetch_posts(&missing)).await {
+            Ok(fetched) => fetched,
+            Err(_) => HashMap::new(),
+        };
+
+        let mut authors = Vec::new();
+        let mut feed = Vec::with_capacity(count);
+        for item in skeleton_items {
+            let record = local
+                .get(&item.post_uri)
+                .cloned()
+                .or_else(|| fetched.get(&item.post_uri).map(|post| post.record.clone()));
+            let Some(record) = record else { continue };
+            if let Some(author) = fetched
+                .get(&item.post_uri)
+                .and_then(|post| post.author.as_ref())
+            {
+                authors.push(author.clone());
+            }
+            let reposted_by = item
+                .reason
+                .as_ref()
+                .filter(|reason| {
+                    reason.get("$type").and_then(Value::as_str)
+                        == Some("app.bsky.feed.defs#reasonRepost")
+                })
+                .and_then(|reason| reason.get("by"))
+                .and_then(|by| {
+                    by.get("handle")
+                        .and_then(Value::as_str)
+                        .or_else(|| by.get("did").and_then(Value::as_str))
+                })
+                .map(str::to_owned);
+            feed.push(HydratedFeedPost {
+                record,
+                reposted_by,
+            });
+        }
+        persist_public_profiles(storage, authors).map_err(|error| error.to_string())?;
         Ok(HydratedFeedPage {
             dropped_count: count.saturating_sub(feed.len()),
             feed,
@@ -458,53 +687,77 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
         })
     }
 
-    async fn hydrate_one(
-        &self,
-        index: usize,
-        item: FeedSkeletonEntry,
-        storage: &dyn Storage,
-    ) -> Option<(usize, HydratedFeedPost)> {
-        let record = storage
-            .record_by_uri("app.bsky.feed.post", &item.post_uri)
-            .ok()
-            .flatten();
-        let record = match record {
-            Some(record) => record,
-            None => self.fetch_live_post(&item.post_uri).await.ok()?,
-        };
-        let reposted_by = match item
-            .reason
-            .as_ref()
-            .filter(|reason| {
-                reason.get("$type").and_then(Value::as_str)
-                    == Some("app.bsky.feed.defs#reasonRepost")
-            })
-            .and_then(|reason| reason.get("by"))
-            .and_then(|by| by.get("did"))
-            .and_then(Value::as_str)
+    /// Fetch unindexed posts through the public AppView in batches of 25. The long-lived cache
+    /// stays in front; only missing batch results fall back to their authors' PDSes.
+    pub async fn fetch_posts(&self, uris: &[String]) -> HashMap<String, FetchedPublicPost> {
+        let now = tokio::time::Instant::now();
+        let mut fetched = HashMap::new();
+        let mut missing = Vec::new();
+        let mut seen = HashSet::new();
         {
-            Some(did) => self
-                .identity
-                .resolve_did(did)
-                .await
-                .ok()
-                .map(|identity| identity.handle.unwrap_or(identity.did)),
-            None => None,
-        };
-        Some((
-            index,
-            HydratedFeedPost {
-                record,
-                reposted_by,
-            },
-        ))
+            let mut cache = self.live_post_cache.lock().await;
+            cache.retain(|_, (expires, _)| *expires > now);
+            for uri in uris {
+                if !seen.insert(uri.as_str()) {
+                    continue;
+                }
+                if let Some((_, post)) = cache.get(uri) {
+                    fetched.insert(uri.clone(), post.clone());
+                } else {
+                    missing.push(uri.clone());
+                }
+            }
+        }
+
+        let batches = missing
+            .chunks(PUBLIC_POST_BATCH_SIZE)
+            .map(|batch| batch.to_vec())
+            .collect::<Vec<_>>();
+        let http = self.http.clone();
+        let base = self.public_appview_base.clone();
+        let mut batch_results = stream::iter(batches.into_iter().map(|batch| {
+            let http = http.clone();
+            let base = base.clone();
+            async move {
+                let result = fetch_public_posts_batch(&http, &base, &batch).await;
+                (batch, result)
+            }
+        }))
+        .buffer_unordered(PUBLIC_POST_BATCH_CONCURRENCY);
+        let mut unanswered = Vec::new();
+        while let Some((batch, result)) = batch_results.next().await {
+            match result {
+                Ok(posts) => {
+                    for post in posts {
+                        if batch.iter().any(|requested| requested == &post.record.uri) {
+                            cache_live_post(&self.live_post_cache, &post.record.uri, post.clone())
+                                .await;
+                            fetched.insert(post.record.uri.clone(), post);
+                        }
+                    }
+                    unanswered.extend(batch.into_iter().filter(|uri| !fetched.contains_key(uri)));
+                }
+                Err(_) => unanswered.extend(batch),
+            }
+        }
+
+        let client = self;
+        let mut fallback_fetches = stream::iter(unanswered.into_iter().map(|uri| async move {
+            let post = client.fetch_live_post_data(&uri).await.ok();
+            (uri, post)
+        }))
+        .buffer_unordered(16);
+        while let Some((uri, Some(post))) = fallback_fetches.next().await {
+            fetched.insert(uri, post);
+        }
+        fetched
     }
 
-    async fn fetch_live_post(&self, uri: &str) -> Result<IndexedRecord, String> {
-        if let Some((expires, record)) = self.live_post_cache.lock().await.get(uri).cloned()
+    async fn fetch_live_post_data(&self, uri: &str) -> Result<FetchedPublicPost, String> {
+        if let Some((expires, post)) = self.live_post_cache.lock().await.get(uri).cloned()
             && expires > tokio::time::Instant::now()
         {
-            return Ok(record);
+            return Ok(post);
         }
         let (did, collection, rkey) = parse_post_uri(uri)?;
         let document = self
@@ -540,38 +793,28 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
             .unwrap_or_default()
             .as_micros()
             .min(u64::MAX as u128) as u64;
-        let record = IndexedRecord {
-            did,
-            collection,
-            rkey,
-            uri: uri.to_owned(),
-            cid: body.get("cid").and_then(Value::as_str).map(str::to_owned),
-            time_us,
-            record: value,
+        let post = FetchedPublicPost {
+            record: IndexedRecord {
+                did,
+                collection,
+                rkey,
+                uri: uri.to_owned(),
+                cid: body.get("cid").and_then(Value::as_str).map(str::to_owned),
+                time_us,
+                record: value,
+            },
+            author: None,
         };
-        // Kept long and large so a feed refresh only fetches posts it has not seen (feed generators have no
-        // "changes since"). Posts are immutable once written; a deletion shows for at most the TTL.
-        let mut cache = self.live_post_cache.lock().await;
-        if cache.len() >= LIVE_POST_CACHE_ENTRIES {
-            cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
-        }
-        if cache.len() >= LIVE_POST_CACHE_ENTRIES
-            && let Some(oldest) = cache.keys().next().cloned()
-        {
-            cache.remove(&oldest);
-        }
-        cache.insert(
-            uri.to_owned(),
-            (
-                tokio::time::Instant::now() + Duration::from_secs(LIVE_POST_CACHE_SECS),
-                record.clone(),
-            ),
-        );
-        Ok(record)
+        cache_live_post(&self.live_post_cache, uri, post.clone()).await;
+        Ok(post)
     }
 
     pub async fn fetch_post(&self, uri: &str) -> Result<IndexedRecord, String> {
-        self.fetch_live_post(uri).await
+        self.fetch_posts(&[uri.to_owned()])
+            .await
+            .remove(uri)
+            .map(|post| post.record)
+            .ok_or_else(|| "post could not be fetched from its author PDS".to_owned())
     }
 }
 
@@ -846,7 +1089,11 @@ mod tests {
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        (format!("http://localhost:{}/xrpc/", address.port()), state, task)
+        (
+            format!("http://localhost:{}/xrpc/", address.port()),
+            state,
+            task,
+        )
     }
 
     fn public_post(uri: &str) -> serde_json::Value {
@@ -861,7 +1108,10 @@ mod tests {
         })
     }
 
-    fn fake_batch_identity(dids: impl IntoIterator<Item = String>, pds: &str) -> Arc<IdentityResolver<FakeIdentity>> {
+    fn fake_batch_identity(
+        dids: impl IntoIterator<Item = String>,
+        pds: &str,
+    ) -> Arc<IdentityResolver<FakeIdentity>> {
         let documents = dids
             .into_iter()
             .map(|did| (did.clone(), document(&did, pds, vec![])))
@@ -1207,6 +1457,8 @@ mod tests {
 
     #[tokio::test]
     async fn feed_hydration_batches_public_posts_in_groups_of_twenty_five() {
+        use crate::ingest::{MemoryStorage, Storage};
+
         let uris = (0..51)
             .map(|index| format!("at://did:plc:batch{index}/app.bsky.feed.post/p{index}"))
             .collect::<Vec<_>>();
@@ -1233,14 +1485,20 @@ mod tests {
             cursor: None,
         };
 
-        let page = client
-            .hydrate_skeleton(skeleton, &crate::ingest::MemoryStorage::default())
-            .await
-            .unwrap();
+        let storage = MemoryStorage::default();
+        let page = client.hydrate_skeleton(skeleton, &storage).await.unwrap();
 
         assert_eq!(page.feed.len(), 51);
-        assert_eq!(*state.appview_calls.lock().unwrap(), [25, 25, 1]);
+        let mut call_sizes = state.appview_calls.lock().unwrap().clone();
+        call_sizes.sort_unstable();
+        assert_eq!(call_sizes, [1, 25, 25]);
         assert_eq!(*state.pds_calls.lock().unwrap(), 0);
+        let author_profile = storage
+            .get_record("did:plc:batch0", "app.bsky.actor.profile", "self")
+            .unwrap()
+            .unwrap();
+        assert_eq!(author_profile.record["publicHandle"], "batch.test");
+        assert_eq!(author_profile.record["displayName"], "Batch author");
         server.abort();
     }
 
@@ -1250,8 +1508,12 @@ mod tests {
 
         let uri = "at://did:plc:fallback/app.bsky.feed.post/p1";
         let fallback_posts = HashMap::from([(uri.to_owned(), public_post(uri))]);
-        let (pds, state, server) =
-            batch_server(HashMap::new(), fallback_posts, StatusCode::SERVICE_UNAVAILABLE).await;
+        let (pds, state, server) = batch_server(
+            HashMap::new(),
+            fallback_posts,
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+        .await;
         let pds_endpoint = pds.trim_end_matches("/xrpc/").to_owned();
         let identity = fake_batch_identity(["did:plc:fallback".to_owned()], &pds_endpoint);
         let client = test_client_with_appview(identity, pds);

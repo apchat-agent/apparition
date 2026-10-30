@@ -595,6 +595,9 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
             posts
         })
     }
+    fn supports_public_post_batching(&self) -> bool {
+        false
+    }
     fn fetch_author_profile<'a>(
         &'a self,
         _did: &'a str,
@@ -2965,6 +2968,19 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
         Box::pin(async move { self.feed_client.fetch_post(uri).await })
     }
 
+    fn fetch_public_posts<'a>(
+        &'a self,
+        uris: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = HashMap<String, crate::feeds::FetchedPublicPost>> + Send + 'a>>
+    {
+        let uris = uris.to_vec();
+        Box::pin(async move { self.feed_client.fetch_posts(&uris).await })
+    }
+
+    fn supports_public_post_batching(&self) -> bool {
+        true
+    }
+
     fn fetch_author_profile<'a>(
         &'a self,
         did: &'a str,
@@ -4423,11 +4439,31 @@ async fn hydrate_page_parents<F: OAuthFlow, S: Storage>(
     parent_uris.sort_unstable();
     parent_uris.dedup();
 
+    let mut first_round_uris = parent_uris.clone();
+    if flow.supports_public_post_batching() {
+        first_round_uris.extend(page_records.iter().filter_map(|record| {
+            record
+                .record
+                .get("embed")
+                .and_then(quoted_record_ref)
+                .filter(|reference| !reference.unavailable)
+                .filter(|reference| at_uri_collection(&reference.uri) == Some("app.bsky.feed.post"))
+                .map(|reference| reference.uri)
+        }));
+    }
+    first_round_uris.sort_unstable();
+    first_round_uris.dedup();
+
     for depth in 0..=2 {
-        if parent_uris.is_empty() || tokio::time::Instant::now() >= deadline {
+        let uris = if depth == 0 {
+            &first_round_uris
+        } else {
+            &parent_uris
+        };
+        if uris.is_empty() || tokio::time::Instant::now() >= deadline {
             break;
         }
-        hydrate_parent_uri_batch(flow, storage, &parent_uris, &mut parents, deadline).await?;
+        hydrate_parent_uri_batch(flow, storage, uris, &mut parents, deadline).await?;
         if depth == 2 {
             break;
         }
@@ -4470,26 +4506,48 @@ async fn hydrate_parent_uri_batch<F: OAuthFlow, S: Storage>(
         .filter(|uri| parents.get(*uri).is_some_and(Option::is_none))
         .cloned()
         .collect::<Vec<_>>();
-    let flow = flow.clone();
-    let mut fetches = stream::iter(missing.into_iter().map(|uri| {
+    if missing.is_empty() {
+        return Ok(());
+    }
+    if !flow.supports_public_post_batching() {
         let flow = flow.clone();
-        async move {
-            let fetched = flow.fetch_post(&uri).await;
-            (uri, fetched)
-        }
-    }))
-    .buffer_unordered(PAGE_QUOTE_CONCURRENCY);
-    let _ = tokio::time::timeout_at(deadline, async {
-        while let Some((uri, fetched)) = fetches.next().await {
-            if let Ok(record) = fetched
-                && record.uri == uri
-                && record.collection == "app.bsky.feed.post"
-            {
-                parents.insert(uri, Some(record));
+        let mut fetches = stream::iter(missing.into_iter().map(|uri| {
+            let flow = flow.clone();
+            async move {
+                let fetched = flow.fetch_post(&uri).await;
+                (uri, fetched)
+            }
+        }))
+        .buffer_unordered(PAGE_QUOTE_CONCURRENCY);
+        let _ = tokio::time::timeout_at(deadline, async {
+            while let Some((uri, fetched)) = fetches.next().await {
+                if let Ok(record) = fetched
+                    && record.uri == uri
+                    && record.collection == "app.bsky.feed.post"
+                {
+                    parents.insert(uri, Some(record));
+                }
+            }
+        })
+        .await;
+        return Ok(());
+    }
+    if let Ok(fetched) = tokio::time::timeout_at(deadline, flow.fetch_public_posts(&missing)).await
+    {
+        let mut public_profiles = Vec::new();
+        for uri in missing {
+            let Some(post) = fetched.get(&uri) else {
+                continue;
+            };
+            if post.record.uri == uri && post.record.collection == "app.bsky.feed.post" {
+                parents.insert(uri, Some(post.record.clone()));
+                if let Some(author) = &post.author {
+                    public_profiles.push(author.clone());
+                }
             }
         }
-    })
-    .await;
+        crate::feeds::persist_public_profiles(storage, public_profiles)?;
+    }
     Ok(())
 }
 
@@ -4584,28 +4642,59 @@ async fn hydrate_page_quotes<F: OAuthFlow, S: Storage>(
         result.insert(reference.uri, state);
     }
 
-    let flow = flow.clone();
-    let mut fetches = stream::iter(missing_posts.into_iter().map(|uri| {
+    if !flow.supports_public_post_batching() {
         let flow = flow.clone();
-        async move {
-            let fetched = flow.fetch_post(&uri).await;
-            (uri, fetched)
+        let mut fetches = stream::iter(missing_posts.into_iter().map(|uri| {
+            let flow = flow.clone();
+            async move {
+                let fetched = flow.fetch_post(&uri).await;
+                (uri, fetched)
+            }
+        }))
+        .buffer_unordered(PAGE_QUOTE_CONCURRENCY);
+        let fetch_result = tokio::time::timeout_at(deadline, async {
+            while let Some((uri, fetched)) = fetches.next().await {
+                let state = match fetched {
+                    Ok(record)
+                        if record.uri == uri && record.collection == "app.bsky.feed.post" =>
+                    {
+                        QuoteRenderState::Found(record)
+                    }
+                    Ok(_) | Err(_) => QuoteRenderState::NotFound,
+                };
+                result.insert(uri, state);
+            }
+        })
+        .await;
+        if fetch_result.is_err() {
+            tracing::debug!(
+                pending = result
+                    .values()
+                    .filter(|state| matches!(state, QuoteRenderState::Pending))
+                    .count(),
+                "quoted post hydration reached page budget"
+            );
         }
-    }))
-    .buffer_unordered(PAGE_QUOTE_CONCURRENCY);
-    let fetch_result = tokio::time::timeout_at(deadline, async {
-        while let Some((uri, fetched)) = fetches.next().await {
-            let state = match fetched {
-                Ok(record) if record.uri == uri && record.collection == "app.bsky.feed.post" => {
-                    QuoteRenderState::Found(record)
+    } else if let Ok(fetched) =
+        tokio::time::timeout_at(deadline, flow.fetch_public_posts(&missing_posts)).await
+    {
+        let mut public_profiles = Vec::new();
+        for uri in missing_posts {
+            let state = match fetched.get(&uri) {
+                Some(post)
+                    if post.record.uri == uri && post.record.collection == "app.bsky.feed.post" =>
+                {
+                    if let Some(author) = &post.author {
+                        public_profiles.push(author.clone());
+                    }
+                    QuoteRenderState::Found(post.record.clone())
                 }
-                Ok(_) | Err(_) => QuoteRenderState::NotFound,
+                _ => QuoteRenderState::NotFound,
             };
             result.insert(uri, state);
         }
-    })
-    .await;
-    if fetch_result.is_err() {
+        crate::feeds::persist_public_profiles(storage, public_profiles)?;
+    } else {
         tracing::debug!(
             pending = result
                 .values()
@@ -11309,7 +11398,7 @@ mod tests {
         assert!(page.contains("Hydrated ancestor quote body"), "{page}");
         let mut fetched = flow.fetched.lock().unwrap().clone();
         fetched.sort();
-        let mut expected = vec![root.uri, quote.uri];
+        let mut expected = vec![root.uri.clone(), quote.uri.clone()];
         expected.sort();
         assert_eq!(
             fetched, expected,
@@ -11319,11 +11408,43 @@ mod tests {
         for batch in &mut batches {
             batch.sort();
         }
-        assert_eq!(
-            batches,
-            [expected],
-            "parents and quotes share the first batch round"
+        assert_eq!(batches, [[root.uri], [quote.uri]]);
+    }
+
+    #[tokio::test]
+    async fn page_parent_and_quote_uris_share_the_first_batch_round() {
+        let storage = MemoryStorage::default();
+        let parent = test_web_post("did:plc:parent-author", "parent", 1, "Parent", None);
+        let quoted = test_web_post("did:plc:quote-author", "quoted", 1, "Quote", None);
+        let mut reply = test_web_post(
+            "did:plc:reply-author",
+            "reply",
+            2,
+            "Reply",
+            Some(&parent.uri),
         );
+        reply.record["embed"] = quote_embed(&quoted.uri);
+        let flow = QuoteHydrationTestFlow::new([parent.clone(), quoted.clone()]);
+        let page_records = [&reply];
+
+        let hydrated = hydrate_page_parents(
+            &flow,
+            &storage,
+            &page_records,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+        assert!(hydrated.get(&parent.uri).is_some_and(Option::is_some));
+        assert!(hydrated.get(&quoted.uri).is_some_and(Option::is_some));
+        let mut batches = flow.batches.lock().unwrap().clone();
+        for batch in &mut batches {
+            batch.sort();
+        }
+        let mut expected = vec![parent.uri, quoted.uri];
+        expected.sort();
+        assert_eq!(batches, [expected]);
     }
 
     #[tokio::test]
@@ -12352,6 +12473,10 @@ mod tests {
                     })
                     .collect()
             })
+        }
+
+        fn supports_public_post_batching(&self) -> bool {
+            true
         }
     }
 
