@@ -2027,11 +2027,11 @@ fn sqlite_writer_loop(
                                 }
                             }
                         }
-                        if batch_error.is_none() {
-                            if let Err(error) = transaction.commit() {
-                                tracing::warn!(%error, "SQLite queued write batch commit failed");
-                                batch_error = Some(StorageError::Sqlite(error));
-                            }
+                        if batch_error.is_none()
+                            && let Err(error) = transaction.commit()
+                        {
+                            tracing::warn!(%error, "SQLite queued write batch commit failed");
+                            batch_error = Some(StorageError::Sqlite(error));
                         }
                     }
                     Err(error) => {

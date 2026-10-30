@@ -2355,8 +2355,8 @@ a.quoted-post-card:hover,
   }
 
   .mobile-nav .icon {
-    width: 1.35rem;
-    height: 1.35rem;
+    width: 1.2rem;
+    height: 1.2rem;
   }
 
   .mobile-compose {
@@ -2498,21 +2498,33 @@ a.quoted-post-card:hover,
   }
 
   body:has(.mobile-nav) {
-    --mobile-nav-height: calc(2.75rem + 0.2rem + 1px + max(4px, calc(env(safe-area-inset-bottom) * 0.25)));
+    --mobile-nav-height: calc(2rem + 0.2rem + 1px + max(4px, calc(env(safe-area-inset-bottom) * 0.25)));
     --mobile-compose-clearance: calc(var(--mobile-nav-height) + 0.75rem);
   }
 
-  /* Labels stay available to assistive technology while each icon keeps a 44-pixel hit area. */
+  /* Icon-only bottom bar at about half the old height (owner, 2026-10-29); labels stay for screen readers.
+     The extra padding widens each icon's hit area toward 44 px without growing the compact bar. */
   body:has(.mobile-nav) .mobile-nav {
     min-height: 0;
     padding-top: 0.1rem;
     padding-bottom: calc(0.1rem + max(4px, calc(env(safe-area-inset-bottom) * 0.25)));
   }
 
+  /* Every phone tap target starts at 44 px (88546cc)... */
   body:has(.mobile-nav) .mobile-nav a,
   body:has(.mobile-nav) .mobile-nav button {
     min-height: 44px;
     min-width: 44px;
+  }
+
+  /* ...then the compact bar (1df5bc1) trims vertical slack, and the widened padding keeps each
+     icon's hit area at least 44 px tall despite the 2rem content box. */
+  body:has(.mobile-nav) .mobile-nav a,
+  body:has(.mobile-nav) .mobile-nav button {
+    min-height: 2rem;
+    min-width: 44px;
+    padding: 0.65rem 0.2rem;
+    margin: -0.65rem -0.2rem;
   }
 
   body:has(.mobile-nav) .mobile-nav a > span,

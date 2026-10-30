@@ -6169,22 +6169,22 @@ where
             verified_cookie_video_access(&state.public, &headers, state.storage.as_ref());
         let profile = profile_view_from_storage(state.storage.as_ref(), &did)
             .unwrap_or_else(|_| json!({"did":did,"handle":did}));
-        render_composer(
-            "",
-            "media-composer",
-            "new-post",
-            "/post",
-            "Write a post",
-            "What's up?",
-            "Post",
-            &avatar_markup(&profile, "composer-avatar"),
-            "",
-            "",
-            render_media_picker(blob_access, video_access, "post-media"),
-            render_link_picker("new-post-link"),
-            "",
-            blob_access || video_access,
-        )
+        render_composer(ComposerSpec {
+            form_attributes: "",
+            classes: "media-composer",
+            textarea_id: "new-post",
+            action: "/post",
+            label: "Write a post",
+            placeholder: "What's up?",
+            submit_label: "Post",
+            avatar: &composer_avatar_markup(&profile),
+            hidden_fields: "",
+            context: "",
+            media_picker: render_media_picker(blob_access, video_access, "post-media"),
+            link_picker: render_link_picker("new-post-link"),
+            trailing: "",
+            media_access: blob_access || video_access,
+        })
     } else {
         String::new()
     };
@@ -8362,25 +8362,25 @@ where
             verified_cookie_video_access(&state.public, &headers, state.storage.as_ref());
         let profile = profile_view_from_storage(state.storage.as_ref(), &viewer_did)
             .unwrap_or_else(|_| json!({"did":viewer_did,"handle":viewer_did}));
-        render_composer(
-            "",
-            "quote-composer media-composer",
-            "quote-text",
-            "/quote",
-            "Write a quote post",
-            "What's up?",
-            "Post",
-            &avatar_markup(&profile, "composer-avatar"),
-            &format!(
+        render_composer(ComposerSpec {
+            form_attributes: "",
+            classes: "quote-composer media-composer",
+            textarea_id: "quote-text",
+            action: "/quote",
+            label: "Write a quote post",
+            placeholder: "What's up?",
+            submit_label: "Post",
+            avatar: &composer_avatar_markup(&profile),
+            hidden_fields: &format!(
                 "<input type=\"hidden\" name=\"quote_uri\" value=\"{}\">",
                 html_escape(&quoted.uri)
             ),
-            "",
-            render_media_picker(blob_access, video_access, "quote-media"),
-            render_link_picker("quote-text-link"),
-            &render_quote_preview(state.storage.as_ref(), &quoted),
-            blob_access || video_access,
-        )
+            context: "",
+            media_picker: render_media_picker(blob_access, video_access, "quote-media"),
+            link_picker: render_link_picker("quote-text-link"),
+            trailing: &render_quote_preview(state.storage.as_ref(), &quoted),
+            media_access: blob_access || video_access,
+        })
     } else {
         format!(
             "<p role=\"status\">Read-only: write permissions were not granted.</p>{}",
@@ -8660,46 +8660,64 @@ fn render_reply_composer<S: Storage>(
     let handle = profile_handle(&profile, &parent.did);
     let viewer = profile_view_from_storage(storage, viewer_did)
         .unwrap_or_else(|_| json!({"did":viewer_did,"handle":viewer_did}));
-    render_composer(
-        "id=\"reply-composer\"",
-        "reply-composer media-composer",
-        "reply-text",
-        "/reply",
-        "Write a reply",
-        "Write a reply…",
-        "Reply",
-        &avatar_markup(&viewer, "composer-avatar"),
-        &format!(
+    render_composer(ComposerSpec {
+        form_attributes: "id=\"reply-composer\"",
+        classes: "reply-composer media-composer",
+        textarea_id: "reply-text",
+        action: "/reply",
+        label: "Write a reply",
+        placeholder: "Write a reply…",
+        submit_label: "Reply",
+        avatar: &composer_avatar_markup(&viewer),
+        hidden_fields: &format!(
             "<input type=\"hidden\" name=\"parent_uri\" value=\"{}\">",
             html_escape(&parent.uri)
         ),
-        &format!(
+        context: &format!(
             "<p class=\"reply-context\">Replying to @{}</p>",
             html_escape(&handle)
         ),
-        render_media_picker(blob_access, video_access, "reply-media"),
-        render_link_picker("reply-text-link"),
-        "",
-        blob_access || video_access,
-    )
+        media_picker: render_media_picker(blob_access, video_access, "reply-media"),
+        link_picker: render_link_picker("reply-text-link"),
+        trailing: "",
+        media_access: blob_access || video_access,
+    })
 }
 
-fn render_composer(
-    form_attributes: &str,
-    classes: &str,
-    textarea_id: &str,
-    action: &str,
-    label: &str,
-    placeholder: &str,
-    submit_label: &str,
-    avatar: &str,
-    hidden_fields: &str,
-    context: &str,
+struct ComposerSpec<'a> {
+    form_attributes: &'a str,
+    classes: &'a str,
+    textarea_id: &'a str,
+    action: &'a str,
+    label: &'a str,
+    placeholder: &'a str,
+    submit_label: &'a str,
+    avatar: &'a str,
+    hidden_fields: &'a str,
+    context: &'a str,
     media_picker: String,
     link_picker: String,
-    trailing: &str,
+    trailing: &'a str,
     media_access: bool,
-) -> String {
+}
+
+fn render_composer(spec: ComposerSpec<'_>) -> String {
+    let ComposerSpec {
+        form_attributes,
+        classes,
+        textarea_id,
+        action,
+        label,
+        placeholder,
+        submit_label,
+        avatar,
+        hidden_fields,
+        context,
+        media_picker,
+        link_picker,
+        trailing,
+        media_access,
+    } = spec;
     let media_button_disabled = if media_access { "" } else { " disabled" };
     format!(
         "<form {form_attributes} class=\"composer {classes}\" action=\"{action}\" method=\"post\" enctype=\"multipart/form-data\" data-media-composer data-compact-composer>{hidden_fields}<div class=\"composer-input-row\">{avatar}<label class=\"sr-only\" for=\"{textarea_id}\">{label}</label><textarea id=\"{textarea_id}\" name=\"text\" rows=\"1\" maxlength=\"300\" placeholder=\"{placeholder}\" required data-compose-input></textarea></div><div class=\"composer-toolbar\" data-compose-toolbar><div class=\"composer-tools\"><button class=\"composer-icon-button\" type=\"button\" data-compose-media aria-label=\"Add photo or video\"{media_button_disabled}>{}</button><button class=\"composer-icon-button\" type=\"button\" data-link-toggle aria-label=\"Add a link\" aria-controls=\"{textarea_id}-link-picker\" aria-expanded=\"false\">{}</button></div><output class=\"composer-character-count\" data-character-count aria-live=\"polite\">0/300</output><button class=\"composer-submit\" type=\"submit\">{submit_label}</button></div><div class=\"composer-fields\">{context}{media_picker}{link_picker}{trailing}</div><p class=\"composer-error\" data-composer-error role=\"alert\" hidden></p></form>",
@@ -10684,6 +10702,19 @@ fn avatar_markup_with_priority(profile: &Value, class_name: &str, eager: bool) -
         )
     } else {
         format!("<span class=\"{class_name} avatar-placeholder\" aria-hidden=\"true\"></span>")
+    }
+}
+
+/// The composer's own avatar sits above the fold on every page, so it renders without the
+/// list-oriented loading/decoding hints; it must not shift the lazy-load budget of post lists.
+fn composer_avatar_markup(profile: &Value) -> String {
+    if let Some(avatar) = safe_avatar_url(profile).and_then(avatar_thumbnail_url) {
+        format!(
+            "<img class=\"composer-avatar\" src=\"{}\" alt=\"\" width=\"44\" height=\"44\">",
+            html_escape(&avatar)
+        )
+    } else {
+        "<span class=\"composer-avatar avatar-placeholder\" aria-hidden=\"true\"></span>".to_owned()
     }
 }
 
@@ -14224,7 +14255,7 @@ mod tests {
         flow.store
             .web_cache_set(
                 &cache_key,
-                &serde_json::to_string(&[stale.clone()]).unwrap(),
+                &serde_json::to_string(std::slice::from_ref(&stale)).unwrap(),
             )
             .unwrap();
         let stale_at_ms = unix_time_ms() - SAVED_FEED_PREFERENCE_CACHE_TTL.as_millis() as i64 - 1;
