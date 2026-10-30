@@ -13603,6 +13603,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_persisted_mutes_return_immediately_and_refresh_once_in_background() {
+        let (flow, state, server) = feed_test_flow(false).await;
+        let did = FEED_VIEWER_DID.to_owned();
+        let stale = vec!["did:plc:persisted-muted".to_owned()];
+        let cache_key = muted_actor_cache_key(&did);
+        flow.store
+            .web_cache_set(&cache_key, &serde_json::to_string(&stale).unwrap())
+            .unwrap();
+        flow.store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE web_cache SET stored_at_ms=?1 WHERE cache_key=?2",
+                params![
+                    unix_time_ms() - MUTED_ACTOR_CACHE_TTL.as_millis() as i64 - 1,
+                    cache_key
+                ],
+            )
+            .unwrap();
+        state.lock().unwrap().mutes_delay = Duration::from_millis(180);
+
+        let actors =
+            tokio::time::timeout(Duration::from_millis(60), flow.fetch_muted_actor_dids(&did))
+                .await
+                .expect("stale persisted mutes should not wait for the upstream")
+                .unwrap();
+        assert_eq!(actors, HashSet::from([stale[0].clone()]));
+
+        tokio::time::sleep(Duration::from_millis(240)).await;
+        assert_eq!(state.lock().unwrap().mutes_calls, 1);
+        assert!(flow.fetch_muted_actor_dids(&did).await.unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn stale_saved_feed_preferences_return_immediately_and_refresh_once_in_background() {
         let (flow, state, server) = feed_test_flow(false).await;
         let did = FEED_VIEWER_DID.to_owned();
@@ -13651,6 +13687,72 @@ mod tests {
                 .iter()
                 .all(|preferences| preferences == std::slice::from_ref(&stale))
         );
+
+        tokio::time::sleep(Duration::from_millis(240)).await;
+        assert_eq!(state.lock().unwrap().preferences_calls, 1);
+        assert_eq!(
+            flow.saved_feed_preferences(&did).await.unwrap(),
+            [refreshed]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stale_persisted_saved_feed_preferences_return_immediately_and_refresh_once_in_background()
+     {
+        let (flow, state, server) = feed_test_flow(false).await;
+        let did = FEED_VIEWER_DID.to_owned();
+        let stale = SavedFeedPreference {
+            id: "persisted-old-feed".to_owned(),
+            feed_type: "feed".to_owned(),
+            value: "at://did:plc:old/app.bsky.feed.generator/old".to_owned(),
+            pinned: true,
+        };
+        let refreshed = SavedFeedPreference {
+            id: "persisted-new-feed".to_owned(),
+            feed_type: "feed".to_owned(),
+            value: "at://did:plc:new/app.bsky.feed.generator/new".to_owned(),
+            pinned: false,
+        };
+        {
+            let mut state = state.lock().unwrap();
+            state.preferences_delay = Duration::from_millis(180);
+            state.preferences_response = Some(json!({"preferences":[{
+                "$type":"app.bsky.actor.defs#savedFeedsPrefV2",
+                "items":[{
+                    "id":refreshed.id,
+                    "type":refreshed.feed_type,
+                    "value":refreshed.value,
+                    "pinned":refreshed.pinned
+                }]
+            }]}));
+        }
+        let cache_key = saved_feed_cache_key(&did);
+        flow.store
+            .web_cache_set(
+                &cache_key,
+                &serde_json::to_string(&[stale.clone()]).unwrap(),
+            )
+            .unwrap();
+        flow.store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE web_cache SET stored_at_ms=?1 WHERE cache_key=?2",
+                params![
+                    unix_time_ms() - SAVED_FEED_PREFERENCE_CACHE_TTL.as_millis() as i64 - 1,
+                    cache_key
+                ],
+            )
+            .unwrap();
+
+        let preferences =
+            tokio::time::timeout(Duration::from_millis(60), flow.saved_feed_preferences(&did))
+                .await
+                .expect("stale persisted saved feeds should not wait for the upstream")
+                .unwrap();
+        assert_eq!(preferences, [stale]);
 
         tokio::time::sleep(Duration::from_millis(240)).await;
         assert_eq!(state.lock().unwrap().preferences_calls, 1);
