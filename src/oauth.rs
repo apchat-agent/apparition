@@ -571,6 +571,30 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<IndexedRecord, String>> + Send + 'a>> {
         Box::pin(async { Err("post fetch is not available".to_owned()) })
     }
+    fn fetch_public_posts<'a>(
+        &'a self,
+        uris: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = HashMap<String, crate::feeds::FetchedPublicPost>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let posts = futures_util::stream::iter(uris.iter().cloned().map(|uri| async move {
+                self.fetch_post(&uri).await.ok().map(|record| {
+                    (
+                        uri,
+                        crate::feeds::FetchedPublicPost {
+                            record,
+                            author: None,
+                        },
+                    )
+                })
+            }))
+            .buffer_unordered(PAGE_QUOTE_CONCURRENCY)
+            .filter_map(|post| async move { post })
+            .collect::<HashMap<_, _>>()
+            .await;
+            posts
+        })
+    }
     fn fetch_author_profile<'a>(
         &'a self,
         _did: &'a str,
@@ -11291,6 +11315,15 @@ mod tests {
             fetched, expected,
             "one parent fetch and one batched quote fetch"
         );
+        let mut batches = flow.batches.lock().unwrap().clone();
+        for batch in &mut batches {
+            batch.sort();
+        }
+        assert_eq!(
+            batches,
+            [expected],
+            "parents and quotes share the first batch round"
+        );
     }
 
     #[tokio::test]
@@ -12223,6 +12256,8 @@ mod tests {
     struct QuoteHydrationTestFlow {
         records: Arc<HashMap<String, IndexedRecord>>,
         fetched: Arc<Mutex<Vec<String>>>,
+        batches: Arc<Mutex<Vec<Vec<String>>>>,
+        requested: Arc<Mutex<HashSet<String>>>,
     }
 
     impl QuoteHydrationTestFlow {
@@ -12235,6 +12270,8 @@ mod tests {
                         .collect(),
                 ),
                 fetched: Arc::new(Mutex::new(Vec::new())),
+                batches: Arc::new(Mutex::new(Vec::new())),
+                requested: Arc::new(Mutex::new(HashSet::new())),
             }
         }
     }
@@ -12274,6 +12311,47 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| "fixture post was not found".to_owned());
             Box::pin(async move { record })
+        }
+
+        fn fetch_public_posts<'a>(
+            &'a self,
+            uris: &'a [String],
+        ) -> Pin<
+            Box<dyn Future<Output = HashMap<String, crate::feeds::FetchedPublicPost>> + Send + 'a>,
+        > {
+            let uris = uris.to_vec();
+            let records = self.records.clone();
+            let fetched = self.fetched.clone();
+            let batches = self.batches.clone();
+            let requested = self.requested.clone();
+            Box::pin(async move {
+                let mut fresh = Vec::new();
+                {
+                    let mut requested = requested.lock().unwrap();
+                    for uri in &uris {
+                        if requested.insert(uri.clone()) {
+                            fresh.push(uri.clone());
+                        }
+                    }
+                }
+                if !fresh.is_empty() {
+                    batches.lock().unwrap().push(fresh.clone());
+                    fetched.lock().unwrap().extend(fresh);
+                }
+                uris.into_iter()
+                    .filter_map(|uri| {
+                        records.get(&uri).cloned().map(|record| {
+                            (
+                                uri,
+                                crate::feeds::FetchedPublicPost {
+                                    record,
+                                    author: None,
+                                },
+                            )
+                        })
+                    })
+                    .collect()
+            })
         }
     }
 
