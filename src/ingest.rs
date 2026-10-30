@@ -2753,13 +2753,6 @@ impl SqliteStorage {
             write_started,
             &mut records_written,
         )?;
-        self.delete_snapshot_follows(
-            did,
-            follow_rowid_cutoff,
-            records_per_second,
-            write_started,
-            &mut records_written,
-        )?;
         self.delete_snapshot_rows(
             did,
             scope_rowid_cutoff,
@@ -2787,8 +2780,16 @@ impl SqliteStorage {
                     let mut inserted_follow_rows = 0_u64;
                     let mut inserted_subjects = Vec::new();
                     {
+                        // Inserting before the stale-row cleanup is what keeps
+                        // a re-snapshot from ever blanking rows its records
+                        // still back. A snapshotted subject whose row already
+                        // says following=1 is re-inserted with REPLACE so it
+                        // gets a fresh rowid (> the captured cutoff) and the
+                        // cleanup cannot touch it; a row an outside unfollow
+                        // left at following=0 stands (the old INSERT OR IGNORE
+                        // never overwrote it either); only absent rows insert.
                         let mut insert_follow = transaction.prepare(
-                            "INSERT OR IGNORE INTO follows(actor,subject,following) VALUES(?1,?2,1)",
+                            "INSERT OR REPLACE INTO follows(actor,subject,following) VALUES(?1,?2,1)",
                         )?;
                         let mut insert_scope = transaction.prepare(
                             "INSERT OR IGNORE INTO backfill_scope(owner_did,target_did) VALUES(?1,?2)",
@@ -2803,18 +2804,28 @@ impl SqliteStorage {
                              ON CONFLICT(did) DO UPDATE SET done=0",
                         )?;
                         for subject in writer_batch {
-                            let inserted = insert_follow.execute(params![writer_did, subject])?;
-                            inserted_follow_rows =
-                                inserted_follow_rows.saturating_add(inserted as u64);
-                            if inserted > 0 {
-                                inserted_subjects.push(subject.clone());
-                            }
-                            let is_following: bool = transaction.query_row(
+                            let previous_following: Option<bool> = transaction.query_row(
                                 "SELECT following FROM follows WHERE actor=?1 AND subject=?2",
                                 params![writer_did, subject],
                                 |row| row.get(0),
-                            )?;
-                            if registered_for_tracker && is_following {
+                            )
+                            .optional()?;
+                            match previous_following {
+                                // An outside unfollow stands: the row is left
+                                // exactly as it is, unanswered by this snapshot.
+                                Some(false) => continue,
+                                Some(true) => {
+                                    insert_follow.execute(params![writer_did, subject])?;
+                                }
+                                None => {
+                                    let inserted =
+                                        insert_follow.execute(params![writer_did, subject])?;
+                                    inserted_follow_rows =
+                                        inserted_follow_rows.saturating_add(inserted as u64);
+                                    inserted_subjects.push(subject.clone());
+                                }
+                            }
+                            if registered_for_tracker {
                                 enqueue.execute(params![subject, MAX_BACKFILL_QUEUE])?;
                                 if transaction.query_row(
                                     "SELECT EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
@@ -2842,6 +2853,16 @@ impl SqliteStorage {
                 Self::pace_snapshot_writes(records_per_second, write_started, records_written);
             }
         }
+        // Cleanup runs only after every snapshotted follow row is live: it
+        // removes the actor's pre-snapshot rows (rowid <= cutoff) that the
+        // REPLACE inserts did not replace, i.e. follows the repo dropped.
+        self.delete_snapshot_follows(
+            did,
+            follow_rowid_cutoff,
+            records_per_second,
+            write_started,
+            &mut records_written,
+        )?;
 
         let total_batches = records.len().div_ceil(SNAPSHOT_BATCH);
         for (batch_index, (batch, batch_json)) in records
