@@ -15659,6 +15659,202 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn account_labels_arrive_on_the_next_page_after_a_timed_out_page() {
+        let (flow, state, server) = feed_test_flow(false).await;
+        let viewer_did = FEED_VIEWER_DID.to_owned();
+        let actor_did = "did:plc:page-deadline-actor";
+        let labeler_did = "did:plc:stale-cache-labeler";
+        {
+            let mut state = state.lock().unwrap();
+            state.profiles_delay = Duration::from_millis(180);
+            state.profiles_response = Some(json!({"profiles":[{
+                "did":actor_did,
+                "handle":"deadline.actor.test",
+                "displayName":"Deadline actor",
+                "labels":[{"src":labeler_did,"uri":actor_did,"val":"spider"}]
+            }]}));
+        }
+        flow.labeler_preference_cache.lock().await.insert(
+            viewer_did.clone(),
+            (
+                tokio::time::Instant::now() + Duration::from_secs(60),
+                vec![labeler_did.to_owned()],
+            ),
+        );
+        let storage = Arc::new(MemoryStorage::default());
+        let post = test_web_post(
+            actor_did,
+            "page-deadline",
+            1,
+            "Post by the slow author",
+            None,
+        );
+        storage.put_record(&post).unwrap();
+        let page_records = vec![&post];
+
+        let logs = FeedTestLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(logs.clone())
+            .finish();
+        let first = hydrate_page_content(
+            &flow,
+            &viewer_did,
+            storage.clone(),
+            &page_records,
+            &[],
+            [actor_did.to_owned()],
+            tokio::time::Instant::now() + Duration::from_millis(60),
+        )
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+        assert!(
+            first.quote_index.account_labels.is_empty(),
+            "the page that ran out of time cannot show labels it never received"
+        );
+        let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        let timeout_lines = output
+            .lines()
+            .filter(|line| line.contains("account labels timed out"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            timeout_lines.len(),
+            1,
+            "the page-deadline timeout of account data must warn: {output}"
+        );
+        assert!(
+            timeout_lines[0].contains("WARN")
+                && timeout_lines[0].contains(&viewer_did)
+                && timeout_lines[0].contains("actors=1"),
+            "the warn must name the viewer DID and the actor count: {}",
+            timeout_lines[0]
+        );
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(state.lock().unwrap().profiles_calls, 1);
+        let second = hydrate_page_content(
+            &flow,
+            &viewer_did,
+            storage.clone(),
+            &page_records,
+            &[],
+            [actor_did.to_owned()],
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            second.quote_index.account_labels.get(actor_did),
+            Some(&vec![AccountLabel {
+                subject_did: actor_did.to_owned(),
+                labeler_did: labeler_did.to_owned(),
+                labeler_name: "Fresh labeler".to_owned(),
+                labeler_handle: labeler_did.to_owned(),
+                value: "spider".to_owned(),
+                display_name: "Fresh spider label".to_owned(),
+                description: String::new(),
+                severity: "alert".to_owned(),
+                blurs: "media".to_owned(),
+            }]),
+            "a dropped page must not strand the refresh: the next page shows the labels"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn labeler_dids_arrive_after_a_caller_times_out_mid_refresh() {
+        let (flow, state, server) = feed_test_flow(false).await;
+        let viewer_did = FEED_VIEWER_DID.to_owned();
+        {
+            let mut state = state.lock().unwrap();
+            state.preferences_delay = Duration::from_millis(180);
+            state.preferences_response = Some(json!({"preferences":[{
+                "$type":"app.bsky.actor.defs#labelersPref",
+                "labelers":[{"did":"did:plc:patience-labeler"}]
+            }]}));
+        }
+
+        let first = tokio::time::timeout(
+            Duration::from_millis(60),
+            flow.labeler_dids_for_viewer(&viewer_did),
+        )
+        .await;
+        assert!(
+            first.is_err(),
+            "the first caller runs out of time before the slow fake PDS answers"
+        );
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(state.lock().unwrap().preferences_calls, 1);
+        let dids = flow.labeler_dids_for_viewer(&viewer_did).await.unwrap();
+        assert_eq!(
+            dids,
+            vec![
+                BSKY_MODERATION_LABELER_DID.to_owned(),
+                "did:plc:patience-labeler".to_owned()
+            ],
+            "a dropped caller must not strand the refresh: later callers get the labeler DIDs"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn account_labels_ms_reports_the_awaited_cold_refresh() {
+        let (flow, state, server) = feed_test_flow(false).await;
+        let viewer_did = FEED_VIEWER_DID.to_owned();
+        let actor_did = "did:plc:measured-actor";
+        let labeler_did = "did:plc:stale-cache-labeler";
+        {
+            let mut state = state.lock().unwrap();
+            state.profiles_delay = Duration::from_millis(80);
+            state.profiles_response = Some(json!({"profiles":[{
+                "did":actor_did,
+                "handle":"measured.actor.test",
+                "displayName":"Measured actor",
+                "labels":[{"src":labeler_did,"uri":actor_did,"val":"spider"}]
+            }]}));
+        }
+        flow.labeler_preference_cache.lock().await.insert(
+            viewer_did.clone(),
+            (
+                tokio::time::Instant::now() + Duration::from_secs(60),
+                vec![labeler_did.to_owned()],
+            ),
+        );
+        let storage = Arc::new(MemoryStorage::default());
+        let post = test_web_post(
+            actor_did,
+            "measured",
+            1,
+            "Post by the measured author",
+            None,
+        );
+        storage.put_record(&post).unwrap();
+        let page_records = vec![&post];
+
+        let hydration = hydrate_page_content(
+            &flow,
+            &viewer_did,
+            storage.clone(),
+            &page_records,
+            &[],
+            [actor_did.to_owned()],
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(!hydration.quote_index.account_labels.is_empty());
+        assert!(
+            hydration.account_labels_ms >= 80,
+            "account_labels_ms must carry the measured cold-refresh wait, got {} ms",
+            hydration.account_labels_ms
+        );
+        server.abort();
+    }
+
     const CORNELL_FIXTURE_DID: &str = "did:plc:oubsyca6hhgqhmbbk27lvs7c";
     const CORNELL_FIXTURE_NAME: &str = "Account Activity Labeler";
 
