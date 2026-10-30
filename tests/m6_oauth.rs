@@ -50,6 +50,38 @@ impl<S: Subscriber> Layer<S> for ProfileHydrationTiming {
 }
 
 #[derive(Clone)]
+struct WarningCapture(Arc<Mutex<Vec<String>>>);
+
+struct WarningVisitor<'a>(&'a mut String);
+
+impl Visit for WarningVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write as _;
+        let _ = write!(self.0, "{}={value:?} ", field.name());
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        use std::fmt::Write as _;
+        let _ = write!(self.0, "{}={value} ", field.name());
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        use std::fmt::Write as _;
+        let _ = write!(self.0, "{}={value} ", field.name());
+    }
+}
+
+impl<S: Subscriber> Layer<S> for WarningCapture {
+    fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+        if *event.metadata().level() == tracing::Level::WARN {
+            let mut line = String::new();
+            event.record(&mut WarningVisitor(&mut line));
+            self.0.lock().unwrap().push(line);
+        }
+    }
+}
+
+#[derive(Clone)]
 struct FakeOAuthFlow {
     actions: Arc<Mutex<Vec<String>>>,
     granted_scope: Option<String>,
@@ -3087,6 +3119,84 @@ async fn web_post_actions_and_logout_reject_same_site_cross_origin_requests() {
     }
     assert!(actions.lock().unwrap().is_empty());
     assert!(storage.is_registered("did:plc:alice").unwrap());
+}
+
+#[tokio::test]
+async fn link_preview_and_post_client_errors_emit_one_sanitized_warning_each() {
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), Arc::new(MemoryStorage::default()));
+    let warnings = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(WarningCapture(warnings.clone()));
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    for (path, body) in [
+        (
+            "/link-preview",
+            "url=https%3A%2F%2Fgithub.com%2Fowner%2Frepo",
+        ),
+        ("/post", "text=private+post+text"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .header("origin", "https://sibling.appview.example")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+    let malformed_preview = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/link-preview")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("origin", "https://appview.example")
+                .body(Body::from("ignored=value"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(malformed_preview.status().is_client_error());
+
+    let warnings = warnings.lock().unwrap();
+    assert_eq!(warnings.len(), 3, "{warnings:?}");
+    assert!(
+        warnings.iter().any(|line| {
+            line.contains("route=/link-preview")
+                && line.contains("status=403")
+                && line.contains("reason=Forbidden")
+        }),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|line| {
+            line.contains("route=/post")
+                && line.contains("status=403")
+                && line.contains("reason=Forbidden")
+        }),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings.iter().any(|line| {
+            line.contains("route=/link-preview")
+                && line.contains(&format!("status={}", malformed_preview.status().as_u16()))
+        }),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .all(|line| { !line.contains("github.com") && !line.contains("private post text") }),
+        "{warnings:?}"
+    );
 }
 
 #[tokio::test]
