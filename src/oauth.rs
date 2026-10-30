@@ -103,8 +103,8 @@ const OAUTH_STORE_WRITER_BATCH_SIZE: usize = 64;
 const OAUTH_STORE_WRITER_BATCH_DELAY: Duration = Duration::from_millis(5);
 const OAUTH_STORE_WRITER_METRICS_INTERVAL: Duration = Duration::from_secs(60);
 static NEXT_OAUTH_MEMORY_DATABASE_ID: AtomicUsize = AtomicUsize::new(1);
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m23";
-const WEB_SCRIPT_URL: &str = "/static/app.js?v=js17";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m24";
+const WEB_SCRIPT_URL: &str = "/static/app.js?v=js18";
 const HLS_SCRIPT_URL: &str = "/static/vendor/hls.min.js?v=1.7.3";
 const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
 const SAVED_FEED_CACHE_PREFIX: &str = "saved-feed-preferences:";
@@ -5541,6 +5541,12 @@ fn icon_content(name: &str) -> &'static str {
         "share" => {
             "<circle cx=\"18\" cy=\"5\" r=\"3\"/><circle cx=\"6\" cy=\"12\" r=\"3\"/><circle cx=\"18\" cy=\"19\" r=\"3\"/><path d=\"m8.7 10.7 6.6-4.4M8.7 13.3l6.6 4.4\"/>"
         }
+        "image" => {
+            "<rect x=\"3\" y=\"4\" width=\"18\" height=\"16\" rx=\"2\"/><circle cx=\"8.5\" cy=\"9\" r=\"1.5\"/><path d=\"m21 15-5-5L5 20\"/>"
+        }
+        "link" => {
+            "<path d=\"M10 13a5 5 0 0 0 7.1 0l3-3A5 5 0 0 0 13 2.9l-1.7 1.7\"/><path d=\"M14 11a5 5 0 0 0-7.1 0l-3 3A5 5 0 0 0 11 21.1l1.7-1.7\"/>"
+        }
         "more" => {
             "<circle cx=\"5\" cy=\"12\" r=\"1\"/><circle cx=\"12\" cy=\"12\" r=\"1\"/><circle cx=\"19\" cy=\"12\" r=\"1\"/>"
         }
@@ -5549,7 +5555,7 @@ fn icon_content(name: &str) -> &'static str {
 }
 
 fn icon_sprite() -> String {
-    const ICONS: [&str; 12] = [
+    const ICONS: [&str; 14] = [
         "home",
         "feeds",
         "notifications",
@@ -5562,6 +5568,8 @@ fn icon_sprite() -> String {
         "like",
         "share",
         "more",
+        "image",
+        "link",
     ];
     let symbols = ICONS
         .iter()
@@ -6086,14 +6094,27 @@ where
         "<p role=\"status\">Read-only: write permissions were not granted, so posting, liking, and reposting are disabled.</p>".to_owned()
     };
     let post_form = if write_forms_enabled {
-        format!(
-            "<form class=\"composer media-composer\" action=\"/post\" method=\"post\" enctype=\"multipart/form-data\" data-media-composer><label for=\"new-post\">Write a post</label><textarea id=\"new-post\" name=\"text\" rows=\"3\" maxlength=\"300\" required></textarea>{}{}<button type=\"submit\">Post</button><p class=\"composer-error\" data-composer-error role=\"alert\" hidden></p></form>",
-            render_media_picker(
-                verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref()),
-                verified_cookie_video_access(&state.public, &headers, state.storage.as_ref()),
-                "post-media"
-            ),
-            render_link_picker("post-link")
+        let blob_access =
+            verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref());
+        let video_access =
+            verified_cookie_video_access(&state.public, &headers, state.storage.as_ref());
+        let profile = profile_view_from_storage(state.storage.as_ref(), &did)
+            .unwrap_or_else(|_| json!({"did":did,"handle":did}));
+        render_composer(
+            "",
+            "media-composer",
+            "new-post",
+            "/post",
+            "Write a post",
+            "What's up?",
+            "Post",
+            &avatar_markup(&profile, "composer-avatar"),
+            "",
+            "",
+            render_media_picker(blob_access, video_access, "post-media"),
+            render_link_picker("new-post-link"),
+            "",
+            blob_access || video_access,
         )
     } else {
         String::new()
@@ -8170,6 +8191,7 @@ where
     let reply_composer = if write_forms_enabled {
         render_reply_composer(
             state.storage.as_ref(),
+            &viewer_did,
             &record,
             verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref()),
             verified_cookie_video_access(&state.public, &headers, state.storage.as_ref()),
@@ -8265,16 +8287,30 @@ where
     let write_forms_enabled =
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
     let composer = if write_forms_enabled {
-        format!(
-            "<form class=\"composer quote-composer media-composer\" action=\"/quote\" method=\"post\" enctype=\"multipart/form-data\" data-media-composer><label for=\"quote-text\">Write a quote post</label><input type=\"hidden\" name=\"quote_uri\" value=\"{}\"><textarea id=\"quote-text\" name=\"text\" rows=\"4\" maxlength=\"300\" required></textarea>{}{}{}<button type=\"submit\">Post</button><p class=\"composer-error\" data-composer-error role=\"alert\" hidden></p></form>",
-            html_escape(&quoted.uri),
-            render_media_picker(
-                verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref()),
-                verified_cookie_video_access(&state.public, &headers, state.storage.as_ref()),
-                "quote-media",
+        let blob_access =
+            verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref());
+        let video_access =
+            verified_cookie_video_access(&state.public, &headers, state.storage.as_ref());
+        let profile = profile_view_from_storage(state.storage.as_ref(), &viewer_did)
+            .unwrap_or_else(|_| json!({"did":viewer_did,"handle":viewer_did}));
+        render_composer(
+            "",
+            "quote-composer media-composer",
+            "quote-text",
+            "/quote",
+            "Write a quote post",
+            "What's up?",
+            "Post",
+            &avatar_markup(&profile, "composer-avatar"),
+            &format!(
+                "<input type=\"hidden\" name=\"quote_uri\" value=\"{}\">",
+                html_escape(&quoted.uri)
             ),
-            render_link_picker("quote-link"),
-            render_quote_preview(state.storage.as_ref(), &quoted)
+            "",
+            render_media_picker(blob_access, video_access, "quote-media"),
+            render_link_picker("quote-text-link"),
+            &render_quote_preview(state.storage.as_ref(), &quoted),
+            blob_access || video_access,
         )
     } else {
         format!(
@@ -8545,6 +8581,7 @@ async fn load_post_record_with_source_until<F: OAuthFlow, S: Storage>(
 
 fn render_reply_composer<S: Storage>(
     storage: &S,
+    viewer_did: &str,
     parent: &IndexedRecord,
     blob_access: bool,
     video_access: bool,
@@ -8552,12 +8589,53 @@ fn render_reply_composer<S: Storage>(
     let profile = profile_view_from_storage(storage, &parent.did)
         .unwrap_or_else(|_| json!({"did":parent.did,"handle":parent.did}));
     let handle = profile_handle(&profile, &parent.did);
-    format!(
-        "<form id=\"reply-composer\" class=\"composer reply-composer media-composer\" action=\"/reply\" method=\"post\" enctype=\"multipart/form-data\" data-media-composer><p class=\"reply-context\">Replying to @{}</p><input type=\"hidden\" name=\"parent_uri\" value=\"{}\"><label for=\"reply-text\">Write a reply</label><textarea id=\"reply-text\" name=\"text\" rows=\"3\" maxlength=\"300\" required></textarea>{}{}<button type=\"submit\">Reply</button><p class=\"composer-error\" data-composer-error role=\"alert\" hidden></p></form>",
-        html_escape(&handle),
-        html_escape(&parent.uri),
+    let viewer = profile_view_from_storage(storage, viewer_did)
+        .unwrap_or_else(|_| json!({"did":viewer_did,"handle":viewer_did}));
+    render_composer(
+        "id=\"reply-composer\"",
+        "reply-composer media-composer",
+        "reply-text",
+        "/reply",
+        "Write a reply",
+        "Write a reply…",
+        "Reply",
+        &avatar_markup(&viewer, "composer-avatar"),
+        &format!(
+            "<input type=\"hidden\" name=\"parent_uri\" value=\"{}\">",
+            html_escape(&parent.uri)
+        ),
+        &format!(
+            "<p class=\"reply-context\">Replying to @{}</p>",
+            html_escape(&handle)
+        ),
         render_media_picker(blob_access, video_access, "reply-media"),
-        render_link_picker("reply-link")
+        render_link_picker("reply-text-link"),
+        "",
+        blob_access || video_access,
+    )
+}
+
+fn render_composer(
+    form_attributes: &str,
+    classes: &str,
+    textarea_id: &str,
+    action: &str,
+    label: &str,
+    placeholder: &str,
+    submit_label: &str,
+    avatar: &str,
+    hidden_fields: &str,
+    context: &str,
+    media_picker: String,
+    link_picker: String,
+    trailing: &str,
+    media_access: bool,
+) -> String {
+    let media_button_disabled = if media_access { "" } else { " disabled" };
+    format!(
+        "<form {form_attributes} class=\"composer {classes}\" action=\"{action}\" method=\"post\" enctype=\"multipart/form-data\" data-media-composer data-compact-composer>{hidden_fields}<div class=\"composer-input-row\">{avatar}<label class=\"sr-only\" for=\"{textarea_id}\">{label}</label><textarea id=\"{textarea_id}\" name=\"text\" rows=\"1\" maxlength=\"300\" placeholder=\"{placeholder}\" required data-compose-input></textarea></div><div class=\"composer-toolbar\" data-compose-toolbar><div class=\"composer-tools\"><button class=\"composer-icon-button\" type=\"button\" data-compose-media aria-label=\"Add photo or video\"{media_button_disabled}>{}</button><button class=\"composer-icon-button\" type=\"button\" data-link-toggle aria-label=\"Add a link\" aria-controls=\"{textarea_id}-link-picker\" aria-expanded=\"false\">{}</button></div><output class=\"composer-character-count\" data-character-count aria-live=\"polite\">0/300</output><button class=\"composer-submit\" type=\"submit\">{submit_label}</button></div><div class=\"composer-fields\">{context}{media_picker}{link_picker}{trailing}</div><p class=\"composer-error\" data-composer-error role=\"alert\" hidden></p></form>",
+        icon_svg("image"),
+        icon_svg("link"),
     )
 }
 
@@ -8566,13 +8644,13 @@ fn render_media_picker(image_access: bool, video_access: bool, id: &str) -> Stri
         return "<p class=\"picture-permission-hint\" role=\"status\"><a href=\"/login\">Log in again to enable pictures</a></p><p class=\"video-permission-hint\" role=\"status\"><a href=\"/login\">sign in again to post videos</a></p>".to_owned();
     }
     format!(
-        "<fieldset class=\"media-picker\"><legend>Add media</legend><input class=\"media-file-input\" id=\"{id}\" type=\"file\" name=\"media\" accept=\"image/*,video/mp4,video/webm,video/quicktime\" multiple data-media-input data-image-access=\"{image_access}\" data-video-access=\"{video_access}\"><label class=\"media-add-button\" for=\"{id}\"><span aria-hidden=\"true\">＋</span> Add media</label><p class=\"media-picker-hint\">Up to 4 pictures, or one video up to 300 MB and 10 minutes.</p><div class=\"media-previews\" data-media-previews></div><p class=\"media-picker-status\" data-media-status role=\"status\" aria-live=\"polite\"></p><label class=\"video-alt-label\" for=\"{id}-alt\" data-video-alt-label hidden>Video alt text (optional)<textarea id=\"{id}-alt\" name=\"video_alt\" maxlength=\"2000\" rows=\"2\" data-video-alt></textarea></label><progress data-video-progress max=\"100\" value=\"0\" hidden></progress><p class=\"video-upload-status\" data-video-upload-status role=\"status\" aria-live=\"polite\"></p></fieldset>"
+        "<fieldset class=\"media-picker\" data-media-picker><legend>Add media</legend><input class=\"media-file-input\" id=\"{id}\" type=\"file\" name=\"media\" accept=\"image/*,video/mp4,video/webm,video/quicktime\" multiple data-media-input data-image-access=\"{image_access}\" data-video-access=\"{video_access}\"><label class=\"media-add-button\" for=\"{id}\"><span aria-hidden=\"true\">＋</span> Add media</label><p class=\"media-picker-hint\">Up to 4 pictures, or one video up to 300 MB and 10 minutes.</p><div class=\"media-previews\" data-media-previews></div><p class=\"media-picker-status\" data-media-status role=\"status\" aria-live=\"polite\"></p><label class=\"video-alt-label\" for=\"{id}-alt\" data-video-alt-label hidden>Video alt text (optional)<textarea id=\"{id}-alt\" name=\"video_alt\" maxlength=\"2000\" rows=\"2\" data-video-alt></textarea></label><progress data-video-progress max=\"100\" value=\"0\" hidden></progress><p class=\"video-upload-status\" data-video-upload-status role=\"status\" aria-live=\"polite\"></p></fieldset>"
     )
 }
 
 fn render_link_picker(id: &str) -> String {
     format!(
-        "<fieldset class=\"link-picker\"><legend>Add a webpage</legend><label for=\"{id}\">Webpage URL</label><div class=\"link-picker-controls\"><input id=\"{id}\" name=\"link_url\" type=\"url\" inputmode=\"url\" placeholder=\"https://example.com/article\" data-link-input><button type=\"button\" data-link-preview>Preview link</button></div><p class=\"link-picker-status\" data-link-status role=\"status\" aria-live=\"polite\"></p><div class=\"link-preview\" data-link-preview-card hidden></div><p class=\"composer-notice\" data-link-image-note hidden>Pictures will be attached to the post; the webpage link will be omitted.</p></fieldset>"
+        "<fieldset id=\"{id}-picker\" class=\"link-picker\" data-link-picker><legend>Add a webpage</legend><label for=\"{id}\">Webpage URL</label><div class=\"link-picker-controls\"><input id=\"{id}\" name=\"link_url\" type=\"url\" inputmode=\"url\" placeholder=\"https://example.com/article\" data-link-input><button type=\"button\" data-link-preview>Preview link</button></div><p class=\"link-picker-status\" data-link-status role=\"status\" aria-live=\"polite\"></p><div class=\"link-preview\" data-link-preview-card hidden></div><p class=\"composer-notice\" data-link-image-note hidden>Pictures will be attached to the post; the webpage link will be omitted.</p></fieldset>"
     )
 }
 
@@ -12618,8 +12696,8 @@ mod tests {
         assert!(css.contains(".thread-focus-actions .is-liked .icon {\n  fill: var(--accent);"));
         assert!(css.contains(".infinite-scroll-status {"));
         assert!(css.contains(".infinite-scroll-retry[hidden] {\n  display: none;"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m23"));
-        assert!(WEB_SCRIPT_URL.contains("v=js17"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m24"));
+        assert!(WEB_SCRIPT_URL.contains("v=js18"));
     }
 
     #[test]
@@ -12637,7 +12715,7 @@ mod tests {
         ));
         assert!(css.contains("bottom: var(--mobile-compose-clearance);"));
         assert!(css.contains("padding-bottom: max(4.25rem, var(--mobile-compose-clearance));"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m23"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m24"));
     }
 
     #[test]

@@ -528,6 +528,71 @@ function attachLinkPreview(form, helpers = {}) {
   return { updateImagePrecedence };
 }
 
+function enhanceCompactComposer(form) {
+  const textarea = form.querySelector("[data-compose-input]");
+  if (!textarea) return null;
+
+  const counter = form.querySelector("[data-character-count]");
+  const mediaButton = form.querySelector("[data-compose-media]");
+  const mediaInput = form.querySelector("[data-media-input]");
+  const mediaPicker = form.querySelector("[data-media-picker]");
+  const linkButton = form.querySelector("[data-link-toggle]");
+  const linkPicker = form.querySelector("[data-link-picker]");
+  const updateCounter = () => {
+    const length = [...textarea.value].length;
+    if (counter) {
+      counter.textContent = `${length}/300`;
+      counter.classList.toggle("is-near-limit", length >= 270);
+    }
+  };
+  const resize = () => {
+    const expanded = form.classList.contains("is-expanded");
+    if (!expanded && !textarea.value) {
+      textarea.rows = 1;
+      return;
+    }
+    const computed = window.getComputedStyle?.(textarea);
+    const lineHeight = Number.parseFloat(computed?.lineHeight) || 24;
+    const verticalPadding = (Number.parseFloat(computed?.paddingTop) || 0) +
+      (Number.parseFloat(computed?.paddingBottom) || 0);
+    textarea.rows = Math.min(10, Math.max(expanded ? 2 : 1, Math.ceil((textarea.scrollHeight - verticalPadding) / lineHeight)));
+  };
+  const expand = () => {
+    form.classList.add("is-expanded");
+    form.classList.remove("is-collapsed");
+    resize();
+  };
+
+  form.classList.add("is-enhanced");
+  if (form.querySelector(".reply-context, .quoted-post-preview")) form.classList.add("has-context");
+  if (textarea.value || mediaInput?.files?.length) expand();
+  else form.classList.add("is-collapsed");
+  updateCounter();
+  textarea.addEventListener("focus", expand);
+  textarea.addEventListener("input", () => {
+    updateCounter();
+    if (textarea.value) expand();
+    else resize();
+  });
+  mediaButton?.addEventListener("click", () => {
+    expand();
+    mediaInput?.click();
+  });
+  mediaInput?.addEventListener("change", () => {
+    const selected = Boolean(mediaInput.files?.length);
+    mediaPicker?.classList.toggle("has-media", selected);
+    form.classList.toggle("has-open-field", selected || Boolean(linkPicker?.classList.contains("is-open")));
+    if (selected) expand();
+  });
+  linkButton?.addEventListener("click", () => {
+    const open = linkPicker?.classList.toggle("is-open") || false;
+    linkButton.setAttribute("aria-expanded", String(open));
+    form.classList.toggle("has-open-field", open || Boolean(mediaPicker?.classList.contains("has-media")));
+    if (open) expand();
+  });
+  return { expand, resize, updateCounter };
+}
+
 function attachMediaComposer(form, helpers = {}) {
   const linkPreview = attachLinkPreview(form);
   const input = form.querySelector("[data-media-input]");
@@ -555,6 +620,7 @@ function attachMediaComposer(form, helpers = {}) {
   };
   const drawPreviews = () => {
     previews.replaceChildren();
+    form.querySelector("[data-media-picker]")?.classList.toggle("has-media", selected.length > 0);
     selected.forEach((item, index) => {
       const preview = document.createElement("div");
       preview.className = item.kind === "video" ? "media-preview media-video-preview" : "media-preview image-preview";
@@ -675,7 +741,10 @@ function attachMediaComposer(form, helpers = {}) {
   return { selected };
 }
 
-(document.querySelectorAll?.("form[data-media-composer]") || []).forEach((form) => attachMediaComposer(form));
+(document.querySelectorAll?.("form[data-media-composer]") || []).forEach((form) => {
+  enhanceCompactComposer(form);
+  attachMediaComposer(form);
+});
 
 function installInfiniteScroll({
   pageDocument = document,

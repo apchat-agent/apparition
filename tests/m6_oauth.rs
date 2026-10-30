@@ -1207,13 +1207,13 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
             ),
             "{path}"
         );
-        assert!(html.contains("href=\"/static/app.css?v=m23\""), "{path}");
+        assert!(html.contains("href=\"/static/app.css?v=m24\""), "{path}");
         assert!(!html.contains("style="), "{path}");
         // Both playback and interaction scripts are local, deferred, and never inline.
         assert_eq!(html.matches("<script").count(), 2, "{path}");
         assert!(html.contains("<script src=\"/static/vendor/hls.min.js?v=1.7.3\" defer></script>"));
         assert!(
-            html.contains("<script src=\"/static/app.js?v=js17\" defer></script>"),
+            html.contains("<script src=\"/static/app.js?v=js18\" defer></script>"),
             "{path}"
         );
     }
@@ -1221,7 +1221,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
     let stylesheet = app
         .oneshot(
             Request::builder()
-                .uri("/static/app.css?v=m23")
+                .uri("/static/app.css?v=m24")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1385,6 +1385,34 @@ async fn quote_composer_quotes_existing_quote_posts_and_notifies_once() {
     .unwrap();
     assert!(timeline_html.contains("Quote post"), "{timeline_html}");
     assert!(
+        timeline_html.contains("data-compose-input"),
+        "{timeline_html}"
+    );
+    assert!(
+        timeline_html.contains("data-compose-toolbar"),
+        "{timeline_html}"
+    );
+    assert!(
+        timeline_html.contains("data-link-toggle"),
+        "{timeline_html}"
+    );
+    assert!(
+        timeline_html.contains("data-character-count"),
+        "{timeline_html}"
+    );
+    assert!(
+        timeline_html.contains("placeholder=\"What's up?\""),
+        "{timeline_html}"
+    );
+    assert!(
+        timeline_html.contains("class=\"composer-avatar"),
+        "{timeline_html}"
+    );
+    assert!(
+        timeline_html.contains("class=\"sr-only\" for=\"new-post\""),
+        "{timeline_html}"
+    );
+    assert!(
         timeline_html.contains("enctype=\"multipart/form-data\""),
         "{timeline_html}"
     );
@@ -1424,6 +1452,15 @@ async fn quote_composer_quotes_existing_quote_posts_and_notifies_once() {
     )
     .unwrap();
     assert!(compose_html.contains("action=\"/quote\""), "{compose_html}");
+    assert!(
+        compose_html.contains("data-compose-input"),
+        "{compose_html}"
+    );
+    assert!(compose_html.contains("data-link-toggle"), "{compose_html}");
+    assert!(
+        compose_html.contains("quote-text-link-picker"),
+        "{compose_html}"
+    );
     assert!(
         compose_html.contains(
             "name=\"media\" accept=\"image/*,video/mp4,video/webm,video/quicktime\" multiple"
@@ -1526,12 +1563,12 @@ async fn sign_in_error_page_uses_the_shared_mobile_document_shell() {
     );
     assert!(html.contains("Login failed, try again"));
     assert!(html.contains("href=\"/login\""));
-    assert!(html.contains("href=\"/static/app.css?v=m23\""));
+    assert!(html.contains("href=\"/static/app.css?v=m24\""));
     assert!(!html.contains("style="));
     // The shared shell loads both local deferred scripts, never inline code.
     assert_eq!(html.matches("<script").count(), 2);
     assert!(html.contains("<script src=\"/static/vendor/hls.min.js?v=1.7.3\" defer></script>"));
-    assert!(html.contains("<script src=\"/static/app.js?v=js17\" defer></script>"));
+    assert!(html.contains("<script src=\"/static/app.js?v=js18\" defer></script>"));
 }
 
 #[tokio::test]
@@ -4996,6 +5033,9 @@ async fn thread_page_uses_large_focus_post_stats_chain_lines_and_reply_bar() {
     assert_eq!(html.matches("thread-continues").count(), 1, "{html}");
     assert!(html.contains("aria-label=\"Mobile reply bar\""), "{html}");
     assert!(html.contains("Write your reply"), "{html}");
+    assert!(html.contains("id=\"reply-composer\""), "{html}");
+    assert!(html.contains("data-compose-input"), "{html}");
+    assert!(html.contains("data-link-toggle"), "{html}");
     assert!(
         html.contains("aria-label=\"Mobile search\""),
         "thread mobile navigation should include its search tab"

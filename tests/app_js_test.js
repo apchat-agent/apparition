@@ -23,11 +23,104 @@ Deno.test("composer markup provides a compact control row and an icon-only link 
   assert(reply.includes("data-compose-toolbar"), "reply composer should have a dedicated toolbar");
   assert(reply.includes("data-link-toggle"), "link entry should be opened from its toolbar icon");
   assert(reply.includes("data-character-count"), "reply composer should expose its character count");
-  assert(reply.includes("What's up?"), "the compact text field should use the short placeholder");
+  assert(source.includes("\"What's up?\""), "the main and quote fields should use the short placeholder");
 
   const css = await Deno.readTextFile(new URL("../static/app.css", import.meta.url));
-  assert(css.includes(".composer.is-collapsed .composer-toolbar"));
+  assert(css.includes(".composer.is-enhanced.is-collapsed .composer-toolbar"));
   assert(css.includes(".composer.is-enhanced .link-picker:not(.is-open)"));
+});
+
+Deno.test("composer expands, opens link entry, grows its text area, and warns near the limit", async () => {
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  const start = source.indexOf("function enhanceCompactComposer");
+  const end = source.indexOf("function attachMediaComposer", start);
+  const enhance = new Function(`${source.slice(start, end)}; return enhanceCompactComposer;`)();
+  const events = new Map();
+  const makeClassList = () => {
+    const names = new Set();
+    return {
+      add(name) { names.add(name); },
+      remove(name) { names.delete(name); },
+      contains(name) { return names.has(name); },
+      toggle(name, force) {
+        const enabled = force === undefined ? !names.has(name) : force;
+        if (enabled) names.add(name);
+        else names.delete(name);
+        return enabled;
+      },
+    };
+  };
+  const textarea = {
+    value: "",
+    rows: 1,
+    scrollHeight: 64,
+    classList: makeClassList(),
+    addEventListener(name, listener) { events.set(`textarea:${name}`, listener); },
+  };
+  const counter = { textContent: "", classList: makeClassList() };
+  const mediaInput = {
+    files: [],
+    clicked: false,
+    click() { this.clicked = true; },
+    addEventListener(name, listener) { events.set(`media:${name}`, listener); },
+  };
+  const mediaPicker = { classList: makeClassList() };
+  const linkPicker = { classList: makeClassList() };
+  const linkButton = {
+    attributes: new Map(),
+    addEventListener(name, listener) { events.set(`link:${name}`, listener); },
+    setAttribute(name, value) { this.attributes.set(name, value); },
+  };
+  const mediaButton = { addEventListener(name, listener) { events.set(`media-button:${name}`, listener); } };
+  const form = {
+    classList: makeClassList(),
+    querySelector(selector) {
+      return ({
+        "[data-compose-input]": textarea,
+        "[data-character-count]": counter,
+        "[data-compose-media]": mediaButton,
+        "[data-media-input]": mediaInput,
+        "[data-media-picker]": mediaPicker,
+        "[data-link-toggle]": linkButton,
+        "[data-link-picker]": linkPicker,
+        ".reply-context, .quoted-post-preview": null,
+      })[selector] || null;
+    },
+  };
+  const originalWindow = globalThis.window;
+  globalThis.window = {
+    getComputedStyle() { return { lineHeight: "24px", paddingTop: "8px", paddingBottom: "8px" }; },
+  };
+  try {
+    enhance(form);
+    assert(form.classList.contains("is-enhanced"));
+    assert(form.classList.contains("is-collapsed"));
+    assertEquals(textarea.rows, 1);
+
+    events.get("textarea:focus")();
+    assert(form.classList.contains("is-expanded"));
+    assertEquals(textarea.rows, 2);
+
+    events.get("link:click")();
+    assert(linkPicker.classList.contains("is-open"));
+    assertEquals(linkButton.attributes.get("aria-expanded"), "true");
+    assert(form.classList.contains("has-open-field"));
+
+    textarea.value = "x".repeat(275);
+    textarea.scrollHeight = 88;
+    events.get("textarea:input")();
+    assertEquals(counter.textContent, "275/300");
+    assert(counter.classList.contains("is-near-limit"));
+    assertEquals(textarea.rows, 3);
+
+    events.get("media-button:click")();
+    assert(mediaInput.clicked);
+    mediaInput.files = [{}];
+    events.get("media:change")();
+    assert(mediaPicker.classList.contains("has-media"));
+  } finally {
+    globalThis.window = originalWindow;
+  }
 });
 
 Deno.test("like handler fills the heart and clears it when unliked", async () => {
