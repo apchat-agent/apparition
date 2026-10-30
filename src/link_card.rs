@@ -87,7 +87,13 @@ impl LinkCardFetcher {
         let html = String::from_utf8_lossy(response.body());
         let metadata = parse_open_graph(&html, &final_url);
         let thumbnail = match metadata.image_url {
-            Some(image_url) => Some(self.fetch_thumbnail(image_url).await?),
+            Some(image_url) => match self.fetch_thumbnail(image_url).await {
+                Ok(thumbnail) => Some(thumbnail),
+                Err(error) => {
+                    tracing::debug!(%error, "link card thumbnail failed; keeping card metadata");
+                    None
+                }
+            },
             None => None,
         };
         Ok(LinkCard {
@@ -110,7 +116,10 @@ impl LinkCardFetcher {
             )
             .await?;
         if !response.status().is_success() {
-            return Err("The webpage thumbnail could not be loaded.".to_owned());
+            return Err(format!(
+                "The webpage thumbnail could not be loaded (HTTP {}).",
+                response.status()
+            ));
         }
         let mime_type = response
             .headers()
@@ -551,18 +560,13 @@ mod tests {
         assert_eq!(card.thumbnail.unwrap().bytes, [1, 2, 3]);
         assert!(fetcher.fetch(&format!("{base}/wrong")).await.is_err());
         assert!(fetcher.fetch(&format!("{base}/large")).await.is_err());
-        assert!(
-            fetcher
-                .fetch(&format!("{base}/bad-thumbnail-page"))
+        for path in ["bad-thumbnail-page", "large-thumbnail-page"] {
+            let card = fetcher
+                .fetch(&format!("{base}/{path}"))
                 .await
-                .is_err()
-        );
-        assert!(
-            fetcher
-                .fetch(&format!("{base}/large-thumbnail-page"))
-                .await
-                .is_err()
-        );
+                .expect("a broken thumbnail must not discard the link card");
+            assert!(card.thumbnail.is_none());
+        }
         assert!(fetcher.fetch(&format!("{base}/redirect")).await.is_err());
         assert_eq!(
             private_requests.load(Ordering::Relaxed),
