@@ -1611,6 +1611,7 @@ function extractListBlockLeak(source) {
 
 function makeListBlockItem({ listUri, listName, postUri }) {
   const header = { appended: [], append(node) { this.appended.push(node); } };
+  const classes = new Set();
   return {
     hidden: true,
     attrs: new Map([
@@ -1618,10 +1619,10 @@ function makeListBlockItem({ listUri, listName, postUri }) {
       ["data-list-block-name", listName],
     ]),
     dataset: {},
-    classes: new Set(),
+    classes,
     classList: {
-      add(name) { this.classes.add(name); },
-      contains(name) { return this.classes.has(name); },
+      add(name) { classes.add(name); },
+      contains(name) { return classes.has(name); },
     },
     matches(selector) { return selector === "[data-list-block]"; },
     getAttribute(name) { return this.attrs.get(name) ?? null; },
@@ -1639,25 +1640,30 @@ function makeListBlockItem({ listUri, listName, postUri }) {
   };
 }
 
+function setLocalStorageForTest(mock) {
+  const original = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  Object.defineProperty(globalThis, "localStorage", { configurable: true, value: mock });
+  return () => Object.defineProperty(globalThis, "localStorage", original);
+}
+
 Deno.test("list-blocked posts stay hidden at pct 0 or with no stored value", async () => {
   const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
   const { applyListBlockLeak } = extractListBlockLeak(source);
   const listUri = "at://did:plc:list-owner/app.bsky.graph.list/spamlist";
-  const originalLocalStorage = globalThis.localStorage;
+  const restoreStorage = setLocalStorageForTest({ getItem: () => null });
   try {
-    globalThis.localStorage = { getItem: () => null };
     const missing = makeListBlockItem({ listUri, listName: "Spam list", postUri: "at://did:plc:x/app.bsky.feed.post/1" });
     applyListBlockLeak(missing);
     assert(missing.hidden === true, "no stored value keeps the post hidden");
     assert(!missing.classes.has("list-block-leak"));
 
-    globalThis.localStorage = { getItem: () => JSON.stringify({ [listUri]: 0 }) };
+    setLocalStorageForTest({ getItem: () => JSON.stringify({ [listUri]: 0 }) });
     const zero = makeListBlockItem({ listUri, listName: "Spam list", postUri: "at://did:plc:x/app.bsky.feed.post/1" });
     applyListBlockLeak(zero);
     assert(zero.hidden === true, "pct 0 keeps the post hidden");
     assert(!zero.classes.has("list-block-leak"));
   } finally {
-    globalThis.localStorage = originalLocalStorage;
+    restoreStorage();
   }
 });
 
@@ -1665,9 +1671,8 @@ Deno.test("pct 100 shows a list-blocked post with the leak class and a header no
   const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
   const { applyListBlockLeak } = extractListBlockLeak(source);
   const listUri = "at://did:plc:list-owner/app.bsky.graph.list/spamlist";
-  const originalLocalStorage = globalThis.localStorage;
+  const restoreStorage = setLocalStorageForTest({ getItem: () => JSON.stringify({ [listUri]: 100 }) });
   try {
-    globalThis.localStorage = { getItem: () => JSON.stringify({ [listUri]: 100 }) };
     const item = makeListBlockItem({ listUri, listName: "Spam list", postUri: "at://did:plc:x/app.bsky.feed.post/1" });
     applyListBlockLeak(item);
     assert(item.hidden === false, "pct 100 lets every post through");
@@ -1676,7 +1681,7 @@ Deno.test("pct 100 shows a list-blocked post with the leak class and a header no
     assertEquals(item.header.appended[0].className, "list-block-note");
     assertEquals(item.header.appended[0].textContent, "via block list: Spam list");
   } finally {
-    globalThis.localStorage = originalLocalStorage;
+    restoreStorage();
   }
 });
 
@@ -1693,24 +1698,23 @@ Deno.test("the leak sample is deterministic and roughly matches the percentage",
     const postUri = `at://did:plc:author${index % 37}/app.bsky.feed.post/rkey-${index}`;
     if (listBlockLeakSample(postUri, listUri) < 30) passed += 1;
   }
-  assert(passed >= 20 && passed <= 40, `expected 20-40 of 1000 uris to pass at pct 30, got ${passed}`);
+  assert(passed >= 250 && passed <= 350, `expected 250-350 of 1000 uris to pass at pct 30, got ${passed}`);
 });
 
 Deno.test("a throwing localStorage is treated as pct 0 without an exception", async () => {
   const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
   const { applyListBlockLeak } = extractListBlockLeak(source);
   const listUri = "at://did:plc:list-owner/app.bsky.graph.list/spamlist";
-  const originalLocalStorage = globalThis.localStorage;
+  const restoreStorage = setLocalStorageForTest({
+    getItem() { throw new Error("storage disabled"); },
+    setItem() { throw new Error("storage disabled"); },
+  });
   try {
-    globalThis.localStorage = {
-      getItem() { throw new Error("storage disabled"); },
-      setItem() { throw new Error("storage disabled"); },
-    };
     const item = makeListBlockItem({ listUri, listName: "Spam list", postUri: "at://did:plc:x/app.bsky.feed.post/1" });
     applyListBlockLeak(item);
     assert(item.hidden === true, "a throwing storage falls back to pct 0");
     assert(!item.classes.has("list-block-leak"));
   } finally {
-    globalThis.localStorage = originalLocalStorage;
+    restoreStorage();
   }
 });

@@ -975,6 +975,29 @@ button:hover,
   border-bottom: 1px solid var(--line);
 }
 
+.post-item.list-block-leak {
+  opacity: 0.55;
+  background: var(--surface-raised);
+}
+
+@media (prefers-color-scheme: dark) {
+  .post-item.list-block-leak {
+    opacity: 0.42;
+  }
+}
+
+.list-block-note {
+  margin-left: 0.5rem;
+  padding: 0.1rem 0.45rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  background: var(--surface-raised);
+  font-size: 0.72rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
 .reply-parent-slot,
 .notification-reply-parent {
   position: relative;

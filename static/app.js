@@ -965,6 +965,7 @@ function installInfiniteScroll({
             }
             fillProfileIdentities(post);
             initializeVideoPlayers(post);
+            applyListBlockLeak(post);
             existingPostNodes.set(post.getAttribute("data-post-uri"), post);
           }
           if (threadMore) {
@@ -1006,6 +1007,7 @@ function installInfiniteScroll({
       list.append(card);
       fillProfileIdentities(card);
       initializeVideoPlayers(card);
+      applyListBlockLeak(card);
       appended.push(card);
     }
     return appended;
@@ -1103,8 +1105,87 @@ function initializeVideoPlayers(root = document) {
   }
 }
 
+// Subscribed block lists hide member posts server-side (hidden attribute).
+// The owner's per-list "leak" slider (localStorage, default 0) lets a
+// deterministic sample of those posts through; JS-off visitors see them hidden.
+function listBlockLeakSample(postUri, listUri) {
+  const text = `${postUri}\u0000${listUri}`;
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0) % 100;
+}
+
+function readListBlockLeakSettings() {
+  try {
+    const stored = localStorage.getItem("listBlockLeak");
+    if (!stored) return {};
+    const parsed = JSON.parse(stored);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const percentages = {};
+    for (const [listUri, value] of Object.entries(parsed)) {
+      const pct = Number(value);
+      if (Number.isFinite(pct)) percentages[listUri] = Math.max(0, Math.min(100, Math.round(pct)));
+    }
+    return percentages;
+  } catch {
+    return {};
+  }
+}
+
+function applyListBlockLeak(root = document) {
+  const elements = [];
+  if (root.matches?.("[data-list-block]")) elements.push(root);
+  for (const element of root.querySelectorAll?.("[data-list-block]") || []) elements.push(element);
+  if (!elements.length) return;
+  const percentages = readListBlockLeakSettings();
+  for (const element of elements) {
+    if (element.dataset?.listBlockLeakApplied === "true") continue;
+    if (element.dataset) element.dataset.listBlockLeakApplied = "true";
+    const listUri = element.getAttribute("data-list-block");
+    if (!listUri) continue;
+    const pct = percentages[listUri] || 0;
+    if (pct <= 0) continue;
+    const post =
+      element.querySelector?.('[data-post-kind="post"]') ||
+      element.querySelector?.("[data-post-uri]");
+    const postUri = post?.getAttribute?.("data-post-uri") || "";
+    if (listBlockLeakSample(postUri, listUri) >= pct) continue;
+    element.hidden = false;
+    element.classList?.add("list-block-leak");
+    const header = element.querySelector?.(".post-header");
+    if (!header || element.querySelector?.(".list-block-note")) continue;
+    const note = (element.ownerDocument || document).createElement("span");
+    note.className = "list-block-note";
+    note.textContent = `via block list: ${element.getAttribute("data-list-block-name") || "block list"}`;
+    header.append(note);
+  }
+}
+
+function installBlockListLeakSettings() {
+  document.addEventListener("change", (event) => {
+    const input = event.target;
+    if (!input?.matches?.("[data-list-block-uri]")) return;
+    const listUri = input.getAttribute("data-list-block-uri");
+    if (!listUri) return;
+    const pct = Number(input.value);
+    const percentages = readListBlockLeakSettings();
+    percentages[listUri] = Number.isFinite(pct) ? Math.max(0, Math.min(100, Math.round(pct))) : 0;
+    try {
+      localStorage.setItem("listBlockLeak", JSON.stringify(percentages));
+    } catch {
+      // Storage unavailable: nothing is recorded, so the leak stays at 0.
+    }
+  });
+}
+
 installInfiniteScroll();
 initializeVideoPlayers();
+
+applyListBlockLeak();
+installBlockListLeakSettings();
 
 // Phones: the app frame is pinned to the screen (app.css), so the document itself should never be scrolled. iOS can
 // still leave it scrolled after the keyboard closes; put it back.
