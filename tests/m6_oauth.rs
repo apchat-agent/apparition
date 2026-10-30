@@ -4,8 +4,8 @@ use appview_rs::{
     ingest::{IndexedRecord, Ingestor, MemoryStorage, ScopeMode, SqliteStorage, Storage},
     oauth::{
         AccountLabel, FetchedAuthorProfile, OAuthAccount, OAuthCallback, OAuthFlow, OAuthPublic,
-        PdsCreatedRecord, PinnedFeedTabs, PostImage, PostStrongRef, ProfileListChoice,
-        ProfileRefreshWorker, SqliteOAuthStore, WebShutdown,
+        PageAccountData, PdsCreatedRecord, PinnedFeedTabs, PostImage, PostStrongRef,
+        ProfileListChoice, ProfileRefreshWorker, SqliteOAuthStore, WebShutdown,
     },
 };
 use appview_rs::{router, router_with_oauth_flow};
@@ -61,6 +61,8 @@ struct FakeOAuthFlow {
     feed_timeline_delay_ms: u64,
     author_profiles: Arc<Mutex<std::collections::HashMap<String, FetchedAuthorProfile>>>,
     profile_requests: Arc<Mutex<Vec<String>>>,
+    profile_batch_requests: Arc<Mutex<Vec<Vec<String>>>>,
+    handle_resolution_requests: Arc<Mutex<Vec<String>>>,
     profile_delays_ms: Arc<Mutex<std::collections::HashMap<String, u64>>>,
     live_posts: Arc<Mutex<std::collections::HashMap<String, IndexedRecord>>>,
     post_requests: Arc<Mutex<Vec<String>>>,
@@ -84,6 +86,8 @@ impl Default for FakeOAuthFlow {
             feed_timeline_delay_ms: 0,
             author_profiles: Arc::new(Mutex::new(std::collections::HashMap::new())),
             profile_requests: Arc::new(Mutex::new(Vec::new())),
+            profile_batch_requests: Arc::new(Mutex::new(Vec::new())),
+            handle_resolution_requests: Arc::new(Mutex::new(Vec::new())),
             profile_delays_ms: Arc::new(Mutex::new(std::collections::HashMap::new())),
             live_posts: Arc::new(Mutex::new(std::collections::HashMap::new())),
             post_requests: Arc::new(Mutex::new(Vec::new())),
@@ -348,6 +352,10 @@ impl OAuthFlow for FakeOAuthFlow {
         did: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Option<String>, String>> + Send + 'a>> {
         Box::pin(async move {
+            self.handle_resolution_requests
+                .lock()
+                .unwrap()
+                .push(did.to_owned());
             Ok(self
                 .author_profiles
                 .lock()
@@ -594,6 +602,62 @@ impl OAuthFlow for FakeOAuthFlow {
                 .filter(|label| actor_dids.contains(&label.subject_did))
                 .cloned()
                 .collect())
+        })
+    }
+
+    fn page_account_data_for_page<'a>(
+        &'a self,
+        viewer_did: &'a str,
+        mut actor_dids: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<PageAccountData, String>> + Send + 'a>> {
+        actor_dids.sort();
+        actor_dids.dedup();
+        self.profile_batch_requests
+            .lock()
+            .unwrap()
+            .push(actor_dids.clone());
+        let records = self.author_profiles.lock().unwrap().clone();
+        let delays = self.profile_delays_ms.lock().unwrap().clone();
+        let viewer_did = viewer_did.to_owned();
+        Box::pin(async move {
+            if let Some(delay_ms) = actor_dids
+                .iter()
+                .filter_map(|did| delays.get(did))
+                .max()
+                .copied()
+            {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            let profiles = actor_dids
+                .iter()
+                .filter_map(|did| {
+                    let fetched = records.get(did)?;
+                    let record = fetched.profile.as_ref().map(|profile| &profile.record);
+                    let avatar_cid = record
+                        .and_then(|record| record.pointer("/avatar/ref/$link"))
+                        .and_then(Value::as_str);
+                    Some(appview_rs::feeds::PublicProfileView {
+                        did: did.clone(),
+                        handle: fetched.verified_handle.clone(),
+                        display_name: record
+                            .and_then(|record| record.get("displayName"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        avatar: avatar_cid.map(|cid| {
+                            format!("https://cdn.bsky.app/img/avatar/plain/{did}/{cid}@jpeg")
+                        }),
+                        labels: record
+                            .and_then(|record| record.get("labels"))
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default(),
+                    })
+                })
+                .collect();
+            let labels = self
+                .account_labels_for_page(&viewer_did, actor_dids)
+                .await?;
+            Ok(PageAccountData { labels, profiles })
         })
     }
 
@@ -4282,7 +4346,7 @@ async fn timeline_profile_and_notification_pages_offer_older_cursor_links() {
 }
 
 #[tokio::test]
-async fn page_fetches_missing_author_profile_stores_it_and_keeps_avatar_url_safe() {
+async fn page_uses_public_profile_batch_without_page_path_verification() {
     let storage = Arc::new(MemoryStorage::default());
     let author = "did:plc:author";
     storage.set_follow("did:plc:alice", author, true).unwrap();
@@ -4315,7 +4379,8 @@ async fn page_fetches_missing_author_profile_stores_it_and_keeps_avatar_url_safe
                 record: serde_json::json!({
                     "$type":"app.bsky.actor.profile",
                     "displayName":"<Hydrated & Co>",
-                    "avatar":{"$type":"blob","ref":{"$link":"avatar-cid"}}
+                    "avatar":{"$type":"blob","ref":{"$link":"avatar-cid"}},
+                    "labels":[{"src":"did:plc:labeler","uri":"did:plc:author","val":"!test"}]
                 }),
             }),
             verified_handle: Some("author.test".into()),
@@ -4353,15 +4418,19 @@ async fn page_fetches_missing_author_profile_stores_it_and_keeps_avatar_url_safe
         )),
         "{html}"
     );
-    assert_eq!(flow.profile_requests.lock().unwrap().as_slice(), [author]);
+    assert!(flow.profile_requests.lock().unwrap().is_empty());
+    assert!(flow.handle_resolution_requests.lock().unwrap().is_empty());
     assert_eq!(
-        storage
-            .get_record(author, "app.bsky.actor.profile", "self")
-            .unwrap()
-            .unwrap()
-            .record["displayName"],
-        "<Hydrated & Co>"
+        flow.profile_batch_requests.lock().unwrap().as_slice(),
+        [vec![author.to_owned()]]
     );
+    let stored = storage
+        .get_record(author, "app.bsky.actor.profile", "self")
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.record["publicHandle"], "author.test");
+    assert_eq!(stored.record["displayName"], "<Hydrated & Co>");
+    assert_eq!(stored.record["labels"][0]["val"], "!test");
 }
 
 #[tokio::test]

@@ -232,6 +232,12 @@ pub struct AccountLabel {
     pub blurs: String,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PageAccountData {
+    pub labels: Vec<AccountLabel>,
+    pub profiles: Vec<crate::feeds::PublicProfileView>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PostStrongRef {
     pub uri: String,
@@ -676,6 +682,19 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
         _actor_dids: Vec<String>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<AccountLabel>, String>> + Send + 'a>> {
         Box::pin(async { Ok(Vec::new()) })
+    }
+    fn page_account_data_for_page<'a>(
+        &'a self,
+        viewer_did: &'a str,
+        actor_dids: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<PageAccountData, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let labels = self.account_labels_for_page(viewer_did, actor_dids).await?;
+            Ok(PageAccountData {
+                labels,
+                profiles: Vec::new(),
+            })
+        })
     }
     fn timeline<'a>(
         &'a self,
