@@ -33,6 +33,8 @@ pub struct Config {
     pub public_url: String,
     #[serde(default)]
     pub oauth_mode: OAuthMode,
+    #[serde(default)]
+    pub login_allowlist: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -60,6 +62,7 @@ impl Default for Config {
             appview_did: default_appview_did(),
             public_url: default_public_url(),
             oauth_mode: OAuthMode::default(),
+            login_allowlist: Vec::new(),
         }
     }
 }
@@ -144,6 +147,9 @@ impl Config {
                 "APPVIEW_OAUTH_MODE" => {
                     config.oauth_mode = parse_oauth_mode(value)?;
                 }
+                "APPVIEW_LOGIN_ALLOWLIST" => {
+                    config.login_allowlist = parse_login_allowlist(value);
+                }
                 _ => {}
             }
         }
@@ -221,6 +227,10 @@ impl Config {
                 "APPVIEW_OAUTH_MODE",
                 env::var("APPVIEW_OAUTH_MODE").unwrap_or_default(),
             ),
+            (
+                "APPVIEW_LOGIN_ALLOWLIST",
+                env::var("APPVIEW_LOGIN_ALLOWLIST").unwrap_or_default(),
+            ),
         ];
         let nonempty = env_values
             .into_iter()
@@ -263,6 +273,9 @@ impl Config {
                     "APPVIEW_DID" => config.appview_did = value,
                     "APPVIEW_PUBLIC_URL" => config.public_url = value,
                     "APPVIEW_OAUTH_MODE" => config.oauth_mode = parse_oauth_mode(&value)?,
+                    "APPVIEW_LOGIN_ALLOWLIST" => {
+                        config.login_allowlist = parse_login_allowlist(&value)
+                    }
                     _ => unreachable!(),
                 }
             }
@@ -279,6 +292,15 @@ fn parse_oauth_mode(value: &str) -> Result<OAuthMode, ConfigError> {
         "loopback" => Ok(OAuthMode::Loopback),
         _ => Err(ConfigError::InvalidOAuthMode(value.to_owned())),
     }
+}
+
+fn parse_login_allowlist(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn parse_backfill_rate(value: &str) -> Result<u64, ConfigError> {

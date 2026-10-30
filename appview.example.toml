@@ -10,3 +10,4 @@ jetstream_event_timeout_secs = 60
 appview_did = "did:web:appview.example.com"
 public_url = "https://appview.example.com"
 oauth_mode = "confidential"
+login_allowlist = []
