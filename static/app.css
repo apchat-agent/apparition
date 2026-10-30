@@ -2570,24 +2570,31 @@ a.quoted-post-card:hover,
   }
 }
 
-/* iOS Safari in the browser (owner, 2026-10-30): Safari's glass toolbar starts with a strip of the bar's own
-   colour (~15 css px on the owner's 714 px screen) that reads as part of our bar, so the icons looked high —
-   ~9 px above the icon against ~27 px below. In this mode safe-area-inset-bottom is 0 and the home-indicator
-   share is not needed: padding-bottom 0 and padding-top 14 px put the icon 18 px below the bar's top line
-   (1 px border + 14 px + the 3 px above the icon inside the item) and 3 px + Safari's ~15 px = 18 px under it.
-   --mobile-nav-height follows the real height (1 px border + 14 px + 1.2rem + 6 px = 40.2 px) so compose,
-   reply and padding clearances still match. Standalone home-screen mode (display-mode: standalone), desktop
-   Safari, Firefox and Android match neither condition and compute exactly as before. */
+/* iOS Safari in the browser (owner's 6 px squeeze, 2026-10-30): Safari's glass toolbar starts with a strip of
+   the bar's own colour (~15 css px on the owner's 714 px screen) that reads as part of our bar. In this mode
+   safe-area-inset-bottom is 0 and the home-indicator share is not needed: padding-top 14 px, padding-bottom 0,
+   and each bar item's negative margin grows to calc(0.6rem - 22px) so the item occupies 1.2rem of bar height
+   instead of 1.2rem + 6 px — the 3 px above and below the icon are gone while the 44 px hit box and its equal
+   padding stay, so the icon stays centred in it. The icon sits 15 px below the bar's top line (1 px border +
+   14 px) and 0 px + Safari's ~15 px under it: centred, and the bar is 6 px shorter. --mobile-nav-height
+   follows the real height (1 px border + 14 px + 1.2rem = 34.2 px) so compose, reply and padding clearances
+   still match. Standalone home-screen mode (display-mode: standalone), desktop Safari, Firefox and Android
+   match neither condition and compute exactly as before. */
 @supports (-webkit-touch-callout: none) {
   @media (display-mode: browser) {
     @media (max-width: 799px) {
       body:has(.mobile-nav) {
-        --mobile-nav-height: calc(1px + 14px + 1.2rem + 6px);
+        --mobile-nav-height: calc(1px + 14px + 1.2rem);
       }
 
       body:has(.mobile-nav) .mobile-nav {
         padding-top: 14px;
         padding-bottom: 0;
+      }
+
+      body:has(.mobile-nav) .mobile-nav a,
+      body:has(.mobile-nav) .mobile-nav button {
+        margin: calc(0.6rem - 22px) -0.2rem;
       }
     }
   }
