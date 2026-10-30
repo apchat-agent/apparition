@@ -131,7 +131,7 @@ Deno.test("phone navigation and post actions keep 44-pixel tap targets", async (
   };
   assert(/min-height:\s*44px/.test(declarations(".post-action")), "post action buttons should be at least 44 pixels tall");
   assert(css.includes(".feed-tabs,\n.feed-tab {\n  min-height: 2.75rem;"), "feed tabs should meet the 44-pixel target");
-  assert(css.includes("body:has(.mobile-nav) .mobile-nav a,\nbody:has(.mobile-nav) .mobile-nav button {\n    min-height: 44px;"));
+  assert(/body:has\(\.mobile-nav\) \.mobile-nav a,\s*body:has\(\.mobile-nav\) \.mobile-nav button\s*\{\s*min-height:\s*44px;/.test(css));
   assert(/width:\s*44px;[\s\S]*?height:\s*44px;/.test(declarations(".profile-overflow-trigger")));
 });
 

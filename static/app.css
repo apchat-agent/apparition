@@ -423,7 +423,7 @@ textarea:focus-visible {
   display: grid;
   gap: 0.45rem;
   margin: 0;
-  padding: 0.65rem 1rem;
+  padding: 0.45rem 1rem;
   border: 0;
   border-bottom: 1px solid var(--line);
   border-radius: 0;
@@ -782,7 +782,7 @@ textarea:focus-visible {
 }
 
 .composer-link-card > button {
-  min-height: 38px;
+  min-height: 44px;
   font-size: 0.88rem;
 }
 
@@ -848,7 +848,7 @@ textarea:focus-visible {
 }
 
 .media-preview button {
-  min-height: 38px;
+  min-height: 44px;
   padding: 0.4rem 0.7rem;
   background: var(--surface);
   color: var(--text);
@@ -860,8 +860,8 @@ textarea:focus-visible {
   top: 0.65rem;
   right: 0.65rem;
   display: grid;
-  width: 2rem;
-  min-height: 2rem;
+  width: 44px;
+  min-height: 44px;
   place-items: center;
   padding: 0;
   border: 1px solid color-mix(in srgb, var(--line) 70%, #000);
@@ -1259,7 +1259,7 @@ button:hover,
 .repost-menu-options .post-action,
 .repost-menu-options a {
   display: flex;
-  min-height: 40px;
+  min-height: 44px;
   align-items: center;
   justify-content: flex-start;
   padding: 0.5rem 0.65rem;
@@ -1474,22 +1474,22 @@ a.quoted-post-card:hover,
 
 .notification-group {
   display: grid;
-  grid-template-columns: 2.5rem minmax(0, 1fr);
-  gap: 0.75rem;
+  grid-template-columns: 2.75rem minmax(0, 1fr);
+  gap: 0.7rem;
   align-items: start;
-  padding: 0.85rem 0.75rem;
+  padding: 0.8rem 0.2rem;
 }
 
 .notification-group-icon {
   display: grid;
-  min-height: 2.75rem;
+  min-height: 44px;
   place-items: center;
   color: var(--muted);
 }
 
 .notification-type-icon {
-  width: 1.65rem;
-  height: 1.65rem;
+  width: 1.4rem;
+  height: 1.4rem;
 }
 
 .notification-like-icon {
@@ -1508,9 +1508,9 @@ a.quoted-post-card:hover,
 .notification-avatar,
 .notification-avatar.avatar-placeholder {
   display: block;
-  width: 3rem;
-  height: 3rem;
-  flex: 0 0 3rem;
+  width: 2.75rem;
+  height: 2.75rem;
+  flex: 0 0 2.75rem;
   border-radius: 50%;
   object-fit: cover;
 }
@@ -1660,7 +1660,7 @@ a.quoted-post-card:hover,
 }
 
 .profile-primary-action button {
-  min-height: 2.45rem;
+  min-height: 44px;
   padding: 0.4rem 1rem;
   border: 1px solid var(--accent);
   border-radius: 999px;
@@ -1682,8 +1682,8 @@ a.quoted-post-card:hover,
 
 .profile-overflow-trigger {
   display: grid;
-  width: 2.45rem;
-  height: 2.45rem;
+  width: 44px;
+  height: 44px;
   place-items: center;
   border: 1px solid var(--line);
   border-radius: 50%;
@@ -1719,7 +1719,7 @@ a.quoted-post-card:hover,
 .profile-menu .profile-action-form button {
   display: flex;
   width: 100%;
-  min-height: 2.5rem;
+  min-height: 44px;
   align-items: center;
   justify-content: flex-start;
   padding: 0.5rem 0.65rem;
@@ -1774,7 +1774,7 @@ a.quoted-post-card:hover,
 .profile-list-row select {
   width: auto;
   min-width: 0;
-  min-height: 2.45rem;
+  min-height: 44px;
   flex: 1 1 auto;
   padding: 0.35rem 0.55rem;
   border: 1px solid var(--line);
@@ -1786,7 +1786,7 @@ a.quoted-post-card:hover,
 }
 
 .profile-list-action {
-  min-height: 2.45rem;
+  min-height: 44px;
   flex: 0 0 auto;
   padding: 0.35rem 0.8rem;
   border-radius: 999px;
@@ -1926,6 +1926,10 @@ a.quoted-post-card:hover,
 }
 
 .thread-topbar a {
+  display: grid;
+  width: 44px;
+  min-height: 44px;
+  place-items: center;
   color: var(--text);
   font-size: 1.6rem;
   line-height: 1;
@@ -2094,6 +2098,24 @@ a.quoted-post-card:hover,
   text-decoration: none;
 }
 
+@media (max-width: 799px) {
+  body:has(.mobile-nav) .thread-reply-bar {
+    display: none;
+  }
+
+  body:has(.mobile-nav) .reply-composer {
+    position: fixed;
+    z-index: 6;
+    right: 0;
+    bottom: var(--mobile-nav-height);
+    left: 0;
+    width: min(100%, 600px);
+    margin-inline: auto;
+    border-top: 1px solid var(--line);
+    background: var(--page);
+  }
+}
+
 .thread-reply-bar + .reply-composer {
   margin-bottom: 5rem;
 }
@@ -2131,7 +2153,7 @@ a.quoted-post-card:hover,
 
 .infinite-scroll-retry {
   display: block;
-  min-height: 2.4rem;
+  min-height: 44px;
   margin: 0 auto 0.9rem;
   padding: 0.45rem 0.85rem;
   font-size: 0.9rem;
@@ -2329,8 +2351,8 @@ a.quoted-post-card:hover,
   }
 
   .mobile-nav .icon {
-    width: 1.2rem;
-    height: 1.2rem;
+    width: 1.35rem;
+    height: 1.35rem;
   }
 
   .mobile-compose {
@@ -2472,11 +2494,11 @@ a.quoted-post-card:hover,
   }
 
   body:has(.mobile-nav) {
-    --mobile-nav-height: calc(2rem + 0.2rem + 1px + max(4px, calc(env(safe-area-inset-bottom) * 0.25)));
+    --mobile-nav-height: calc(2.75rem + 0.2rem + 1px + max(4px, calc(env(safe-area-inset-bottom) * 0.25)));
     --mobile-compose-clearance: calc(var(--mobile-nav-height) + 0.75rem);
   }
 
-  /* Icon-only bottom bar at about half the old height (owner, 2026-10-29); labels stay for screen readers. */
+  /* Labels stay available to assistive technology while each icon keeps a 44-pixel hit area. */
   body:has(.mobile-nav) .mobile-nav {
     min-height: 0;
     padding-top: 0.1rem;
@@ -2485,7 +2507,7 @@ a.quoted-post-card:hover,
 
   body:has(.mobile-nav) .mobile-nav a,
   body:has(.mobile-nav) .mobile-nav button {
-    min-height: 2rem;
+    min-height: 44px;
     min-width: 44px;
   }
 
@@ -2514,10 +2536,9 @@ a.quoted-post-card:hover,
   }
 }
 
-/* Density (owner, 2026-10-29: "much more compact and dense ... use all available space"). Kept as one block so it is
-   easy to tune; it overrides the roomier defaults above. Tap targets stay >= 36 px. */
+/* Phone spacing and tap targets are tuned together so feed controls remain readable and easy to hit. */
 body {
-  line-height: 1.4;
+  line-height: 1.45;
 }
 
 .page-content {
@@ -2526,16 +2547,16 @@ body {
 
 .feed-tabs,
 .feed-tab {
-  min-height: 2.5rem;
+  min-height: 2.75rem;
 }
 
 .feed-tab {
-  line-height: 2.5rem;
+  line-height: 2.75rem;
 }
 
 .post-card,
 .notification-card {
-  padding: 0.55rem 0.75rem 0.2rem;
+  padding: 0.65rem 0.9rem 0.35rem;
 }
 
 .post-header,
@@ -2545,13 +2566,15 @@ body {
 
 .avatar,
 .avatar-placeholder {
-  width: 2.25rem;
-  height: 2.25rem;
-  flex-basis: 2.25rem;
+  width: 2.75rem;
+  height: 2.75rem;
+  flex-basis: 2.75rem;
 }
 
 .post-text {
-  margin: 0.3rem 0 0.15rem;
+  margin: 0.4rem 0 0.25rem;
+  font-size: 1rem;
+  line-height: 1.45;
 }
 
 .post-actions {
@@ -2559,9 +2582,14 @@ body {
 }
 
 .post-action {
-  min-height: 36px;
+  min-height: 44px;
   gap: 0.3rem;
-  padding: 0.1rem 0.2rem;
+  padding: 0.2rem;
+}
+
+.post-action .icon {
+  width: 1.3rem;
+  height: 1.3rem;
 }
 
 .reply-context {

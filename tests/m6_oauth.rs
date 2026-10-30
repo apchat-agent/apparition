@@ -907,6 +907,106 @@ async fn get_html(app: &Router, uri: &str, cookie: &str) -> String {
     .unwrap()
 }
 
+#[tokio::test]
+async fn capture_mobile_visual_fixtures_when_requested() {
+    let Some(output_dir) = std::env::var_os("APPVIEW_WEB_CAPTURE_DIR") else {
+        return;
+    };
+    let output_dir = std::path::PathBuf::from(output_dir);
+    std::fs::create_dir_all(&output_dir).unwrap();
+
+    let storage = Arc::new(MemoryStorage::default());
+    let viewer = "did:plc:alice";
+    let author = "did:plc:author";
+    let root_uri = format!("at://{author}/app.bsky.feed.post/root");
+    let reply_uri = format!("at://{viewer}/app.bsky.feed.post/reply");
+    storage.set_follow(viewer, author, true).unwrap();
+    for (did, handle, name) in [
+        (viewer, "alice.test", "Alice Example"),
+        (author, "author.test", "Morgan Garden"),
+        ("did:plc:bob", "bob.test", "Bob Reader"),
+    ] {
+        storage.set_verified_handle(did, handle).unwrap();
+        storage
+            .put_record(&IndexedRecord {
+                did: did.to_owned(),
+                collection: "app.bsky.actor.profile".to_owned(),
+                rkey: "self".to_owned(),
+                uri: format!("at://{did}/app.bsky.actor.profile/self"),
+                cid: Some(format!("{did}-profile")),
+                time_us: 1,
+                record: serde_json::json!({
+                    "$type":"app.bsky.actor.profile",
+                    "publicHandle":handle,
+                    "displayName":name,
+                    "description":"Small observations from the garden, the studio, and daily life.",
+                }),
+            })
+            .unwrap();
+    }
+    for record in [
+        IndexedRecord {
+            did: author.to_owned(),
+            collection: "app.bsky.feed.post".to_owned(),
+            rkey: "root".to_owned(),
+            uri: root_uri.clone(),
+            cid: Some("root-cid".to_owned()),
+            time_us: 10,
+            record: serde_json::json!({
+                "$type":"app.bsky.feed.post",
+                "text":"The first tomatoes are finally turning red. The garden is doing better than my calendar.",
+                "createdAt":"2026-10-29T09:30:00Z"
+            }),
+        },
+        IndexedRecord {
+            did: viewer.to_owned(),
+            collection: "app.bsky.feed.post".to_owned(),
+            rkey: "reply".to_owned(),
+            uri: reply_uri.clone(),
+            cid: Some("reply-cid".to_owned()),
+            time_us: 20,
+            record: serde_json::json!({
+                "$type":"app.bsky.feed.post",
+                "text":"That first harvest is always special. Enjoy it!",
+                "createdAt":"2026-10-29T10:15:00Z",
+                "reply":{"root":{"uri":root_uri,"cid":"root-cid"},"parent":{"uri":root_uri,"cid":"root-cid"}}
+            }),
+        },
+        IndexedRecord {
+            did: "did:plc:bob".to_owned(),
+            collection: "app.bsky.feed.like".to_owned(),
+            rkey: "like".to_owned(),
+            uri: "at://did:plc:bob/app.bsky.feed.like/like".to_owned(),
+            cid: Some("like-cid".to_owned()),
+            time_us: 30,
+            record: serde_json::json!({
+                "$type":"app.bsky.feed.like",
+                "subject":{"uri":reply_uri,"cid":"reply-cid"},
+                "createdAt":"2026-10-29T11:00:00Z"
+            }),
+        },
+    ] {
+        storage.put_record(&record).unwrap();
+    }
+
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage);
+    let cookie = finish_login(&app).await;
+    let root_uri_encoded =
+        url::form_urlencoded::byte_serialize(root_uri.as_bytes()).collect::<String>();
+    let paths = [
+        ("timeline.html", "/app".to_owned()),
+        ("thread.html", format!("/thread?uri={root_uri_encoded}")),
+        ("profile.html", format!("/profile?did={author}")),
+        ("notifications.html", "/notifications".to_owned()),
+    ];
+    for (filename, path) in paths {
+        let html = get_html(&app, &path, &cookie).await;
+        std::fs::write(output_dir.join(filename), html).unwrap();
+    }
+}
+
 #[derive(Clone)]
 struct PanicCallbackFlow;
 
@@ -1207,7 +1307,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
             ),
             "{path}"
         );
-        assert!(html.contains("href=\"/static/app.css?v=m24\""), "{path}");
+        assert!(html.contains("href=\"/static/app.css?v=m25\""), "{path}");
         assert!(!html.contains("style="), "{path}");
         // Both playback and interaction scripts are local, deferred, and never inline.
         assert_eq!(html.matches("<script").count(), 2, "{path}");
@@ -1221,7 +1321,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
     let stylesheet = app
         .oneshot(
             Request::builder()
-                .uri("/static/app.css?v=m24")
+                .uri("/static/app.css?v=m25")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1563,7 +1663,7 @@ async fn sign_in_error_page_uses_the_shared_mobile_document_shell() {
     );
     assert!(html.contains("Login failed, try again"));
     assert!(html.contains("href=\"/login\""));
-    assert!(html.contains("href=\"/static/app.css?v=m24\""));
+    assert!(html.contains("href=\"/static/app.css?v=m25\""));
     assert!(!html.contains("style="));
     // The shared shell loads both local deferred scripts, never inline code.
     assert_eq!(html.matches("<script").count(), 2);
