@@ -13265,6 +13265,34 @@ mod tests {
         assert!(WEB_STYLESHEET_URL.contains("v=m29"));
     }
 
+    #[test]
+    fn ios_safari_browser_mode_pads_the_bar_around_safaris_own_toolbar_strip() {
+        let css = include_str!("../static/app.css");
+
+        assert!(
+            css.contains("@supports (-webkit-touch-callout: none) {\n  @media (display-mode: browser) {\n    @media (max-width: 799px) {\n      body:has(.mobile-nav) {\n        --mobile-nav-height: calc(1px + 14px + 1.2rem + 6px);\n      }\n\n      body:has(.mobile-nav) .mobile-nav {\n        padding-top: 14px;\n        padding-bottom: 0;\n      }\n    }\n  }\n}"),
+            "iOS Safari in the browser must pad the bar 14 px above the icons and 0 below, and set --mobile-nav-height to the new 40.2 px bar"
+        );
+        assert!(
+            css.contains("min-height: 0;\n    padding-top: 0.25rem;\n    padding-bottom: calc(0.1rem + max(4px, calc(env(safe-area-inset-bottom) * 0.25)));"),
+            "the default body:has(.mobile-nav) .mobile-nav rule must stay unchanged for every other mode"
+        );
+        assert!(
+            css.contains("--mobile-nav-height: calc(1.2rem + 6px + 0.25rem + 0.1rem + 1px + max(4px, calc(env(safe-area-inset-bottom) * 0.25)));"),
+            "the default --mobile-nav-height must stay unchanged for every other mode"
+        );
+        let default_rule = css
+            .find("body:has(.mobile-nav) .mobile-nav {\n    min-height: 0;")
+            .expect("the default bar rule must exist");
+        let ios_rule = css
+            .find("body:has(.mobile-nav) .mobile-nav {\n        padding-top: 14px;")
+            .expect("the iOS-Safari-browser bar rule must exist");
+        assert!(
+            ios_rule > default_rule,
+            "the iOS-Safari-browser bar rule must come after the default rule so it wins the cascade"
+        );
+    }
+
     fn css_rule_bodies(css: &str, selector: &str) -> Vec<String> {
         let mut bodies = Vec::new();
         let mut rest = css;
