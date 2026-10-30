@@ -163,6 +163,7 @@ struct FakeOAuthFlow {
     listblock_requests: Arc<Mutex<Vec<String>>>,
     block_list_requests: Arc<Mutex<Vec<String>>>,
     block_list_failure: Arc<Mutex<Option<String>>>,
+    block_list_delay: Arc<Mutex<Option<Duration>>>,
     feed_timeline_records: Arc<Mutex<Vec<IndexedRecord>>>,
 }
 
@@ -195,6 +196,7 @@ impl Default for FakeOAuthFlow {
             listblock_requests: Arc::new(Mutex::new(Vec::new())),
             block_list_requests: Arc::new(Mutex::new(Vec::new())),
             block_list_failure: Arc::new(Mutex::new(None)),
+            block_list_delay: Arc::new(Mutex::new(None)),
             feed_timeline_records: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -716,6 +718,7 @@ impl OAuthFlow for FakeOAuthFlow {
     ) -> Pin<Box<dyn Future<Output = Result<BlockListDetail, String>> + Send + 'a>> {
         let requests = self.block_list_requests.clone();
         let failure = self.block_list_failure.lock().unwrap().clone();
+        let delay = *self.block_list_delay.lock().unwrap();
         let found = self
             .block_lists
             .lock()
@@ -726,6 +729,9 @@ impl OAuthFlow for FakeOAuthFlow {
         let list_uri = list_uri.to_owned();
         Box::pin(async move {
             requests.lock().unwrap().push(list_uri.clone());
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
             if let Some(error) = failure {
                 return Err(error);
             }
@@ -7542,4 +7548,45 @@ async fn block_lists_page_shows_each_subscribed_list_with_a_leak_slider() {
         .unwrap();
     assert_eq!(anonymous.status(), StatusCode::SEE_OTHER);
     assert_eq!(anonymous.headers()["location"], "/login");
+}
+
+#[tokio::test]
+async fn a_block_list_slower_than_the_page_budget_is_still_applied_on_a_later_page() {
+    // A 742-member list needs ~8 getList pages (~4 s). The page waits at most its budget,
+    // but the refresh it started must run to completion, so the NEXT page has the members.
+    let list_uri = "at://did:plc:list-owner/app.bsky.graph.list/biglist";
+    let storage = Arc::new(MemoryStorage::default());
+    storage
+        .set_follow("did:plc:alice", "did:plc:list-member", true)
+        .unwrap();
+    storage
+        .put_record(&fake_feed_post(
+            "did:plc:list-member",
+            "member-post",
+            1,
+            "A post by a block list member",
+        ))
+        .unwrap();
+    let flow = FakeOAuthFlow {
+        block_lists: Arc::new(Mutex::new(vec![fake_block_list(
+            list_uri,
+            "Big list",
+            &["did:plc:list-member"],
+        )])),
+        block_list_delay: Arc::new(Mutex::new(Some(Duration::from_millis(2500)))),
+        ..FakeOAuthFlow::default()
+    };
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage);
+    let cookie = finish_login(&app).await;
+    let (status, _) = get_body(&app, "/app", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let (status, html) = get_body(&app, "/app", &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains(&format!("hidden data-list-block=\"{list_uri}\"")),
+        "the slow refresh started by the first page must have finished and been cached: {html}"
+    );
 }
