@@ -1112,7 +1112,45 @@ const resetDocumentScroll = () => {
   if (document.querySelector(".mobile-nav") && (window.scrollY !== 0 || window.scrollX !== 0)) window.scrollTo(0, 0);
 };
 document.addEventListener("focusout", () => setTimeout(resetDocumentScroll, 100));
-window.visualViewport?.addEventListener("resize", resetDocumentScroll);
+
+// Owner report 2026-10-30 (iPhone, Safari, post page): "when starting the reply, the onscreen keyboard and url
+// display pop out obscure the input". The keyboard opening IS a visualViewport resize, so resetting the document
+// scroll there undid iOS's own attempt to bring the focused textarea into view. While a text field is focused we
+// skip that reset and instead keep the composer's bottom edge above the visible area minus a 56 px clearance
+// (keyboard accessory bar ~44 px + Safari's floating URL pill), scrolling the inner scroller — never the window.
+const keyboardClearancePx = 56;
+const takesTextInput = (element) => {
+  if (!element?.tagName) return false;
+  if (element.tagName === "TEXTAREA" || element.isContentEditable) return true;
+  if (element.tagName !== "INPUT") return false;
+  const type = String(element.getAttribute?.("type") || "text").toLowerCase();
+  return !["button", "checkbox", "color", "file", "hidden", "image", "radio", "range", "reset", "submit"].includes(type);
+};
+const scrollableAncestorOf = (node) => {
+  for (let element = node.parentElement; element; element = element.parentElement) {
+    const overflowY = window.getComputedStyle?.(element)?.overflowY;
+    if ((overflowY === "auto" || overflowY === "scroll") && element.scrollHeight > element.clientHeight) return element;
+  }
+  return null;
+};
+const keepComposerAboveKeyboard = () => {
+  const viewport = window.visualViewport;
+  if (!viewport) return; // desktop and old browsers: no viewport telemetry, so do nothing
+  const textarea = document.activeElement;
+  if (textarea?.tagName !== "TEXTAREA") return;
+  const overlap = textarea.getBoundingClientRect().bottom - (viewport.offsetTop + viewport.height - keyboardClearancePx);
+  if (overlap <= 0) return;
+  const scroller = scrollableAncestorOf(textarea);
+  if (scroller) scroller.scrollTop += overlap;
+};
+document.addEventListener("focusin", keepComposerAboveKeyboard);
+window.visualViewport?.addEventListener("resize", () => {
+  if (takesTextInput(document.activeElement)) {
+    keepComposerAboveKeyboard();
+    return;
+  }
+  resetDocumentScroll();
+});
 
 // Keep the notification badge live while the page is open. SSE is the normal path;
 // the JSON count endpoint provides a low-frequency fallback for proxies that close streams.
