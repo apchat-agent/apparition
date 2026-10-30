@@ -1464,6 +1464,7 @@ impl HttpClient for OAuthMetadataHttpClient {
 struct SharedOAuthSession {
     inner: Arc<RestoredOAuthSession>,
     did: String,
+    store: SqliteOAuthStore,
     cache: OAuthSessionCache,
     restores: OAuthSessionRestores,
 }
@@ -1498,10 +1499,44 @@ impl XrpcClient for SharedOAuthSession {
                 .to_ascii_lowercase()
                 .contains("invalid_token")
         {
+            // The PDS rejected this access token. Drop the cached session, mark the stored
+            // session expired so the OAuth client's registry really refreshes it, and retry
+            // once: the first call after a revocation must recover with the new token instead
+            // of handing the stale one back to the caller.
             self.cache.lock().await.remove(&self.did);
             self.restores.lock().await.remove(&self.did);
+            if self.expire_stored_session().await {
+                let retry = self.inner.send_xrpc(request).await;
+                if retry.is_ok() {
+                    // The retried call refreshed this session in place; the cache must only
+                    // ever hand out this post-refresh session, never the pre-refresh one.
+                    self.cache.lock().await.insert(
+                        self.did.clone(),
+                        (
+                            tokio::time::Instant::now() + OAUTH_SESSION_CACHE_TTL,
+                            self.inner.clone(),
+                        ),
+                    );
+                }
+                return retry;
+            }
         }
         result
+    }
+}
+
+impl SharedOAuthSession {
+    /// Rewrite the stored session so the OAuth client treats its access token as expired and
+    /// the next send exchanges the refresh token instead of replaying a rejected access token.
+    async fn expire_stored_session(&self) -> bool {
+        let Ok(did) = self.did.parse::<Did>() else {
+            return false;
+        };
+        let Ok(Some(mut session)) = self.store.get(&did).await else {
+            return false;
+        };
+        session.token_set.expires_at = None;
+        self.store.set(did, session).await.is_ok()
     }
 }
 
@@ -1530,6 +1565,7 @@ impl CloneWithProxy for SharedOAuthSession {
         Self {
             inner: Arc::new(self.inner.clone_with_proxy(did, service_type)),
             did: self.did.clone(),
+            store: self.store.clone(),
             cache: self.cache.clone(),
             restores: self.restores.clone(),
         }
@@ -2252,6 +2288,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             return Ok(SharedOAuthSession {
                 inner: session,
                 did: key,
+                store: self.store.clone(),
                 cache: self.session_cache.clone(),
                 restores: self.session_restores.clone(),
             });
@@ -2293,6 +2330,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         result.map(|inner| SharedOAuthSession {
             inner,
             did: key,
+            store: self.store.clone(),
             cache: self.session_cache.clone(),
             restores: self.session_restores.clone(),
         })
