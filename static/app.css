@@ -1211,6 +1211,10 @@ button:hover,
   text-decoration: underline;
 }
 
+.post-text a.post-text-link {
+  color: var(--accent);
+}
+
 .post-link-targets {
   margin: -0.35rem 0 0.9rem;
   font-size: 0.75rem;
