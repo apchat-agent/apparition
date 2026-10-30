@@ -7515,16 +7515,20 @@ async fn block_lists_page_shows_each_subscribed_list_with_a_leak_slider() {
         )),
         "the slider carries the list uri and starts at 0: {html}"
     );
-    assert!(html.contains(&format!(
-        "data-list-block-uri=\"{second_uri}\""
-    )));
+    assert!(html.contains(&format!("data-list-block-uri=\"{second_uri}\"")));
     assert!(
         html.matches("% of posts let through").count() == 2,
         "each slider is labelled: {html}"
     );
     assert!(html.contains("3 members"), "member counts render: {html}");
-    assert!(html.contains("href=\"/app/block-lists\""), "linked from the app navigation: {html}");
-    assert!(!html.contains("style="), "no inline style attributes: {html}");
+    assert!(
+        html.contains("href=\"/app/block-lists\""),
+        "linked from the app navigation: {html}"
+    );
+    assert!(
+        !html.contains("style="),
+        "no inline style attributes: {html}"
+    );
     assert_eq!(html.matches("<script").count(), 2, "CSP unchanged: {html}");
     let anonymous = app
         .clone()

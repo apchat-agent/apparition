@@ -2212,6 +2212,51 @@ a.quoted-post-card:hover,
   list-style: none;
 }
 
+.block-list-settings {
+  display: grid;
+  gap: 0.9rem;
+  margin: 1rem 0;
+  padding: 0;
+  list-style: none;
+}
+
+.block-list-setting {
+  display: grid;
+  gap: 0.4rem;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 1rem;
+  background: var(--surface);
+}
+
+.block-list-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.6rem;
+}
+
+.block-list-name {
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+.block-list-count {
+  color: var(--muted);
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+
+.block-list-setting label {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.block-list-setting input[type="range"] {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
 .feed-card {
   display: grid;
   grid-template-columns: auto 1fr;

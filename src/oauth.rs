@@ -1098,6 +1098,7 @@ impl OAuthPublic {
             .route("/logout", post(logout::<F, S>))
             .route("/app", get(app_home::<F, S>))
             .route("/feeds", get(feeds_page::<F, S>))
+            .route("/app/block-lists", get(block_lists_page::<F, S>))
             .route("/app/feed", get(feed_timeline_page::<F, S>))
             .route("/app/thread", get(thread_page::<F, S>))
             .route("/quote-fragment", get(quote_fragment::<F, S>))
@@ -4947,12 +4948,13 @@ fn page_shell_with_options(
     } = options;
     let navigation = if authenticated {
         format!(
-            "<nav class=\"primary-nav\" aria-label=\"Main navigation\"><a href=\"/app\">{}<span>Home</span></a><a href=\"/feeds\">{}<span>Feeds</span></a><a class=\"notification-nav-link\" href=\"/notifications\">{}<span>Notifications</span>{}</a><a href=\"/profile\">{}<span>Profile</span></a><a class=\"compose-link\" href=\"/app#new-post\">{}<span>New post</span></a><form action=\"/logout\" method=\"post\"><button type=\"submit\">Sign out</button></form></nav>",
+            "<nav class=\"primary-nav\" aria-label=\"Main navigation\"><a href=\"/app\">{}<span>Home</span></a><a href=\"/feeds\">{}<span>Feeds</span></a><a class=\"notification-nav-link\" href=\"/notifications\">{}<span>Notifications</span>{}</a><a href=\"/profile\">{}<span>Profile</span></a><a href=\"/app/block-lists\">{}<span>Block lists</span></a><a class=\"compose-link\" href=\"/app#new-post\">{}<span>New post</span></a><form action=\"/logout\" method=\"post\"><button type=\"submit\">Sign out</button></form></nav>",
             icon_svg("home"),
             icon_svg("feeds"),
             icon_svg("notifications"),
             notification_badge_markup(unread_count),
             icon_svg("profile"),
+            icon_svg("block-lists"),
             icon_svg("compose")
         )
     } else {
@@ -5965,12 +5967,13 @@ fn icon_content(name: &str) -> &'static str {
         "more" => {
             "<circle cx=\"5\" cy=\"12\" r=\"1\"/><circle cx=\"12\" cy=\"12\" r=\"1\"/><circle cx=\"19\" cy=\"12\" r=\"1\"/>"
         }
+        "block-lists" => "<circle cx=\"12\" cy=\"12\" r=\"9\"/><path d=\"m5.6 5.6 12.8 12.8\"/>",
         _ => "",
     }
 }
 
 fn icon_sprite() -> String {
-    const ICONS: [&str; 14] = [
+    const ICONS: [&str; 15] = [
         "home",
         "feeds",
         "notifications",
@@ -5985,6 +5988,7 @@ fn icon_sprite() -> String {
         "more",
         "image",
         "link",
+        "block-lists",
     ];
     let symbols = ICONS
         .iter()
@@ -6978,6 +6982,63 @@ where
         ),
         true,
         &feeds,
+        None,
+        false,
+        unread_badge_count(state.storage.as_ref(), &did),
+    ))
+    .into_response()
+}
+
+fn render_block_list_setting(index: usize, list: &BlockListDetail) -> String {
+    let uri = html_escape(&list.uri);
+    let input_id = format!("block-list-leak-{index}");
+    let member_word = if list.member_dids.len() == 1 {
+        "member"
+    } else {
+        "members"
+    };
+    format!(
+        "<li class=\"block-list-setting\" data-block-list-uri=\"{uri}\"><div class=\"block-list-head\"><span class=\"block-list-name\">{}</span><span class=\"block-list-count\">{} {member_word}</span></div><label for=\"{input_id}\">% of posts let through</label><input id=\"{input_id}\" type=\"range\" min=\"0\" max=\"100\" step=\"1\" value=\"0\" data-list-block-uri=\"{uri}\"></li>",
+        html_escape(&list.name),
+        list.member_dids.len(),
+    )
+}
+
+async fn block_lists_page<F, S>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    headers: HeaderMap,
+) -> Response
+where
+    F: OAuthFlow,
+    S: Storage + 'static,
+{
+    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+        return Redirect::to("/login").into_response();
+    };
+    let tabs = pinned_feeds_for_layout(
+        &state.flow,
+        &did,
+        verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()),
+    )
+    .await;
+    let lists = subscribed_block_lists_for_page(&state.flow, &state.block_lists, &did).await;
+    let entries = lists
+        .iter()
+        .enumerate()
+        .map(|(index, list)| render_block_list_setting(index, list))
+        .collect::<String>();
+    let entries = if entries.is_empty() {
+        "<li class=\"empty-state\">No lists are subscribed as block lists yet. Subscribe to a moderation list as a block list and it will appear here.</li>".to_owned()
+    } else {
+        entries
+    };
+    Html(page_shell_with_feeds_and_badge(
+        "Block lists",
+        &format!(
+            "<header class=\"page-heading\"><p class=\"eyebrow\">Your moderation</p><h1>Block lists</h1><p class=\"page-subtitle\">Posts by members of these lists stay hidden. Let a share of their posts through anyway.</p></header><ol class=\"block-list-settings\">{entries}</ol>"
+        ),
+        true,
+        &tabs.feeds,
         None,
         false,
         unread_badge_count(state.storage.as_ref(), &did),
