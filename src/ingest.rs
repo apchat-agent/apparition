@@ -5194,6 +5194,71 @@ mod sqlite_writer_tests {
     }
 
     #[test]
+    fn shutdown_waits_for_a_delayed_queued_write_before_database_reopens() {
+        let path = test_path("shutdown-waits-for-write");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("CREATE TABLE shutdown_write(value TEXT NOT NULL);")
+            .unwrap();
+        let writer = SqliteWriter::new(connection).unwrap();
+        writer.fire(|connection| {
+            std::thread::sleep(Duration::from_millis(200));
+            connection.execute(
+                "INSERT INTO shutdown_write(value) VALUES('flushed')",
+                [],
+            )?;
+            Ok(None)
+        });
+
+        drop(writer);
+
+        let reopened = Connection::open(&path).unwrap();
+        let value: String = reopened
+            .query_row("SELECT value FROM shutdown_write", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "flushed");
+        drop(reopened);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn a_failing_fire_write_does_not_rollback_other_writes_in_its_batch() {
+        let path = test_path("independent-batch-writes");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("CREATE TABLE batch_write(value TEXT PRIMARY KEY);")
+            .unwrap();
+        let writer = SqliteWriter::new(connection).unwrap();
+        writer.fire(|connection| {
+            connection.execute("INSERT INTO batch_write(value) VALUES('good-before')", [])?;
+            Ok(None)
+        });
+        writer.fire(|connection| {
+            connection.execute("INSERT INTO batch_write(value) VALUES('bad')", [])?;
+            connection.execute("INSERT INTO batch_write(value) VALUES('bad')", [])?;
+            Ok(None)
+        });
+        writer.fire(|connection| {
+            connection.execute("INSERT INTO batch_write(value) VALUES('good-after')", [])?;
+            Ok(None)
+        });
+        writer.flush().unwrap();
+
+        let values = writer
+            .call(|connection| {
+                let mut statement = connection.prepare("SELECT value FROM batch_write ORDER BY value")?;
+                let values = statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(values)
+            })
+            .unwrap();
+        assert_eq!(values, ["good-after", "good-before"]);
+        drop(writer);
+        remove_database(&path);
+    }
+
+    #[test]
     fn ordered_handle_refresh_only_touches_the_requested_dids() {
         let storage = SqliteStorage::open(":memory:").unwrap();
         storage
