@@ -2120,7 +2120,9 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
 
         let deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
         loop {
-            if let Some((preferences, _)) = self.cached_saved_feed_preferences(did).await {
+            if let Some((preferences, stale)) = self.cached_saved_feed_preferences(did).await
+                && !stale
+            {
                 return Ok(preferences);
             }
             if tokio::time::Instant::now() >= deadline {
@@ -2221,7 +2223,10 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             drop(pending);
             let deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
             loop {
-                if let Some((_, actors)) = self.muted_actor_cache.lock().await.get(did).cloned() {
+                if let Some((expires, actors)) =
+                    self.muted_actor_cache.lock().await.get(did).cloned()
+                    && expires > tokio::time::Instant::now()
+                {
                     return Ok(actors);
                 }
                 if tokio::time::Instant::now() >= deadline {

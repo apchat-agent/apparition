@@ -10,8 +10,9 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, RwLock, TryLockError,
+        Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -32,6 +33,21 @@ const BACKFILL_RETRY_MAX: Duration = Duration::from_secs(60 * 60);
 const MAX_BACKFILL_QUEUE: usize = 1_000;
 const BACKFILL_BATCH_SIZE: usize = 8;
 const MAX_PROFILE_FETCH_QUEUE: usize = 10_000;
+const SQLITE_WRITER_QUEUE: usize = 256;
+const SQLITE_WRITER_BATCH_SIZE: usize = 64;
+const SQLITE_WRITER_BATCH_DELAY: Duration = Duration::from_millis(5);
+const SQLITE_WRITER_METRICS_INTERVAL: Duration = Duration::from_secs(60);
+static NEXT_MEMORY_DATABASE_ID: AtomicU64 = AtomicU64::new(1);
+
+struct EphemeralDatabase(PathBuf);
+
+impl Drop for EphemeralDatabase {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+        let _ = fs::remove_file(format!("{}-wal", self.0.display()));
+        let _ = fs::remove_file(format!("{}-shm", self.0.display()));
+    }
+}
 const JETSTREAM_BATCH_SIZE: usize = 200;
 const JETSTREAM_BATCH_DELAY: Duration = Duration::from_millis(250);
 
@@ -197,6 +213,8 @@ pub enum StorageError {
     Poisoned,
     #[error("storage I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("SQLite writer stopped before replying")]
+    WriterStopped,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1745,22 +1763,275 @@ impl Storage for MemoryStorage {
 const SNAPSHOT_BATCH: usize = 500;
 const SQLITE_READ_CONNECTIONS: usize = 4;
 
+type FireCompletion = Box<dyn FnOnce() + Send>;
+type FireWrite =
+    Box<dyn FnOnce(&Connection) -> Result<Option<FireCompletion>, StorageError> + Send>;
+type BlockingWrite = Box<dyn FnOnce(&mut Connection) + Send>;
+
+enum SqliteWriterMessage {
+    Fire(FireWrite),
+    Blocking(BlockingWrite),
+}
+
+#[derive(Default)]
+struct SqliteWriterMetrics {
+    queue_depth: AtomicU64,
+    queue_depth_max: AtomicU64,
+    dropped: AtomicU64,
+    batch_count: AtomicU64,
+    transaction_count: AtomicU64,
+    transaction_total_ns: AtomicU64,
+    transaction_max_ns: AtomicU64,
+}
+
+impl SqliteWriterMetrics {
+    fn queued(&self) {
+        let depth = self.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut maximum = self.queue_depth_max.load(Ordering::Relaxed);
+        while depth > maximum {
+            match self.queue_depth_max.compare_exchange_weak(
+                maximum,
+                depth,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => maximum = actual,
+            }
+        }
+    }
+
+    fn dequeued(&self) {
+        self.queue_depth.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn record_batch(&self, elapsed: Duration) {
+        let elapsed_ns = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
+        self.batch_count.fetch_add(1, Ordering::Relaxed);
+        self.transaction_count.fetch_add(1, Ordering::Relaxed);
+        self.transaction_total_ns
+            .fetch_add(elapsed_ns, Ordering::Relaxed);
+        self.transaction_max_ns
+            .fetch_max(elapsed_ns, Ordering::Relaxed);
+    }
+
+    fn report(&self) {
+        let count = self.transaction_count.swap(0, Ordering::Relaxed);
+        let total_ns = self.transaction_total_ns.swap(0, Ordering::Relaxed);
+        let max_ns = self.transaction_max_ns.swap(0, Ordering::Relaxed);
+        tracing::info!(
+            writer_queue_depth_max = self
+                .queue_depth_max
+                .swap(self.queue_depth.load(Ordering::Relaxed), Ordering::Relaxed,),
+            batch_count = self.batch_count.swap(0, Ordering::Relaxed),
+            transaction_mean_ms = if count == 0 {
+                0.0
+            } else {
+                total_ns as f64 / count as f64 / 1_000_000.0
+            },
+            transaction_max_ms = max_ns as f64 / 1_000_000.0,
+            dropped_count = self.dropped.swap(0, Ordering::Relaxed),
+            "SQLite writer minute metrics"
+        );
+    }
+}
+
+struct SqliteWriter {
+    sender: Option<SyncSender<SqliteWriterMessage>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    metrics: Arc<SqliteWriterMetrics>,
+}
+
+impl SqliteWriter {
+    fn new(connection: Connection) -> Result<Self, StorageError> {
+        let (sender, receiver) = mpsc::sync_channel(SQLITE_WRITER_QUEUE);
+        let metrics = Arc::new(SqliteWriterMetrics::default());
+        let thread_metrics = Arc::clone(&metrics);
+        let worker = std::thread::Builder::new()
+            .name("sqlite-writer".to_owned())
+            .spawn(move || sqlite_writer_loop(connection, receiver, thread_metrics))?;
+        Ok(Self {
+            sender: Some(sender),
+            worker: Some(worker),
+            metrics,
+        })
+    }
+
+    fn call<R: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&mut Connection) -> Result<R, StorageError> + Send + 'static,
+    ) -> Result<R, StorageError> {
+        let (reply, result) = mpsc::sync_channel(1);
+        let command = SqliteWriterMessage::Blocking(Box::new(move |connection| {
+            let _ = reply.send(operation(connection));
+        }));
+        self.metrics.queued();
+        let Some(sender) = self.sender.as_ref() else {
+            self.metrics.dequeued();
+            return Err(StorageError::WriterStopped);
+        };
+        if sender.send(command).is_err() {
+            self.metrics.dequeued();
+            return Err(StorageError::WriterStopped);
+        }
+        result.recv().map_err(|_| StorageError::WriterStopped)?
+    }
+
+    fn fire(
+        &self,
+        operation: impl FnOnce(&Connection) -> Result<Option<FireCompletion>, StorageError>
+        + Send
+        + 'static,
+    ) {
+        let Some(sender) = self.sender.as_ref() else {
+            self.metrics.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        self.metrics.queued();
+        if let Err(error) = sender.try_send(SqliteWriterMessage::Fire(Box::new(operation))) {
+            self.metrics.dequeued();
+            match error {
+                mpsc::TrySendError::Full(_) => {
+                    self.metrics.dropped.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!("SQLite writer queue full; dropped request-path write");
+                }
+                mpsc::TrySendError::Disconnected(_) => {
+                    self.metrics.dropped.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!("SQLite writer stopped; dropped request-path write");
+                }
+            }
+        }
+    }
+
+    fn flush(&self) -> Result<(), StorageError> {
+        self.call(|_| Ok(()))
+    }
+
+    fn shutdown(&mut self) {
+        drop(self.sender.take());
+        if let Some(worker) = self.worker.take()
+            && worker.join().is_err()
+        {
+            tracing::error!("SQLite writer thread panicked during shutdown");
+        }
+    }
+}
+
+impl Drop for SqliteWriter {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn sqlite_writer_loop(
+    mut connection: Connection,
+    receiver: Receiver<SqliteWriterMessage>,
+    metrics: Arc<SqliteWriterMetrics>,
+) {
+    let mut next_metrics = Instant::now() + SQLITE_WRITER_METRICS_INTERVAL;
+    let mut pending = None;
+    loop {
+        let message = if let Some(message) = pending.take() {
+            Some(message)
+        } else {
+            match receiver.recv_timeout(next_metrics.saturating_duration_since(Instant::now())) {
+                Ok(message) => Some(message),
+                Err(RecvTimeoutError::Timeout) => {
+                    metrics.report();
+                    next_metrics = Instant::now() + SQLITE_WRITER_METRICS_INTERVAL;
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => None,
+            }
+        };
+        let Some(message) = message else {
+            break;
+        };
+        metrics.dequeued();
+        match message {
+            SqliteWriterMessage::Blocking(operation) => {
+                let started = Instant::now();
+                operation(&mut connection);
+                metrics.record_batch(started.elapsed());
+            }
+            SqliteWriterMessage::Fire(first) => {
+                let mut writes = vec![first];
+                let deadline = Instant::now() + SQLITE_WRITER_BATCH_DELAY;
+                while writes.len() < SQLITE_WRITER_BATCH_SIZE {
+                    match receiver.try_recv() {
+                        Ok(SqliteWriterMessage::Fire(write)) => {
+                            metrics.dequeued();
+                            writes.push(write);
+                        }
+                        Ok(blocking @ SqliteWriterMessage::Blocking(_)) => {
+                            pending = Some(blocking);
+                            break;
+                        }
+                        Err(TryRecvError::Empty) if Instant::now() < deadline => {
+                            std::thread::sleep(Duration::from_micros(100));
+                        }
+                        Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                    }
+                }
+                let started = Instant::now();
+                let mut completions = Vec::new();
+                let mut first_error = None;
+                match connection.transaction() {
+                    Ok(transaction) => {
+                        for write in writes {
+                            match write(&transaction) {
+                                Ok(Some(completion)) => completions.push(completion),
+                                Ok(None) => {}
+                                Err(error) if first_error.is_none() => first_error = Some(error),
+                                Err(_) => {}
+                            }
+                        }
+                        if first_error.is_none()
+                            && let Err(error) = transaction.commit()
+                        {
+                            tracing::warn!(%error, "SQLite queued write batch commit failed");
+                            first_error = Some(StorageError::Sqlite(error));
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "SQLite queued write batch could not start");
+                        first_error = Some(StorageError::Sqlite(error));
+                    }
+                }
+                if first_error.is_none() {
+                    for completion in completions {
+                        completion();
+                    }
+                } else if let Some(error) = first_error {
+                    tracing::warn!(%error, "SQLite queued write batch rolled back");
+                }
+                metrics.record_batch(started.elapsed());
+            }
+        }
+        if Instant::now() >= next_metrics {
+            metrics.report();
+            next_metrics = Instant::now() + SQLITE_WRITER_METRICS_INTERVAL;
+        }
+    }
+}
+
 pub struct SqliteStorage {
-    connection: Mutex<Connection>,
+    writer: SqliteWriter,
     read_connections: Vec<Mutex<Connection>>,
     next_read_connection: AtomicU64,
-    deferred_handle_refreshes: Mutex<HashSet<String>>,
     path: PathBuf,
     checkpointer_stop: Arc<AtomicBool>,
     checkpoint_backlog: Arc<AtomicU64>,
     tracked: Arc<RwLock<TrackedSet>>,
     profile_index: Arc<RwLock<HashMap<String, ProfileIndexEntry>>>,
     notification_hub: NotificationHub,
+    _ephemeral_database: Option<EphemeralDatabase>,
 }
 
 impl Drop for SqliteStorage {
     fn drop(&mut self) {
         self.checkpointer_stop.store(true, Ordering::Relaxed);
+        self.writer.shutdown();
     }
 }
 
@@ -1850,11 +2121,25 @@ fn spawn_checkpointer(
 impl SqliteStorage {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
+        let is_memory = path == Path::new(":memory:");
+        if !is_memory && let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        ensure_private_database_file(&path)?;
-        let connection = Connection::open(&path)?;
+        let ephemeral_database = if is_memory {
+            Some(EphemeralDatabase(std::env::temp_dir().join(format!(
+                "appview-rs-memory-{}-{}.sqlite3",
+                std::process::id(),
+                NEXT_MEMORY_DATABASE_ID.fetch_add(1, Ordering::Relaxed)
+            ))))
+        } else {
+            None
+        };
+        let database_path = ephemeral_database
+            .as_ref()
+            .map(|database| database.0.clone())
+            .unwrap_or_else(|| path.clone());
+        ensure_private_database_file(&database_path)?;
+        let connection = Connection::open(&database_path)?;
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
@@ -1951,7 +2236,8 @@ impl SqliteStorage {
              );
              CREATE TABLE IF NOT EXISTS handle_refresh_queue (
                  did TEXT PRIMARY KEY,
-                 requested_at INTEGER NOT NULL DEFAULT (unixepoch())
+                 requested_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                 priority INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS profile_index_status (
                  did TEXT PRIMARY KEY,
@@ -1962,6 +2248,20 @@ impl SqliteStorage {
                  seq INTEGER PRIMARY KEY AUTOINCREMENT,
                  did TEXT NOT NULL UNIQUE
              );",
+        )?;
+        let handle_refresh_has_priority: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('handle_refresh_queue') WHERE name='priority')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !handle_refresh_has_priority {
+            connection.execute(
+                "ALTER TABLE handle_refresh_queue ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        connection.execute_batch(
+            "CREATE INDEX IF NOT EXISTS handle_refresh_priority ON handle_refresh_queue(priority DESC);",
         )?;
         connection.execute(
             "INSERT OR IGNORE INTO profile_index_status(did,has_profile,fetched_at_ms)
@@ -2007,38 +2307,40 @@ impl SqliteStorage {
             "Built in-memory profile index"
         );
         let mut read_connections = Vec::new();
-        if path.as_os_str() != ":memory:" {
-            for _ in 0..SQLITE_READ_CONNECTIONS {
-                let reader = Connection::open(&path)?;
-                reader.execute_batch("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON;")?;
-                read_connections.push(Mutex::new(reader));
-            }
+        for _ in 0..SQLITE_READ_CONNECTIONS {
+            let reader = Connection::open(&database_path)?;
+            reader.execute_batch("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON;")?;
+            read_connections.push(Mutex::new(reader));
         }
         let stop = Arc::new(AtomicBool::new(false));
         let backlog = Arc::new(AtomicU64::new(0));
-        if path.as_os_str() != ":memory:" {
+        if !is_memory {
             backlog.store(u64::MAX, Ordering::Relaxed);
-            spawn_checkpointer(path.clone(), Arc::clone(&stop), Arc::clone(&backlog))?;
+            spawn_checkpointer(
+                database_path.clone(),
+                Arc::clone(&stop),
+                Arc::clone(&backlog),
+            )?;
         }
         Ok(Self {
-            connection: Mutex::new(connection),
+            writer: SqliteWriter::new(connection)?,
             read_connections,
             next_read_connection: AtomicU64::new(0),
-            deferred_handle_refreshes: Mutex::new(HashSet::new()),
             path,
             checkpointer_stop: stop,
             checkpoint_backlog: backlog,
             tracked: Arc::new(RwLock::new(tracked_set)),
             profile_index: Arc::new(RwLock::new(profile_index)),
             notification_hub: NotificationHub::default(),
+            _ephemeral_database: ephemeral_database,
         })
     }
 
     /// The main connection's automatic-checkpoint threshold (0 = off).
     pub fn wal_autocheckpoint(&self) -> Result<i64, StorageError> {
-        Ok(self
-            .conn()?
-            .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))?)
+        self.writer.call(|connection| {
+            Ok(connection.query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))?)
+        })
     }
 
     /// Rebuild the startup scope table from SQLite and compare it with the live table.
@@ -2049,6 +2351,7 @@ impl SqliteStorage {
     }
 
     pub fn profile_index_matches_sqlite(&self) -> Result<bool, StorageError> {
+        self.writer.flush()?;
         let connection = self.read_conn()?;
         let rebuilt = build_profile_index(&connection)?;
         Ok(*self
@@ -2077,13 +2380,17 @@ impl SqliteStorage {
         did: &str,
         entry: ProfileIndexEntry,
     ) -> Result<(), StorageError> {
-        self.conn()?.execute(
-            "INSERT INTO profile_index_status(did,has_profile,fetched_at_ms)
-             VALUES(?1,?2,?3)
-             ON CONFLICT(did) DO UPDATE SET
-                 has_profile=excluded.has_profile,fetched_at_ms=excluded.fetched_at_ms",
-            params![did, entry.has_profile, entry.fetched_at_ms],
-        )?;
+        let writer_did = did.to_owned();
+        self.writer.call(move |connection| {
+            connection.execute(
+                "INSERT INTO profile_index_status(did,has_profile,fetched_at_ms)
+                 VALUES(?1,?2,?3)
+                 ON CONFLICT(did) DO UPDATE SET
+                     has_profile=excluded.has_profile,fetched_at_ms=excluded.fetched_at_ms",
+                params![writer_did, entry.has_profile, entry.fetched_at_ms],
+            )?;
+            Ok(())
+        })?;
         self.profile_index
             .write()
             .map_err(|_| StorageError::Poisoned)?
@@ -2109,15 +2416,9 @@ impl SqliteStorage {
         )
     }
 
-    fn conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StorageError> {
-        self.connection.lock().map_err(|_| StorageError::Poisoned)
-    }
-
     fn read_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StorageError> {
         if self.read_connections.is_empty() {
-            // Private in-memory databases cannot be opened by independent SQLite
-            // connections. File-backed production databases always use the reader pool.
-            return self.conn();
+            return Err(StorageError::WriterStopped);
         }
         let index = self.next_read_connection.fetch_add(1, Ordering::Relaxed) as usize
             % self.read_connections.len();
@@ -2156,12 +2457,17 @@ impl SqliteStorage {
         records_written: &mut u64,
     ) -> Result<(), StorageError> {
         loop {
-            let mut connection = self.conn()?;
-            let transaction = connection.transaction()?;
-            let deleted =
-                transaction.execute(sql, params![did, cutoff_us, SNAPSHOT_BATCH as i64])?;
-            transaction.commit()?;
-            drop(connection);
+            let writer_did = did.to_owned();
+            let writer_sql = sql.to_owned();
+            let deleted = self.writer.call(move |connection| {
+                let transaction = connection.transaction()?;
+                let deleted = transaction.execute(
+                    &writer_sql,
+                    params![writer_did, cutoff_us, SNAPSHOT_BATCH as i64],
+                )?;
+                transaction.commit()?;
+                Ok(deleted)
+            })?;
             if deleted == 0 {
                 return Ok(());
             }
@@ -2180,41 +2486,44 @@ impl SqliteStorage {
         records_written: &mut u64,
     ) -> Result<(), StorageError> {
         loop {
-            let mut connection = self.conn()?;
-            let transaction = connection.transaction()?;
-            let actor_is_registered: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM registered_users WHERE did=?1)",
-                [did],
-                |row| row.get(0),
-            )?;
-            let subjects = {
-                let mut statement = transaction.prepare(
-                    "SELECT subject FROM follows WHERE following=1 AND rowid IN (
+            let writer_did = did.to_owned();
+            let (actor_is_registered, subjects, deleted) = self.writer.call(move |connection| {
+                let transaction = connection.transaction()?;
+                let actor_is_registered: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM registered_users WHERE did=?1)",
+                    [&writer_did],
+                    |row| row.get(0),
+                )?;
+                let subjects = {
+                    let mut statement = transaction.prepare(
+                        "SELECT subject FROM follows WHERE following=1 AND rowid IN (
+                             SELECT rowid FROM follows WHERE actor=?1 AND rowid<=?2
+                             ORDER BY rowid LIMIT ?3
+                         )",
+                    )?;
+                    statement
+                        .query_map(
+                            params![writer_did, rowid_cutoff, SNAPSHOT_BATCH as i64],
+                            |row| row.get::<_, String>(0),
+                        )?
+                        .collect::<Result<Vec<_>, _>>()?
+                };
+                let deleted = transaction.execute(
+                    "DELETE FROM follows WHERE rowid IN (
                          SELECT rowid FROM follows WHERE actor=?1 AND rowid<=?2
                          ORDER BY rowid LIMIT ?3
                      )",
+                    params![writer_did, rowid_cutoff, SNAPSHOT_BATCH as i64],
                 )?;
-                statement
-                    .query_map(params![did, rowid_cutoff, SNAPSHOT_BATCH as i64], |row| {
-                        row.get::<_, String>(0)
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?
-            };
-            let deleted = transaction.execute(
-                "DELETE FROM follows WHERE rowid IN (
-                     SELECT rowid FROM follows WHERE actor=?1 AND rowid<=?2
-                     ORDER BY rowid LIMIT ?3
-                 )",
-                params![did, rowid_cutoff, SNAPSHOT_BATCH as i64],
-            )?;
-            transaction.commit()?;
+                transaction.commit()?;
+                Ok((actor_is_registered, subjects, deleted))
+            })?;
             if actor_is_registered {
                 let mut tracked = self.tracked.write().map_err(|_| StorageError::Poisoned)?;
                 for subject in &subjects {
                     tracked.apply_follow_delta(subject, -1);
                 }
             }
-            drop(connection);
             if deleted == 0 {
                 return Ok(());
             }
@@ -2237,17 +2546,21 @@ impl SqliteStorage {
             .collect::<Result<Vec<_>, _>>()?;
         let write_started = Instant::now();
         let cutoff_us = epoch_micros();
-        let follow_rowid_cutoff: i64 = self.conn()?.query_row(
-            "SELECT COALESCE(MAX(rowid),0) FROM follows WHERE actor=?1",
-            [did],
-            |row| row.get(0),
-        )?;
-        let scope_rowid_cutoff: i64 = self.conn()?.query_row(
-            "SELECT COALESCE(MAX(rowid),0) FROM backfill_scope
-             WHERE owner_did=?1 AND target_did!=?1",
-            [did],
-            |row| row.get(0),
-        )?;
+        let writer_did = did.to_owned();
+        let (follow_rowid_cutoff, scope_rowid_cutoff) = self.writer.call(move |connection| {
+            let follow_rowid_cutoff: i64 = connection.query_row(
+                "SELECT COALESCE(MAX(rowid),0) FROM follows WHERE actor=?1",
+                [&writer_did],
+                |row| row.get(0),
+            )?;
+            let scope_rowid_cutoff: i64 = connection.query_row(
+                "SELECT COALESCE(MAX(rowid),0) FROM backfill_scope
+                 WHERE owner_did=?1 AND target_did!=?1",
+                [&writer_did],
+                |row| row.get(0),
+            )?;
+            Ok((follow_rowid_cutoff, scope_rowid_cutoff))
+        })?;
         let mut records_written = 0_u64;
         self.delete_snapshot_rows(
             did,
@@ -2288,77 +2601,70 @@ impl SqliteStorage {
             write_started,
             &mut records_written,
         )?;
-        let mut connection = self.conn()?;
-        let transaction = connection.transaction()?;
-        let is_registered: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM registered_users WHERE did=?1)",
-            [did],
-            |row| row.get(0),
-        )?;
-        transaction.commit()?;
-        drop(connection);
-
         let follow_batches = following.chunks(SNAPSHOT_BATCH).collect::<Vec<_>>();
         for (batch_index, batch) in follow_batches.iter().enumerate() {
-            let mut connection = self.conn()?;
-            let transaction = connection.transaction()?;
-            let registered_for_tracker: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM registered_users WHERE did=?1)",
-                [did],
-                |row| row.get(0),
-            )?;
-            let mut inserted_follow_rows = 0_u64;
-            let mut inserted_subjects = Vec::new();
-            {
-                // Preserve follow changes that arrived after cleanup began.
-                // Tombstones let a live unfollow win over the fetched snapshot.
-                let mut insert_follow = transaction.prepare(
-                    "INSERT OR IGNORE INTO follows(actor,subject,following) VALUES(?1,?2,1)",
-                )?;
-                let mut insert_scope = transaction.prepare(
-                    "INSERT OR IGNORE INTO backfill_scope(owner_did,target_did) VALUES(?1,?2)",
-                )?;
-                let mut enqueue = transaction.prepare(
-                    "INSERT OR IGNORE INTO backfill_queue(did)
-                     SELECT ?1 WHERE (SELECT COUNT(*) FROM backfill_queue) < ?2
-                        OR EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
-                )?;
-                let mut set_pending = transaction.prepare(
-                    "INSERT INTO backfill_status(did,done) VALUES(?1,0)
-                     ON CONFLICT(did) DO UPDATE SET done=0",
-                )?;
-                for subject in *batch {
-                    let inserted = insert_follow.execute(params![did, subject])?;
-                    inserted_follow_rows = inserted_follow_rows.saturating_add(inserted as u64);
-                    if inserted > 0 {
-                        inserted_subjects.push(subject.clone());
-                    }
-                    let is_following: bool = transaction.query_row(
-                        "SELECT following FROM follows WHERE actor=?1 AND subject=?2",
-                        params![did, subject],
+            let writer_did = did.to_owned();
+            let writer_batch = batch.iter().map(|did| (*did).clone()).collect::<Vec<_>>();
+            let (registered_for_tracker, inserted_subjects, inserted_follow_rows) =
+                self.writer.call(move |connection| {
+                    let transaction = connection.transaction()?;
+                    let registered_for_tracker: bool = transaction.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM registered_users WHERE did=?1)",
+                        [&writer_did],
                         |row| row.get(0),
                     )?;
-                    if is_registered && is_following {
-                        enqueue.execute(params![subject, MAX_BACKFILL_QUEUE])?;
-                        if transaction.query_row(
-                            "SELECT EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
-                            [subject],
-                            |row| row.get::<_, bool>(0),
-                        )? {
-                            insert_scope.execute(params![did, subject])?;
-                            set_pending.execute([subject])?;
+                    let mut inserted_follow_rows = 0_u64;
+                    let mut inserted_subjects = Vec::new();
+                    {
+                        let mut insert_follow = transaction.prepare(
+                            "INSERT OR IGNORE INTO follows(actor,subject,following) VALUES(?1,?2,1)",
+                        )?;
+                        let mut insert_scope = transaction.prepare(
+                            "INSERT OR IGNORE INTO backfill_scope(owner_did,target_did) VALUES(?1,?2)",
+                        )?;
+                        let mut enqueue = transaction.prepare(
+                            "INSERT OR IGNORE INTO backfill_queue(did)
+                             SELECT ?1 WHERE (SELECT COUNT(*) FROM backfill_queue) < ?2
+                                OR EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
+                        )?;
+                        let mut set_pending = transaction.prepare(
+                            "INSERT INTO backfill_status(did,done) VALUES(?1,0)
+                             ON CONFLICT(did) DO UPDATE SET done=0",
+                        )?;
+                        for subject in writer_batch {
+                            let inserted = insert_follow.execute(params![writer_did, subject])?;
+                            inserted_follow_rows =
+                                inserted_follow_rows.saturating_add(inserted as u64);
+                            if inserted > 0 {
+                                inserted_subjects.push(subject.clone());
+                            }
+                            let is_following: bool = transaction.query_row(
+                                "SELECT following FROM follows WHERE actor=?1 AND subject=?2",
+                                params![writer_did, subject],
+                                |row| row.get(0),
+                            )?;
+                            if registered_for_tracker && is_following {
+                                enqueue.execute(params![subject, MAX_BACKFILL_QUEUE])?;
+                                if transaction.query_row(
+                                    "SELECT EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
+                                    [&subject],
+                                    |row| row.get::<_, bool>(0),
+                                )? {
+                                    insert_scope.execute(params![writer_did, subject])?;
+                                    set_pending.execute([subject])?;
+                                }
+                            }
                         }
                     }
-                }
-            }
-            transaction.commit()?;
+                    transaction.commit()?;
+                    Ok((registered_for_tracker, inserted_subjects, inserted_follow_rows))
+                })?;
             if registered_for_tracker {
                 let mut tracked = self.tracked.write().map_err(|_| StorageError::Poisoned)?;
                 for subject in inserted_subjects {
                     tracked.apply_follow_delta(&subject, 1);
                 }
             }
-            drop(connection);
             std::thread::yield_now();
             records_written = records_written.saturating_add(inserted_follow_rows);
             if records_per_second.is_some() && batch_index + 1 < follow_batches.len() {
@@ -2372,35 +2678,36 @@ impl SqliteStorage {
             .zip(record_json.chunks(SNAPSHOT_BATCH))
             .enumerate()
         {
-            let mut connection = self.conn()?;
-            let transaction = connection.transaction()?;
-            let mut inserted_records = 0_u64;
-            {
-                // A live event may have written one of these rows between batches;
-                // it is newer than the snapshot, so it wins.
-                let mut insert = transaction.prepare(
-                    "INSERT INTO records (did, collection, rkey, uri, cid, time_us, record_json)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                     ON CONFLICT(did, collection, rkey) DO NOTHING",
-                )?;
-                for (record, json) in batch.iter().zip(batch_json) {
-                    let inserted = insert.execute(params![
-                        record.did,
-                        record.collection,
-                        record.rkey,
-                        record.uri,
-                        record.cid,
-                        record.time_us,
-                        json,
-                    ])?;
-                    if inserted > 0 {
-                        inserted_records += inserted as u64;
-                        write_notification_events(&transaction, record)?;
+            let writer_batch = batch.to_vec();
+            let writer_json = batch_json.to_vec();
+            let inserted_records = self.writer.call(move |connection| {
+                let transaction = connection.transaction()?;
+                let mut inserted_records = 0_u64;
+                {
+                    let mut insert = transaction.prepare(
+                        "INSERT INTO records (did, collection, rkey, uri, cid, time_us, record_json)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                         ON CONFLICT(did, collection, rkey) DO NOTHING",
+                    )?;
+                    for (record, json) in writer_batch.iter().zip(&writer_json) {
+                        let inserted = insert.execute(params![
+                            record.did,
+                            record.collection,
+                            record.rkey,
+                            record.uri,
+                            record.cid,
+                            record.time_us,
+                            json,
+                        ])?;
+                        if inserted > 0 {
+                            inserted_records += inserted as u64;
+                            write_notification_events(&transaction, record)?;
+                        }
                     }
                 }
-            }
-            transaction.commit()?;
-            drop(connection);
+                transaction.commit()?;
+                Ok(inserted_records)
+            })?;
             // std's Mutex is not fair: without a yield this thread takes it straight back.
             std::thread::yield_now();
             records_written = records_written.saturating_add(inserted_records);
@@ -2424,16 +2731,20 @@ impl Storage for SqliteStorage {
             .map(|(_, subject_did, _, _)| subject_did)
             .collect::<Vec<_>>();
         let record_json = serde_json::to_string(&record.record)?;
-        let connection = self.conn()?;
-        connection.execute(
-            "INSERT INTO records (did, collection, rkey, uri, cid, time_us, record_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(did, collection, rkey) DO UPDATE SET
-                 uri=excluded.uri, cid=excluded.cid, time_us=excluded.time_us, record_json=excluded.record_json",
-            params![record.did, record.collection, record.rkey, record.uri, record.cid, record.time_us, record_json],
-        )?;
-        write_notification_events(&connection, record)?;
-        drop(connection);
+        let writer_record = record.clone();
+        self.writer.call(move |connection| {
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "INSERT INTO records (did, collection, rkey, uri, cid, time_us, record_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(did, collection, rkey) DO UPDATE SET
+                     uri=excluded.uri, cid=excluded.cid, time_us=excluded.time_us, record_json=excluded.record_json",
+                params![writer_record.did, writer_record.collection, writer_record.rkey, writer_record.uri, writer_record.cid, writer_record.time_us, record_json],
+            )?;
+            write_notification_events(&transaction, &writer_record)?;
+            transaction.commit()?;
+            Ok(())
+        })?;
         if record.collection == "app.bsky.actor.profile" {
             self.write_profile_index_status(
                 &record.did,
@@ -2454,12 +2765,13 @@ impl Storage for SqliteStorage {
         if updates.is_empty() {
             return Ok(BatchApplyTiming::default());
         }
-        let apply_started = Instant::now();
-        let mut connection = self.conn()?;
-        let transaction = connection.transaction()?;
-        let mut tracked_follow_deltas = HashMap::<String, i64>::new();
-        let mut affected = Vec::new();
-        for update in updates {
+        let writer_updates = updates.to_vec();
+        let (timing, tracked_follow_deltas, affected) = self.writer.call(move |connection| {
+            let apply_started = Instant::now();
+            let transaction = connection.transaction()?;
+            let mut tracked_follow_deltas = HashMap::<String, i64>::new();
+            let mut affected = Vec::new();
+            for update in &writer_updates {
             if let Some(did) = &update.handle_refresh {
                 transaction.execute(
                     "INSERT OR IGNORE INTO handle_refresh_queue(did) VALUES(?1)",
@@ -2570,16 +2882,24 @@ impl Storage for SqliteStorage {
                     [did],
                 )?;
             }
-        }
-        transaction.execute(
-            "INSERT INTO appview_state(key,value) VALUES('jetstream_cursor',?1)
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            [updates.last().expect("nonempty batch").time_us.to_string()],
-        )?;
-        let apply = apply_started.elapsed();
-        let commit_started = Instant::now();
-        transaction.commit()?;
-        drop(connection);
+            }
+            transaction.execute(
+                "INSERT INTO appview_state(key,value) VALUES('jetstream_cursor',?1)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [writer_updates.last().expect("nonempty batch").time_us.to_string()],
+            )?;
+            let apply = apply_started.elapsed();
+            let commit_started = Instant::now();
+            transaction.commit()?;
+            Ok((
+                BatchApplyTiming {
+                    apply,
+                    commit: commit_started.elapsed(),
+                },
+                tracked_follow_deltas,
+                affected,
+            ))
+        })?;
         for update in updates {
             if let Some(record) = &update.upsert
                 && record.collection == "app.bsky.actor.profile"
@@ -2606,43 +2926,41 @@ impl Storage for SqliteStorage {
         }
         self.apply_tracked_follow_deltas(&tracked_follow_deltas)?;
         publish_notification_counts(self, &self.notification_hub, affected);
-        Ok(BatchApplyTiming {
-            apply,
-            commit: commit_started.elapsed(),
-        })
+        Ok(timing)
     }
 
     fn record_skipped_window(&self, from: u64, to: u64) -> Result<(), StorageError> {
-        let mut connection = self.conn()?;
-        let transaction = connection.transaction()?;
-        let stored: Option<String> = transaction
-            .query_row(
-                "SELECT value FROM appview_state WHERE key='jetstream_skipped_windows'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let mut windows = stored
-            .as_deref()
-            .map(serde_json::from_str::<Vec<SkippedCursorWindow>>)
-            .transpose()?
-            .unwrap_or_default();
-        windows.push(SkippedCursorWindow { from, to });
-        if windows.len() > 128 {
-            windows.drain(..windows.len() - 128);
-        }
-        transaction.execute(
-            "INSERT INTO appview_state(key,value) VALUES('jetstream_skipped_windows',?1)
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            [serde_json::to_string(&windows)?],
-        )?;
-        transaction.execute(
-            "INSERT INTO appview_state(key,value) VALUES('jetstream_cursor',?1)
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            [to.to_string()],
-        )?;
-        transaction.commit()?;
-        Ok(())
+        self.writer.call(move |connection| {
+            let transaction = connection.transaction()?;
+            let stored: Option<String> = transaction
+                .query_row(
+                    "SELECT value FROM appview_state WHERE key='jetstream_skipped_windows'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let mut windows = stored
+                .as_deref()
+                .map(serde_json::from_str::<Vec<SkippedCursorWindow>>)
+                .transpose()?
+                .unwrap_or_default();
+            windows.push(SkippedCursorWindow { from, to });
+            if windows.len() > 128 {
+                windows.drain(..windows.len() - 128);
+            }
+            transaction.execute(
+                "INSERT INTO appview_state(key,value) VALUES('jetstream_skipped_windows',?1)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [serde_json::to_string(&windows)?],
+            )?;
+            transaction.execute(
+                "INSERT INTO appview_state(key,value) VALUES('jetstream_cursor',?1)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [to.to_string()],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
     }
 
     fn skipped_windows(&self) -> Result<Vec<SkippedCursorWindow>, StorageError> {
@@ -2730,16 +3048,22 @@ impl Storage for SqliteStorage {
                 })?
                 .collect::<Result<Vec<_>, _>>()?
         };
-        let connection = self.conn()?;
-        connection.execute(
-            "DELETE FROM records WHERE did=?1 AND collection=?2 AND rkey=?3",
-            params![did, collection, rkey],
-        )?;
-        connection.execute(
-            "DELETE FROM notification_events WHERE source_did=?1 AND source_collection=?2 AND source_rkey=?3",
-            params![did, collection, rkey],
-        )?;
-        drop(connection);
+        let writer_did = did.to_owned();
+        let writer_collection = collection.to_owned();
+        let writer_rkey = rkey.to_owned();
+        self.writer.call(move |connection| {
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "DELETE FROM records WHERE did=?1 AND collection=?2 AND rkey=?3",
+                params![writer_did, writer_collection, writer_rkey],
+            )?;
+            transaction.execute(
+                "DELETE FROM notification_events WHERE source_did=?1 AND source_collection=?2 AND source_rkey=?3",
+                params![writer_did, writer_collection, writer_rkey],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })?;
         if collection == "app.bsky.actor.profile" {
             self.write_profile_index_status(
                 did,
@@ -2932,19 +3256,40 @@ impl Storage for SqliteStorage {
         did: &str,
         entry: ProfileIndexEntry,
     ) -> Result<(), StorageError> {
-        self.write_profile_index_status(did, entry)
+        let writer_did = did.to_owned();
+        self.writer.fire(move |connection| {
+            connection.execute(
+                "INSERT INTO profile_index_status(did,has_profile,fetched_at_ms)
+                 VALUES(?1,?2,?3)
+                 ON CONFLICT(did) DO UPDATE SET
+                     has_profile=excluded.has_profile,fetched_at_ms=excluded.fetched_at_ms",
+                params![writer_did, entry.has_profile, entry.fetched_at_ms],
+            )?;
+            Ok(None)
+        });
+        self.profile_index
+            .write()
+            .map_err(|_| StorageError::Poisoned)?
+            .insert(did.to_owned(), entry);
+        Ok(())
     }
 
     fn enqueue_profile_fetches(&self, dids: &[String]) -> Result<(), StorageError> {
-        let connection = self.conn()?;
-        for did in dids {
-            connection.execute(
-                "INSERT OR IGNORE INTO profile_fetch_queue(did)
-                 SELECT ?1 WHERE (SELECT COUNT(*) FROM profile_fetch_queue) < ?2
-                    OR EXISTS(SELECT 1 FROM profile_fetch_queue WHERE did=?1)",
-                params![did, MAX_PROFILE_FETCH_QUEUE],
-            )?;
+        if dids.is_empty() {
+            return Ok(());
         }
+        let writer_dids = dids.to_vec();
+        self.writer.fire(move |connection| {
+            for did in writer_dids {
+                connection.execute(
+                    "INSERT OR IGNORE INTO profile_fetch_queue(did)
+                     SELECT ?1 WHERE (SELECT COUNT(*) FROM profile_fetch_queue) < ?2
+                        OR EXISTS(SELECT 1 FROM profile_fetch_queue WHERE did=?1)",
+                    params![did, MAX_PROFILE_FETCH_QUEUE],
+                )?;
+            }
+            Ok(None)
+        });
         Ok(())
     }
 
@@ -2961,9 +3306,11 @@ impl Storage for SqliteStorage {
     }
 
     fn complete_profile_fetch(&self, did: &str) -> Result<(), StorageError> {
-        self.conn()?
-            .execute("DELETE FROM profile_fetch_queue WHERE did=?1", [did])?;
-        Ok(())
+        let writer_did = did.to_owned();
+        self.writer.call(move |connection| {
+            connection.execute("DELETE FROM profile_fetch_queue WHERE did=?1", [writer_did])?;
+            Ok(())
+        })
     }
 
     fn notifications_for(
@@ -3027,12 +3374,26 @@ impl Storage for SqliteStorage {
     }
 
     fn mark_notifications_seen(&self, did: &str, time_us: u64) -> Result<(), StorageError> {
-        self.conn()?.execute(
-            "INSERT INTO notification_last_seen(viewer_did,time_us) VALUES(?1,?2)
-             ON CONFLICT(viewer_did) DO UPDATE SET time_us=MAX(time_us,excluded.time_us)",
-            params![did, time_us.min(i64::MAX as u64) as i64],
-        )?;
-        publish_notification_counts(self, &self.notification_hub, [did.to_owned()]);
+        let writer_did = did.to_owned();
+        let hub = self.notification_hub.clone();
+        self.writer.fire(move |connection| {
+            connection.execute(
+                "INSERT INTO notification_last_seen(viewer_did,time_us) VALUES(?1,?2)
+                 ON CONFLICT(viewer_did) DO UPDATE SET time_us=MAX(time_us,excluded.time_us)",
+                params![writer_did, time_us.min(i64::MAX as u64) as i64],
+            )?;
+            let unread: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM notification_events
+                 WHERE subject_did=?1 AND time_us > COALESCE(
+                     (SELECT time_us FROM notification_last_seen WHERE viewer_did=?1), 0
+                 )",
+                [&writer_did],
+                |row| row.get(0),
+            )?;
+            Ok(Some(Box::new(move || {
+                hub.publish(&writer_did, unread as usize)
+            })))
+        });
         Ok(())
     }
 
@@ -3176,53 +3537,58 @@ impl Storage for SqliteStorage {
     }
 
     fn set_cursor(&self, cursor: u64) -> Result<(), StorageError> {
-        self.conn()?.execute(
-            "INSERT INTO appview_state(key,value) VALUES('jetstream_cursor',?1)
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            [cursor.to_string()],
-        )?;
-        Ok(())
+        self.writer.call(move |connection| {
+            connection.execute(
+                "INSERT INTO appview_state(key,value) VALUES('jetstream_cursor',?1)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [cursor.to_string()],
+            )?;
+            Ok(())
+        })
     }
 
     fn register_user(&self, did: &str) -> Result<(), StorageError> {
-        let mut connection = self.conn()?;
-        let transaction = connection.transaction()?;
-        let was_registered: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM registered_users WHERE did=?1)",
-            [did],
-            |row| row.get(0),
-        )?;
-        let active_subjects = if was_registered {
-            Vec::new()
-        } else {
-            let mut statement = transaction
-                .prepare("SELECT subject FROM follows WHERE actor=?1 AND following=1")?;
-            statement
-                .query_map([did], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        transaction.execute(
-            "INSERT OR IGNORE INTO registered_users(did) VALUES(?1)",
-            [did],
-        )?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO backfill_queue(did)
-             SELECT ?1 WHERE (SELECT COUNT(*) FROM backfill_queue) < ?2
-                OR EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
-            params![did, MAX_BACKFILL_QUEUE],
-        )?;
-        transaction.execute(
-            "INSERT INTO backfill_status(did,done) VALUES(?1,0)
-             ON CONFLICT(did) DO UPDATE SET done=0
-             WHERE EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
-            [did],
-        )?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO backfill_scope(owner_did,target_did)
-             SELECT ?1,?1 WHERE EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
-            [did],
-        )?;
-        transaction.commit()?;
+        let writer_did = did.to_owned();
+        let (was_registered, active_subjects) = self.writer.call(move |connection| {
+            let transaction = connection.transaction()?;
+            let was_registered: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM registered_users WHERE did=?1)",
+                [&writer_did],
+                |row| row.get(0),
+            )?;
+            let active_subjects = if was_registered {
+                Vec::new()
+            } else {
+                let mut statement = transaction
+                    .prepare("SELECT subject FROM follows WHERE actor=?1 AND following=1")?;
+                statement
+                    .query_map([&writer_did], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            transaction.execute(
+                "INSERT OR IGNORE INTO registered_users(did) VALUES(?1)",
+                [&writer_did],
+            )?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO backfill_queue(did)
+                 SELECT ?1 WHERE (SELECT COUNT(*) FROM backfill_queue) < ?2
+                    OR EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
+                params![writer_did, MAX_BACKFILL_QUEUE],
+            )?;
+            transaction.execute(
+                "INSERT INTO backfill_status(did,done) VALUES(?1,0)
+                 ON CONFLICT(did) DO UPDATE SET done=0
+                 WHERE EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
+                [&writer_did],
+            )?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO backfill_scope(owner_did,target_did)
+                 SELECT ?1,?1 WHERE EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
+                [&writer_did],
+            )?;
+            transaction.commit()?;
+            Ok((was_registered, active_subjects))
+        })?;
         if !was_registered {
             let mut tracked = self.tracked.write().map_err(|_| StorageError::Poisoned)?;
             tracked.registered.insert(did.to_owned());
@@ -3234,33 +3600,39 @@ impl Storage for SqliteStorage {
     }
 
     fn unregister_user(&self, did: &str) -> Result<(), StorageError> {
-        let mut connection = self.conn()?;
-        let transaction = connection.transaction()?;
-        let was_registered: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM registered_users WHERE did=?1)",
-            [did],
-            |row| row.get(0),
-        )?;
-        let active_subjects = if was_registered {
-            let mut statement = transaction
-                .prepare("SELECT subject FROM follows WHERE actor=?1 AND following=1")?;
-            statement
-                .query_map([did], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?
-        } else {
-            Vec::new()
-        };
-        transaction.execute("DELETE FROM registered_users WHERE did=?1", [did])?;
-        transaction.execute("DELETE FROM follows WHERE actor=?1", [did])?;
-        transaction.execute("DELETE FROM backfill_scope WHERE owner_did=?1", [did])?;
-        transaction.execute(
-            "DELETE FROM backfill_queue WHERE did=?1 AND NOT EXISTS (
-                 SELECT 1 FROM follows f JOIN registered_users r ON f.actor=r.did
-                 WHERE f.subject=?1 AND f.following=1
-             )",
-            [did],
-        )?;
-        transaction.commit()?;
+        let writer_did = did.to_owned();
+        let (was_registered, active_subjects) = self.writer.call(move |connection| {
+            let transaction = connection.transaction()?;
+            let was_registered: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM registered_users WHERE did=?1)",
+                [&writer_did],
+                |row| row.get(0),
+            )?;
+            let active_subjects = if was_registered {
+                let mut statement = transaction
+                    .prepare("SELECT subject FROM follows WHERE actor=?1 AND following=1")?;
+                statement
+                    .query_map([&writer_did], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?
+            } else {
+                Vec::new()
+            };
+            transaction.execute("DELETE FROM registered_users WHERE did=?1", [&writer_did])?;
+            transaction.execute("DELETE FROM follows WHERE actor=?1", [&writer_did])?;
+            transaction.execute(
+                "DELETE FROM backfill_scope WHERE owner_did=?1",
+                [&writer_did],
+            )?;
+            transaction.execute(
+                "DELETE FROM backfill_queue WHERE did=?1 AND NOT EXISTS (
+                     SELECT 1 FROM follows f JOIN registered_users r ON f.actor=r.did
+                     WHERE f.subject=?1 AND f.following=1
+                 )",
+                [&writer_did],
+            )?;
+            transaction.commit()?;
+            Ok((was_registered, active_subjects))
+        })?;
         if was_registered {
             let mut tracked = self.tracked.write().map_err(|_| StorageError::Poisoned)?;
             tracked.registered.remove(did);
@@ -3281,32 +3653,36 @@ impl Storage for SqliteStorage {
     }
 
     fn set_follow(&self, actor: &str, subject: &str, following: bool) -> Result<(), StorageError> {
-        let mut connection = self.conn()?;
-        let transaction = connection.transaction()?;
-        let actor_is_registered: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM registered_users WHERE did=?1)",
-            [actor],
-            |row| row.get(0),
-        )?;
-        let was_following: Option<bool> = transaction
-            .query_row(
-                "SELECT following FROM follows WHERE actor=?1 AND subject=?2",
-                params![actor, subject],
+        let writer_actor = actor.to_owned();
+        let writer_subject = subject.to_owned();
+        let (actor_is_registered, was_following) = self.writer.call(move |connection| {
+            let transaction = connection.transaction()?;
+            let actor_is_registered: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM registered_users WHERE did=?1)",
+                [&writer_actor],
                 |row| row.get(0),
-            )
-            .optional()?;
-        let was_following = was_following.unwrap_or(false);
-        transaction.execute(
-            "INSERT OR REPLACE INTO follows(actor,subject,following) VALUES(?1,?2,?3)",
-            params![actor, subject, following],
-        )?;
-        if !following {
-            transaction.execute(
-                "DELETE FROM backfill_scope WHERE owner_did=?1 AND target_did=?2",
-                params![actor, subject],
             )?;
-        }
-        transaction.commit()?;
+            let was_following: Option<bool> = transaction
+                .query_row(
+                    "SELECT following FROM follows WHERE actor=?1 AND subject=?2",
+                    params![writer_actor, writer_subject],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let was_following = was_following.unwrap_or(false);
+            transaction.execute(
+                "INSERT OR REPLACE INTO follows(actor,subject,following) VALUES(?1,?2,?3)",
+                params![writer_actor, writer_subject, following],
+            )?;
+            if !following {
+                transaction.execute(
+                    "DELETE FROM backfill_scope WHERE owner_did=?1 AND target_did=?2",
+                    params![writer_actor, writer_subject],
+                )?;
+            }
+            transaction.commit()?;
+            Ok((actor_is_registered, was_following))
+        })?;
         if actor_is_registered && was_following != following {
             self.apply_tracked_follow_deltas(&HashMap::from([(
                 subject.to_owned(),
@@ -3337,55 +3713,60 @@ impl Storage for SqliteStorage {
     }
 
     fn enqueue_backfill(&self, did: &str) -> Result<(), StorageError> {
-        let mut connection = self.conn()?;
-        let transaction = connection.transaction()?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO backfill_queue(did)
-             SELECT ?1
-             WHERE ((SELECT COUNT(*) FROM backfill_queue) < ?2
-                    OR EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1))
-               AND (EXISTS(SELECT 1 FROM registered_users WHERE did=?1)
-                    OR EXISTS(SELECT 1 FROM follows f JOIN registered_users r ON r.did=f.actor
-                              WHERE f.subject=?1 AND f.following=1))",
-            params![did, MAX_BACKFILL_QUEUE],
-        )?;
-        transaction.execute(
-            "INSERT INTO backfill_status(did,done) VALUES(?1,0)
-             ON CONFLICT(did) DO UPDATE SET done=0
-             WHERE EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
-            [did],
-        )?;
-        transaction.commit()?;
-        Ok(())
+        let writer_did = did.to_owned();
+        self.writer.call(move |connection| {
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO backfill_queue(did)
+                 SELECT ?1
+                 WHERE ((SELECT COUNT(*) FROM backfill_queue) < ?2
+                        OR EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1))
+                   AND (EXISTS(SELECT 1 FROM registered_users WHERE did=?1)
+                        OR EXISTS(SELECT 1 FROM follows f JOIN registered_users r ON r.did=f.actor
+                                  WHERE f.subject=?1 AND f.following=1))",
+                params![writer_did, MAX_BACKFILL_QUEUE],
+            )?;
+            transaction.execute(
+                "INSERT INTO backfill_status(did,done) VALUES(?1,0)
+                 ON CONFLICT(did) DO UPDATE SET done=0
+                 WHERE EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
+                [&writer_did],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
     }
 
     fn enqueue_backfill_for(&self, owner_did: &str, did: &str) -> Result<(), StorageError> {
-        let mut connection = self.conn()?;
-        let transaction = connection.transaction()?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO backfill_queue(did)
-             SELECT ?2
-             WHERE ((SELECT COUNT(*) FROM backfill_queue) < ?3
-                    OR EXISTS(SELECT 1 FROM backfill_queue WHERE did=?2))
-               AND EXISTS(SELECT 1 FROM registered_users WHERE did=?1)
-               AND (?1=?2 OR EXISTS(SELECT 1 FROM follows WHERE actor=?1 AND subject=?2 AND following=1))",
-            params![owner_did, did, MAX_BACKFILL_QUEUE],
-        )?;
-        transaction.execute(
-            "INSERT OR REPLACE INTO backfill_scope(owner_did,target_did)
-             SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM backfill_queue WHERE did=?2)
-               AND EXISTS(SELECT 1 FROM registered_users WHERE did=?1)
-               AND (?1=?2 OR EXISTS(SELECT 1 FROM follows WHERE actor=?1 AND subject=?2 AND following=1))",
-            params![owner_did, did],
-        )?;
-        transaction.execute(
-            "INSERT INTO backfill_status(did,done) VALUES(?1,0)
-             ON CONFLICT(did) DO UPDATE SET done=0
-             WHERE EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
-            [did],
-        )?;
-        transaction.commit()?;
-        Ok(())
+        let writer_owner = owner_did.to_owned();
+        let writer_did = did.to_owned();
+        self.writer.call(move |connection| {
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO backfill_queue(did)
+                 SELECT ?2
+                 WHERE ((SELECT COUNT(*) FROM backfill_queue) < ?3
+                        OR EXISTS(SELECT 1 FROM backfill_queue WHERE did=?2))
+                   AND EXISTS(SELECT 1 FROM registered_users WHERE did=?1)
+                   AND (?1=?2 OR EXISTS(SELECT 1 FROM follows WHERE actor=?1 AND subject=?2 AND following=1))",
+                params![writer_owner, writer_did, MAX_BACKFILL_QUEUE],
+            )?;
+            transaction.execute(
+                "INSERT OR REPLACE INTO backfill_scope(owner_did,target_did)
+                 SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM backfill_queue WHERE did=?2)
+                   AND EXISTS(SELECT 1 FROM registered_users WHERE did=?1)
+                   AND (?1=?2 OR EXISTS(SELECT 1 FROM follows WHERE actor=?1 AND subject=?2 AND following=1))",
+                params![writer_owner, writer_did],
+            )?;
+            transaction.execute(
+                "INSERT INTO backfill_status(did,done) VALUES(?1,0)
+                 ON CONFLICT(did) DO UPDATE SET done=0
+                 WHERE EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
+                [&writer_did],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
     }
 
     fn pending_backfills(&self) -> Result<Vec<String>, StorageError> {
@@ -3404,40 +3785,44 @@ impl Storage for SqliteStorage {
     }
 
     fn complete_backfill(&self, did: &str) -> Result<(), StorageError> {
-        let mut connection = self.conn()?;
-        let transaction = connection.transaction()?;
-        transaction.execute("DELETE FROM backfill_queue WHERE did=?1", [did])?;
-        transaction.execute("DELETE FROM backfill_retry WHERE did=?1", [did])?;
-        transaction.execute(
-            "INSERT INTO backfill_status(did,done) VALUES(?1,1)
-             ON CONFLICT(did) DO UPDATE SET done=1",
-            [did],
-        )?;
-        transaction.commit()?;
-        Ok(())
+        let writer_did = did.to_owned();
+        self.writer.call(move |connection| {
+            let transaction = connection.transaction()?;
+            transaction.execute("DELETE FROM backfill_queue WHERE did=?1", [&writer_did])?;
+            transaction.execute("DELETE FROM backfill_retry WHERE did=?1", [&writer_did])?;
+            transaction.execute(
+                "INSERT INTO backfill_status(did,done) VALUES(?1,1)
+                 ON CONFLICT(did) DO UPDATE SET done=1",
+                [&writer_did],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
     }
 
     fn record_backfill_failure(&self, did: &str) -> Result<Duration, StorageError> {
-        let mut connection = self.conn()?;
-        let transaction = connection.transaction()?;
-        let failures = transaction
-            .query_row(
-                "SELECT failures FROM backfill_retry WHERE did=?1",
-                [did],
-                |row| row.get::<_, u32>(0),
-            )
-            .optional()?
-            .unwrap_or(0_u32)
-            .saturating_add(1);
-        let delay = backfill_retry_delay(failures);
-        let retry_at_ms = epoch_millis().saturating_add(delay.as_millis() as i64);
-        transaction.execute(
-            "INSERT INTO backfill_retry(did,failures,retry_at_ms) VALUES(?1,?2,?3)
-             ON CONFLICT(did) DO UPDATE SET failures=excluded.failures,retry_at_ms=excluded.retry_at_ms",
-            params![did, failures, retry_at_ms],
-        )?;
-        transaction.commit()?;
-        Ok(delay)
+        let writer_did = did.to_owned();
+        self.writer.call(move |connection| {
+            let transaction = connection.transaction()?;
+            let failures = transaction
+                .query_row(
+                    "SELECT failures FROM backfill_retry WHERE did=?1",
+                    [&writer_did],
+                    |row| row.get::<_, u32>(0),
+                )
+                .optional()?
+                .unwrap_or(0_u32)
+                .saturating_add(1);
+            let delay = backfill_retry_delay(failures);
+            let retry_at_ms = epoch_millis().saturating_add(delay.as_millis() as i64);
+            transaction.execute(
+                "INSERT INTO backfill_retry(did,failures,retry_at_ms) VALUES(?1,?2,?3)
+                 ON CONFLICT(did) DO UPDATE SET failures=excluded.failures,retry_at_ms=excluded.retry_at_ms",
+                params![writer_did, failures, retry_at_ms],
+            )?;
+            transaction.commit()?;
+            Ok(delay)
+        })
     }
 
     fn backfill_progress(&self, owner_did: &str) -> Result<(usize, usize), StorageError> {
@@ -3464,25 +3849,34 @@ impl Storage for SqliteStorage {
     }
 
     fn set_verified_handle(&self, did: &str, handle: &str) -> Result<(), StorageError> {
-        let connection = self.conn()?;
-        connection.execute(
-            "INSERT INTO verified_handles(did,handle,updated_at) VALUES(?1,?2,unixepoch())
-             ON CONFLICT(did) DO UPDATE SET handle=excluded.handle,updated_at=unixepoch()",
-            params![did, handle],
-        )?;
-        connection.execute("DELETE FROM invalid_handles WHERE did=?1", [did])?;
-        Ok(())
+        let writer_did = did.to_owned();
+        let writer_handle = handle.to_owned();
+        self.writer.call(move |connection| {
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "INSERT INTO verified_handles(did,handle,updated_at) VALUES(?1,?2,unixepoch())
+                 ON CONFLICT(did) DO UPDATE SET handle=excluded.handle,updated_at=unixepoch()",
+                params![writer_did, writer_handle],
+            )?;
+            transaction.execute("DELETE FROM invalid_handles WHERE did=?1", [&writer_did])?;
+            transaction.commit()?;
+            Ok(())
+        })
     }
 
     fn clear_verified_handle(&self, did: &str) -> Result<(), StorageError> {
-        let connection = self.conn()?;
-        connection.execute("DELETE FROM verified_handles WHERE did=?1", [did])?;
-        connection.execute(
-            "INSERT INTO invalid_handles(did,checked_at) VALUES(?1,unixepoch())
-             ON CONFLICT(did) DO UPDATE SET checked_at=unixepoch()",
-            [did],
-        )?;
-        Ok(())
+        let writer_did = did.to_owned();
+        self.writer.call(move |connection| {
+            let transaction = connection.transaction()?;
+            transaction.execute("DELETE FROM verified_handles WHERE did=?1", [&writer_did])?;
+            transaction.execute(
+                "INSERT INTO invalid_handles(did,checked_at) VALUES(?1,unixepoch())
+                 ON CONFLICT(did) DO UPDATE SET checked_at=unixepoch()",
+                [&writer_did],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
     }
 
     fn verified_handle(&self, did: &str) -> Result<Option<String>, StorageError> {
@@ -3505,26 +3899,29 @@ impl Storage for SqliteStorage {
     }
 
     fn rotate_web_session(&self, did: &str, session_id: &str) -> Result<u64, StorageError> {
-        let mut connection = self.conn()?;
-        let transaction = connection.transaction()?;
-        let current = transaction
-            .query_row(
-                "SELECT generation FROM web_sessions WHERE did=?1 AND session_id=?2",
-                params![did, session_id],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-            .unwrap_or(0);
-        let next = current
-            .checked_add(1)
-            .ok_or(rusqlite::Error::InvalidQuery)?;
-        transaction.execute(
-            "INSERT INTO web_sessions(did,session_id,generation) VALUES(?1,?2,?3)
-             ON CONFLICT(did,session_id) DO UPDATE SET generation=excluded.generation",
-            params![did, session_id, next],
-        )?;
-        transaction.commit()?;
-        u64::try_from(next).map_err(|_| rusqlite::Error::InvalidQuery.into())
+        let writer_did = did.to_owned();
+        let writer_session_id = session_id.to_owned();
+        self.writer.call(move |connection| {
+            let transaction = connection.transaction()?;
+            let current = transaction
+                .query_row(
+                    "SELECT generation FROM web_sessions WHERE did=?1 AND session_id=?2",
+                    params![writer_did, writer_session_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            let next = current
+                .checked_add(1)
+                .ok_or(rusqlite::Error::InvalidQuery)?;
+            transaction.execute(
+                "INSERT INTO web_sessions(did,session_id,generation) VALUES(?1,?2,?3)
+                 ON CONFLICT(did,session_id) DO UPDATE SET generation=excluded.generation",
+                params![writer_did, writer_session_id, next],
+            )?;
+            transaction.commit()?;
+            u64::try_from(next).map_err(|_| rusqlite::Error::InvalidQuery.into())
+        })
     }
 
     fn web_session_generation(
@@ -3609,96 +4006,73 @@ impl Storage for SqliteStorage {
     }
 
     fn queue_handle_refresh(&self, did: &str) -> Result<(), StorageError> {
-        match self.connection.try_lock() {
-            Ok(connection) => {
-                connection.execute(
-                    "INSERT OR IGNORE INTO handle_refresh_queue(did) VALUES(?1)",
-                    [did],
-                )?;
-            }
-            Err(TryLockError::WouldBlock) => {
-                self.deferred_handle_refreshes
-                    .lock()
-                    .map_err(|_| StorageError::Poisoned)?
-                    .insert(did.to_owned());
-            }
-            Err(TryLockError::Poisoned(_)) => return Err(StorageError::Poisoned),
-        }
+        let writer_did = did.to_owned();
+        self.writer.fire(move |connection| {
+            connection.execute(
+                "INSERT OR IGNORE INTO handle_refresh_queue(did,priority)
+                 VALUES(?1, COALESCE((SELECT MAX(priority) FROM handle_refresh_queue),0)+1)",
+                [&writer_did],
+            )?;
+            Ok(None)
+        });
         Ok(())
     }
 
     fn queue_handle_refresh_ordered(&self, dids: &[String]) -> Result<(), StorageError> {
-        let mut connection = self.conn()?;
-        let transaction = connection.transaction()?;
-        let mut statement =
-            transaction.prepare("SELECT did FROM handle_refresh_queue ORDER BY rowid")?;
-        let existing = statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(statement);
+        if dids.is_empty() {
+            return Ok(());
+        }
         let mut seen = HashSet::new();
-        let mut ordered = dids
+        let ordered = dids
             .iter()
-            .chain(existing.iter())
             .filter(|did| seen.insert((*did).clone()))
             .cloned()
             .collect::<Vec<_>>();
-        {
-            let mut deferred = self
-                .deferred_handle_refreshes
-                .lock()
-                .map_err(|_| StorageError::Poisoned)?;
-            let mut rest = deferred.iter().cloned().collect::<Vec<_>>();
-            rest.sort();
-            for did in rest {
-                if seen.insert(did.clone()) {
-                    ordered.push(did);
-                }
+        let did_count = ordered.len() as i64;
+        self.writer.fire(move |connection| {
+            let max_priority: i64 = connection.query_row(
+                "SELECT COALESCE(MAX(priority),0) FROM handle_refresh_queue",
+                [],
+                |row| row.get(0),
+            )?;
+            let first_priority = max_priority.saturating_add(did_count);
+            let mut statement = connection.prepare(
+                "INSERT INTO handle_refresh_queue(did,priority) VALUES(?1,?2)
+                 ON CONFLICT(did) DO UPDATE SET priority=MAX(priority,excluded.priority)",
+            )?;
+            for (index, did) in ordered.into_iter().enumerate() {
+                let priority = first_priority.saturating_sub(index as i64);
+                statement.execute(params![did, priority])?;
             }
-            for did in dids {
-                deferred.remove(did);
-            }
-        }
-        transaction.execute("DELETE FROM handle_refresh_queue", [])?;
-        for did in ordered {
-            transaction.execute("INSERT INTO handle_refresh_queue(did) VALUES(?1)", [did])?;
-        }
-        transaction.commit()?;
+            Ok(None)
+        });
         Ok(())
     }
 
     fn pending_handle_refreshes(&self, limit: usize) -> Result<Vec<String>, StorageError> {
         let limit = limit.max(1);
-        let mut dids = self
-            .deferred_handle_refreshes
-            .lock()
-            .map_err(|_| StorageError::Poisoned)?
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
+        self.writer.flush()?;
         let connection = self.read_conn()?;
-        let mut prioritized = {
-            let mut statement = connection
-                .prepare("SELECT did FROM handle_refresh_queue ORDER BY rowid LIMIT ?1")?;
+        let prioritized = {
+            let mut statement = connection.prepare(
+                "SELECT did FROM handle_refresh_queue ORDER BY priority DESC,rowid LIMIT ?1",
+            )?;
             statement
                 .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| row.get(0))?
                 .collect::<Result<Vec<String>, _>>()?
         };
-        dids.sort();
-        prioritized.append(&mut dids);
-        prioritized.dedup();
-        prioritized.truncate(limit);
         Ok(prioritized)
     }
 
     fn complete_handle_refresh(&self, did: &str) -> Result<(), StorageError> {
-        self.deferred_handle_refreshes
-            .lock()
-            .map_err(|_| StorageError::Poisoned)?
-            .remove(did);
-        self.conn()?
-            .execute("DELETE FROM handle_refresh_queue WHERE did=?1", [did])?;
-        Ok(())
+        let writer_did = did.to_owned();
+        self.writer.call(move |connection| {
+            connection.execute(
+                "DELETE FROM handle_refresh_queue WHERE did=?1",
+                [writer_did],
+            )?;
+            Ok(())
+        })
     }
 
     fn bytes_on_disk(&self) -> u64 {
@@ -4558,9 +4932,11 @@ mod backfill_resource_tests {
 
         let memory_count = memory.inner.lock().unwrap().backfill_queue.len();
         let sqlite_count: usize = sqlite
-            .conn()
-            .unwrap()
-            .query_row("SELECT COUNT(*) FROM backfill_queue", [], |row| row.get(0))
+            .writer
+            .call(|connection| {
+                Ok(connection
+                    .query_row("SELECT COUNT(*) FROM backfill_queue", [], |row| row.get(0))?)
+            })
             .unwrap();
         assert!(
             memory_count <= 1_000,
@@ -4585,24 +4961,27 @@ mod backfill_resource_tests {
                     .as_nanos()
             ));
         let storage = SqliteStorage::open(&path).unwrap();
-        {
-            let connection = storage.conn().unwrap();
-            for index in 0..=1_000 {
-                connection
-                    .execute(
+        storage
+            .writer
+            .call(|connection| {
+                for index in 0..=1_000 {
+                    connection.execute(
                         "INSERT INTO backfill_queue(did) VALUES(?1)",
                         [format!("did:plc:legacy-{index:04}")],
-                    )
-                    .unwrap();
-            }
-        }
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
         drop(storage);
 
         let reopened = SqliteStorage::open(&path).unwrap();
         let queue_count: usize = reopened
-            .conn()
-            .unwrap()
-            .query_row("SELECT COUNT(*) FROM backfill_queue", [], |row| row.get(0))
+            .writer
+            .call(|connection| {
+                Ok(connection
+                    .query_row("SELECT COUNT(*) FROM backfill_queue", [], |row| row.get(0))?)
+            })
             .unwrap();
         drop(reopened);
         std::fs::remove_file(&path).unwrap();
@@ -4649,16 +5028,211 @@ mod jetstream_catchup_tests {
         assert_eq!(skipped.last().unwrap().from, stale_cursor);
         assert_eq!(skipped.last().unwrap().to, reconnect_cursor);
         let persisted: String = storage
-            .conn()
-            .unwrap()
-            .query_row(
-                "SELECT value FROM appview_state WHERE key='jetstream_skipped_windows'",
-                [],
-                |row| row.get(0),
-            )
+            .writer
+            .call(|connection| {
+                Ok(connection.query_row(
+                    "SELECT value FROM appview_state WHERE key='jetstream_skipped_windows'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
             .unwrap();
         assert!(persisted.contains(&stale_cursor.to_string()));
         assert!(persisted.contains(&reconnect_cursor.to_string()));
         assert_eq!(storage.cursor().unwrap(), Some(reconnect_cursor));
+    }
+}
+
+#[cfg(test)]
+mod sqlite_writer_tests {
+    use super::*;
+
+    fn test_path(label: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!(
+                "sqlite-writer-{label}-{}-{}.sqlite3",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))
+    }
+
+    fn remove_database(path: &Path) {
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(format!("{}-wal", path.display()));
+        let _ = fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn page_read_and_refresh_enqueue_finish_while_ingest_holds_the_writer() {
+        let path = test_path("writer-latency");
+        let storage = Arc::new(SqliteStorage::open(&path).unwrap());
+        let writer_storage = Arc::clone(&storage);
+        let (started_tx, started_rx) = mpsc::channel();
+        let ingest = std::thread::spawn(move || {
+            writer_storage
+                .writer
+                .call(move |connection| {
+                    let transaction = connection.transaction()?;
+                    transaction.execute(
+                        "INSERT INTO records(did,collection,rkey,uri,time_us,record_json)
+                         VALUES('did:plc:hold','app.bsky.feed.post','hold','at://did:plc:hold/app.bsky.feed.post/hold',1,'{}')",
+                        [],
+                    )?;
+                    started_tx.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(250));
+                    transaction.commit()?;
+                    Ok(())
+                })
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+
+        let request_started = Instant::now();
+        assert!(
+            storage
+                .get_record("did:plc:hold", "app.bsky.feed.post", "hold")
+                .unwrap()
+                .is_none()
+        );
+        storage
+            .queue_handle_refresh_ordered(&["did:plc:page-author".to_owned()])
+            .unwrap();
+        let elapsed = request_started.elapsed();
+
+        ingest.join().unwrap();
+        storage.writer.flush().unwrap();
+        drop(storage);
+        remove_database(&path);
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "page request waited {elapsed:?} while the writer held an ingest transaction"
+        );
+    }
+
+    #[test]
+    fn fire_and_forget_queue_write_is_visible_after_a_writer_barrier() {
+        let storage = SqliteStorage::open(":memory:").unwrap();
+        storage
+            .queue_handle_refresh_ordered(&[
+                "did:plc:first".to_owned(),
+                "did:plc:second".to_owned(),
+            ])
+            .unwrap();
+        storage.writer.flush().unwrap();
+        assert_eq!(
+            storage.pending_handle_refreshes(10).unwrap(),
+            ["did:plc:first", "did:plc:second"]
+        );
+    }
+
+    #[test]
+    fn full_writer_queue_drops_page_writes_without_waiting_and_counts_them() {
+        let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
+        let writer_storage = Arc::clone(&storage);
+        let (started_tx, started_rx) = mpsc::channel();
+        let ingest = std::thread::spawn(move || {
+            writer_storage
+                .writer
+                .call(move |connection| {
+                    let transaction = connection.transaction()?;
+                    transaction.execute(
+                        "INSERT INTO appview_state(key,value) VALUES('writer-test','held')",
+                        [],
+                    )?;
+                    started_tx.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(250));
+                    transaction.commit()?;
+                    Ok(())
+                })
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+
+        let dropped_before = storage.writer.metrics.dropped.load(Ordering::Relaxed);
+        for index in 0..SQLITE_WRITER_QUEUE {
+            storage
+                .queue_handle_refresh(&format!("did:plc:queued-{index}"))
+                .unwrap();
+        }
+        let request_started = Instant::now();
+        storage
+            .queue_handle_refresh("did:plc:overflow-request")
+            .unwrap();
+        let elapsed = request_started.elapsed();
+        let dropped_after = storage.writer.metrics.dropped.load(Ordering::Relaxed);
+
+        ingest.join().unwrap();
+        storage.writer.flush().unwrap();
+        drop(storage);
+        assert!(
+            elapsed < Duration::from_millis(30),
+            "full request queue blocked for {elapsed:?}"
+        );
+        assert_eq!(dropped_after, dropped_before + 1);
+    }
+
+    #[test]
+    fn shutdown_flushes_queued_request_writes() {
+        let path = test_path("shutdown-flush");
+        let storage = SqliteStorage::open(&path).unwrap();
+        storage
+            .queue_handle_refresh_ordered(&["did:plc:flush-at-shutdown".to_owned()])
+            .unwrap();
+        drop(storage);
+
+        let reopened = SqliteStorage::open(&path).unwrap();
+        assert_eq!(
+            reopened.pending_handle_refreshes(10).unwrap(),
+            ["did:plc:flush-at-shutdown"]
+        );
+        drop(reopened);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn ordered_handle_refresh_only_touches_the_requested_dids() {
+        let storage = SqliteStorage::open(":memory:").unwrap();
+        storage
+            .writer
+            .call(|connection| {
+                connection.execute_batch(
+                    "CREATE TABLE handle_refresh_touches(kind TEXT NOT NULL);
+                     CREATE TRIGGER handle_refresh_insert_touch AFTER INSERT ON handle_refresh_queue
+                     BEGIN INSERT INTO handle_refresh_touches(kind) VALUES('insert'); END;
+                     CREATE TRIGGER handle_refresh_update_touch AFTER UPDATE ON handle_refresh_queue
+                     BEGIN INSERT INTO handle_refresh_touches(kind) VALUES('update'); END;
+                     CREATE TRIGGER handle_refresh_delete_touch AFTER DELETE ON handle_refresh_queue
+                     BEGIN INSERT INTO handle_refresh_touches(kind) VALUES('delete'); END;",
+                )?;
+                for index in 0..2_000 {
+                    connection.execute(
+                        "INSERT INTO handle_refresh_queue(did,priority) VALUES(?1,?2)",
+                        params![format!("did:plc:old-{index}"), index],
+                    )?;
+                }
+                connection.execute("DELETE FROM handle_refresh_touches", [])?;
+                Ok(())
+            })
+            .unwrap();
+
+        storage
+            .queue_handle_refresh_ordered(&["did:plc:new-page-author".to_owned()])
+            .unwrap();
+        storage.writer.flush().unwrap();
+        let touched: i64 = storage
+            .writer
+            .call(|connection| {
+                Ok(connection.query_row(
+                    "SELECT COUNT(*) FROM handle_refresh_touches",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(touched, 1, "one page DID should touch one queue row");
     }
 }
