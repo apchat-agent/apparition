@@ -2498,15 +2498,17 @@ a.quoted-post-card:hover,
   }
 
   body:has(.mobile-nav) {
-    --mobile-nav-height: calc(2rem + 0.2rem + 1px + max(4px, calc(env(safe-area-inset-bottom) * 0.25)));
+    --mobile-nav-height: calc(1.2rem + 6px + 0.25rem + 0.1rem + 1px + max(4px, calc(env(safe-area-inset-bottom) * 0.25)));
     --mobile-compose-clearance: calc(var(--mobile-nav-height) + 0.75rem);
   }
 
-  /* Icon-only bottom bar at about half the old height (owner, 2026-10-29); labels stay for screen readers.
-     The extra padding widens each icon's hit area toward 44 px without growing the compact bar. */
+  /* Icon-only bottom bar, balanced (owner, 2026-10-30): icon height + a 6 px gap above and below it +
+     the safe-area share, so the real bar height equals --mobile-nav-height and labels stay for screen
+     readers. The 1 px border sits over the 4 px padding-top, keeping the space under the icon at most
+     2 px larger than the space above it when the inset is 0. */
   body:has(.mobile-nav) .mobile-nav {
     min-height: 0;
-    padding-top: 0.1rem;
+    padding-top: 0.25rem;
     padding-bottom: calc(0.1rem + max(4px, calc(env(safe-area-inset-bottom) * 0.25)));
   }
 
@@ -2517,14 +2519,16 @@ a.quoted-post-card:hover,
     min-width: 44px;
   }
 
-  /* ...then the compact bar (1df5bc1) trims vertical slack, and the widened padding keeps each
-     icon's hit area at least 44 px tall despite the 2rem content box. */
+  /* ...as a fixed 44 px hit box with the 1.2rem icon centred by equal padding, and an equal negative
+     margin (8.4 px per side) that trims each item to 1.2rem + 6 px of bar height without pushing the
+     icon off-centre; the avatar overflows its content box by 1.6 px per side and stays centred too. */
   body:has(.mobile-nav) .mobile-nav a,
   body:has(.mobile-nav) .mobile-nav button {
+    height: 44px;
     min-height: 2rem;
     min-width: 44px;
-    padding: 0.65rem 0.2rem;
-    margin: -0.65rem -0.2rem;
+    padding: calc((44px - 1.2rem) / 2) 0.2rem;
+    margin: calc(0.6rem - 19px) -0.2rem;
   }
 
   body:has(.mobile-nav) .mobile-nav a > span,
