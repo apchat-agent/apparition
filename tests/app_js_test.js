@@ -249,57 +249,6 @@ Deno.test("image canvas resize bounds JPEG bytes and dimensions", async () => {
   assert(draws.length > 0);
 });
 
-Deno.test("alt suggestion loads only after its button is clicked and protects edits", async () => {
-  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
-  globalThis.document = {
-    addEventListener() {},
-    querySelector() { return null; },
-    querySelectorAll() { return []; },
-  };
-  globalThis.window = { visualViewport: { addEventListener() {} } };
-  const attachAltSuggestion = new Function(`${source}; return attachAltSuggestion;`)();
-  assertEquals(typeof attachAltSuggestion, "function");
-
-  let clickHandler;
-  let modelLoads = 0;
-  const button = {
-    disabled: false,
-    addEventListener(name, listener) {
-      assertEquals(name, "click");
-      clickHandler = listener;
-    },
-    click() {
-      return clickHandler();
-    },
-  };
-  const item = { file: { name: "local.jpg" }, alt: "", suggestedAlt: "" };
-  const altInput = { value: "" };
-  const status = { textContent: "" };
-  const progress = { hidden: true, max: 0, value: 0 };
-  const suggestions = ["A dog on a beach.", "A brown dog on a beach.", "A dog beside the sea."];
-  const loader = async () => {
-    modelLoads++;
-    assert(!progress.hidden, "the first click should reveal download progress");
-    assertEquals(progress.max, 264_713_119, "progress should show the exact model payload size");
-    assert(status.textContent.includes("264,713,119 bytes"), "the download size should be visible before loading");
-    return { caption: async () => suggestions.shift() };
-  };
-
-  attachAltSuggestion(button, item, altInput, status, progress, loader);
-  assertEquals(modelLoads, 0, "the model must stay unloaded until the user taps the button");
-  await button.click();
-  assertEquals(modelLoads, 1);
-  assertEquals(altInput.value, "A dog on a beach.");
-  assertEquals(item.alt, "A dog on a beach.");
-
-  altInput.value = "My own description.";
-  await button.click();
-  assertEquals(altInput.value, "My own description.", "a user edit must win over a later suggestion");
-  altInput.value = "A dog on a beach.";
-  await button.click();
-  assertEquals(altInput.value, "A dog beside the sea.", "the previous suggestion may be replaced");
-});
-
 Deno.test("video selection metadata and upload progress use the dedicated video route", async () => {
   const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
   globalThis.document = {
@@ -433,41 +382,7 @@ Deno.test("unified media selection keeps earlier media when a later pick conflic
   assert(secondVideo.message.includes("one video"));
 });
 
-Deno.test("alt suggestion failure leaves the alt text alone and reports a short message", async () => {
-  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
-  globalThis.document = {
-    addEventListener() {},
-    querySelector() { return null; },
-    querySelectorAll() { return []; },
-  };
-  globalThis.window = { visualViewport: { addEventListener() {} } };
-  const attachAltSuggestion = new Function(`${source}; return attachAltSuggestion;`)();
-  assertEquals(typeof attachAltSuggestion, "function");
-  let clickHandler;
-  const button = {
-    disabled: false,
-    addEventListener(_name, listener) {
-      clickHandler = listener;
-    },
-    click() {
-      return clickHandler();
-    },
-  };
-  const item = { file: { name: "local.jpg" }, alt: "Carefully written alt text", suggestedAlt: "" };
-  const altInput = { value: item.alt };
-  const status = { textContent: "" };
-  const progress = { hidden: true, max: 0, value: 0 };
-
-  attachAltSuggestion(button, item, altInput, status, progress, async () => {
-    throw new Error("fake model download failure");
-  });
-  await button.click();
-  assertEquals(altInput.value, "Carefully written alt text");
-  assert(status.textContent.length > 0, "a useful failure message should be visible");
-  assert(!button.disabled, "the button should be usable after a failure");
-});
-
-Deno.test("each selected image renders an opt-in alt suggestion button", async () => {
+Deno.test("each selected image renders a manual alt text field", async () => {
   const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
   const makeElement = (tag) => ({
     tag,
@@ -506,7 +421,7 @@ Deno.test("each selected image renders an opt-in alt suggestion button", async (
   globalThis.document = {
     addEventListener() {},
     createElement: makeElement,
-    querySelector(selector) { return selector === "form[data-alt-test]" ? null : null; },
+    querySelector() { return null; },
     querySelectorAll(selector) { return selector === "form[data-media-composer]" ? [form] : []; },
   };
   globalThis.window = { visualViewport: { addEventListener() {} } };
@@ -517,95 +432,16 @@ Deno.test("each selected image renders an opt-in alt suggestion button", async (
   assert(preview, "choosing a picture should create its preview");
   assert(!linkImageNote.hidden, "pictures and a link should show the precedence notice");
   const details = preview.children[1];
-  const suggestion = details.children.find((child) => child.tag === "button" && child.textContent === "Suggest alt text");
-  assert(suggestion, "the alt field should have its own suggestion button");
-  assertEquals(suggestion.type, "button", "suggesting must not submit the post form");
-  assertEquals(typeof suggestion.listeners.get("click"), "function");
+  const altLabel = details.children.find((child) => child.tag === "label");
+  assert(altLabel, "the image preview should have a manual alt text label");
+  assertEquals(altLabel.textContent, "Alt text for image 1 (optional)");
+  const altInput = altLabel.children[0];
+  assertEquals(altInput.tag, "textarea");
+  assertEquals(altInput.name, "alts");
+  assertEquals(altInput.maxLength, 2000);
   const remove = details.children.find((child) => child.tag === "button" && child.attributes["aria-label"] === "Remove image 1");
   remove.listeners.get("click")();
   assert(linkImageNote.hidden, "removing the last picture should clear the precedence notice");
-});
-
-Deno.test("posting completes while an alt suggestion is still running", async () => {
-  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
-  globalThis.document = {
-    addEventListener() {},
-    querySelector() { return null; },
-    querySelectorAll() { return []; },
-  };
-  globalThis.window = { visualViewport: { addEventListener() {} }, location: { assign() {} } };
-  const helpers = new Function(`${source}; return { attachAltSuggestion, handleImageComposerSubmit };`)();
-  assertEquals(typeof helpers.handleImageComposerSubmit, "function");
-
-  let releaseModel;
-  const pendingModel = new Promise((resolve) => { releaseModel = resolve; });
-  let suggestionFinished = false;
-  let clickHandler;
-  const suggestionButton = {
-    disabled: false,
-    addEventListener(_name, listener) { clickHandler = listener; },
-    click() { return clickHandler(); },
-  };
-  helpers.attachAltSuggestion(
-    suggestionButton,
-    { file: { name: "local.png" }, alt: "", suggestedAlt: "" },
-    { value: "" },
-    { textContent: "" },
-    { hidden: true, max: 0, value: 0 },
-    () => pendingModel,
-  );
-  const suggestion = suggestionButton.click().then(() => { suggestionFinished = true; });
-  await Promise.resolve();
-
-  const submitButton = { disabled: false };
-  const error = { hidden: true, textContent: "" };
-  const imageInput = { files: [{ name: "local.png" }] };
-  const form = {
-    action: "/post",
-    querySelector(selector) {
-      if (selector === 'button[type="submit"]') return submitButton;
-      if (selector === "[data-composer-error]") return error;
-      if (selector === "[data-media-input]") return imageInput;
-      return null;
-    },
-  };
-  const originalFormData = globalThis.FormData;
-  const originalFile = globalThis.File;
-  const originalFetch = globalThis.fetch;
-  let didPost = false;
-  class FakeFormData {
-    delete() {}
-    append() {}
-  }
-  class FakeFile {
-    constructor(parts, name, options) { this.parts = parts; this.name = name; this.type = options.type; }
-  }
-  globalThis.FormData = FakeFormData;
-  globalThis.File = FakeFile;
-  globalThis.fetch = async () => {
-    didPost = true;
-    return { ok: true, url: "/app" };
-  };
-  try {
-    await helpers.handleImageComposerSubmit(
-      form,
-      [{ file: { name: "local.png" }, alt: "" }],
-      false,
-      { preventDefault() {} },
-      {
-        loadImage: async () => ({ width: 1, height: 1 }),
-        resizeImage: async () => ({ blob: new Blob(["image"]), width: 1, height: 1 }),
-      },
-    );
-    assert(didPost, "the image post should proceed without waiting for the caption model");
-    assert(!suggestionFinished, "the pending caption request must still be pending after posting");
-  } finally {
-    globalThis.FormData = originalFormData;
-    globalThis.File = originalFile;
-    globalThis.fetch = originalFetch;
-  }
-  releaseModel({ caption: async () => "A photo." });
-  await suggestion;
 });
 
 Deno.test("composer link preview is removable and renders metadata as text", async () => {

@@ -182,98 +182,6 @@ async function loadComposerImage(file) {
   }
 }
 
-const ALT_MODEL_DOWNLOAD_BYTES = 264_713_119;
-let altCaptionWorker;
-let altCaptionRequestId = 0;
-const altCaptionRequests = new Map();
-
-function formatAltBytes(bytes) {
-  return new Intl.NumberFormat().format(bytes);
-}
-
-function getAltCaptionWorker() {
-  if (altCaptionWorker) return altCaptionWorker;
-  altCaptionWorker = new Worker("/static/alt-model-worker.js", { type: "module" });
-  altCaptionWorker.addEventListener("message", (event) => {
-    const message = event.data;
-    const request = altCaptionRequests.get(message.requestId);
-    if (!request) return;
-    if (message.type === "progress") {
-      request.onProgress?.(message);
-      return;
-    }
-    altCaptionRequests.delete(message.requestId);
-    if (message.type === "error") request.reject(new Error(message.message || "The caption model failed to load."));
-    else request.resolve(message.result);
-  });
-  altCaptionWorker.addEventListener("error", () => {
-    for (const request of altCaptionRequests.values()) request.reject(new Error("The on-device caption model stopped."));
-    altCaptionRequests.clear();
-    altCaptionWorker?.terminate();
-    altCaptionWorker = undefined;
-  });
-  return altCaptionWorker;
-}
-
-function altCaptionRequest(type, payload = {}, onProgress) {
-  const worker = getAltCaptionWorker();
-  const requestId = ++altCaptionRequestId;
-  return new Promise((resolve, reject) => {
-    altCaptionRequests.set(requestId, { resolve, reject, onProgress });
-    worker.postMessage({ ...payload, requestId, type });
-  });
-}
-
-async function loadAltCaptionModel({ onProgress } = {}) {
-  const loaded = await altCaptionRequest("load", {}, onProgress);
-  return {
-    ...loaded,
-    caption: async (file, progress) => altCaptionRequest("caption", { file }, progress || onProgress),
-  };
-}
-
-function attachAltSuggestion(button, item, altInput, status, progress, loadModel = loadAltCaptionModel) {
-  let previousSuggestion = item.suggestedAlt || "";
-  item.suggestedAlt = previousSuggestion;
-  altInput.addEventListener?.("input", () => {
-    item.alt = altInput.value;
-  });
-  button.addEventListener("click", async () => {
-    if (button.disabled) return;
-    button.disabled = true;
-    status.textContent = `Preparing the on-device model (${formatAltBytes(ALT_MODEL_DOWNLOAD_BYTES)} bytes).`;
-    progress.max = ALT_MODEL_DOWNLOAD_BYTES;
-    progress.value = 0;
-    progress.hidden = false;
-    const onProgress = (update) => {
-      if (Number.isFinite(update.loaded)) progress.value = Math.min(progress.max, update.loaded);
-      if (update.message) status.textContent = update.message;
-      else if (update.loaded > 0) status.textContent = `Loading model: ${formatAltBytes(progress.value)} of ${formatAltBytes(progress.max)} bytes.`;
-    };
-    try {
-      const model = await loadModel({ onProgress });
-      const result = await model.caption(item.file, onProgress);
-      const suggestion = (typeof result === "string" ? result : result.caption || "").trim();
-      if (!suggestion) throw new Error("No caption was returned.");
-      if (!altInput.value.trim() || altInput.value === previousSuggestion) {
-        altInput.value = suggestion;
-        item.alt = suggestion;
-        previousSuggestion = suggestion;
-        item.suggestedAlt = suggestion;
-      } else {
-        item.alt = altInput.value;
-      }
-      status.textContent = "Suggestion ready. Review and edit it before posting.";
-    } catch (reason) {
-      const message = reason instanceof Error ? reason.message : "Could not suggest alt text.";
-      status.textContent = message.slice(0, 180);
-    } finally {
-      progress.hidden = true;
-      button.disabled = false;
-    }
-  });
-}
-
 async function handleImageComposerSubmit(form, selected, selectionInvalid, event, helpers = {}) {
   const input = form.querySelector("[data-media-input]");
   if (!selected.length && !input?.files?.length) return;
@@ -685,20 +593,7 @@ function attachMediaComposer(form, helpers = {}) {
           item.alt = altInput.value;
         });
         altLabel.append(altInput);
-        const suggestion = document.createElement("button");
-        suggestion.type = "button";
-        suggestion.className = "alt-suggestion-button";
-        suggestion.textContent = "Suggest alt text";
-        const suggestionStatus = document.createElement("p");
-        suggestionStatus.className = "alt-suggestion-status";
-        suggestionStatus.setAttribute("role", "status");
-        const suggestionProgress = document.createElement("progress");
-        suggestionProgress.className = "alt-suggestion-progress";
-        suggestionProgress.hidden = true;
-        suggestionProgress.max = ALT_MODEL_DOWNLOAD_BYTES;
-        suggestionProgress.value = 0;
-        attachAltSuggestion(suggestion, item, altInput, suggestionStatus, suggestionProgress);
-        details.append(altLabel, suggestion, suggestionProgress, suggestionStatus);
+        details.append(altLabel);
       }
       const remove = document.createElement("button");
       remove.type = "button";
@@ -781,56 +676,6 @@ function attachMediaComposer(form, helpers = {}) {
 }
 
 (document.querySelectorAll?.("form[data-media-composer]") || []).forEach((form) => attachMediaComposer(form));
-
-const altTestForm = document.querySelector?.("form[data-alt-test]");
-if (altTestForm) {
-  const imageInput = altTestForm.querySelector("[data-alt-test-image]");
-  const runButton = altTestForm.querySelector("[data-alt-test-run]");
-  const progress = document.querySelector("[data-alt-test-progress]");
-  const status = document.querySelector("[data-alt-test-status]");
-  const metrics = {
-    backend: document.querySelector("[data-alt-test-backend]"),
-    bytes: document.querySelector("[data-alt-test-bytes]"),
-    loadMs: document.querySelector("[data-alt-test-load-ms]"),
-    captionMs: document.querySelector("[data-alt-test-caption-ms]"),
-    caption: document.querySelector("[data-alt-test-caption]"),
-  };
-  if (imageInput && runButton && progress && status) {
-    altTestForm.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      const file = imageInput.files?.[0];
-      if (!file) {
-        status.textContent = "Choose a photo first.";
-        return;
-      }
-      runButton.disabled = true;
-      progress.max = ALT_MODEL_DOWNLOAD_BYTES;
-      progress.value = 0;
-      progress.hidden = false;
-      status.textContent = `Preparing the on-device model (${formatAltBytes(ALT_MODEL_DOWNLOAD_BYTES)} bytes).`;
-      const onProgress = (update) => {
-        if (Number.isFinite(update.loaded)) progress.value = Math.min(progress.max, update.loaded);
-        if (update.message) status.textContent = update.message;
-      };
-      try {
-        const model = await loadAltCaptionModel({ onProgress });
-        const result = await model.caption(file, onProgress);
-        metrics.backend.textContent = result.backend || model.backend || "—";
-        metrics.bytes.textContent = formatAltBytes(result.downloadBytes || model.downloadBytes || 0);
-        metrics.loadMs.textContent = String(result.modelLoadMs ?? model.modelLoadMs ?? 0);
-        metrics.captionMs.textContent = String(result.captionMs ?? 0);
-        metrics.caption.textContent = result.caption || "No caption was returned.";
-        status.textContent = "Caption complete. The selected photo stayed in this browser.";
-      } catch (reason) {
-        const message = reason instanceof Error ? reason.message : "The on-device caption could not be created.";
-        status.textContent = message.slice(0, 180);
-      } finally {
-        progress.hidden = true;
-        runButton.disabled = false;
-      }
-    });
-  }
-}
 
 function installInfiniteScroll({
   pageDocument = document,

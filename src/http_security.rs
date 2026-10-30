@@ -203,7 +203,7 @@ fn with_headers(mut response: Response<Body>, public_https: bool) -> Response<Bo
     // HTTPS destinations beyond this origin.
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        "default-src 'none'; base-uri 'none'; form-action 'self' https:; img-src 'self' blob: https://cdn.bsky.app https://video.bsky.app https://video.cdn.bsky.app; media-src 'self' blob: https://video.bsky.app https://video.cdn.bsky.app; style-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self' https://video.bsky.app https://video.cdn.bsky.app; object-src 'none'; frame-ancestors 'none'"
+        "default-src 'none'; base-uri 'none'; form-action 'self' https:; img-src 'self' blob: https://cdn.bsky.app https://video.bsky.app https://video.cdn.bsky.app; media-src 'self' blob: https://video.bsky.app https://video.cdn.bsky.app; style-src 'self'; script-src 'self'; connect-src 'self' https://video.bsky.app https://video.cdn.bsky.app; object-src 'none'; frame-ancestors 'none'"
             .parse()
             .unwrap(),
     );

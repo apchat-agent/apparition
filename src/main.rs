@@ -9,7 +9,7 @@ use appview_rs::{
     init_tracing,
     jwt::ServiceJwtVerifier,
     oauth::{OAuthPublic, ProfileRefreshWorker, SqliteOAuthStore, WebShutdown},
-    router_with_oauth_flow_and_alt_model_dir_and_shutdown,
+    router_with_oauth_flow_and_shutdown,
 };
 use std::{
     error::Error, future::IntoFuture, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration,
@@ -64,11 +64,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         config.appview_did.clone(),
     ));
     let web_shutdown = WebShutdown::new();
-    let app_router = router_with_oauth_flow_and_alt_model_dir_and_shutdown(
+    let app_router = router_with_oauth_flow_and_shutdown(
         oauth,
         oauth_flow.clone(),
         storage.clone(),
-        config.alt_model_dir.clone(),
         web_shutdown.clone(),
     )
     .merge(api_router_with_https(

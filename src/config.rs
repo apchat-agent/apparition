@@ -31,8 +31,6 @@ pub struct Config {
     pub public_url: String,
     #[serde(default)]
     pub oauth_mode: OAuthMode,
-    #[serde(default)]
-    pub alt_model_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -59,7 +57,6 @@ impl Default for Config {
             appview_did: default_appview_did(),
             public_url: default_public_url(),
             oauth_mode: OAuthMode::default(),
-            alt_model_dir: None,
         }
     }
 }
@@ -140,9 +137,6 @@ impl Config {
                 "APPVIEW_OAUTH_MODE" => {
                     config.oauth_mode = parse_oauth_mode(value)?;
                 }
-                "APPVIEW_ALT_MODEL_DIR" => {
-                    config.alt_model_dir = Some(PathBuf::from(value));
-                }
                 _ => {}
             }
         }
@@ -216,10 +210,6 @@ impl Config {
                 "APPVIEW_OAUTH_MODE",
                 env::var("APPVIEW_OAUTH_MODE").unwrap_or_default(),
             ),
-            (
-                "APPVIEW_ALT_MODEL_DIR",
-                env::var("APPVIEW_ALT_MODEL_DIR").unwrap_or_default(),
-            ),
         ];
         let nonempty = env_values
             .into_iter()
@@ -259,9 +249,6 @@ impl Config {
                     "APPVIEW_DID" => config.appview_did = value,
                     "APPVIEW_PUBLIC_URL" => config.public_url = value,
                     "APPVIEW_OAUTH_MODE" => config.oauth_mode = parse_oauth_mode(&value)?,
-                    "APPVIEW_ALT_MODEL_DIR" => {
-                        config.alt_model_dir = Some(PathBuf::from(value));
-                    }
                     _ => unreachable!(),
                 }
             }

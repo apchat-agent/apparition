@@ -40,34 +40,13 @@ where
     F: oauth::OAuthFlow,
     S: ingest::Storage + 'static,
 {
-    router_with_oauth_flow_and_alt_model_dir(oauth, flow, storage, None)
+    router_with_oauth_flow_and_shutdown(oauth, flow, storage, oauth::WebShutdown::new())
 }
 
-pub fn router_with_oauth_flow_and_alt_model_dir<F, S>(
+pub fn router_with_oauth_flow_and_shutdown<F, S>(
     oauth: oauth::OAuthPublic,
     flow: F,
     storage: std::sync::Arc<S>,
-    alt_model_dir: Option<std::path::PathBuf>,
-) -> Router
-where
-    F: oauth::OAuthFlow,
-    S: ingest::Storage + 'static,
-{
-    let public_https = oauth.public_url().starts_with("https://");
-    http_security::protect_with_picture_body_limit(
-        Router::new()
-            .route("/xrpc/_health", get(health))
-            .route("/healthz", get(health))
-            .merge(oauth.router_with_flow_and_alt_model_dir(flow, storage, alt_model_dir)),
-        public_https,
-    )
-}
-
-pub fn router_with_oauth_flow_and_alt_model_dir_and_shutdown<F, S>(
-    oauth: oauth::OAuthPublic,
-    flow: F,
-    storage: std::sync::Arc<S>,
-    alt_model_dir: Option<std::path::PathBuf>,
     shutdown: oauth::WebShutdown,
 ) -> Router
 where
@@ -79,12 +58,7 @@ where
         Router::new()
             .route("/xrpc/_health", get(health))
             .route("/healthz", get(health))
-            .merge(oauth.router_with_flow_and_alt_model_dir_and_shutdown(
-                flow,
-                storage,
-                alt_model_dir,
-                shutdown,
-            )),
+            .merge(oauth.router_with_flow_and_shutdown(flow, storage, shutdown)),
         public_https,
     )
 }
