@@ -1718,3 +1718,24 @@ Deno.test("a throwing localStorage is treated as pct 0 without an exception", as
     restoreStorage();
   }
 });
+
+Deno.test("at pct 30 applyListBlockLeak shows exactly the posts whose sample is under 30", async () => {
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  const { applyListBlockLeak, listBlockLeakSample } = extractListBlockLeak(source);
+  const listUri = "at://did:plc:list-owner/app.bsky.graph.list/spamlist";
+  const restoreStorage = setLocalStorageForTest({ getItem: () => JSON.stringify({ [listUri]: 30 }) });
+  try {
+    let shown = 0;
+    for (let index = 0; index < 200; index += 1) {
+      const postUri = `at://did:plc:author${index % 11}/app.bsky.feed.post/p-${index}`;
+      const item = makeListBlockItem({ listUri, listName: "Spam list", postUri });
+      applyListBlockLeak(item);
+      const expected = listBlockLeakSample(postUri, listUri) < 30;
+      assertEquals(item.hidden, !expected, `${postUri}: shown must follow its sample`);
+      if (!item.hidden) shown += 1;
+    }
+    assert(shown > 20 && shown < 100, `expected roughly 30% of 200 shown, got ${shown}`);
+  } finally {
+    restoreStorage();
+  }
+});
