@@ -795,9 +795,13 @@ async function createInfiniteScrollHarness({ cards = ["post-1", "post-2"], mobil
     }
     querySelectorAll(selector) {
       const matches = [];
+      const attribute = /^\[data-[\w-]+\]$/.test(selector) ? selector.slice(1, -1) : null;
       const visit = (node) => {
         for (const child of node.children || []) {
           if (selector === "video[data-video-playlist]" && child.tagName === "VIDEO" && child.getAttribute("data-video-playlist")) {
+            matches.push(child);
+          }
+          if (attribute && child.getAttribute?.(attribute) !== null) {
             matches.push(child);
           }
           visit(child);
@@ -1205,7 +1209,7 @@ Deno.test("a like form on an appended card uses the existing delegated handler",
 
 function createProfileFillHarness() {
   const makeElement = ({ did = "", avatar = false, name = false, handle = false, tag = "SPAN" } = {}) => ({
-    tagName: tag,
+    tagName: tag.toUpperCase(),
     className: avatar ? "avatar avatar-placeholder" : "",
     dataset: {},
     attributes: new Map([
@@ -1249,7 +1253,8 @@ function createProfileFillHarness() {
 Deno.test("profile fill batches marked DIDs into one request and replaces every element for a DID", async () => {
   const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
   const start = source.indexOf("function fillProfileIdentities(");
-  const end = source.indexOf("\nfillProfileIdentities();", start);
+  const end = source.indexOf("function installInfiniteScroll", start);
+  assert(source.includes("\nfillProfileIdentities();"), "app.js should fill profile placeholders after the page is visible");
   assert(start >= 0 && end > start, "app.js should install background profile fills");
   const fillProfileIdentities = new Function(`${source.slice(start, end)}; return fillProfileIdentities;`)();
   const { makeElement, authorCard } = createProfileFillHarness();
@@ -1311,7 +1316,8 @@ Deno.test("profile fill batches marked DIDs into one request and replaces every 
 Deno.test("profile fill sends at most 25 DIDs in one request", async () => {
   const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
   const start = source.indexOf("function fillProfileIdentities(");
-  const end = source.indexOf("\nfillProfileIdentities();", start);
+  const end = source.indexOf("function installInfiniteScroll", start);
+  assert(source.includes("\nfillProfileIdentities();"), "app.js should fill profile placeholders after the page is visible");
   const fillProfileIdentities = new Function(`${source.slice(start, end)}; return fillProfileIdentities;`)();
   const { authorCard } = createProfileFillHarness();
   const marked = Array.from({ length: 30 }, (_, index) => authorCard(`did:plc:batchauthor${index}`));

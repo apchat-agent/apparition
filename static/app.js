@@ -746,6 +746,79 @@ function attachMediaComposer(form, helpers = {}) {
   attachMediaComposer(form);
 });
 
+// Reply parents, quote authors, and notification actors can be missing from local storage,
+// which leaves them rendered as bare DIDs. Load those identities after the page is visible,
+// in public getProfiles-sized batches, and fix every marked element in place.
+function fillProfileIdentities(root = document) {
+  const batchLimit = 25;
+  const avatarSizes = { "small-avatar": 32, "profile-avatar": 80, "focus-avatar": 56, "mobile-profile-avatar": 25 };
+  const elements = [];
+  if (root.matches?.("[data-profile-did]")) elements.push(root);
+  elements.push(...(root.querySelectorAll?.("[data-profile-did]") || []));
+  const byDid = new Map();
+  for (const element of elements) {
+    if (element.dataset?.profileLoading === "true") continue;
+    const did = element.getAttribute("data-profile-did");
+    if (!did) continue;
+    if (element.dataset) element.dataset.profileLoading = "true";
+    if (!byDid.has(did)) byDid.set(did, []);
+    byDid.get(did).push(element);
+  }
+  const targets = (element, attribute) => {
+    if (element.hasAttribute?.(attribute)) return [element];
+    return [...(element.querySelectorAll?.(`[${attribute}]`) || [])];
+  };
+  const applyIdentity = (element, profile) => {
+    const displayName = typeof profile.displayName === "string" ? profile.displayName : "";
+    const handle = typeof profile.handle === "string" ? profile.handle : "";
+    const avatar = typeof profile.avatar === "string" && profile.avatar.startsWith("https://cdn.bsky.app/") ? profile.avatar : "";
+    if (displayName) {
+      for (const name of targets(element, "data-profile-name")) name.textContent = displayName;
+    }
+    if (handle) {
+      for (const handleElement of targets(element, "data-profile-handle")) handleElement.textContent = `@${handle}`;
+    }
+    if (avatar && element.matches?.("[data-profile-avatar]")) {
+      if (element.tagName === "IMG") {
+        element.setAttribute("src", avatar);
+      } else {
+        const image = document.createElement("img");
+        const classes = (element.className || "").split(/\s+/).filter((name) => name && name !== "avatar-placeholder");
+        image.className = classes.join(" ");
+        const size = avatarSizes[classes[0]] || 44;
+        image.setAttribute("src", avatar);
+        image.setAttribute("alt", "");
+        image.setAttribute("width", String(size));
+        image.setAttribute("height", String(size));
+        image.setAttribute("loading", "lazy");
+        image.setAttribute("decoding", "async");
+        element.replaceWith(image);
+      }
+    }
+  };
+  const dids = [...byDid.keys()];
+  for (let index = 0; index < dids.length; index += batchLimit) {
+    const chunk = dids.slice(index, index + batchLimit);
+    const query = chunk.map((did) => `did=${encodeURIComponent(did)}`).join("&");
+    fetch(`/profile-fragment?${query}`, {
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+    }).then(async (response) => {
+      if (!response.ok) throw new Error(`Profile fragment request failed (${response.status}).`);
+      return response.json();
+    }).then((result) => {
+      const profiles = (result && result.profiles) || {};
+      for (const did of chunk) {
+        const profile = profiles[did];
+        if (!profile) continue;
+        for (const element of byDid.get(did) || []) applyIdentity(element, profile);
+      }
+    }).catch(() => {
+      // The page keeps the short-DID placeholder; the next render retries.
+    });
+  }
+}
+
 function installInfiniteScroll({
   pageDocument = document,
   pageWindow = window,
@@ -890,6 +963,7 @@ function installInfiniteScroll({
             } else {
               existingGroup.append(connector, post);
             }
+            fillProfileIdentities(post);
             initializeVideoPlayers(post);
             existingPostNodes.set(post.getAttribute("data-post-uri"), post);
           }
@@ -930,6 +1004,7 @@ function installInfiniteScroll({
         existingPostNodes.set(uri, post);
       }
       list.append(card);
+      fillProfileIdentities(card);
       initializeVideoPlayers(card);
       appended.push(card);
     }
@@ -1124,3 +1199,4 @@ function fillDeferredQuotes(root = document) {
 }
 
 fillDeferredQuotes();
+fillProfileIdentities();
