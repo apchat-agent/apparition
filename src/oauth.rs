@@ -15158,7 +15158,7 @@ mod tests {
     fn cornell_fixture_definitions() -> Vec<CornellFixtureDefinition> {
         let raw = fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/inputs/cornell-labeler-getServices.json"
+            "/tests/fixtures/cornell-labeler-getServices.json"
         ))
         .expect("Cornell labeler getServices fixture");
         let parsed: Value = serde_json::from_str(&raw).unwrap();

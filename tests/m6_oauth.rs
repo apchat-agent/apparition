@@ -6792,7 +6792,7 @@ async fn profile_labels_are_fetched_once_and_render_as_one_expanded_icon_control
         .unwrap();
     let raw = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/inputs/cornell-labeler-getServices.json"
+        "/tests/fixtures/cornell-labeler-getServices.json"
     ))
     .unwrap();
     let parsed: Value = serde_json::from_str(&raw).unwrap();
