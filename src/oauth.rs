@@ -13235,15 +13235,17 @@ mod tests {
         assert!(css.contains(".mobile-profile-avatar {\n    width: 1.4rem;\n    height: 1.4rem;"));
         assert!(css.contains(".mobile-nav .icon {\n    width: 1.2rem;\n    height: 1.2rem;"));
         assert!(css.contains(
-            "padding-bottom: calc(0.1rem + max(4px, calc(env(safe-area-inset-bottom) * 0.25)));"
+            "height: 44px;\n    min-height: 2rem;\n    min-width: 44px;\n    padding: calc((44px - 1.2rem) / 2) 0.2rem;\n    margin: calc(0.6rem - 19px) -0.2rem;"
         ));
-        assert!(css.contains("min-height: 2rem;\n    min-width: 44px;"));
         assert!(css.contains(
-            "--mobile-nav-height: calc(2rem + 0.2rem + 1px + max(4px, calc(env(safe-area-inset-bottom) * 0.25)));"
+            "padding-top: 0.25rem;\n    padding-bottom: calc(0.1rem + max(4px, calc(env(safe-area-inset-bottom) * 0.25)));"
+        ));
+        assert!(css.contains(
+            "--mobile-nav-height: calc(1.2rem + 6px + 0.25rem + 0.1rem + 1px + max(4px, calc(env(safe-area-inset-bottom) * 0.25)));"
         ));
         assert!(css.contains("bottom: var(--mobile-compose-clearance);"));
         assert!(css.contains("padding-bottom: max(4.25rem, var(--mobile-compose-clearance));"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m26"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m27"));
     }
 
     #[test]
