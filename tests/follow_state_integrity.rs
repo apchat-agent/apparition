@@ -308,6 +308,73 @@ fn startup_rebuilds_missing_follow_rows_for_a_registered_user() {
     drop(storage);
 }
 
+// (e3) The measured defect: a re-backfill of the owner re-snapshotted his repo
+// and the follow rows went to 0 while his follow records stayed in `records`.
+// The snapshot deleted every follow row first and only inserted them back in
+// later writer transactions, so a restart between the two left the rows empty
+// until a fresh re-backfill happened to run, and readers could see the gap.
+// A re-snapshot must never leave a followed subject without a live row.
+#[test]
+fn a_re_snapshot_never_blanks_follow_rows_the_records_still_back() {
+    let dir = temp_dir("resnapshot");
+    let storage = SqliteStorage::open(dir.0.join("appview.db")).unwrap();
+    let owner = "did:plc:resnapshot-owner";
+    let subjects: Vec<String> = (0..1_500)
+        .map(|index| format!("did:plc:keep-{index}"))
+        .collect();
+    let records: Vec<IndexedRecord> = subjects
+        .iter()
+        .enumerate()
+        .map(|(index, subject)| follow_record(owner, subject, &format!("follow-{index}")))
+        .collect();
+    storage
+        .replace_repo_snapshot(owner, &records, &subjects)
+        .unwrap();
+    assert!(storage.is_following(owner, "did:plc:keep-0").unwrap());
+
+    let blanked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let storage_ref = &storage;
+    std::thread::scope(|scope| {
+        let observer = {
+            let blanked = blanked.clone();
+            let finished = finished.clone();
+            scope.spawn(move || {
+                while !finished.load(std::sync::atomic::Ordering::Relaxed) {
+                    if !storage_ref.is_following(owner, "did:plc:keep-0").unwrap() {
+                        blanked.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            })
+        };
+        storage
+            .replace_repo_snapshot_throttled(owner, &records, &subjects, 1_000)
+            .unwrap();
+        finished.store(true, std::sync::atomic::Ordering::Relaxed);
+        observer.join().unwrap();
+    });
+
+    assert!(
+        !blanked.load(std::sync::atomic::Ordering::Relaxed),
+        "a re-snapshot blanked the follows rows while its records were still in `records`"
+    );
+    for subject in &subjects {
+        assert!(
+            storage.is_following(owner, subject).unwrap(),
+            "the re-snapshot lost {subject}"
+        );
+    }
+    assert_eq!(
+        storage
+            .records_for_actor_collection(owner, "app.bsky.graph.follow", 10_000)
+            .unwrap()
+            .len(),
+        1_500
+    );
+    drop(storage);
+}
+
 #[test]
 fn startup_keeps_a_healthy_user_rows_untouched() {
     let dir = temp_dir("startup-healthy");
