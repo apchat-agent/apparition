@@ -166,6 +166,14 @@ fn muted_actor_cache_key(did: &str) -> String {
     format!("{MUTED_ACTOR_CACHE_PREFIX}{did}")
 }
 
+fn listblock_cache_key(did: &str) -> String {
+    format!("{LISTBLOCK_CACHE_PREFIX}{did}")
+}
+
+fn list_members_cache_key(list_uri: &str) -> String {
+    format!("{LIST_MEMBERS_CACHE_PREFIX}{list_uri}")
+}
+
 fn unix_time_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -496,6 +504,13 @@ pub struct PinnedFeedTabs {
     pub tabs_ms: u64,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockListDetail {
+    pub uri: String,
+    pub name: String,
+    pub member_dids: Vec<String>,
+}
+
 pub trait OAuthFlow: Clone + Send + Sync + 'static {
     fn authorize<'a>(
         &'a self,
@@ -695,6 +710,27 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<HashSet<String>, String>> + Send + 'a>> {
         Box::pin(async { Ok(HashSet::new()) })
     }
+    /// The at-uris of the lists the viewer subscribed to as block lists
+    /// (`app.bsky.graph.listblock` subjects). Uncached raw fetch.
+    fn subscribed_block_list_uris<'a>(
+        &'a self,
+        _did: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + 'a>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+    /// One block list's display name and member DIDs. Uncached raw fetch; the
+    /// list usually belongs to another account, so it must not use the viewer's session.
+    fn block_list_detail<'a>(
+        &'a self,
+        _list_uri: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<BlockListDetail, String>> + Send + 'a>> {
+        Box::pin(async { Err("block list lookup is not available".to_owned()) })
+    }
+    /// Handle for the persistent web cache used to keep the block-list caches
+    /// across restarts; `None` keeps a flow's block-list cache memory-only.
+    fn web_cache_store(&self) -> Option<SqliteOAuthStore> {
+        None
+    }
     fn profile_list_choices<'a>(
         &'a self,
         _did: &'a str,
@@ -810,6 +846,7 @@ pub struct OAuthWebState<F, S> {
     profile_counts: ProfileCountsClient,
     link_card_fetcher: LinkCardFetcher,
     feed_page_cache: FeedPageCache,
+    block_lists: Arc<BlockListCache>,
     notification_streams: Arc<Mutex<HashMap<String, usize>>>,
     shutdown: WebShutdown,
 }
@@ -1045,6 +1082,7 @@ impl OAuthPublic {
             link_card_fetcher: LinkCardFetcher::new(),
             shutdown,
             feed_page_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            block_lists: Arc::new(BlockListCache::default()),
             notification_streams: Arc::new(Mutex::new(HashMap::new())),
         });
         let regular_routes = Router::new()
@@ -1601,6 +1639,10 @@ const BSKY_APPVIEW_DID: &str = "did:web:api.bsky.app";
 const BSKY_APPVIEW_SERVICE: &str = "bsky_appview";
 const MUTED_ACTOR_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const MUTED_ACTOR_CACHE_PREFIX: &str = "muted-actors:";
+const LISTBLOCK_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+const LISTBLOCK_CACHE_PREFIX: &str = "list-blocks:";
+const LIST_MEMBERS_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+const LIST_MEMBERS_CACHE_PREFIX: &str = "list-members:";
 
 #[derive(Clone, Debug, Default)]
 struct AccountActorData {
@@ -2567,6 +2609,130 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             }
         }
         Err("PDS listRecords pagination exceeded its safety limit".to_owned())
+    }
+
+    /// Resolve a block list owned by any account: its display name and member
+    /// DIDs, fetched UNauthenticated from the list owner's PDS (the viewer's
+    /// session cannot read another account's repo).
+    async fn fetch_block_list_members(&self, list_uri: &str) -> Result<BlockListDetail, String> {
+        let mut parts = list_uri
+            .strip_prefix("at://")
+            .ok_or_else(|| "block list uri is invalid".to_owned())?
+            .split('/');
+        let owner_did = parts
+            .next()
+            .filter(|did| !did.is_empty())
+            .ok_or_else(|| "block list uri is invalid".to_owned())?;
+        let collection = parts.next().unwrap_or_default();
+        let rkey = parts.next().unwrap_or_default();
+        if collection != "app.bsky.graph.list" || rkey.is_empty() || parts.next().is_some() {
+            return Err("block list uri is invalid".to_owned());
+        }
+        let owner_doc = self
+            .identity_resolver
+            .resolve_did_document(owner_did)
+            .await
+            .map_err(|error| format!("block list owner DID resolution failed: {error}"))?;
+        let pds = owner_doc
+            .pds_endpoint()
+            .ok_or_else(|| "block list owner DID document has no PDS endpoint".to_owned())?;
+        let mut record_url = url::Url::parse(&format!("{pds}/xrpc/com.atproto.repo.getRecord"))
+            .map_err(|_| "block list PDS URL is invalid".to_owned())?;
+        {
+            let mut query = record_url.query_pairs_mut();
+            query.append_pair("repo", owner_did);
+            query.append_pair("collection", "app.bsky.graph.list");
+            query.append_pair("rkey", rkey);
+        }
+        let response = self
+            .http_client
+            .get(&record_url, HeaderMap::new(), 1024 * 1024)
+            .await
+            .map_err(|error| format!("block list getRecord request failed: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "block list getRecord returned status {}",
+                response.status()
+            ));
+        }
+        let record: Value = serde_json::from_slice(response.body())
+            .map_err(|_| "block list record was invalid JSON".to_owned())?;
+        let name = record
+            .get("value")
+            .and_then(|value| value.get("name"))
+            .and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or("Untitled list")
+            .to_owned();
+        let mut members = HashSet::new();
+        let mut cursor: Option<String> = None;
+        let mut total = 0usize;
+        let mut capped = false;
+        for _ in 0..=100 {
+            let mut page_url = url::Url::parse(&format!("{pds}/xrpc/com.atproto.repo.listRecords"))
+                .map_err(|_| "block list PDS URL is invalid".to_owned())?;
+            {
+                let mut query = page_url.query_pairs_mut();
+                query.append_pair("repo", owner_did);
+                query.append_pair("collection", "app.bsky.graph.listitem");
+                query.append_pair("limit", "100");
+                if let Some(value) = cursor.as_deref() {
+                    query.append_pair("cursor", value);
+                }
+            }
+            let response = self
+                .http_client
+                .get(&page_url, HeaderMap::new(), 1024 * 1024)
+                .await
+                .map_err(|error| format!("block list listRecords request failed: {error}"))?;
+            if !response.status().is_success() {
+                return Err(format!(
+                    "block list listRecords returned status {}",
+                    response.status()
+                ));
+            }
+            let page: Value = serde_json::from_slice(response.body())
+                .map_err(|_| "block list listRecords was invalid JSON".to_owned())?;
+            let Some(page_records) = page.get("records").and_then(Value::as_array) else {
+                return Err("block list listRecords returned no records array".to_owned());
+            };
+            total += page_records.len();
+            for item in page_records {
+                let Some(value) = item.get("value") else {
+                    continue;
+                };
+                if value.get("list").and_then(Value::as_str) == Some(list_uri)
+                    && let Some(subject) = value.get("subject").and_then(Value::as_str)
+                {
+                    members.insert(subject.to_owned());
+                }
+            }
+            cursor = page
+                .get("cursor")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if cursor.is_none() || page_records.is_empty() {
+                break;
+            }
+            if total >= 10_000 {
+                capped = true;
+                break;
+            }
+        }
+        if capped {
+            tracing::warn!(
+                list = %list_uri,
+                records = total,
+                "block list member fetch stopped at the 10000 record cap; members beyond it stay unknown"
+            );
+        }
+        let mut member_dids = members.into_iter().collect::<Vec<_>>();
+        member_dids.sort();
+        Ok(BlockListDetail {
+            uri: list_uri.to_owned(),
+            name,
+            member_dids,
+        })
     }
 
     async fn fetch_muted_actor_dids(&self, did: &str) -> Result<HashSet<String>, String> {
@@ -4281,6 +4447,40 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
         Box::pin(async move { self.fetch_muted_actor_dids(did).await })
     }
 
+    fn subscribed_block_list_uris<'a>(
+        &'a self,
+        did: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let records = self
+                .list_repo_collection(did, "app.bsky.graph.listblock")
+                .await?;
+            let mut uris = records
+                .iter()
+                .filter_map(|record| {
+                    let subject = record.get("value")?.get("subject")?.as_str()?;
+                    subject
+                        .contains("/app.bsky.graph.list/")
+                        .then(|| subject.to_owned())
+                })
+                .collect::<Vec<_>>();
+            uris.sort();
+            uris.dedup();
+            Ok(uris)
+        })
+    }
+
+    fn block_list_detail<'a>(
+        &'a self,
+        list_uri: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<BlockListDetail, String>> + Send + 'a>> {
+        Box::pin(async move { self.fetch_block_list_members(list_uri).await })
+    }
+
+    fn web_cache_store(&self) -> Option<SqliteOAuthStore> {
+        Some(self.store.clone())
+    }
+
     fn profile_list_choices<'a>(
         &'a self,
         did: &'a str,
@@ -5033,6 +5233,8 @@ struct WebPageTiming {
     timeline_fetch_live_ms: u64,
     feed_timeline_ms: u64,
     mutes_ms: u64,
+    list_blocks_ms: u64,
+    list_blocked_posts: u64,
     parent_hydration_ms: u64,
     content_hydration_ms: u64,
     profile_hydration_ms: u64,
@@ -5061,6 +5263,8 @@ impl WebPageTiming {
             timeline_fetch_live_ms: 0,
             feed_timeline_ms: 0,
             mutes_ms: 0,
+            list_blocks_ms: 0,
+            list_blocked_posts: 0,
             parent_hydration_ms: 0,
             content_hydration_ms: 0,
             profile_hydration_ms: 0,
@@ -5100,6 +5304,7 @@ impl Drop for WebPageTiming {
             .saturating_add(self.saved_feeds_ms)
             .saturating_add(timeline_phase_ms)
             .saturating_add(self.mutes_ms)
+            .saturating_add(self.list_blocks_ms)
             .saturating_add(self.parent_hydration_ms)
             .saturating_add(self.content_hydration_ms)
             .saturating_add(self.profile_counts_ms)
@@ -5117,6 +5322,8 @@ impl Drop for WebPageTiming {
             timeline_fetch_live_ms = self.timeline_fetch_live_ms,
             feed_timeline_ms = self.feed_timeline_ms,
             mutes_ms = self.mutes_ms,
+            list_blocks_ms = self.list_blocks_ms,
+            list_blocked_posts = self.list_blocked_posts,
             parent_hydration_ms = self.parent_hydration_ms,
             content_hydration_ms = self.content_hydration_ms,
             profile_hydration_ms = self.profile_hydration_ms,
@@ -6162,6 +6369,366 @@ async fn timeline_hidden_actor_dids<F: OAuthFlow, S: Storage>(
     Ok(hidden)
 }
 
+#[derive(Clone, Debug)]
+struct ListBlockMark {
+    list_uri: String,
+    list_name: String,
+}
+
+/// In-memory + web-cache store for subscribed block lists, mirroring the muted
+/// actor cache: serve stale entries and refresh in spawned tasks that own their
+/// pending-set cleanup, so a page dropped mid-refresh cannot strand a key.
+#[derive(Default)]
+struct BlockListCache {
+    listblocks: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, Vec<String>)>>,
+    listblocks_pending: tokio::sync::Mutex<HashSet<String>>,
+    members: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, BlockListDetail)>>,
+    members_pending: tokio::sync::Mutex<HashSet<String>>,
+}
+
+fn remember_block_list_entry<T>(
+    memory: &mut HashMap<String, (tokio::time::Instant, T)>,
+    key: String,
+    value: T,
+    expires: tokio::time::Instant,
+) {
+    let now = tokio::time::Instant::now();
+    memory.retain(|_, (expires, _)| *expires > now);
+    if memory.len() >= 4096
+        && let Some(oldest) = memory.keys().next().cloned()
+    {
+        memory.remove(&oldest);
+    }
+    memory.insert(key, (expires, value));
+}
+
+async fn persist_block_list_entry(store: &SqliteOAuthStore, key: &str, value_json: &str) {
+    if let Err(error) = store.web_cache_set(key, value_json) {
+        tracing::warn!(%error, key, "could not persist block list cache entry");
+    }
+}
+
+fn spawn_listblock_refresh<F: OAuthFlow>(
+    flow: F,
+    cache: Arc<BlockListCache>,
+    did: String,
+    done: Option<oneshot::Sender<Result<Vec<String>, String>>>,
+) {
+    let dispatcher = tracing::dispatcher::get_default(|dispatcher| dispatcher.clone());
+    tokio::spawn(
+        async move {
+            let result =
+                tokio::time::timeout(PAGE_PROFILE_BUDGET, flow.subscribed_block_list_uris(&did))
+                    .await
+                    .unwrap_or_else(|_| Err("block list lookup timed out".to_owned()));
+            match &result {
+                Ok(uris) => {
+                    if let Some(store) = flow.web_cache_store()
+                        && let Ok(value_json) = serde_json::to_string(uris)
+                    {
+                        persist_block_list_entry(&store, &listblock_cache_key(&did), &value_json)
+                            .await;
+                    }
+                    let mut memory = cache.listblocks.lock().await;
+                    remember_block_list_entry(
+                        &mut memory,
+                        did.clone(),
+                        uris.clone(),
+                        tokio::time::Instant::now() + LISTBLOCK_CACHE_TTL,
+                    );
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    viewer = %did,
+                    "subscribed block list lookup failed; keeping the last known list set"
+                ),
+            }
+            cache.listblocks_pending.lock().await.remove(&did);
+            if let Some(done) = done {
+                let _ = done.send(result);
+            }
+        }
+        .with_subscriber(dispatcher),
+    );
+}
+
+async fn schedule_listblock_refresh<F: OAuthFlow>(
+    flow: &F,
+    cache: &Arc<BlockListCache>,
+    did: &str,
+) {
+    let mut pending = cache.listblocks_pending.lock().await;
+    if !pending.insert(did.to_owned()) {
+        return;
+    }
+    drop(pending);
+    spawn_listblock_refresh(flow.clone(), Arc::clone(cache), did.to_owned(), None);
+}
+
+/// The viewer's subscribed block-list URIs, cached like the muted actor list:
+/// fresh memory hit, then stale serving with a background refresh, then the
+/// persisted web cache, and only then a blocking refresh guarded by the
+/// pending set.
+async fn viewer_block_list_uris<F: OAuthFlow>(
+    flow: &F,
+    cache: &Arc<BlockListCache>,
+    did: &str,
+) -> Result<Vec<String>, String> {
+    let now = tokio::time::Instant::now();
+    if let Some((expires, uris)) = cache.listblocks.lock().await.get(did).cloned() {
+        if expires > now {
+            return Ok(uris);
+        }
+        schedule_listblock_refresh(flow, cache, did).await;
+        return Ok(uris);
+    }
+    if let Some(store) = flow.web_cache_store()
+        && let Ok(Some((json, stored_at_ms))) = store.web_cache_get(&listblock_cache_key(did)).await
+        && let Ok(uris) = serde_json::from_str::<Vec<String>>(&json)
+    {
+        let age_ms = unix_time_ms().saturating_sub(stored_at_ms).max(0) as u64;
+        let ttl_ms = LISTBLOCK_CACHE_TTL.as_millis() as u64;
+        let stale = age_ms >= ttl_ms;
+        let expires = now + Duration::from_millis(ttl_ms.saturating_sub(age_ms));
+        let mut memory = cache.listblocks.lock().await;
+        remember_block_list_entry(
+            &mut memory,
+            did.to_owned(),
+            uris.clone(),
+            expires.min(now + LISTBLOCK_CACHE_TTL),
+        );
+        drop(memory);
+        if stale {
+            schedule_listblock_refresh(flow, cache, did).await;
+        }
+        return Ok(uris);
+    }
+    if !cache.listblocks_pending.lock().await.insert(did.to_owned()) {
+        let deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
+        loop {
+            if let Some((_, uris)) = cache.listblocks.lock().await.get(did).cloned() {
+                return Ok(uris);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("block list lookup timed out".to_owned());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    let (done, awaited) = oneshot::channel();
+    spawn_listblock_refresh(flow.clone(), Arc::clone(cache), did.to_owned(), Some(done));
+    match tokio::time::timeout(PAGE_PROFILE_BUDGET, awaited).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("block list refresh task ended without a result".to_owned()),
+        Err(_) => Err("block list lookup timed out".to_owned()),
+    }
+}
+
+fn spawn_members_refresh<F: OAuthFlow>(
+    flow: F,
+    cache: Arc<BlockListCache>,
+    list_uri: String,
+    done: Option<oneshot::Sender<Result<BlockListDetail, String>>>,
+) {
+    let dispatcher = tracing::dispatcher::get_default(|dispatcher| dispatcher.clone());
+    tokio::spawn(
+        async move {
+            let result =
+                tokio::time::timeout(PAGE_PROFILE_BUDGET, flow.block_list_detail(&list_uri))
+                    .await
+                    .unwrap_or_else(|_| Err("block list member fetch timed out".to_owned()));
+            match &result {
+                Ok(detail) => {
+                    if let Some(store) = flow.web_cache_store()
+                        && let Ok(value_json) = serde_json::to_string(detail)
+                    {
+                        persist_block_list_entry(
+                            &store,
+                            &list_members_cache_key(&list_uri),
+                            &value_json,
+                        )
+                        .await;
+                    }
+                    let mut memory = cache.members.lock().await;
+                    remember_block_list_entry(
+                        &mut memory,
+                        list_uri.clone(),
+                        detail.clone(),
+                        tokio::time::Instant::now() + LIST_MEMBERS_CACHE_TTL,
+                    );
+                }
+                Err(error) => tracing::warn!(
+                    %error,
+                    list = %list_uri,
+                    "block list member fetch failed; keeping the last known members"
+                ),
+            }
+            cache.members_pending.lock().await.remove(&list_uri);
+            if let Some(done) = done {
+                let _ = done.send(result);
+            }
+        }
+        .with_subscriber(dispatcher),
+    );
+}
+
+async fn schedule_members_refresh<F: OAuthFlow>(
+    flow: &F,
+    cache: &Arc<BlockListCache>,
+    list_uri: &str,
+) {
+    let mut pending = cache.members_pending.lock().await;
+    if !pending.insert(list_uri.to_owned()) {
+        return;
+    }
+    drop(pending);
+    spawn_members_refresh(flow.clone(), Arc::clone(cache), list_uri.to_owned(), None);
+}
+
+/// One list's name and members, cached per list URI like the muted actor list.
+async fn block_list_detail_cached<F: OAuthFlow>(
+    flow: &F,
+    cache: &Arc<BlockListCache>,
+    list_uri: &str,
+) -> Result<BlockListDetail, String> {
+    let now = tokio::time::Instant::now();
+    if let Some((expires, detail)) = cache.members.lock().await.get(list_uri).cloned() {
+        if expires > now {
+            return Ok(detail);
+        }
+        schedule_members_refresh(flow, cache, list_uri).await;
+        return Ok(detail);
+    }
+    if let Some(store) = flow.web_cache_store()
+        && let Ok(Some((json, stored_at_ms))) =
+            store.web_cache_get(&list_members_cache_key(list_uri)).await
+        && let Ok(detail) = serde_json::from_str::<BlockListDetail>(&json)
+    {
+        let age_ms = unix_time_ms().saturating_sub(stored_at_ms).max(0) as u64;
+        let ttl_ms = LIST_MEMBERS_CACHE_TTL.as_millis() as u64;
+        let stale = age_ms >= ttl_ms;
+        let expires = now + Duration::from_millis(ttl_ms.saturating_sub(age_ms));
+        let mut memory = cache.members.lock().await;
+        remember_block_list_entry(
+            &mut memory,
+            list_uri.to_owned(),
+            detail.clone(),
+            expires.min(now + LIST_MEMBERS_CACHE_TTL),
+        );
+        drop(memory);
+        if stale {
+            schedule_members_refresh(flow, cache, list_uri).await;
+        }
+        return Ok(detail);
+    }
+    if !cache
+        .members_pending
+        .lock()
+        .await
+        .insert(list_uri.to_owned())
+    {
+        let deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
+        loop {
+            if let Some((_, detail)) = cache.members.lock().await.get(list_uri).cloned() {
+                return Ok(detail);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("block list member fetch timed out".to_owned());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    let (done, awaited) = oneshot::channel();
+    spawn_members_refresh(
+        flow.clone(),
+        Arc::clone(cache),
+        list_uri.to_owned(),
+        Some(done),
+    );
+    match tokio::time::timeout(PAGE_PROFILE_BUDGET, awaited).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("block list member refresh task ended without a result".to_owned()),
+        Err(_) => Err("block list member fetch timed out".to_owned()),
+    }
+}
+
+/// The viewer's subscribed block lists for a page, sorted by list URI. A failed
+/// lookup warns and keeps whatever was last known (an empty set on first sight),
+/// so it never hides or unhides anything new.
+async fn subscribed_block_lists_for_page<F: OAuthFlow>(
+    flow: &F,
+    cache: &Arc<BlockListCache>,
+    did: &str,
+) -> Vec<BlockListDetail> {
+    let mut uris = match viewer_block_list_uris(flow, cache, did).await {
+        Ok(uris) => uris,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                viewer = %did,
+                "could not load the viewer's subscribed block lists; rendering without list blocks"
+            );
+            return Vec::new();
+        }
+    };
+    uris.sort();
+    uris.dedup();
+    let mut lists = Vec::new();
+    for uri in uris {
+        match block_list_detail_cached(flow, cache, &uri).await {
+            Ok(detail) => lists.push(detail),
+            Err(error) => tracing::warn!(
+                %error,
+                list = %uri,
+                viewer = %did,
+                "could not load block list members; keeping the last known members"
+            ),
+        }
+    }
+    lists
+}
+
+/// Map each member DID to its block list, keeping the first list in the stable
+/// order sorted by list URI.
+fn first_list_block_marks(lists: &[BlockListDetail]) -> HashMap<String, ListBlockMark> {
+    let mut ordered = lists.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|list| list.uri.as_str());
+    let mut marks = HashMap::new();
+    for list in ordered {
+        for member in &list.member_dids {
+            marks
+                .entry(member.clone())
+                .or_insert_with(|| ListBlockMark {
+                    list_uri: list.uri.clone(),
+                    list_name: list.name.clone(),
+                });
+        }
+    }
+    marks
+}
+
+fn timeline_list_block_attrs(
+    list_blocks: &HashMap<String, ListBlockMark>,
+    author_dids: impl IntoIterator<Item = impl AsRef<str>>,
+) -> String {
+    let mut best: Option<&ListBlockMark> = None;
+    for did in author_dids {
+        if let Some(mark) = list_blocks.get(did.as_ref())
+            && best.is_none_or(|current| mark.list_uri < current.list_uri)
+        {
+            best = Some(mark);
+        }
+    }
+    match best {
+        Some(mark) => format!(
+            " hidden data-list-block=\"{}\" data-list-block-name=\"{}\"",
+            html_escape(&mark.list_uri),
+            html_escape(&mark.list_name)
+        ),
+        None => String::new(),
+    }
+}
+
 async fn app_home<F, S>(
     State(state): State<Arc<OAuthWebState<F, S>>>,
     headers: HeaderMap,
@@ -6217,6 +6784,14 @@ where
     };
     let mut page_records = timeline_page.into_iter().take(limit).collect::<Vec<_>>();
     page_records.retain(|record| !hidden_actors.contains(&record.did));
+    let list_blocks_started = std::time::Instant::now();
+    let block_lists = subscribed_block_lists_for_page(&state.flow, &state.block_lists, &did).await;
+    page_timing.list_blocks_ms = list_blocks_started.elapsed().as_millis() as u64;
+    let list_blocks = first_list_block_marks(&block_lists);
+    page_timing.list_blocked_posts = page_records
+        .iter()
+        .filter(|record| list_blocks.contains_key(&record.did))
+        .count() as u64;
     let timeline = page_records.iter().collect::<Vec<_>>();
     let content_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
     let parent_started = std::time::Instant::now();
@@ -6265,9 +6840,12 @@ where
         &timeline,
         &vec![String::new(); timeline.len()],
         &parents,
-        &did,
-        write_forms_enabled,
-        &quote_index,
+        &TimelineRenderContext {
+            viewer_did: &did,
+            write_forms_enabled,
+            quote_index: &quote_index,
+            list_blocks: &list_blocks,
+        },
     );
     let posts = if posts.is_empty() {
         "<li class=\"empty-state\">No indexed posts yet.</li>".to_owned()
@@ -6499,6 +7077,14 @@ where
         .iter()
         .map(|post| &post.record)
         .collect::<Vec<_>>();
+    let list_blocks_started = std::time::Instant::now();
+    let block_lists = subscribed_block_lists_for_page(&state.flow, &state.block_lists, &did).await;
+    page_timing.list_blocks_ms = list_blocks_started.elapsed().as_millis() as u64;
+    let list_blocks = first_list_block_marks(&block_lists);
+    page_timing.list_blocked_posts = feed_records
+        .iter()
+        .filter(|record| list_blocks.contains_key(&record.did))
+        .count() as u64;
     let content_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
     let parent_started = std::time::Instant::now();
     let parent_result = hydrate_page_parents(
@@ -6560,9 +7146,12 @@ where
         &feed_records,
         &feed_preludes,
         &parents,
-        &did,
-        write_forms_enabled,
-        &quote_index,
+        &TimelineRenderContext {
+            viewer_did: &did,
+            write_forms_enabled,
+            quote_index: &quote_index,
+            list_blocks: &list_blocks,
+        },
     );
     let posts = if posts.is_empty() {
         "<li class=\"empty-state\">This feed has no available posts on this page.</li>".to_owned()
@@ -7738,14 +8327,18 @@ where
     let write_forms_enabled =
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
     let render_started = std::time::Instant::now();
+    let no_list_blocks = HashMap::new();
     let posts = render_timeline_post_items(
         state.storage.as_ref(),
         &records,
         &vec![String::new(); records.len()],
         &parents,
-        &did,
-        write_forms_enabled,
-        &quote_index,
+        &TimelineRenderContext {
+            viewer_did: &did,
+            write_forms_enabled,
+            quote_index: &quote_index,
+            list_blocks: &no_list_blocks,
+        },
     );
     let posts = if posts.is_empty() {
         "<li class=\"empty-state\">No indexed posts yet.</li>".to_owned()
@@ -11587,6 +12180,7 @@ struct TimelinePostItemOptions<'a> {
     write_forms_enabled: bool,
     eager_avatar: bool,
     quote_index: &'a QuoteRenderIndex,
+    list_block_attrs: String,
 }
 
 #[derive(Default)]
@@ -11710,20 +12304,24 @@ fn timeline_post_grouping(
     grouping
 }
 
+struct TimelineRenderContext<'a> {
+    viewer_did: &'a str,
+    write_forms_enabled: bool,
+    quote_index: &'a QuoteRenderIndex,
+    list_blocks: &'a HashMap<String, ListBlockMark>,
+}
+
 fn render_timeline_post_items<S: Storage>(
     storage: &S,
     records: &[&IndexedRecord],
     preludes: &[String],
     parents: &PageParentIndex,
-    viewer_did: &str,
-    write_forms_enabled: bool,
-    quote_index: &QuoteRenderIndex,
+    context: &TimelineRenderContext<'_>,
 ) -> String {
     let grouping = timeline_post_grouping(records, parents);
     let mut html = String::new();
     for (index, record) in records.iter().enumerate() {
         if let Some(group) = grouping.groups_by_newest.get(&index) {
-            html.push_str("<li class=\"post-item thread-group\" aria-label=\"Reply thread\">");
             let mut members = group
                 .ancestors
                 .iter()
@@ -11735,6 +12333,13 @@ fn render_timeline_post_items<S: Storage>(
                     .iter()
                     .map(|member| (records[*member], Some(*member))),
             );
+            let attrs = timeline_list_block_attrs(
+                context.list_blocks,
+                members.iter().map(|(member, _)| member.did.as_str()),
+            );
+            html.push_str(&format!(
+                "<li class=\"post-item thread-group\"{attrs} aria-label=\"Reply thread\">"
+            ));
             let self_thread = members.first().is_some_and(|(first, _)| {
                 members.iter().all(|(member, _)| member.did == first.did)
             });
@@ -11764,11 +12369,11 @@ fn render_timeline_post_items<S: Storage>(
                 html.push_str(&render_web_post(
                     storage,
                     member,
-                    viewer_did,
-                    write_forms_enabled,
+                    context.viewer_did,
+                    context.write_forms_enabled,
                     true,
                     page_index.is_none_or(|page_index| page_index < 6),
-                    quote_index,
+                    context.quote_index,
                 ));
             }
             let skipped = members.len().saturating_sub(visible.len());
@@ -11798,10 +12403,14 @@ fn render_timeline_post_items<S: Storage>(
                         .checked_sub(1)
                         .map(|previous| records[previous].uri.as_str()),
                     parents,
-                    viewer_did,
-                    write_forms_enabled,
+                    viewer_did: context.viewer_did,
+                    write_forms_enabled: context.write_forms_enabled,
                     eager_avatar: index < 6,
-                    quote_index,
+                    quote_index: context.quote_index,
+                    list_block_attrs: timeline_list_block_attrs(
+                        context.list_blocks,
+                        [record.did.as_str()],
+                    ),
                 },
             ));
         }
@@ -11828,12 +12437,15 @@ fn render_timeline_post_item<S: Storage>(
         .pointer("/reply/parent/uri")
         .and_then(Value::as_str)
     else {
-        return format!("<li class=\"post-item\">{}{article}</li>", options.prelude);
+        return format!(
+            "<li class=\"post-item\"{}>{}{article}</li>",
+            options.list_block_attrs, options.prelude
+        );
     };
     if options.previous_uri == Some(parent_uri) {
         return format!(
-            "<li class=\"post-item reply-connected-to-previous\">{}<span class=\"reply-connector reply-connector-previous\" aria-hidden=\"true\"></span>{article}</li>",
-            options.prelude
+            "<li class=\"post-item reply-connected-to-previous\"{}>{}<span class=\"reply-connector reply-connector-previous\" aria-hidden=\"true\"></span>{article}</li>",
+            options.list_block_attrs, options.prelude
         );
     }
     let parent = options.parents.get(parent_uri).and_then(Option::as_ref);
@@ -11841,8 +12453,8 @@ fn render_timeline_post_item<S: Storage>(
         .map(|parent| render_reply_parent_card(storage, parent))
         .unwrap_or_else(|| render_reply_parent_fallback(storage, parent_uri));
     format!(
-        "<li class=\"post-item reply-with-parent\">{}<div class=\"reply-parent-slot\">{parent_markup}<span class=\"reply-connector\" aria-hidden=\"true\"></span></div>{article}</li>",
-        options.prelude
+        "<li class=\"post-item reply-with-parent\"{}>{}<div class=\"reply-parent-slot\">{parent_markup}<span class=\"reply-connector\" aria-hidden=\"true\"></span></div>{article}</li>",
+        options.list_block_attrs, options.prelude
     )
 }
 

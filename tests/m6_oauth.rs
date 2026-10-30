@@ -3,9 +3,9 @@ use appview_rs::{
     feeds::{FeedTimeline, FeedTimelineTiming, HydratedFeedPage, HydratedFeedPost, ResolvedFeed},
     ingest::{IndexedRecord, Ingestor, MemoryStorage, ScopeMode, SqliteStorage, Storage},
     oauth::{
-        AccountLabel, BlockListDetail, FetchedAuthorProfile, OAuthAccount, OAuthCallback, OAuthFlow,
-        OAuthPublic, PageAccountData, PdsCreatedRecord, PinnedFeedTabs, PostImage, PostStrongRef,
-        ProfileListChoice, ProfileRefreshWorker, SqliteOAuthStore, WebShutdown,
+        AccountLabel, BlockListDetail, FetchedAuthorProfile, OAuthAccount, OAuthCallback,
+        OAuthFlow, OAuthPublic, PageAccountData, PdsCreatedRecord, PinnedFeedTabs, PostImage,
+        PostStrongRef, ProfileListChoice, ProfileRefreshWorker, SqliteOAuthStore, WebShutdown,
     },
 };
 use appview_rs::{router, router_with_oauth_flow};
@@ -7240,7 +7240,7 @@ async fn following_page_marks_block_list_member_posts_hidden_but_still_renders_t
         .unwrap();
     let flow = FakeOAuthFlow {
         block_lists: Arc::new(Mutex::new(vec![fake_block_list(
-            &list_uri,
+            list_uri,
             "Spam list",
             &["did:plc:list-member"],
         )])),
@@ -7276,7 +7276,7 @@ async fn custom_feed_page_marks_block_list_member_posts_hidden_but_still_renders
     let storage = Arc::new(MemoryStorage::default());
     let flow = FakeOAuthFlow {
         block_lists: Arc::new(Mutex::new(vec![fake_block_list(
-            &list_uri,
+            list_uri,
             "Spam list",
             &["did:plc:list-member"],
         )])),
@@ -7342,7 +7342,7 @@ async fn a_failing_block_list_member_fetch_keeps_the_page_available_and_warns_wi
         .unwrap();
     let flow = FakeOAuthFlow {
         block_lists: Arc::new(Mutex::new(vec![fake_block_list(
-            &list_uri,
+            list_uri,
             "Spam list",
             &["did:plc:list-member"],
         )])),
@@ -7372,8 +7372,7 @@ async fn a_failing_block_list_member_fetch_keeps_the_page_available_and_warns_wi
     let warnings = warnings.lock().unwrap();
     assert!(
         warnings.iter().any(|line| {
-            line.contains("PDS listRecords refused the member page")
-                && line.contains(list_uri)
+            line.contains("PDS listRecords refused the member page") && line.contains(list_uri)
         }),
         "the warn logs the real error text and the list uri: {warnings:?}"
     );
@@ -7396,7 +7395,7 @@ async fn two_following_pages_within_the_ttl_fetch_the_block_list_once() {
         .unwrap();
     let flow = FakeOAuthFlow {
         block_lists: Arc::new(Mutex::new(vec![fake_block_list(
-            &list_uri,
+            list_uri,
             "Spam list",
             &["did:plc:list-member"],
         )])),
@@ -7421,7 +7420,7 @@ async fn two_following_pages_within_the_ttl_fetch_the_block_list_once() {
     );
     assert_eq!(
         *block_list_requests.lock().unwrap(),
-        vec![list_uri.clone()],
+        vec![list_uri.to_owned()],
         "the member fetch is cached within its TTL"
     );
 }
@@ -7454,7 +7453,7 @@ async fn the_following_timing_line_counts_list_blocked_posts() {
         .unwrap();
     let flow = FakeOAuthFlow {
         block_lists: Arc::new(Mutex::new(vec![fake_block_list(
-            &list_uri,
+            list_uri,
             "Spam list",
             &["did:plc:list-member"],
         )])),
