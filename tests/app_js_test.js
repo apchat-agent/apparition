@@ -1508,3 +1508,95 @@ Deno.test("bar debug overlay shows bottom-bar metrics only when ?bar-debug=1", a
   assertEquals(withoutParam.bodyChildren.length, 0);
   assertEquals(withoutParam.windowListeners.size, 0);
 });
+
+async function createKeyboardClearanceHarness({ textareaBottom = 700, withVisualViewport = true } = {}) {
+  const documentListeners = new Map();
+  const viewportListeners = new Map();
+  const scroller = {
+    className: "app-layout",
+    scrollTop: 0,
+    scrollHeight: 3000,
+    clientHeight: 600,
+    parentElement: null,
+  };
+  const textarea = {
+    tagName: "TEXTAREA",
+    parentElement: scroller,
+    getBoundingClientRect: () => ({ bottom: textareaBottom - scroller.scrollTop }),
+  };
+  const visualViewport = {
+    height: 500,
+    offsetTop: 0,
+    addEventListener(name, listener) { viewportListeners.set(name, listener); },
+  };
+  const windowMock = {
+    scrollY: 0,
+    scrollX: 0,
+    scrollTo(x, y) { this.scrollX = x; this.scrollY = y; },
+    getComputedStyle(element) { return { overflowY: element === scroller ? "auto" : "visible" }; },
+    matchMedia() { return { matches: true }; },
+    addEventListener() {},
+  };
+  if (withVisualViewport) windowMock.visualViewport = visualViewport;
+  const documentMock = {
+    activeElement: null,
+    addEventListener(name, listener) { documentListeners.set(name, listener); },
+    querySelector(selector) { return selector === ".mobile-nav" ? {} : null; },
+    querySelectorAll() { return []; },
+  };
+  globalThis.document = documentMock;
+  globalThis.window = windowMock;
+  globalThis.HTMLFormElement = class {};
+  globalThis.Node = { TEXT_NODE: 3 };
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  new Function(source)();
+  const resets = [];
+  let phase = "load";
+  windowMock.scrollTo = (x, y) => { windowMock.scrollX = x; windowMock.scrollY = y; resets.push(phase); };
+  return { documentMock, documentListeners, phase: () => phase, resets, scroller, setPhase: (name) => { phase = name; }, textarea, viewportListeners, visualViewport, windowMock };
+}
+
+Deno.test("focused composer textarea scrolls its inner scroller by exactly the keyboard overlap", async () => {
+  const harness = await createKeyboardClearanceHarness({ textareaBottom: 700 });
+  harness.windowMock.scrollY = 200;
+  harness.documentMock.activeElement = harness.textarea;
+  harness.documentListeners.get("focusin")();
+  assertEquals(harness.scroller.scrollTop, 256, "700 - (0 + 500 - 56) = 256 px of overlap must move the inner scroller");
+  harness.viewportListeners.get("resize")();
+  assertEquals(harness.scroller.scrollTop, 256, "once the box clears the 56 px area a keyboard resize must not scroll again");
+  assertEquals(harness.resets.length, 0, "a visualViewport resize while a text field is focused must not call window.scrollTo(0, 0)");
+});
+
+Deno.test("a composer textarea that already clears the keyboard area is left alone", async () => {
+  const harness = await createKeyboardClearanceHarness({ textareaBottom: 300 });
+  harness.windowMock.scrollY = 140;
+  harness.documentMock.activeElement = harness.textarea;
+  harness.documentListeners.get("focusin")();
+  harness.setPhase("resize");
+  harness.viewportListeners.get("resize")();
+  assertEquals(harness.scroller.scrollTop, 0, "300 is above 500 - 56, so nothing may scroll");
+  assertEquals(harness.resets.length, 0, "the keyboard resize while focused must not reset the document scroll");
+});
+
+Deno.test("missing visualViewport skips the keyboard clearance without error or scroll", async () => {
+  const harness = await createKeyboardClearanceHarness({ textareaBottom: 700, withVisualViewport: false });
+  harness.documentMock.activeElement = harness.textarea;
+  harness.documentListeners.get("focusin")();
+  assertEquals(harness.scroller.scrollTop, 0, "desktop and old browsers have no visualViewport, so the page must not move");
+});
+
+Deno.test("focusout still resets a document the closing keyboard left scrolled", async () => {
+  const harness = await createKeyboardClearanceHarness({ textareaBottom: 700 });
+  harness.windowMock.scrollY = 120;
+  harness.documentMock.activeElement = harness.textarea;
+  harness.setPhase("focus");
+  harness.documentListeners.get("focusin")();
+  harness.setPhase("resize");
+  harness.viewportListeners.get("resize")();
+  assertEquals(harness.resets.length, 0, "the keyboard opening must not reset the document while the textarea is focused");
+  harness.setPhase("focusout");
+  harness.documentMock.activeElement = null;
+  harness.documentListeners.get("focusout")();
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assertEquals(harness.resets.join(","), "focusout", "focusout keeps the original document reset (its 100 ms timeout included)");
+});
