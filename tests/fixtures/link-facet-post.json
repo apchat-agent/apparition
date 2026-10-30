@@ -1,0 +1,26 @@
+{
+ "uri": "at://did:plc:ckaz32jwl6t2cno6fmuw2nhn/app.bsky.feed.post/3mz27h4raoc2e",
+ "cid": "bafyreifrrashdsyhq6szxjwgjhlo4sb4opysq2envzmm7b36litabo44ra",
+ "record": {
+  "$type": "app.bsky.feed.post",
+  "createdAt": "2026-10-29T21:27:52.674Z",
+  "facets": [
+   {
+    "features": [
+     {
+      "$type": "app.bsky.richtext.facet#link",
+      "uri": "https://cheekypint.substack.com/p/why-sam-altman-is-against-a-single"
+     }
+    ],
+    "index": {
+     "byteEnd": 143,
+     "byteStart": 104
+    }
+   }
+  ],
+  "langs": [
+   "en"
+  ],
+  "text": "Sam Altman felt a sense of loss after observing a scientific breakthrough, one that isn’t yet public\n\ncheekypint.substack.com/p/why-sam-al..."
+ }
+}

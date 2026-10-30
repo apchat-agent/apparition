@@ -13721,7 +13721,7 @@ mod tests {
         assert!(css.contains(".thread-focus-actions .is-liked .icon {\n  fill: var(--accent);"));
         assert!(css.contains(".infinite-scroll-status {"));
         assert!(css.contains(".infinite-scroll-retry[hidden] {\n  display: none;"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m33"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m34"));
         assert!(WEB_SCRIPT_URL.contains("v=js20"));
     }
 
@@ -13742,7 +13742,7 @@ mod tests {
         ));
         assert!(css.contains("bottom: var(--mobile-compose-clearance);"));
         assert!(css.contains("padding-bottom: max(4.25rem, var(--mobile-compose-clearance));"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m33"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m34"));
     }
 
     #[test]
@@ -13926,7 +13926,7 @@ mod tests {
         let head = page_shell("Write a post", "", true);
         assert!(
             head.contains(
-                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m33\"></noscript>"
+                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m34\"></noscript>"
             ),
             "the head must restore the full form for no-JS visitors: {head}"
         );
@@ -16413,6 +16413,204 @@ mod tests {
             ),
         );
         assert!(public.verify_session_cookie(&cookie).is_none());
+    }
+
+    const CHEEKY_URI: &str = "https://cheekypint.substack.com/p/why-sam-altman-is-against-a-single";
+    const CHEEKY_TEXT: &str = "cheekypint.substack.com/p/why-sam-al...";
+
+    fn link_facet_fixture_record() -> IndexedRecord {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/link-facet-post.json")).unwrap();
+        IndexedRecord {
+            did: "did:plc:ckaz32jwl6t2cno6fmuw2nhn".to_owned(),
+            collection: "app.bsky.feed.post".to_owned(),
+            rkey: "3mz27h4raoc2e".to_owned(),
+            uri: fixture["uri"].as_str().unwrap().to_owned(),
+            cid: fixture["cid"].as_str().map(str::to_owned),
+            time_us: 1,
+            record: fixture["record"].clone(),
+        }
+    }
+
+    fn link_facet(byte_start: u64, byte_end: u64, uri: &str) -> Value {
+        json!({
+            "index": {"byteStart": byte_start, "byteEnd": byte_end},
+            "features": [{"$type": "app.bsky.richtext.facet#link", "uri": uri}]
+        })
+    }
+
+    #[test]
+    fn link_facets_in_post_text_become_anchors_with_the_full_target_url_underneath() {
+        let record = link_facet_fixture_record();
+        let storage = MemoryStorage::default();
+        storage.put_record(&record).unwrap();
+        let index = QuoteRenderIndex::default();
+
+        let rendered =
+            render_web_post(&storage, &record, "did:plc:viewer", false, true, false, &index);
+
+        assert!(
+            rendered.contains(&format!(
+                "<a class=\"post-text-link\" href=\"{CHEEKY_URI}\" rel=\"nofollow noopener noreferrer\" target=\"_blank\">{CHEEKY_TEXT}</a>"
+            )),
+            "the facet span (UTF-8 byte offsets past the curly apostrophe) becomes the tappable anchor: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "<p class=\"post-link-targets\"><a class=\"post-link-target\" href=\"{CHEEKY_URI}\" rel=\"nofollow noopener noreferrer\" target=\"_blank\">{CHEEKY_URI}</a></p>"
+            )),
+            "the full target URL sits in small print under the post text: {rendered}"
+        );
+        assert!(
+            !rendered.contains("<a class=\"post-text-link\" href=\"/app/thread"),
+            "the whole-text thread link must not nest around an external anchor: {rendered}"
+        );
+    }
+
+    #[test]
+    fn thread_focus_renders_facet_links_and_their_target_lines() {
+        let record = link_facet_fixture_record();
+        let storage = MemoryStorage::default();
+        storage.put_record(&record).unwrap();
+        let index = QuoteRenderIndex::default();
+
+        let rendered = render_thread_focus(&storage, &record, "did:plc:viewer", false, false, &index);
+
+        assert!(
+            rendered.contains(&format!(
+                "<a class=\"post-text-link\" href=\"{CHEEKY_URI}\" rel=\"nofollow noopener noreferrer\" target=\"_blank\">{CHEEKY_TEXT}</a>"
+            )),
+            "the focused post's link facet is tappable: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "<p class=\"post-link-targets\"><a class=\"post-link-target\" href=\"{CHEEKY_URI}\""
+            )),
+            "the focused post shows the full target line: {rendered}"
+        );
+    }
+
+    #[test]
+    fn out_of_range_overlapping_and_mid_char_link_facets_render_as_plain_text() {
+        let text = "it’s https://x.example/a/b tail more";
+        let good = link_facet(6, 27, "https://x.example/a/b");
+
+        assert_eq!(
+            render_post_text(text, &[link_facet(100, 200, "https://x.example/a/b")]),
+            html_escape(text),
+            "offsets past the end of the text stay plain text"
+        );
+        assert_eq!(
+            render_post_text(text, &[link_facet(4, 27, "https://x.example/a/b")]),
+            html_escape(text),
+            "an offset inside the 3-byte apostrophe stays plain text"
+        );
+        let overlapping =
+            render_post_text(text, &[link_facet(20, 35, "https://y.example/z"), good.clone()]);
+        assert_eq!(
+            overlapping.matches("<a class=\"post-text-link\"").count(),
+            1,
+            "only the first of two overlapping facets becomes an anchor: {overlapping}"
+        );
+        assert!(
+            overlapping.contains(&format!(
+                "<a class=\"post-text-link\" href=\"https://x.example/a/b\" rel=\"nofollow noopener noreferrer\" target=\"_blank\">https://x.example/a/b</a>"
+            )),
+            "the first facet still renders: {overlapping}"
+        );
+        assert!(
+            overlapping.contains("tail more"),
+            "the rest of the text is plain: {overlapping}"
+        );
+    }
+
+    #[test]
+    fn javascript_uris_and_non_link_facets_stay_plain_text() {
+        let text = "it’s https://x.example/a/b tail more";
+        assert_eq!(
+            render_post_text(text, &[link_facet(6, 27, "javascript:alert(1)")]),
+            html_escape(text),
+            "only http/https facet URIs become links"
+        );
+        let mention = json!({
+            "index": {"byteStart": 6, "byteEnd": 13},
+            "features": [{"$type": "app.bsky.richtext.facet#mention", "did": "did:plc:friend"}]
+        });
+        assert_eq!(
+            render_post_text("hello @friend tail", &[mention]),
+            html_escape("hello @friend tail"),
+            "mentions are out of scope and stay plain text"
+        );
+    }
+
+    #[test]
+    fn target_lines_show_the_full_uri_once_and_skip_links_that_already_show_their_url() {
+        let dup = "https://x.example/dup";
+        let text = format!("one {dup} two {dup}");
+        let targets = render_post_link_targets(
+            &text,
+            &[link_facet(4, 25, dup), link_facet(30, 51, dup)],
+        );
+        assert_eq!(
+            targets.matches("<p class=\"post-link-targets\">").count(),
+            1,
+            "one target line per distinct link, deduplicated: {targets}"
+        );
+        assert!(
+            targets.contains(&format!(
+                "<p class=\"post-link-targets\"><a class=\"post-link-target\" href=\"{dup}\" rel=\"nofollow noopener noreferrer\" target=\"_blank\">{dup}</a></p>"
+            )),
+            "the line carries the full URI: {targets}"
+        );
+
+        let shown = "x.example/plain";
+        let text = format!("read {shown}");
+        assert_eq!(
+            render_post_link_targets(&text, &[link_facet(5, 20, "https://x.example/plain")]),
+            "",
+            "a link whose visible text is already the URL needs no target line"
+        );
+        assert!(
+            render_post_text(&text, &[link_facet(5, 20, "https://x.example/plain")])
+                .contains("<a class=\"post-text-link\" href=\"https://x.example/plain\""),
+            "the text itself is still tappable"
+        );
+    }
+
+    #[test]
+    fn a_post_without_link_facets_renders_exactly_as_before() {
+        assert_eq!(render_post_text("just words", &[]), html_escape("just words"));
+        assert_eq!(
+            render_post_text("thread post 2/3", &[]),
+            format!(
+                "{}<span class=\"thread-number-pill\">{}</span>",
+                html_escape("thread post "),
+                html_escape("2/3")
+            ),
+            "the thread-number pill stays where it was"
+        );
+        assert_eq!(render_post_text("1/2", &[]), "<span class=\"thread-number-pill\">1/2</span>");
+        assert_eq!(render_post_link_targets("just words", &[]), "");
+    }
+
+    #[test]
+    fn post_link_target_lines_are_small_muted_and_wrap_inside_the_card() {
+        let css = include_str!("../static/app.css");
+        let bodies = css_rule_bodies(css, ".post-link-targets");
+        assert!(
+            !bodies.is_empty(),
+            "app.css must style the small-print target lines"
+        );
+        let body = bodies.last().unwrap();
+        assert_eq!(
+            css_declaration(body, "overflow-wrap").as_deref(),
+            Some("anywhere"),
+            "a long URL must wrap instead of widening the card at 402 px"
+        );
+        assert_eq!(css_declaration(body, "font-size").as_deref(), Some("0.75rem"));
+        assert_eq!(css_declaration(body, "color").as_deref(), Some("var(--muted)"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m34"));
+        assert!(WEB_NOJS_STYLESHEET_URL.contains("v=m34"));
     }
 }
 
