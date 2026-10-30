@@ -14597,6 +14597,13 @@ mod tests {
     }
 
     #[test]
+    fn profile_block_lists_link_icon_has_a_size() {
+        // Without one the inline SVG takes the 300x150 default and the button is huge (owner, 2026-10-30).
+        let css = include_str!("../static/app.css");
+        assert!(css.contains(".profile-block-lists-link .icon {\n  width: 1.1rem;\n  height: 1.1rem;"));
+    }
+
+    #[test]
     fn mobile_bottom_bar_uses_compact_safe_area_aware_geometry() {
         let css = include_str!("../static/app.css");
 
