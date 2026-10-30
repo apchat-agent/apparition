@@ -12485,6 +12485,295 @@ mod tests {
         server.abort();
     }
 
+    async fn label_routing_test_flow(
+        public_appview_base: String,
+        labelled_appview_base: String,
+    ) -> (AtriumOAuthFlow<FeedTestIdentity>, String) {
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        let identity = Arc::new(IdentityResolver::new(
+            FeedTestIdentity(HashMap::new()),
+            Duration::from_secs(30),
+        ));
+        let flow = AtriumOAuthFlow::new_with_public_appview_base(
+            &public,
+            identity,
+            SqliteOAuthStore::open(":memory:").unwrap(),
+            "http://127.0.0.1:1/",
+            SafeHttpClient::new().with_http_test_hosts(["127.0.0.1".to_owned()]),
+            &public_appview_base,
+        )
+        .unwrap()
+        .with_labelled_appview_base(labelled_appview_base);
+        let mut preferences = flow.labeler_preference_cache.lock().await;
+        for viewer in [
+            "did:plc:base-routing-viewer",
+            "did:plc:dropped-labeler-viewer",
+            "did:plc:applied-labeler-viewer",
+        ] {
+            preferences.insert(
+                viewer.to_owned(),
+                (
+                    tokio::time::Instant::now() + Duration::from_secs(60),
+                    vec![
+                        BSKY_MODERATION_LABELER_DID.to_owned(),
+                        "did:plc:customlabeler".to_owned(),
+                    ],
+                ),
+            );
+        }
+        drop(preferences);
+        (flow, "did:plc:base-routing-viewer".to_owned())
+    }
+
+    async fn label_base_probe_servers() -> (
+        String,
+        String,
+        Arc<Mutex<Vec<String>>>,
+        Arc<Mutex<Vec<(String, Option<String>)>>>,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let public_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let public_address = public_listener.local_addr().unwrap();
+        let labelled_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let labelled_address = labelled_listener.local_addr().unwrap();
+
+        let public_requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let public_profiles = public_requests.clone();
+        let public_services = public_requests.clone();
+        let public_app = Router::new()
+            .route(
+                "/xrpc/app.bsky.actor.getProfiles",
+                get(move || {
+                    let requests = public_profiles.clone();
+                    async move {
+                        requests
+                            .lock()
+                            .unwrap()
+                            .push("/xrpc/app.bsky.actor.getProfiles".to_owned());
+                        Json(json!({"profiles": []}))
+                    }
+                }),
+            )
+            .route(
+                "/xrpc/app.bsky.labeler.getServices",
+                get(move || {
+                    let requests = public_services.clone();
+                    async move {
+                        requests
+                            .lock()
+                            .unwrap()
+                            .push("/xrpc/app.bsky.labeler.getServices".to_owned());
+                        Json(json!({"views":[{
+                            "creator":{"did":"did:plc:customlabeler","displayName":"Careful Labeler"},
+                            "policies":{"labelValueDefinitions":[{
+                                "identifier":"spider",
+                                "severity":"alert",
+                                "blurs":"media",
+                                "locales":[{"lang":"en","name":"Spider Warning"}]
+                            }]}
+                        }]}))
+                    }
+                }),
+            );
+        let public_server = tokio::spawn(async move {
+            axum::serve(public_listener, public_app).await.unwrap();
+        });
+
+        let labelled_requests = Arc::new(Mutex::new(Vec::<(String, Option<String>)>::new()));
+        let labelled_profiles = labelled_requests.clone();
+        let labelled_app = Router::new().route(
+            "/xrpc/app.bsky.actor.getProfiles",
+            get(move |uri: Uri, headers: axum::http::HeaderMap| {
+                let requests = labelled_profiles.clone();
+                async move {
+                    let query = uri.query().unwrap_or_default();
+                    requests.lock().unwrap().push((
+                        uri.to_string(),
+                        headers
+                            .get("atproto-accept-labelers")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned),
+                    ));
+                    let mut profiles = Vec::new();
+                    for actor in ["did:plc:labelled-author", "did:plc:dropped-label-author"] {
+                        if query.contains(&format!("actors={actor}")) {
+                            profiles.push(json!({
+                                "did": actor,
+                                "labels": [{
+                                    "src": "did:plc:customlabeler",
+                                    "uri": actor,
+                                    "val": "spider",
+                                }]
+                            }));
+                        }
+                    }
+                    let applied_labelers = if query.contains("actors=did:plc:dropped-label-author")
+                    {
+                        "did:plc:ar7c4by46qjdydhdevvrndac;redact"
+                    } else {
+                        "did:plc:ar7c4by46qjdydhdevvrndac;redact,did:plc:customlabeler"
+                    };
+                    let mut response_headers = axum::http::HeaderMap::new();
+                    response_headers.insert(
+                        "atproto-content-labelers",
+                        axum::http::HeaderValue::from_static(applied_labelers),
+                    );
+                    (response_headers, Json(json!({"profiles": profiles})))
+                }
+            }),
+        );
+        let labelled_server = tokio::spawn(async move {
+            axum::serve(labelled_listener, labelled_app).await.unwrap();
+        });
+
+        (
+            format!("http://{public_address}/xrpc/"),
+            format!("http://{labelled_address}/xrpc/"),
+            public_requests,
+            labelled_requests,
+            public_server,
+            labelled_server,
+        )
+    }
+
+    #[tokio::test]
+    async fn page_account_labels_fetch_profiles_from_the_labelled_base_not_the_public_one() {
+        let (
+            public_base,
+            labelled_base,
+            public_requests,
+            labelled_requests,
+            public_server,
+            labelled_server,
+        ) = label_base_probe_servers().await;
+        let (flow, viewer) = label_routing_test_flow(public_base, labelled_base).await;
+
+        let labels = flow
+            .fetch_account_labels_for_page(
+                viewer.as_str(),
+                vec!["did:plc:labelled-author".to_owned()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            labels.len(),
+            1,
+            "the label returned by the labelled base reaches the page fetch"
+        );
+        assert_eq!(labels[0].labeler_did, "did:plc:customlabeler");
+        assert_eq!(labels[0].display_name, "Spider Warning");
+
+        let rendered = render_account_label_chips(
+            &HashMap::from([("did:plc:labelled-author".to_owned(), labels)]),
+            "did:plc:labelled-author",
+        );
+        assert!(
+            rendered.contains("<details class=\"account-labels\">"),
+            "the fetched label reaches the rendered control: {rendered}"
+        );
+        assert!(rendered.contains("Spider Warning"), "{rendered}");
+
+        let public_calls = public_requests.lock().unwrap();
+        assert!(
+            public_calls
+                .iter()
+                .all(|uri| !uri.starts_with("/xrpc/app.bsky.actor.getProfiles")),
+            "getProfiles must not ask the public base: {public_calls:?}"
+        );
+        assert!(
+            public_calls
+                .iter()
+                .any(|uri| uri.starts_with("/xrpc/app.bsky.labeler.getServices")),
+            "labeler presentations still come from the public base: {public_calls:?}"
+        );
+        drop(public_calls);
+        let labelled_calls = labelled_requests.lock().unwrap();
+        let profile_calls = labelled_calls
+            .iter()
+            .filter(|(uri, _)| uri.starts_with("/xrpc/app.bsky.actor.getProfiles?"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            profile_calls.len(),
+            1,
+            "one batched getProfiles goes to the labelled base"
+        );
+        let accepted = profile_calls[0].1.as_deref().unwrap();
+        assert!(accepted.contains(BSKY_MODERATION_LABELER_DID), "{accepted}");
+        assert!(accepted.contains("did:plc:customlabeler"), "{accepted}");
+        drop(labelled_calls);
+        public_server.abort();
+        labelled_server.abort();
+    }
+
+    #[tokio::test]
+    async fn dropped_applied_labelers_warn_once_with_requested_and_applied_dids() {
+        let (
+            public_base,
+            labelled_base,
+            _public_requests,
+            _labelled_requests,
+            public_server,
+            labelled_server,
+        ) = label_base_probe_servers().await;
+        let (flow, _) = label_routing_test_flow(public_base, labelled_base).await;
+
+        let warn_logs = FeedTestLogs::default();
+        let warn_subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(warn_logs.clone())
+            .finish();
+        flow.fetch_account_labels_for_page(
+            "did:plc:dropped-labeler-viewer",
+            vec!["did:plc:dropped-label-author".to_owned()],
+        )
+        .with_subscriber(warn_subscriber)
+        .await
+        .unwrap();
+        let output = String::from_utf8(warn_logs.0.lock().unwrap().clone()).unwrap();
+        let warnings = output
+            .lines()
+            .filter(|line| {
+                line.contains("WARN")
+                    && line.contains("Bluesky getProfiles did not apply every requested labeler")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1, "exactly one warning line: {output}");
+        assert!(
+            warnings[0].contains("did:plc:customlabeler"),
+            "the warning names the dropped labeler: {}",
+            warnings[0]
+        );
+        assert!(
+            warnings[0].contains(BSKY_MODERATION_LABELER_DID),
+            "the warning names the applied labelers: {}",
+            warnings[0]
+        );
+
+        let clean_logs = FeedTestLogs::default();
+        let clean_subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(clean_logs.clone())
+            .finish();
+        flow.fetch_account_labels_for_page(
+            "did:plc:applied-labeler-viewer",
+            vec!["did:plc:labelled-author".to_owned()],
+        )
+        .with_subscriber(clean_subscriber)
+        .await
+        .unwrap();
+        let clean_output = String::from_utf8(clean_logs.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            !clean_output.contains("Bluesky getProfiles did not apply every requested labeler"),
+            "an applied-labelers header that covers every requested DID stays quiet: {clean_output}"
+        );
+
+        public_server.abort();
+        labelled_server.abort();
+    }
+
     #[derive(Clone)]
     struct SlowMutesTestFlow;
 
