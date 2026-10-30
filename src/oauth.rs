@@ -10,7 +10,11 @@ use crate::{
         RecordCursor, Storage, StorageError,
     },
     link_card::{LinkCard, LinkCardFetcher, LinkThumbnail},
-    net::SafeHttpClient,
+    net::{
+        OutboundCallSnapshot, OutboundCallTimer, RequestOutboundAccounting, SafeHttpClient,
+        current_outbound_call_snapshot, current_request_outbound_accounting,
+        with_request_outbound_accounting,
+    },
     profile_counts::{PUBLIC_APPVIEW_BASE, ProfileCountsClient, apply_profile_counts},
 };
 use atrium_api::{
@@ -41,6 +45,7 @@ use axum::{
         DefaultBodyLimit, Form, FromRequest, Multipart, Path as AxumPath, Query, Request, State,
     },
     http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware::{Next, from_fn},
     response::{
         Html, IntoResponse, Redirect, Response,
         sse::{Event, Sse},
@@ -982,6 +987,7 @@ impl OAuthPublic {
             .route("/like", post(write_like::<F, S>))
             .route("/repost", post(write_repost::<F, S>))
             .layer(DefaultBodyLimit::max(MAX_POST_BODY_BYTES))
+            .layer(from_fn(account_web_outbound_calls))
             .with_state(state.clone());
         let video_routes = Router::new()
             .route("/video", post(upload_video::<F, S>))
@@ -2284,6 +2290,8 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         url.set_path(&format!("/xrpc/{lexicon}"));
         url.query_pairs_mut()
             .extend_pairs(parameters.iter().copied());
+        let call_timer =
+            OutboundCallTimer::new(&axum::http::Method::GET, &url, std::time::Instant::now());
         let response = self
             .video_http_client
             .get(url)
@@ -2291,7 +2299,9 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             .send()
             .await
             .map_err(|error| format!("video service {lexicon} request failed: {error}"))?;
-        read_video_service_response(response).await
+        let result = read_video_service_response(response).await;
+        drop(call_timer);
+        result
     }
 
     async fn upload_video_blob(&self, did: &str, video: &PostVideo) -> Result<Value, String> {
@@ -2314,6 +2324,8 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             .await
             .map_err(|error| format!("temporary video file could not be reopened: {error}"))?;
         let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+        let call_timer =
+            OutboundCallTimer::new(&axum::http::Method::POST, &url, std::time::Instant::now());
         let response = self
             .video_http_client
             .post(url)
@@ -2324,7 +2336,9 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             .send()
             .await
             .map_err(|error| format!("video service upload request failed: {error}"))?;
-        let initial = read_video_service_response(response).await?;
+        let initial_result = read_video_service_response(response).await;
+        drop(call_timer);
+        let initial = initial_result?;
         let initial_status = job_status_value(&initial);
         let state = initial_status
             .get("state")
@@ -3745,6 +3759,7 @@ struct PageContentHydration {
     quote_index: QuoteRenderIndex,
     profile_hydration_ms: u64,
     quote_hydration_ms: u64,
+    account_labels_ms: u64,
 }
 
 type PageParentIndex = HashMap<String, Option<IndexedRecord>>;
@@ -3762,17 +3777,69 @@ enum AncestorSource {
     Live,
 }
 
+async fn account_web_outbound_calls(request: Request, next: Next) -> Response {
+    let write_route = if request.method() == axum::http::Method::POST {
+        match request.uri().path() {
+            "/like" => Some("like"),
+            "/repost" => Some("repost"),
+            "/reply" => Some("reply"),
+            "/post" => Some("post"),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let started = std::time::Instant::now();
+    let accounting = RequestOutboundAccounting::default();
+    let response = with_request_outbound_accounting(accounting.clone(), next.run(request)).await;
+    if let Some(route) = write_route {
+        let calls = accounting.snapshot();
+        tracing::info!(
+            route,
+            total_ms = started.elapsed().as_millis() as u64,
+            outbound_call_count = calls.total_calls,
+            outbound_call_ms = calls.total_ms,
+            dpop_nonce_retries = calls.dpop_nonce_retries,
+            dpop_nonce_retry = calls.dpop_nonce_retries > 0,
+            outbound_calls = %format_outbound_calls(&calls),
+            "web write"
+        );
+    }
+    response
+}
+
+fn format_outbound_calls(calls: &OutboundCallSnapshot) -> String {
+    if calls.by_kind.is_empty() {
+        return "none".to_owned();
+    }
+    calls
+        .by_kind
+        .iter()
+        .map(|(kind, (count, duration_ms))| format!("{kind}:{count}/{duration_ms}ms"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 struct WebPageTiming {
     page: &'static str,
     started: std::time::Instant,
     session_token_refresh_ms: u64,
+    saved_feeds_ms: u64,
     preferences_ms: u64,
     tabs_ms: u64,
     timeline_fetch_index_ms: u64,
     timeline_fetch_live_ms: u64,
+    feed_timeline_ms: u64,
+    mutes_ms: u64,
     parent_hydration_ms: u64,
+    content_hydration_ms: u64,
     profile_hydration_ms: u64,
     quote_hydration_ms: u64,
+    account_labels_ms: u64,
+    profile_counts_ms: u64,
+    profile_action_panel_ms: u64,
+    profile_action_mutes_ms: u64,
+    profile_list_choices_ms: u64,
     render_ms: u64,
     ancestors_from_index: usize,
     ancestors_live: usize,
@@ -3785,13 +3852,22 @@ impl WebPageTiming {
             page,
             started: std::time::Instant::now(),
             session_token_refresh_ms: 0,
+            saved_feeds_ms: 0,
             preferences_ms: 0,
             tabs_ms: 0,
             timeline_fetch_index_ms: 0,
             timeline_fetch_live_ms: 0,
+            feed_timeline_ms: 0,
+            mutes_ms: 0,
             parent_hydration_ms: 0,
+            content_hydration_ms: 0,
             profile_hydration_ms: 0,
             quote_hydration_ms: 0,
+            account_labels_ms: 0,
+            profile_counts_ms: 0,
+            profile_action_panel_ms: 0,
+            profile_action_mutes_ms: 0,
+            profile_list_choices_ms: 0,
             render_ms: 0,
             ancestors_from_index: 0,
             ancestors_live: 0,
@@ -3802,21 +3878,63 @@ impl WebPageTiming {
 
 impl Drop for WebPageTiming {
     fn drop(&mut self) {
+        let total_ms = self.started.elapsed().as_millis() as u64;
+        // The *_hydration_ms, preferences_ms/tabs_ms, and profile action subphase fields are
+        // details nested within their enclosing wall-clock phase. Keep those details out of this
+        // additive coverage sum because hydration runs its profile, quote, and label futures in
+        // parallel.
+        let timeline_phase_ms = if self.page == "feed" {
+            self.feed_timeline_ms
+        } else {
+            self.timeline_fetch_index_ms
+                .saturating_add(self.timeline_fetch_live_ms)
+        };
+        let session_phase_ms = if self.page == "feed" {
+            0
+        } else {
+            self.session_token_refresh_ms
+        };
+        let phase_sum_ms = session_phase_ms
+            .saturating_add(self.saved_feeds_ms)
+            .saturating_add(timeline_phase_ms)
+            .saturating_add(self.mutes_ms)
+            .saturating_add(self.parent_hydration_ms)
+            .saturating_add(self.content_hydration_ms)
+            .saturating_add(self.profile_counts_ms)
+            .saturating_add(self.profile_action_panel_ms)
+            .saturating_add(self.render_ms);
+        let phase_gap_ms = total_ms as i64 - phase_sum_ms as i64;
+        let calls = current_outbound_call_snapshot();
         tracing::info!(
             page = self.page,
             session_token_refresh_ms = self.session_token_refresh_ms,
+            saved_feeds_ms = self.saved_feeds_ms,
             preferences_ms = self.preferences_ms,
             tabs_ms = self.tabs_ms,
             timeline_fetch_index_ms = self.timeline_fetch_index_ms,
             timeline_fetch_live_ms = self.timeline_fetch_live_ms,
+            feed_timeline_ms = self.feed_timeline_ms,
+            mutes_ms = self.mutes_ms,
             parent_hydration_ms = self.parent_hydration_ms,
+            content_hydration_ms = self.content_hydration_ms,
             profile_hydration_ms = self.profile_hydration_ms,
             quote_hydration_ms = self.quote_hydration_ms,
+            account_labels_ms = self.account_labels_ms,
+            profile_counts_ms = self.profile_counts_ms,
+            profile_action_panel_ms = self.profile_action_panel_ms,
+            profile_action_mutes_ms = self.profile_action_mutes_ms,
+            profile_list_choices_ms = self.profile_list_choices_ms,
             render_ms = self.render_ms,
             ancestors_from_index = self.ancestors_from_index,
             ancestors_live = self.ancestors_live,
             ancestors_timed_out = self.ancestors_timed_out,
-            total_ms = self.started.elapsed().as_millis() as u64,
+            outbound_call_count = calls.total_calls,
+            outbound_call_ms = calls.total_ms,
+            outbound_calls = %format_outbound_calls(&calls),
+            dpop_nonce_retries = calls.dpop_nonce_retries,
+            phase_sum_ms,
+            phase_gap_ms,
+            total_ms,
             "web page phases"
         );
     }
@@ -4176,7 +4294,8 @@ async fn hydrate_page_content<F: OAuthFlow, S: Storage + 'static>(
     let label_flow = flow.clone();
     let viewer_did = viewer_did.to_owned();
     let label_hydration = async move {
-        match tokio::time::timeout_at(
+        let started = std::time::Instant::now();
+        let labels = match tokio::time::timeout_at(
             deadline,
             label_flow.account_labels_for_page(&viewer_did, label_actor_dids),
         )
@@ -4188,34 +4307,40 @@ async fn hydrate_page_content<F: OAuthFlow, S: Storage + 'static>(
                 Vec::new()
             }
             Err(_) => Vec::new(),
-        }
+        };
+        (labels, started.elapsed().as_millis() as u64)
     };
     let quote_storage = storage.clone();
     let profile_flow = flow.clone();
-    let profile_task = tokio::spawn(async move {
-        let result = hydrate_page_profiles(&profile_flow, storage, authors, deadline).await;
-        if let Err(error) = &result {
-            tracing::warn!(%error, "background page profile hydration failed");
-        }
-        result
-    });
+    let profile_started = std::time::Instant::now();
+    let profile_accounting = current_request_outbound_accounting().unwrap_or_default();
+    let profile_task = tokio::spawn(with_request_outbound_accounting(
+        profile_accounting,
+        async move {
+            let result = hydrate_page_profiles(&profile_flow, storage, authors, deadline).await;
+            if let Err(error) = &result {
+                tracing::warn!(%error, "background page profile hydration failed");
+            }
+            result
+        },
+    ));
     tokio::task::yield_now().await;
     let profile_fast_path = async move {
-        let started = std::time::Instant::now();
-        match profile_task.await {
-            Ok(result) => result.map(|_| started.elapsed().as_millis() as u64),
+        let result = match profile_task.await {
+            Ok(result) => result.map(|_| ()),
             Err(error) => {
                 tracing::warn!(%error, "page profile hydration task failed");
-                Ok(started.elapsed().as_millis() as u64)
+                Ok(())
             }
-        }
+        };
+        (result, profile_started.elapsed().as_millis() as u64)
     };
     let quote_hydration = async {
         let started = std::time::Instant::now();
         let quotes = hydrate_page_quotes(flow, quote_storage.as_ref(), refs, deadline).await;
         (quotes, started.elapsed().as_millis() as u64)
     };
-    let (quote_hydration, profile_hydration_ms, labels) =
+    let (quote_hydration, (profile_result, profile_hydration_ms), (labels, account_labels_ms)) =
         tokio::join!(quote_hydration, profile_fast_path, label_hydration);
     let mut quote_index = quote_hydration.0?;
     for label in labels {
@@ -4227,8 +4352,12 @@ async fn hydrate_page_content<F: OAuthFlow, S: Storage + 'static>(
     }
     Ok(PageContentHydration {
         quote_index,
-        profile_hydration_ms: profile_hydration_ms?,
+        profile_hydration_ms: {
+            profile_result?;
+            profile_hydration_ms
+        },
         quote_hydration_ms: quote_hydration.1,
+        account_labels_ms,
     })
 }
 
@@ -4900,12 +5029,14 @@ where
         return Redirect::to("/login").into_response();
     };
     page_timing.session_token_refresh_ms = session_started.elapsed().as_millis() as u64;
+    let saved_feeds_started = std::time::Instant::now();
     let tabs = pinned_feeds_for_layout(
         &state.flow,
         &did,
         verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()),
     )
     .await;
+    page_timing.saved_feeds_ms = saved_feeds_started.elapsed().as_millis() as u64;
     page_timing.preferences_ms = tabs.preferences_ms;
     page_timing.tabs_ms = tabs.tabs_ms;
     let pinned_feeds = tabs.feeds;
@@ -4928,30 +5059,34 @@ where
     page_timing.timeline_fetch_index_ms = timeline_started.elapsed().as_millis() as u64;
     let has_more = timeline_page.len() > limit;
     let next_cursor_record = timeline_page.get(limit.saturating_sub(1)).cloned();
-    let hidden_actors =
-        match timeline_hidden_actor_dids(&state.flow, state.storage.as_ref(), &did).await {
-            Ok(hidden) => hidden,
-            Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
-        };
+    let mutes_started = std::time::Instant::now();
+    let hidden_actors_result =
+        timeline_hidden_actor_dids(&state.flow, state.storage.as_ref(), &did).await;
+    page_timing.mutes_ms = mutes_started.elapsed().as_millis() as u64;
+    let hidden_actors = match hidden_actors_result {
+        Ok(hidden) => hidden,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+    };
     let mut page_records = timeline_page.into_iter().take(limit).collect::<Vec<_>>();
     page_records.retain(|record| !hidden_actors.contains(&record.did));
     let timeline = page_records.iter().collect::<Vec<_>>();
     let content_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
     let parent_started = std::time::Instant::now();
-    let parents = match hydrate_page_parents(
+    let parent_result = hydrate_page_parents(
         &state.flow,
         state.storage.as_ref(),
         &timeline,
         content_deadline,
     )
-    .await
-    {
+    .await;
+    page_timing.parent_hydration_ms = parent_started.elapsed().as_millis() as u64;
+    let parents = match parent_result {
         Ok(parents) => parents,
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
-    page_timing.parent_hydration_ms = parent_started.elapsed().as_millis() as u64;
     let quote_records = page_records_with_parents(&timeline, &parents);
-    let quote_index = match hydrate_page_content(
+    let content_started = std::time::Instant::now();
+    let content_result = hydrate_page_content(
         &state.flow,
         &did,
         state.storage.clone(),
@@ -4960,11 +5095,13 @@ where
         std::iter::empty(),
         content_deadline,
     )
-    .await
-    {
+    .await;
+    page_timing.content_hydration_ms = content_started.elapsed().as_millis() as u64;
+    let quote_index = match content_result {
         Ok(hydration) => {
             page_timing.profile_hydration_ms = hydration.profile_hydration_ms;
             page_timing.quote_hydration_ms = hydration.quote_hydration_ms;
+            page_timing.account_labels_ms = hydration.account_labels_ms;
             hydration.quote_index
         }
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
@@ -4972,9 +5109,9 @@ where
     if let Err(error) = queue_missing_parent_authors(state.storage.as_ref(), &parents) {
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
-    let render_started = std::time::Instant::now();
     let write_forms_enabled =
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
+    let render_started = std::time::Instant::now();
     let posts = render_timeline_post_items(
         state.storage.as_ref(),
         &timeline,
@@ -4989,6 +5126,7 @@ where
     } else {
         posts
     };
+    let posts_render_ms = render_started.elapsed().as_millis() as u64;
     let indexing_status = if page_records.is_empty() && next_cursor_record.is_none() {
         let (total, done) = match state.storage.backfill_progress(&did) {
             Ok(progress) => progress,
@@ -5016,6 +5154,7 @@ where
     } else {
         String::new()
     };
+    let rest_render_started = std::time::Instant::now();
     let read_only_message = if write_forms_enabled {
         String::new()
     } else {
@@ -5065,7 +5204,7 @@ where
         unread_badge_count(state.storage.as_ref(), &did),
     ))
     .into_response();
-    page_timing.render_ms = render_started.elapsed().as_millis() as u64;
+    page_timing.render_ms = posts_render_ms + rest_render_started.elapsed().as_millis() as u64;
     response
 }
 
@@ -5172,6 +5311,7 @@ where
             );
         }
     }
+    page_timing.feed_timeline_ms = timeline_started.elapsed().as_millis() as u64;
     page_timing.session_token_refresh_ms = page
         .timing
         .session_token_refresh_ms
@@ -5180,11 +5320,14 @@ where
     if page.timing.cache_hit {
         page_timing.timeline_fetch_index_ms = timeline_started.elapsed().as_millis() as u64;
     }
-    let hidden_actors =
-        match timeline_hidden_actor_dids(&state.flow, state.storage.as_ref(), &did).await {
-            Ok(hidden) => hidden,
-            Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
-        };
+    let mutes_started = std::time::Instant::now();
+    let hidden_actors_result =
+        timeline_hidden_actor_dids(&state.flow, state.storage.as_ref(), &did).await;
+    page_timing.mutes_ms = mutes_started.elapsed().as_millis() as u64;
+    let hidden_actors = match hidden_actors_result {
+        Ok(hidden) => hidden,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+    };
     let feed_items = page
         .timeline
         .feed
@@ -5197,20 +5340,21 @@ where
         .collect::<Vec<_>>();
     let content_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
     let parent_started = std::time::Instant::now();
-    let parents = match hydrate_page_parents(
+    let parent_result = hydrate_page_parents(
         &state.flow,
         state.storage.as_ref(),
         &feed_records,
         content_deadline,
     )
-    .await
-    {
+    .await;
+    page_timing.parent_hydration_ms = parent_started.elapsed().as_millis() as u64;
+    let parents = match parent_result {
         Ok(parents) => parents,
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
-    page_timing.parent_hydration_ms = parent_started.elapsed().as_millis() as u64;
     let quote_records = page_records_with_parents(&feed_records, &parents);
-    let quote_index = match hydrate_page_content(
+    let content_started = std::time::Instant::now();
+    let content_result = hydrate_page_content(
         &state.flow,
         &did,
         state.storage.clone(),
@@ -5219,11 +5363,13 @@ where
         std::iter::empty(),
         content_deadline,
     )
-    .await
-    {
+    .await;
+    page_timing.content_hydration_ms = content_started.elapsed().as_millis() as u64;
+    let quote_index = match content_result {
         Ok(hydration) => {
             page_timing.profile_hydration_ms = hydration.profile_hydration_ms;
             page_timing.quote_hydration_ms = hydration.quote_hydration_ms;
+            page_timing.account_labels_ms = hydration.account_labels_ms;
             hydration.quote_index
         }
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
@@ -5231,9 +5377,9 @@ where
     if let Err(error) = queue_missing_parent_authors(state.storage.as_ref(), &parents) {
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
-    let render_started = std::time::Instant::now();
     let write_forms_enabled =
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
+    let render_started = std::time::Instant::now();
     let feed_preludes = feed_items
         .iter()
         .map(|post| {
@@ -5282,9 +5428,13 @@ where
             )
         })
         .unwrap_or_default();
+    let pre_tabs_render_ms = render_started.elapsed().as_millis() as u64;
+    let saved_feeds_started = std::time::Instant::now();
     let tabs = pinned_feeds_for_layout(&state.flow, &did, true).await;
+    page_timing.saved_feeds_ms = saved_feeds_started.elapsed().as_millis() as u64;
     page_timing.preferences_ms = tabs.preferences_ms;
     page_timing.tabs_ms = tabs.tabs_ms;
+    let shell_render_started = std::time::Instant::now();
     let response = Html(page_shell_with_feeds_and_badge(
         &page.generator.display_name,
         &format!(
@@ -5299,7 +5449,7 @@ where
         unread_badge_count(state.storage.as_ref(), &did),
     ))
     .into_response();
-    page_timing.render_ms = render_started.elapsed().as_millis() as u64;
+    page_timing.render_ms = pre_tabs_render_ms + shell_render_started.elapsed().as_millis() as u64;
     response
 }
 
@@ -5598,12 +5748,14 @@ where
         return Redirect::to("/login").into_response();
     };
     page_timing.session_token_refresh_ms = session_started.elapsed().as_millis() as u64;
+    let saved_feeds_started = std::time::Instant::now();
     let tabs = pinned_feeds_for_layout(
         &state.flow,
         &did,
         verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()),
     )
     .await;
+    page_timing.saved_feeds_ms = saved_feeds_started.elapsed().as_millis() as u64;
     page_timing.preferences_ms = tabs.preferences_ms;
     page_timing.tabs_ms = tabs.tabs_ms;
     let limit = query
@@ -5657,20 +5809,21 @@ where
     }
     let content_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
     let parent_started = std::time::Instant::now();
-    let parents = match hydrate_page_parents(
+    let parent_result = hydrate_page_parents(
         &state.flow,
         state.storage.as_ref(),
         &notification_records,
         content_deadline,
     )
-    .await
-    {
+    .await;
+    page_timing.parent_hydration_ms = parent_started.elapsed().as_millis() as u64;
+    let parents = match parent_result {
         Ok(parents) => parents,
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
-    page_timing.parent_hydration_ms = parent_started.elapsed().as_millis() as u64;
     let quote_records = page_records_with_parents(&notification_records, &parents);
-    let quote_index = match hydrate_page_content(
+    let content_started = std::time::Instant::now();
+    let content_result = hydrate_page_content(
         &state.flow,
         &did,
         state.storage.clone(),
@@ -5679,11 +5832,13 @@ where
         leading_authors,
         content_deadline,
     )
-    .await
-    {
+    .await;
+    page_timing.content_hydration_ms = content_started.elapsed().as_millis() as u64;
+    let quote_index = match content_result {
         Ok(hydration) => {
             page_timing.profile_hydration_ms = hydration.profile_hydration_ms;
             page_timing.quote_hydration_ms = hydration.quote_hydration_ms;
+            page_timing.account_labels_ms = hydration.account_labels_ms;
             hydration.quote_index
         }
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
@@ -5950,6 +6105,7 @@ async fn profile_action_panel<F: OAuthFlow, S: Storage>(
     storage: &S,
     viewer_did: &str,
     subject_did: &str,
+    timing: &mut ProfileActionTiming,
 ) -> Result<String, String> {
     let following = storage
         .is_following(viewer_did, subject_did)
@@ -5963,8 +6119,15 @@ async fn profile_action_panel<F: OAuthFlow, S: Storage>(
     let block_access = verified_cookie_block_access(public, headers, storage);
     let mute_access = verified_cookie_mute_access(public, headers, storage);
     let list_access = verified_cookie_list_access(public, headers, storage);
-    let muted = if mute_access {
-        match flow.muted_actor_dids(viewer_did).await {
+    let mutes_started = std::time::Instant::now();
+    let muted_result = if mute_access {
+        Some(flow.muted_actor_dids(viewer_did).await)
+    } else {
+        None
+    };
+    timing.mutes_ms = mutes_started.elapsed().as_millis() as u64;
+    let muted = if let Some(muted_result) = muted_result {
+        match muted_result {
             Ok(muted) => muted.contains(subject_did),
             Err(error) => {
                 tracing::warn!(%error, "could not load the viewer's muted accounts");
@@ -5974,8 +6137,15 @@ async fn profile_action_panel<F: OAuthFlow, S: Storage>(
     } else {
         false
     };
-    let lists = if list_access {
-        match flow.profile_list_choices(viewer_did, subject_did).await {
+    let lists_started = std::time::Instant::now();
+    let lists_result = if list_access {
+        Some(flow.profile_list_choices(viewer_did, subject_did).await)
+    } else {
+        None
+    };
+    timing.list_choices_ms = lists_started.elapsed().as_millis() as u64;
+    let lists = if let Some(lists_result) = lists_result {
+        match lists_result {
             Ok(lists) => lists,
             Err(error) => {
                 tracing::warn!(%error, "could not load the viewer's lists");
@@ -5996,6 +6166,12 @@ async fn profile_action_panel<F: OAuthFlow, S: Storage>(
         list_access,
         lists: &lists,
     }))
+}
+
+#[derive(Default)]
+struct ProfileActionTiming {
+    mutes_ms: u64,
+    list_choices_ms: u64,
 }
 
 struct ProfileActionState<'a> {
@@ -6147,12 +6323,14 @@ where
         return Redirect::to("/login").into_response();
     };
     page_timing.session_token_refresh_ms = session_started.elapsed().as_millis() as u64;
+    let saved_feeds_started = std::time::Instant::now();
     let tabs = pinned_feeds_for_layout(
         &state.flow,
         &did,
         verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()),
     )
     .await;
+    page_timing.saved_feeds_ms = saved_feeds_started.elapsed().as_millis() as u64;
     page_timing.preferences_ms = tabs.preferences_ms;
     page_timing.tabs_ms = tabs.tabs_ms;
     let subject = query.get("did").map(String::as_str).unwrap_or(&did);
@@ -6177,20 +6355,21 @@ where
     let records = records.iter().take(limit).collect::<Vec<_>>();
     let content_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
     let parent_started = std::time::Instant::now();
-    let parents = match hydrate_page_parents(
+    let parent_result = hydrate_page_parents(
         &state.flow,
         state.storage.as_ref(),
         &records,
         content_deadline,
     )
-    .await
-    {
+    .await;
+    page_timing.parent_hydration_ms = parent_started.elapsed().as_millis() as u64;
+    let parents = match parent_result {
         Ok(parents) => parents,
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
-    page_timing.parent_hydration_ms = parent_started.elapsed().as_millis() as u64;
     let quote_records = page_records_with_parents(&records, &parents);
-    let quote_index = match hydrate_page_content(
+    let content_started = std::time::Instant::now();
+    let content_result = hydrate_page_content(
         &state.flow,
         &did,
         state.storage.clone(),
@@ -6199,11 +6378,13 @@ where
         std::iter::once(subject.to_owned()).chain(records.iter().map(|record| record.did.clone())),
         content_deadline,
     )
-    .await
-    {
+    .await;
+    page_timing.content_hydration_ms = content_started.elapsed().as_millis() as u64;
+    let quote_index = match content_result {
         Ok(hydration) => {
             page_timing.profile_hydration_ms = hydration.profile_hydration_ms;
             page_timing.quote_hydration_ms = hydration.quote_hydration_ms;
+            page_timing.account_labels_ms = hydration.account_labels_ms;
             hydration.quote_index
         }
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
@@ -6211,12 +6392,14 @@ where
     if let Err(error) = queue_missing_parent_authors(state.storage.as_ref(), &parents) {
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
-    let render_started = std::time::Instant::now();
     let mut profile = match profile_view_from_storage(state.storage.as_ref(), subject) {
         Ok(profile) => profile,
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
-    if let Some(counts) = state.profile_counts.get_counts(subject).await {
+    let profile_counts_started = std::time::Instant::now();
+    let counts = state.profile_counts.get_counts(subject).await;
+    page_timing.profile_counts_ms = profile_counts_started.elapsed().as_millis() as u64;
+    if let Some(counts) = counts {
         apply_profile_counts(&mut profile, counts);
     }
     let handle = profile_handle(&profile, subject);
@@ -6241,16 +6424,22 @@ where
     let action_html = if subject == did {
         String::new()
     } else {
-        match profile_action_panel(
+        let mut action_timing = ProfileActionTiming::default();
+        let action_started = std::time::Instant::now();
+        let action_result = profile_action_panel(
             &state.flow,
             &state.public,
             &headers,
             state.storage.as_ref(),
             &did,
             subject,
+            &mut action_timing,
         )
-        .await
-        {
+        .await;
+        page_timing.profile_action_panel_ms = action_started.elapsed().as_millis() as u64;
+        page_timing.profile_action_mutes_ms = action_timing.mutes_ms;
+        page_timing.profile_list_choices_ms = action_timing.list_choices_ms;
+        match action_result {
             Ok(html) => html,
             Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
         }
@@ -6276,6 +6465,7 @@ where
     .collect::<String>();
     let write_forms_enabled =
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
+    let render_started = std::time::Instant::now();
     let posts = render_timeline_post_items(
         state.storage.as_ref(),
         &records,
@@ -6862,6 +7052,7 @@ where
         .get("x-appview-fetch")
         .is_some_and(|value| value.as_bytes() == b"1")
     {
+        let mut action_timing = ProfileActionTiming::default();
         return match profile_action_panel(
             &state.flow,
             &state.public,
@@ -6869,6 +7060,7 @@ where
             state.storage.as_ref(),
             &viewer_did,
             subject_did,
+            &mut action_timing,
         )
         .await
         {
@@ -6895,12 +7087,14 @@ where
         return Redirect::to("/login").into_response();
     };
     page_timing.session_token_refresh_ms = session_started.elapsed().as_millis() as u64;
+    let saved_feeds_started = std::time::Instant::now();
     let tabs = pinned_feeds_for_layout(
         &state.flow,
         &viewer_did,
         verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()),
     )
     .await;
+    page_timing.saved_feeds_ms = saved_feeds_started.elapsed().as_millis() as u64;
     page_timing.preferences_ms = tabs.preferences_ms;
     page_timing.tabs_ms = tabs.tabs_ms;
     let page_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
@@ -6908,22 +7102,25 @@ where
         return oauth_error(StatusCode::BAD_REQUEST, "uri is required");
     };
     let record_started = std::time::Instant::now();
-    let (record, record_was_live) = match load_post_record_with_source_until(
-        &state.flow,
-        state.storage.as_ref(),
-        uri,
-        page_deadline,
-    )
-    .await
-    {
+    let record_result =
+        load_post_record_with_source_until(&state.flow, state.storage.as_ref(), uri, page_deadline)
+            .await;
+    let record_elapsed_ms = record_started.elapsed().as_millis() as u64;
+    let (record, record_was_live) = match record_result {
         Ok(Some(record)) => record,
-        Ok(None) => return oauth_error(StatusCode::NOT_FOUND, "post not found"),
-        Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
+        Ok(None) => {
+            page_timing.timeline_fetch_live_ms += record_elapsed_ms;
+            return oauth_error(StatusCode::NOT_FOUND, "post not found");
+        }
+        Err(error) => {
+            page_timing.timeline_fetch_live_ms += record_elapsed_ms;
+            return oauth_error(StatusCode::BAD_GATEWAY, &error);
+        }
     };
     if record_was_live {
-        page_timing.timeline_fetch_live_ms += record_started.elapsed().as_millis() as u64;
+        page_timing.timeline_fetch_live_ms += record_elapsed_ms;
     } else {
-        page_timing.timeline_fetch_index_ms += record_started.elapsed().as_millis() as u64;
+        page_timing.timeline_fetch_index_ms += record_elapsed_ms;
     }
     let write_forms_enabled =
         verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
@@ -6938,22 +7135,25 @@ where
         .unwrap_or(3)
         .min(6);
     let ancestors_started = std::time::Instant::now();
-    let (ancestors, ancestor_stats) = match thread_ancestors(
+    let ancestors_result = thread_ancestors(
         &state.flow,
         state.storage.as_ref(),
         &record,
         parent_height,
         page_deadline,
     )
-    .await
-    {
+    .await;
+    let ancestors_ms = ancestors_started.elapsed().as_millis() as u64;
+    let (ancestors, ancestor_stats) = match ancestors_result {
         Ok(ancestors) => ancestors,
-        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+        Err(error) => {
+            page_timing.timeline_fetch_live_ms += ancestors_ms;
+            return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error);
+        }
     };
     page_timing.ancestors_from_index = ancestor_stats.from_index;
     page_timing.ancestors_live = ancestor_stats.live;
     page_timing.ancestors_timed_out = ancestor_stats.timed_out;
-    let ancestors_ms = ancestors_started.elapsed().as_millis() as u64;
     if ancestor_stats.live > 0 || ancestor_stats.timed_out > 0 {
         page_timing.timeline_fetch_live_ms += ancestors_ms;
     } else {
@@ -6975,7 +7175,8 @@ where
         .chain(std::iter::once(&record))
         .chain(thread_reply_records.iter())
         .collect::<Vec<_>>();
-    let quote_index = match hydrate_page_content(
+    let content_started = std::time::Instant::now();
+    let content_result = hydrate_page_content(
         &state.flow,
         &viewer_did,
         state.storage.clone(),
@@ -6984,11 +7185,13 @@ where
         std::iter::empty(),
         page_deadline,
     )
-    .await
-    {
+    .await;
+    page_timing.content_hydration_ms = content_started.elapsed().as_millis() as u64;
+    let quote_index = match content_result {
         Ok(hydration) => {
             page_timing.profile_hydration_ms = hydration.profile_hydration_ms;
             page_timing.quote_hydration_ms = hydration.quote_hydration_ms;
+            page_timing.account_labels_ms = hydration.account_labels_ms;
             hydration.quote_index
         }
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
@@ -10829,6 +11032,18 @@ mod tests {
                 Ok(HashSet::new())
             })
         }
+
+        fn profile_list_choices<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<ProfileListChoice>, String>> + Send + 'a>>
+        {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                Ok(Vec::new())
+            })
+        }
     }
 
     #[tokio::test]
@@ -10836,6 +11051,9 @@ mod tests {
         let storage = Arc::new(MemoryStorage::default());
         let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
         let viewer = "did:plc:slow-mutes-viewer";
+        let other = "did:plc:slow-list-subject";
+        let post = test_web_post(viewer, "phase-coverage", 1, "Fake slow path", None);
+        storage.put_record(&post).unwrap();
         let generation = storage
             .rotate_web_session(viewer, "slow-mutes-session")
             .unwrap();
@@ -10845,42 +11063,57 @@ mod tests {
             generation,
             SessionPermissions {
                 write: false,
-                feed: false,
+                feed: true,
                 blob: false,
                 video: false,
                 follow: false,
                 block: false,
-                mute: false,
-                list: false,
+                mute: true,
+                list: true,
             },
         );
         let app = public.router_with_flow(SlowMutesTestFlow, storage);
         let logs = FeedTestLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::INFO)
-            .with_writer(logs.clone())
-            .finish();
-        let response = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .uri("/app")
-                    .header("cookie", format!("{SESSION_COOKIE}={token}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .with_subscriber(subscriber)
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        let paths = [
+            "/app".to_owned(),
+            "/app/feed?uri=at%3A%2F%2Fdid%3Aplc%3Aslow-mutes-viewer%2Fapp.bsky.feed.generator%2Ffeed".to_owned(),
+            "/notifications".to_owned(),
+            format!("/profile?did={other}"),
+            format!("/thread?uri={}", form_encoded(&post.uri)),
+        ];
+        for path in paths {
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(logs.clone())
+                .finish();
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(path)
+                        .header("cookie", format!("{SESSION_COOKIE}={token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .with_subscriber(subscriber)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
 
         let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-        let line = output
+        let lines = output
             .lines()
-            .find(|line| line.contains("web page phases"))
-            .unwrap_or_else(|| panic!("missing web page phase log: {output}"));
-        let metric = |name: &str| -> u64 {
+            .filter(|line| line.contains("web page phases"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lines.len(),
+            5,
+            "one phase line for every page kind: {output}"
+        );
+        let metric = |line: &str, name: &str| -> i64 {
             line.split_whitespace()
                 .find_map(|field| {
                     field
@@ -10889,8 +11122,39 @@ mod tests {
                 })
                 .unwrap_or_else(|| panic!("missing {name} in {line}"))
         };
-        assert!(metric("mutes_ms") >= 30, "{line}");
-        assert!(metric("phase_gap_ms") <= 5, "{line}");
+        for line in &lines {
+            assert!(metric(line, "phase_gap_ms").abs() <= 5, "{line}");
+            assert!(
+                metric(line, "total_ms").abs_diff(metric(line, "phase_sum_ms")) <= 5,
+                "{line}"
+            );
+        }
+        let app_line = lines
+            .iter()
+            .find(|line| line.contains("page=\"app\""))
+            .unwrap();
+        assert!(metric(app_line, "mutes_ms") >= 30, "{app_line}");
+        assert!(
+            metric(app_line, "render_ms") < metric(app_line, "mutes_ms"),
+            "{app_line}"
+        );
+        let feed_line = lines
+            .iter()
+            .find(|line| line.contains("page=\"feed\""))
+            .unwrap();
+        assert!(metric(feed_line, "mutes_ms") >= 30, "{feed_line}");
+        let profile_line = lines
+            .iter()
+            .find(|line| line.contains("page=\"profile\""))
+            .unwrap();
+        assert!(
+            metric(profile_line, "profile_action_mutes_ms") >= 30,
+            "{profile_line}"
+        );
+        assert!(
+            metric(profile_line, "profile_list_choices_ms") >= 30,
+            "{profile_line}"
+        );
     }
 
     #[test]

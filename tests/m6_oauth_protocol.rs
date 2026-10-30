@@ -563,6 +563,7 @@ async fn write_timing_line_counts_a_fake_pds_dpop_nonce_retry() {
     let line = lines[0];
     assert!(line.contains("route=\"post\""), "{line}");
     assert!(line.contains("dpop_nonce_retry=true"), "{line}");
+    assert!(line.contains("dpop_nonce_retry:1/"), "{line}");
     assert!(
         line.contains(&format!("outbound_call_count={}", write_requests.len())),
         "{line}"

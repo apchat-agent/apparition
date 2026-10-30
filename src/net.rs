@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
@@ -26,20 +26,57 @@ pub(crate) struct OutboundCallSnapshot {
     pub total_calls: usize,
     pub total_ms: u64,
     pub dpop_nonce_retries: usize,
-    pub by_kind: HashMap<String, (usize, u64)>,
+    pub by_kind: BTreeMap<String, (usize, u64)>,
+}
+
+#[derive(Default)]
+struct RequestOutboundCallState {
+    snapshot: OutboundCallSnapshot,
+    pending_nonce_retries: HashSet<String>,
 }
 
 #[derive(Clone, Default)]
 pub(crate) struct RequestOutboundAccounting {
-    snapshot: Arc<Mutex<OutboundCallSnapshot>>,
+    state: Arc<Mutex<RequestOutboundCallState>>,
 }
 
 impl RequestOutboundAccounting {
     pub(crate) fn snapshot(&self) -> OutboundCallSnapshot {
-        self.snapshot
+        self.state
             .lock()
-            .map(|snapshot| snapshot.clone())
+            .map(|state| state.snapshot.clone())
             .unwrap_or_default()
+    }
+
+    fn next_call_kind(&self, key: &str, normal_kind: &str) -> String {
+        self.state
+            .lock()
+            .map(|mut state| {
+                if state.pending_nonce_retries.remove(key) {
+                    "dpop_nonce_retry".to_owned()
+                } else {
+                    normal_kind.to_owned()
+                }
+            })
+            .unwrap_or_else(|_| normal_kind.to_owned())
+    }
+
+    fn record_call(&self, kind: &str, elapsed: Duration, nonce_challenge: bool, key: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            let elapsed_ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
+            state.snapshot.total_calls = state.snapshot.total_calls.saturating_add(1);
+            state.snapshot.total_ms = state.snapshot.total_ms.saturating_add(elapsed_ms);
+            if kind == "dpop_nonce_retry" {
+                state.snapshot.dpop_nonce_retries =
+                    state.snapshot.dpop_nonce_retries.saturating_add(1);
+            }
+            let (count, total_ms) = state.snapshot.by_kind.entry(kind.to_owned()).or_default();
+            *count = count.saturating_add(1);
+            *total_ms = total_ms.saturating_add(elapsed_ms);
+            if nonce_challenge {
+                state.pending_nonce_retries.insert(key.to_owned());
+            }
+        }
     }
 }
 
@@ -52,6 +89,101 @@ pub(crate) async fn with_request_outbound_accounting<F: Future>(
     future: F,
 ) -> F::Output {
     REQUEST_OUTBOUND_ACCOUNTING.scope(accounting, future).await
+}
+
+pub(crate) fn current_request_outbound_accounting() -> Option<RequestOutboundAccounting> {
+    REQUEST_OUTBOUND_ACCOUNTING.try_with(Clone::clone).ok()
+}
+
+pub(crate) fn current_outbound_call_snapshot() -> OutboundCallSnapshot {
+    current_request_outbound_accounting()
+        .map(|accounting| accounting.snapshot())
+        .unwrap_or_default()
+}
+
+pub(crate) struct OutboundCallTimer {
+    accounting: Option<RequestOutboundAccounting>,
+    kind: String,
+    key: String,
+    started: Instant,
+    nonce_challenge: bool,
+}
+
+impl OutboundCallTimer {
+    pub(crate) fn new(method: &http::Method, url: &Url, started: Instant) -> Self {
+        let key = format!("{method} {url}");
+        let normal_kind = outbound_call_kind(url);
+        let accounting = current_request_outbound_accounting();
+        let kind = accounting
+            .as_ref()
+            .map(|accounting| accounting.next_call_kind(&key, normal_kind))
+            .unwrap_or_else(|| normal_kind.to_owned());
+        Self {
+            accounting,
+            kind,
+            key,
+            started,
+            nonce_challenge: false,
+        }
+    }
+}
+
+impl Drop for OutboundCallTimer {
+    fn drop(&mut self) {
+        if let Some(accounting) = &self.accounting {
+            accounting.record_call(
+                &self.kind,
+                self.started.elapsed(),
+                self.nonce_challenge,
+                &self.key,
+            );
+        }
+    }
+}
+
+fn outbound_call_kind(url: &Url) -> &'static str {
+    let host = url.host_str().unwrap_or_default().trim_end_matches('.');
+    let host = host.to_ascii_lowercase();
+    let path = url.path();
+    if host == "plc.directory" || host.ends_with(".plc.directory") || path.starts_with("/did:plc:")
+    {
+        "plc"
+    } else if host == "cloudflare-dns.com"
+        || path.ends_with("/.well-known/atproto-did")
+        || path.contains("dns-query")
+    {
+        "handle_resolution"
+    } else if path.starts_with("/xrpc/com.atproto.repo.getRecord") {
+        "pds_get_record"
+    } else if host == "public.api.bsky.app"
+        || host == "api.bsky.app"
+        || path.starts_with("/xrpc/app.bsky.actor.getProfile")
+        || path.starts_with("/xrpc/app.bsky.actor.getProfiles")
+        || path.starts_with("/xrpc/app.bsky.labeler.getServices")
+        || path.starts_with("/xrpc/app.bsky.feed.getPosts")
+        || path.starts_with("/xrpc/app.bsky.feed.getPostThread")
+    {
+        "public_appview"
+    } else {
+        "other"
+    }
+}
+
+fn is_dpop_nonce_challenge(
+    status: http::StatusCode,
+    headers: &http::HeaderMap,
+    body: &[u8],
+) -> bool {
+    if status != http::StatusCode::UNAUTHORIZED {
+        return false;
+    }
+    headers
+        .get(http::header::WWW_AUTHENTICATE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("use_dpop_nonce"))
+        || body
+            .windows(b"use_dpop_nonce".len())
+            .any(|window| window == b"use_dpop_nonce")
 }
 
 fn request_pool(background: bool) -> Arc<Semaphore> {
@@ -318,11 +450,13 @@ impl SafeHttpClient {
         let mut url = Url::parse(&request.uri().to_string())
             .map_err(|_| "outbound request URL is invalid".to_owned())?;
         for redirect_count in 0..=max_redirects {
+            let call_started = Instant::now();
             let addresses = self.resolve_safe(&url).await?;
             let host = url
                 .host_str()
                 .ok_or_else(|| "outbound URL has no host".to_owned())?;
             let client = self.client_for(host, &addresses)?;
+            let mut call_timer = OutboundCallTimer::new(request.method(), &url, call_started);
             let response = client
                 .request(request.method().clone(), url.clone())
                 .headers(request.headers().clone())
@@ -398,6 +532,7 @@ impl SafeHttpClient {
                 }
                 body.extend_from_slice(&chunk);
             }
+            call_timer.nonce_challenge = is_dpop_nonce_challenge(status, &headers, &body);
             let mut builder = http::Response::builder().status(status).version(version);
             for (name, value) in &headers {
                 builder = builder.header(name, value);
@@ -717,6 +852,7 @@ mod tests {
                 let requests = server_requests.clone();
                 async move {
                     requests.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(std::time::Duration::from_millis(3)).await;
                     "ok"
                 }
             }),
@@ -758,6 +894,10 @@ mod tests {
         assert_eq!(
             snapshot.total_calls, 2,
             "spawned work is outside the request scope"
+        );
+        assert!(
+            snapshot.total_ms >= 4,
+            "request calls carry elapsed time: {snapshot:?}"
         );
         assert_eq!(snapshot.by_kind.get("pds_get_record").unwrap().0, 1);
         assert_eq!(snapshot.by_kind.get("other").unwrap().0, 1);
