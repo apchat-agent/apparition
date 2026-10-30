@@ -13373,7 +13373,7 @@ mod tests {
         assert!(css.contains(".thread-focus-actions .is-liked .icon {\n  fill: var(--accent);"));
         assert!(css.contains(".infinite-scroll-status {"));
         assert!(css.contains(".infinite-scroll-retry[hidden] {\n  display: none;"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m31"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m32"));
         assert!(WEB_SCRIPT_URL.contains("v=js20"));
     }
 
@@ -13394,7 +13394,7 @@ mod tests {
         ));
         assert!(css.contains("bottom: var(--mobile-compose-clearance);"));
         assert!(css.contains("padding-bottom: max(4.25rem, var(--mobile-compose-clearance));"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m31"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m32"));
     }
 
     #[test]
@@ -13402,8 +13402,8 @@ mod tests {
         let css = include_str!("../static/app.css");
 
         assert!(
-            css.contains("@supports (-webkit-touch-callout: none) {\n  @media (display-mode: browser) {\n    @media (max-width: 799px) {\n      body:has(.mobile-nav) {\n        --mobile-nav-height: calc(1px + 14px + 1.2rem + 6px);\n      }\n\n      body:has(.mobile-nav) .mobile-nav {\n        padding-top: 14px;\n        padding-bottom: 0;\n      }\n    }\n  }\n}"),
-            "iOS Safari in the browser must pad the bar 14 px above the icons and 0 below, and set --mobile-nav-height to the new 40.2 px bar"
+            css.contains("@supports (-webkit-touch-callout: none) {\n  @media (display-mode: browser) {\n    @media (max-width: 799px) {\n      body:has(.mobile-nav) {\n        --mobile-nav-height: calc(1px + 14px + 1.2rem);\n      }\n\n      body:has(.mobile-nav) .mobile-nav {\n        padding-top: 14px;\n        padding-bottom: 0;\n      }\n\n      body:has(.mobile-nav) .mobile-nav a,\n      body:has(.mobile-nav) .mobile-nav button {\n        margin: calc(0.6rem - 22px) -0.2rem;\n      }\n    }\n  }\n}"),
+            "iOS Safari in the browser must drop the 3 px above and below the icon, keep padding-top 14 px and padding-bottom 0, and set --mobile-nav-height to the squeezed 34.2 px bar"
         );
         assert!(
             css.contains("min-height: 0;\n    padding-top: 0.25rem;\n    padding-bottom: calc(0.1rem + max(4px, calc(env(safe-area-inset-bottom) * 0.25)));"),
@@ -13422,6 +13422,34 @@ mod tests {
         assert!(
             ios_rule > default_rule,
             "the iOS-Safari-browser bar rule must come after the default rule so it wins the cascade"
+        );
+    }
+
+    #[test]
+    fn ios_safari_browser_mode_squeezes_the_bar_to_34_2_px_and_keeps_the_icons_centred() {
+        let css = include_str!("../static/app.css");
+
+        assert!(
+            css.contains(
+                "body:has(.mobile-nav) .mobile-nav a,\n      body:has(.mobile-nav) .mobile-nav button {\n        margin: calc(0.6rem - 22px) -0.2rem;\n      }"
+            ),
+            "inside the iOS-Safari block each bar item must occupy exactly 1.2rem of bar height, its 44 px hit box and equal padding intact so the icon stays centred"
+        );
+        assert!(
+            css.contains("--mobile-nav-height: calc(1px + 14px + 1.2rem);"),
+            "--mobile-nav-height must equal the squeezed real bar height (1 px border + 14 px + 1.2rem = 34.2 px)"
+        );
+        assert!(
+            css.contains(
+                "padding: calc((44px - 1.2rem) / 2) 0.2rem;\n    margin: calc(0.6rem - 19px) -0.2rem;"
+            ),
+            "the all-phones item rule must keep the 1.2rem + 6 px trim so Firefox, Android, desktop and standalone mode do not change"
+        );
+        assert!(
+            css.contains(
+                "--mobile-nav-height: calc(1.2rem + 6px + 0.25rem + 0.1rem + 1px + max(4px, calc(env(safe-area-inset-bottom) * 0.25)));"
+            ),
+            "the all-phones --mobile-nav-height line must stay unchanged"
         );
     }
 
@@ -13550,7 +13578,7 @@ mod tests {
         let head = page_shell("Write a post", "", true);
         assert!(
             head.contains(
-                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m31\"></noscript>"
+                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m32\"></noscript>"
             ),
             "the head must restore the full form for no-JS visitors: {head}"
         );
