@@ -106,9 +106,9 @@ const OAUTH_STORE_WRITER_BATCH_SIZE: usize = 64;
 const OAUTH_STORE_WRITER_BATCH_DELAY: Duration = Duration::from_millis(5);
 const OAUTH_STORE_WRITER_METRICS_INTERVAL: Duration = Duration::from_secs(60);
 static NEXT_OAUTH_MEMORY_DATABASE_ID: AtomicUsize = AtomicUsize::new(1);
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m33";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m34";
 const WEB_SCRIPT_URL: &str = "/static/app.js?v=js20";
-const WEB_NOJS_STYLESHEET_URL: &str = "/static/nojs.css?v=m33";
+const WEB_NOJS_STYLESHEET_URL: &str = "/static/nojs.css?v=m34";
 const HLS_SCRIPT_URL: &str = "/static/vendor/hls.min.js?v=1.7.3";
 const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
 const SAVED_FEED_CACHE_PREFIX: &str = "saved-feed-preferences:";
@@ -8753,7 +8753,7 @@ fn render_quote_preview<S: Storage>(storage: &S, quoted: &IndexedRecord) -> Stri
         "<article class=\"quoted-post-preview\" aria-label=\"Quoted post\"><header>{}{}</header><p class=\"post-text\">{}</p>{embed}</article>",
         avatar_markup(&profile, "small-avatar"),
         author,
-        render_post_text(text)
+        render_post_text(text, record_facets(&quoted.record))
     )
 }
 
@@ -9099,7 +9099,8 @@ fn render_thread_focus<S: Storage>(
     } else {
         text.to_owned()
     };
-    let text = render_post_text(&text);
+    let link_targets = render_post_link_targets(&text, record_facets(&record.record));
+    let text = render_post_text(&text, record_facets(&record.record));
     let time = record
         .record
         .get("createdAt")
@@ -9210,7 +9211,7 @@ fn render_thread_focus<S: Storage>(
         .unwrap_or_default();
     let fill = author_fill(&profile, &record.did);
     format!(
-        "<article class=\"post-card thread-post-focus\"><header class=\"thread-focus-author\">{}<div class=\"thread-focus-names\"{}><a class=\"author-name\" href=\"{}\"{}>{}</a><a class=\"author-handle\" href=\"{}\"{}>@{}</a></div></header><p class=\"thread-focus-text\">{text}</p><p class=\"thread-focus-meta\">{time}{reply_policy}</p><hr><div class=\"thread-stats\" aria-label=\"Post statistics\">{stats}</div><hr><div class=\"thread-focus-actions\">{reply_action}{repost_action}{like_action}{share_action}{more_action}</div>{embed}</article>",
+        "<article class=\"post-card thread-post-focus\"><header class=\"thread-focus-author\">{}<div class=\"thread-focus-names\"{}><a class=\"author-name\" href=\"{}\"{}>{}</a><a class=\"author-handle\" href=\"{}\"{}>@{}</a></div></header><p class=\"thread-focus-text\">{text}</p>{link_targets}<p class=\"thread-focus-meta\">{time}{reply_policy}</p><hr><div class=\"thread-stats\" aria-label=\"Post statistics\">{stats}</div><hr><div class=\"thread-focus-actions\">{reply_action}{repost_action}{like_action}{share_action}{more_action}</div>{embed}</article>",
         avatar_markup_with_priority_and_attrs(
             &profile,
             "focus-avatar",
@@ -11100,7 +11101,163 @@ fn relative_time(created_at: &str) -> String {
     }
 }
 
-fn render_post_text(text: &str) -> String {
+struct PostLinkFacet {
+    byte_start: usize,
+    byte_end: usize,
+    uri: String,
+}
+
+fn record_facets(record: &Value) -> &[Value] {
+    record
+        .get("facets")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+fn is_http_facet_uri(uri: &str) -> bool {
+    (uri.get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https:"))
+        && uri.get(6..8) == Some("//"))
+        || (uri
+            .get(..5)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http:"))
+            && uri.get(5..7) == Some("//"))
+}
+
+fn uri_without_scheme(uri: &str) -> &str {
+    for scheme in ["https://", "http://"] {
+        if uri.len() >= scheme.len() && uri[..scheme.len()].eq_ignore_ascii_case(scheme) {
+            return &uri[scheme.len()..];
+        }
+    }
+    uri
+}
+
+fn collect_post_link_facets(text: &str, facets: &[Value]) -> Vec<PostLinkFacet> {
+    let mut found: Vec<PostLinkFacet> = Vec::new();
+    for facet in facets {
+        let Some(uri) = facet
+            .get("features")
+            .and_then(Value::as_array)
+            .and_then(|features| {
+                features.iter().find_map(|feature| {
+                    (feature.get("$type").and_then(Value::as_str)
+                        == Some("app.bsky.richtext.facet#link"))
+                    .then(|| feature.get("uri").and_then(Value::as_str))
+                    .flatten()
+                })
+            })
+        else {
+            continue;
+        };
+        if !is_http_facet_uri(uri) {
+            continue;
+        }
+        let Some(byte_start) = facet
+            .pointer("/index/byteStart")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            continue;
+        };
+        let Some(byte_end) = facet
+            .pointer("/index/byteEnd")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            continue;
+        };
+        if byte_start >= byte_end || byte_end > text.len() {
+            continue;
+        }
+        if !text.is_char_boundary(byte_start) || !text.is_char_boundary(byte_end) {
+            continue;
+        }
+        found.push(PostLinkFacet {
+            byte_start,
+            byte_end,
+            uri: uri.to_owned(),
+        });
+    }
+    found.sort_by_key(|link| (link.byte_start, link.byte_end));
+    let mut accepted: Vec<PostLinkFacet> = Vec::new();
+    for link in found {
+        if accepted
+            .last()
+            .is_some_and(|previous: &PostLinkFacet| link.byte_start < previous.byte_end)
+        {
+            continue;
+        }
+        accepted.push(link);
+    }
+    accepted
+}
+
+fn post_link_anchor(uri: &str, label: &str) -> String {
+    format!(
+        "<a class=\"post-text-link\" href=\"{}\" rel=\"nofollow noopener noreferrer\" target=\"_blank\">{}</a>",
+        html_escape(uri),
+        html_escape(label),
+    )
+}
+
+fn render_post_text(text: &str, facets: &[Value]) -> String {
+    let links = collect_post_link_facets(text, facets);
+    if links.is_empty() {
+        return render_post_text_plain(text);
+    }
+    let mut rendered = String::new();
+    let mut position = 0usize;
+    for link in &links {
+        rendered.push_str(&html_escape(&text[position..link.byte_start]));
+        rendered.push_str(&post_link_anchor(
+            &link.uri,
+            &text[link.byte_start..link.byte_end],
+        ));
+        position = link.byte_end;
+    }
+    let tail = &text[position..];
+    if let Some((separator_start, separator)) = tail
+        .char_indices()
+        .rev()
+        .find(|(_, character)| character.is_whitespace())
+    {
+        let number_start = separator_start + separator.len_utf8();
+        let number = &tail[number_start..];
+        if is_thread_number(number) {
+            rendered.push_str(&html_escape(&tail[..number_start]));
+            rendered.push_str(&format!(
+                "<span class=\"thread-number-pill\">{}</span>",
+                html_escape(number)
+            ));
+            return rendered;
+        }
+    }
+    rendered.push_str(&html_escape(tail));
+    rendered
+}
+
+fn render_post_link_targets(text: &str, facets: &[Value]) -> String {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut rendered = String::new();
+    for link in collect_post_link_facets(text, facets) {
+        if &text[link.byte_start..link.byte_end] == uri_without_scheme(&link.uri) {
+            continue;
+        }
+        if !seen.insert(link.uri.clone()) {
+            continue;
+        }
+        rendered.push_str(&format!(
+            "<p class=\"post-link-targets\"><a class=\"post-link-target\" href=\"{}\" rel=\"nofollow noopener noreferrer\" target=\"_blank\">{}</a></p>",
+            html_escape(&link.uri),
+            html_escape(&link.uri),
+        ));
+    }
+    rendered
+}
+
+fn render_post_text_plain(text: &str) -> String {
     let Some((separator_start, separator)) = text
         .char_indices()
         .rev()
@@ -11195,8 +11352,9 @@ fn render_web_post<S: Storage>(
         .get("text")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let text = render_post_text(text);
-    let text = if link_text_to_thread {
+    let link_targets = render_post_link_targets(text, record_facets(&record.record));
+    let text = render_post_text(text, record_facets(&record.record));
+    let text = if link_text_to_thread && !text.contains("<a ") {
         let thread_uri = format!(
             "/app/thread?uri={}",
             url::form_urlencoded::byte_serialize(record.uri.as_bytes()).collect::<String>()
@@ -11297,7 +11455,7 @@ fn render_web_post<S: Storage>(
         .unwrap_or_default();
     let anchor = post_anchor(&record.uri);
     format!(
-        "<article class=\"post-card\" id=\"{anchor}\" data-post-kind=\"post\" data-post-uri=\"{uri}\"><header class=\"post-header\">{author}{time}</header><p class=\"post-text\">{text}</p>{embed}<div class=\"post-actions\" aria-label=\"Post actions\">{actions}</div></article>"
+        "<article class=\"post-card\" id=\"{anchor}\" data-post-kind=\"post\" data-post-uri=\"{uri}\"><header class=\"post-header\">{author}{time}</header><p class=\"post-text\">{text}</p>{link_targets}{embed}<div class=\"post-actions\" aria-label=\"Post actions\">{actions}</div></article>"
     )
 }
 
@@ -11353,7 +11511,7 @@ fn render_reply_parent_card<S: Storage>(storage: &S, parent: &IndexedRecord) -> 
         html_escape(&display_name),
         fill.handle,
         html_escape(&handle),
-        render_post_text(text),
+        render_post_text(text, &[]),
     )
 }
 
@@ -11979,7 +12137,7 @@ fn render_web_quote<S: Storage>(
         html_escape(display_name),
         fill.handle,
         html_escape(&handle),
-        render_post_text(text)
+        render_post_text(text, &[])
     )
 }
 
@@ -16446,8 +16604,15 @@ mod tests {
         storage.put_record(&record).unwrap();
         let index = QuoteRenderIndex::default();
 
-        let rendered =
-            render_web_post(&storage, &record, "did:plc:viewer", false, true, false, &index);
+        let rendered = render_web_post(
+            &storage,
+            &record,
+            "did:plc:viewer",
+            false,
+            true,
+            false,
+            &index,
+        );
 
         assert!(
             rendered.contains(&format!(
@@ -16474,7 +16639,8 @@ mod tests {
         storage.put_record(&record).unwrap();
         let index = QuoteRenderIndex::default();
 
-        let rendered = render_thread_focus(&storage, &record, "did:plc:viewer", false, false, &index);
+        let rendered =
+            render_thread_focus(&storage, &record, "did:plc:viewer", false, false, &index);
 
         assert!(
             rendered.contains(&format!(
@@ -16493,7 +16659,7 @@ mod tests {
     #[test]
     fn out_of_range_overlapping_and_mid_char_link_facets_render_as_plain_text() {
         let text = "it’s https://x.example/a/b tail more";
-        let good = link_facet(6, 27, "https://x.example/a/b");
+        let good = link_facet(7, 28, "https://x.example/a/b");
 
         assert_eq!(
             render_post_text(text, &[link_facet(100, 200, "https://x.example/a/b")]),
@@ -16501,21 +16667,23 @@ mod tests {
             "offsets past the end of the text stay plain text"
         );
         assert_eq!(
-            render_post_text(text, &[link_facet(4, 27, "https://x.example/a/b")]),
+            render_post_text(text, &[link_facet(4, 28, "https://x.example/a/b")]),
             html_escape(text),
             "an offset inside the 3-byte apostrophe stays plain text"
         );
-        let overlapping =
-            render_post_text(text, &[link_facet(20, 35, "https://y.example/z"), good.clone()]);
+        let overlapping = render_post_text(
+            text,
+            &[link_facet(21, 36, "https://y.example/z"), good.clone()],
+        );
         assert_eq!(
             overlapping.matches("<a class=\"post-text-link\"").count(),
             1,
             "only the first of two overlapping facets becomes an anchor: {overlapping}"
         );
         assert!(
-            overlapping.contains(&format!(
+            overlapping.contains(
                 "<a class=\"post-text-link\" href=\"https://x.example/a/b\" rel=\"nofollow noopener noreferrer\" target=\"_blank\">https://x.example/a/b</a>"
-            )),
+            ),
             "the first facet still renders: {overlapping}"
         );
         assert!(
@@ -16528,7 +16696,7 @@ mod tests {
     fn javascript_uris_and_non_link_facets_stay_plain_text() {
         let text = "it’s https://x.example/a/b tail more";
         assert_eq!(
-            render_post_text(text, &[link_facet(6, 27, "javascript:alert(1)")]),
+            render_post_text(text, &[link_facet(7, 28, "javascript:alert(1)")]),
             html_escape(text),
             "only http/https facet URIs become links"
         );
@@ -16547,10 +16715,8 @@ mod tests {
     fn target_lines_show_the_full_uri_once_and_skip_links_that_already_show_their_url() {
         let dup = "https://x.example/dup";
         let text = format!("one {dup} two {dup}");
-        let targets = render_post_link_targets(
-            &text,
-            &[link_facet(4, 25, dup), link_facet(30, 51, dup)],
-        );
+        let targets =
+            render_post_link_targets(&text, &[link_facet(4, 25, dup), link_facet(30, 51, dup)]);
         assert_eq!(
             targets.matches("<p class=\"post-link-targets\">").count(),
             1,
@@ -16579,7 +16745,10 @@ mod tests {
 
     #[test]
     fn a_post_without_link_facets_renders_exactly_as_before() {
-        assert_eq!(render_post_text("just words", &[]), html_escape("just words"));
+        assert_eq!(
+            render_post_text("just words", &[]),
+            html_escape("just words")
+        );
         assert_eq!(
             render_post_text("thread post 2/3", &[]),
             format!(
@@ -16589,7 +16758,10 @@ mod tests {
             ),
             "the thread-number pill stays where it was"
         );
-        assert_eq!(render_post_text("1/2", &[]), "<span class=\"thread-number-pill\">1/2</span>");
+        assert_eq!(
+            render_post_text("1/2", &[]),
+            "<span class=\"thread-number-pill\">1/2</span>"
+        );
         assert_eq!(render_post_link_targets("just words", &[]), "");
     }
 
@@ -16607,8 +16779,14 @@ mod tests {
             Some("anywhere"),
             "a long URL must wrap instead of widening the card at 402 px"
         );
-        assert_eq!(css_declaration(body, "font-size").as_deref(), Some("0.75rem"));
-        assert_eq!(css_declaration(body, "color").as_deref(), Some("var(--muted)"));
+        assert_eq!(
+            css_declaration(body, "font-size").as_deref(),
+            Some("0.75rem")
+        );
+        assert_eq!(
+            css_declaration(body, "color").as_deref(),
+            Some("var(--muted)")
+        );
         assert!(WEB_STYLESHEET_URL.contains("v=m34"));
         assert!(WEB_NOJS_STYLESHEET_URL.contains("v=m34"));
     }

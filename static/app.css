@@ -1211,6 +1211,19 @@ button:hover,
   text-decoration: underline;
 }
 
+.post-link-targets {
+  margin: -0.35rem 0 0.9rem;
+  font-size: 0.75rem;
+  line-height: 1.35;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.post-link-target {
+  color: inherit;
+  overflow-wrap: anywhere;
+}
+
 .post-actions {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
