@@ -17,7 +17,7 @@ use crate::{
     profile_counts::{PUBLIC_APPVIEW_BASE, ProfileCountsClient, apply_profile_counts},
 };
 use atrium_api::{
-    agent::{Agent, SessionManager},
+    agent::{Agent, CloneWithProxy, Configure, SessionManager},
     types::string::{AtIdentifier, Datetime, Did},
 };
 use atrium_common::store::Store;
@@ -35,7 +35,8 @@ use atrium_oauth::{
 };
 use atrium_xrpc::error::XrpcErrorKind;
 use atrium_xrpc::{
-    Error as XrpcClientError, InputDataOrBytes, OutputDataOrBytes, XrpcClient, XrpcRequest,
+    Error as XrpcClientError, HttpClient, InputDataOrBytes, OutputDataOrBytes, XrpcClient,
+    XrpcRequest,
 };
 use axum::{
     Json, Router,
@@ -78,7 +79,7 @@ use std::{
 };
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::io::AsyncWriteExt;
+use tokio::{io::AsyncWriteExt, sync::OnceCell};
 
 const METADATA_PATH: &str = "/.well-known/oauth-client-metadata.json";
 const CALLBACK_PATH: &str = "/oauth/callback";
@@ -99,9 +100,14 @@ const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
 const SAVED_FEED_CACHE_PREFIX: &str = "saved-feed-preferences:";
 const BSKY_MODERATION_LABELER_DID: &str = "did:plc:ar7c4by46qjdydhdevvrndac";
 const ACCOUNT_LABEL_PROFILE_BATCH_SIZE: usize = 25;
-const ACCOUNT_LABEL_CACHE_TTL: Duration = Duration::from_secs(60);
+const ACCOUNT_LABEL_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const LABELER_PREFERENCE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const LABELER_PRESENTATION_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const SAVED_FEED_PREFERENCE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const OAUTH_SESSION_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+const OAUTH_SESSION_CACHE_CAPACITY: usize = 1024;
+const OAUTH_METADATA_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const OAUTH_METADATA_RESOLVER_CACHE_TTL: Duration = Duration::from_secs(1);
 const VIDEO_SERVICE_DID: &str = "did:web:video.bsky.app";
 const VIDEO_SERVICE_URL: &str = "https://video.bsky.app";
 const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.graph.getMutes?aud=*";
@@ -139,6 +145,10 @@ type HmacSha256 = Hmac<Sha256>;
 
 fn saved_feed_cache_key(did: &str) -> String {
     format!("{SAVED_FEED_CACHE_PREFIX}{did}")
+}
+
+fn muted_actor_cache_key(did: &str) -> String {
+    format!("{MUTED_ACTOR_CACHE_PREFIX}{did}")
 }
 
 fn unix_time_ms() -> i64 {
@@ -1236,7 +1246,18 @@ type AppOAuthClient = OAuthClient<
     SqliteOAuthStore,
     OAuthDidResolver,
     OAuthHandleResolver,
-    SafeHttpClient,
+    OAuthMetadataHttpClient,
+>;
+type RestoredOAuthSession = atrium_oauth::OAuthSession<
+    OAuthMetadataHttpClient,
+    OAuthDidResolver,
+    OAuthHandleResolver,
+    SqliteOAuthStore,
+>;
+type OAuthSessionCache =
+    Arc<tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, Arc<RestoredOAuthSession>)>>>;
+type OAuthSessionRestores = Arc<
+    tokio::sync::Mutex<HashMap<String, Arc<OnceCell<Result<Arc<RestoredOAuthSession>, String>>>>>,
 >;
 type SavedFeedCache =
     Arc<tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, Vec<SavedFeedPreference>)>>>;
@@ -1253,12 +1274,233 @@ type FeedSkeletonCache = Arc<
 >;
 type MutedActorCache =
     Arc<tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, HashSet<String>)>>>;
+type MutedActorRefreshes = Arc<tokio::sync::Mutex<HashSet<String>>>;
 type LabelerPreferenceCache =
     Arc<tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, Vec<String>)>>>;
-type AccountLabelPageCache =
-    Arc<tokio::sync::Mutex<HashMap<(String, String), (tokio::time::Instant, PageAccountData)>>>;
+type LabelerPreferenceRefreshes = Arc<tokio::sync::Mutex<HashSet<String>>>;
+type AccountLabelActorCache =
+    Arc<tokio::sync::Mutex<HashMap<(String, String), (tokio::time::Instant, AccountActorData)>>>;
+type AccountLabelRefreshes = Arc<tokio::sync::Mutex<HashSet<(String, String)>>>;
 type LabelerPresentationCache =
     Arc<tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, LabelerPresentation)>>>;
+type OAuthMetadataColdRefreshes = Arc<
+    tokio::sync::Mutex<HashMap<String, Arc<OnceCell<Result<CachedOAuthMetadataResponse, String>>>>>,
+>;
+
+#[derive(Clone)]
+struct CachedOAuthMetadataResponse {
+    expires: tokio::time::Instant,
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct OAuthMetadataHttpClient {
+    inner: SafeHttpClient,
+    cache: Arc<tokio::sync::Mutex<HashMap<String, CachedOAuthMetadataResponse>>>,
+    refreshes: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    cold_refreshes: OAuthMetadataColdRefreshes,
+}
+
+impl OAuthMetadataHttpClient {
+    fn new(inner: SafeHttpClient) -> Self {
+        Self {
+            inner,
+            cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            refreshes: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            cold_refreshes: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn metadata_key(request: &http::Request<Vec<u8>>) -> Option<String> {
+        let path = request.uri().path();
+        (request.method() == http::Method::GET
+            && (path.ends_with("/.well-known/oauth-authorization-server")
+                || path.ends_with("/.well-known/oauth-protected-resource")))
+        .then(|| format!("{} {}", request.method(), request.uri()))
+    }
+
+    fn build_response(cached: CachedOAuthMetadataResponse) -> http::Response<Vec<u8>> {
+        let mut response = http::Response::builder()
+            .status(cached.status)
+            .body(cached.body)
+            .expect("cached OAuth metadata response has a valid status");
+        *response.headers_mut() = cached.headers;
+        response
+    }
+
+    async fn schedule_refresh(&self, key: String, request: http::Request<Vec<u8>>) {
+        let mut refreshes = self.refreshes.lock().await;
+        if !refreshes.insert(key.clone()) {
+            return;
+        }
+        drop(refreshes);
+        let client = self.inner.clone().background();
+        let cache = self.cache.clone();
+        let refreshes = self.refreshes.clone();
+        tokio::spawn(async move {
+            if let Ok(response) = client.send_http(request).await
+                && response.status().is_success()
+            {
+                let (parts, body) = response.into_parts();
+                let mut cache = cache.lock().await;
+                cache.retain(|_, entry| entry.expires > tokio::time::Instant::now());
+                if cache.len() >= 256
+                    && !cache.contains_key(&key)
+                    && let Some(oldest) = cache.keys().next().cloned()
+                {
+                    cache.remove(&oldest);
+                }
+                cache.insert(
+                    key.clone(),
+                    CachedOAuthMetadataResponse {
+                        expires: tokio::time::Instant::now() + OAUTH_METADATA_CACHE_TTL,
+                        status: parts.status,
+                        headers: parts.headers,
+                        body,
+                    },
+                );
+            }
+            refreshes.lock().await.remove(&key);
+        });
+    }
+}
+
+impl HttpClient for OAuthMetadataHttpClient {
+    async fn send_http(
+        &self,
+        request: http::Request<Vec<u8>>,
+    ) -> Result<http::Response<Vec<u8>>, Box<dyn std::error::Error + Send + Sync + 'static>> {
+        let Some(key) = Self::metadata_key(&request) else {
+            return self.inner.send_http(request).await;
+        };
+        if let Some(cached) = self.cache.lock().await.get(&key).cloned() {
+            if cached.expires > tokio::time::Instant::now() {
+                return Ok(Self::build_response(cached));
+            }
+            self.schedule_refresh(key, request).await;
+            return Ok(Self::build_response(cached));
+        }
+
+        let refresh = {
+            let mut pending = self.cold_refreshes.lock().await;
+            pending
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
+        };
+        let result = refresh
+            .get_or_init(|| async {
+                let response = self
+                    .inner
+                    .send_http(request)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let (parts, body) = response.into_parts();
+                let cached = CachedOAuthMetadataResponse {
+                    expires: tokio::time::Instant::now() + OAUTH_METADATA_CACHE_TTL,
+                    status: parts.status,
+                    headers: parts.headers.clone(),
+                    body,
+                };
+                if parts.status.is_success() {
+                    let mut cache = self.cache.lock().await;
+                    if cache.len() >= 256
+                        && !cache.contains_key(&key)
+                        && let Some(oldest) = cache.keys().next().cloned()
+                    {
+                        cache.remove(&oldest);
+                    }
+                    cache.insert(key.clone(), cached.clone());
+                }
+                Ok(cached)
+            })
+            .await
+            .clone();
+        self.cold_refreshes.lock().await.remove(&key);
+        match result {
+            Ok(cached) => Ok(Self::build_response(cached)),
+            Err(error) => Err(Box::new(std::io::Error::other(error))),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SharedOAuthSession {
+    inner: Arc<RestoredOAuthSession>,
+    did: String,
+    cache: OAuthSessionCache,
+    restores: OAuthSessionRestores,
+}
+
+impl HttpClient for SharedOAuthSession {
+    async fn send_http(
+        &self,
+        request: http::Request<Vec<u8>>,
+    ) -> Result<http::Response<Vec<u8>>, Box<dyn std::error::Error + Send + Sync + 'static>> {
+        self.inner.send_http(request).await
+    }
+}
+
+impl XrpcClient for SharedOAuthSession {
+    fn base_uri(&self) -> String {
+        self.inner.base_uri()
+    }
+
+    async fn send_xrpc<P, I, O, E>(
+        &self,
+        request: &XrpcRequest<P, I>,
+    ) -> Result<OutputDataOrBytes<O>, XrpcClientError<E>>
+    where
+        P: Serialize + Send + Sync,
+        I: Serialize + Send + Sync,
+        O: serde::de::DeserializeOwned + Send + Sync,
+        E: serde::de::DeserializeOwned + Send + Sync + std::fmt::Debug,
+    {
+        let result = self.inner.send_xrpc(request).await;
+        if let Err(error) = &result
+            && format!("{error:?}")
+                .to_ascii_lowercase()
+                .contains("invalid_token")
+        {
+            self.cache.lock().await.remove(&self.did);
+            self.restores.lock().await.remove(&self.did);
+        }
+        result
+    }
+}
+
+impl SessionManager for SharedOAuthSession {
+    async fn did(&self) -> Option<Did> {
+        self.inner.did().await
+    }
+}
+
+impl Configure for SharedOAuthSession {
+    fn configure_endpoint(&self, endpoint: String) {
+        self.inner.configure_endpoint(endpoint);
+    }
+
+    fn configure_labelers_header(&self, labeler_dids: Option<Vec<(Did, bool)>>) {
+        self.inner.configure_labelers_header(labeler_dids);
+    }
+
+    fn configure_proxy_header(&self, did: Did, service_type: impl AsRef<str>) {
+        self.inner.configure_proxy_header(did, service_type);
+    }
+}
+
+impl CloneWithProxy for SharedOAuthSession {
+    fn clone_with_proxy(&self, did: Did, service_type: impl AsRef<str>) -> Self {
+        Self {
+            inner: Arc::new(self.inner.clone_with_proxy(did, service_type)),
+            did: self.did.clone(),
+            cache: self.cache.clone(),
+            restores: self.restores.clone(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 struct LabelerPresentation {
@@ -1276,7 +1518,14 @@ const SERVICE_AUTH_LIFETIME_SECS: u64 = 30 * 60;
 const FEED_PAGE_CACHE_SECS: u64 = 60;
 const BSKY_APPVIEW_DID: &str = "did:web:api.bsky.app";
 const BSKY_APPVIEW_SERVICE: &str = "bsky_appview";
-const MUTED_ACTOR_CACHE_TTL: Duration = Duration::from_secs(60);
+const MUTED_ACTOR_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const MUTED_ACTOR_CACHE_PREFIX: &str = "muted-actors:";
+
+#[derive(Clone, Debug, Default)]
+struct AccountActorData {
+    labels: Vec<AccountLabel>,
+    profile: Option<crate::feeds::PublicProfileView>,
+}
 
 pub struct AtriumOAuthFlow<B: crate::identity::IdentityBackend = HttpIdentityBackend> {
     client: Arc<AppOAuthClient>,
@@ -1287,14 +1536,19 @@ pub struct AtriumOAuthFlow<B: crate::identity::IdentityBackend = HttpIdentityBac
     public_appview_base: String,
     video_http_client: reqwest::Client,
     video_service_url: String,
+    session_cache: OAuthSessionCache,
+    session_restores: OAuthSessionRestores,
     saved_feed_cache: SavedFeedCache,
     saved_feed_refreshes: SavedFeedRefreshes,
     service_auth_cache: ServiceAuthCache,
     feed_page_cache: FeedPageCache,
     feed_skeleton_cache: FeedSkeletonCache,
     muted_actor_cache: MutedActorCache,
+    muted_actor_refreshes: MutedActorRefreshes,
     labeler_preference_cache: LabelerPreferenceCache,
-    account_label_page_cache: AccountLabelPageCache,
+    labeler_preference_refreshes: LabelerPreferenceRefreshes,
+    account_label_actor_cache: AccountLabelActorCache,
+    account_label_refreshes: AccountLabelRefreshes,
     labeler_presentation_cache: LabelerPresentationCache,
 }
 
@@ -1309,14 +1563,19 @@ impl<B: crate::identity::IdentityBackend> Clone for AtriumOAuthFlow<B> {
             public_appview_base: self.public_appview_base.clone(),
             video_http_client: self.video_http_client.clone(),
             video_service_url: self.video_service_url.clone(),
+            session_cache: self.session_cache.clone(),
+            session_restores: self.session_restores.clone(),
             saved_feed_cache: self.saved_feed_cache.clone(),
             saved_feed_refreshes: self.saved_feed_refreshes.clone(),
             service_auth_cache: self.service_auth_cache.clone(),
             feed_page_cache: self.feed_page_cache.clone(),
             feed_skeleton_cache: self.feed_skeleton_cache.clone(),
             muted_actor_cache: self.muted_actor_cache.clone(),
+            muted_actor_refreshes: self.muted_actor_refreshes.clone(),
             labeler_preference_cache: self.labeler_preference_cache.clone(),
-            account_label_page_cache: self.account_label_page_cache.clone(),
+            labeler_preference_refreshes: self.labeler_preference_refreshes.clone(),
+            account_label_actor_cache: self.account_label_actor_cache.clone(),
+            account_label_refreshes: self.account_label_refreshes.clone(),
             labeler_presentation_cache: self.labeler_presentation_cache.clone(),
         }
     }
@@ -1407,6 +1666,15 @@ impl SqliteOAuthStore {
                  ON CONFLICT(cache_key) DO UPDATE SET value_json=excluded.value_json,stored_at_ms=excluded.stored_at_ms",
                 params![key, value_json, stored_at_ms],
             )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub(crate) fn web_cache_delete(&self, key: &str) -> Result<(), String> {
+        self.connection
+            .lock()
+            .map_err(|_| "OAuth cache database lock is poisoned".to_owned())?
+            .execute("DELETE FROM web_cache WHERE cache_key=?1", [key])
             .map_err(|error| error.to_string())?;
         Ok(())
     }
@@ -1561,23 +1829,32 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         ));
         let retained_http_client = guarded_client.clone();
         let http_client = Arc::new(guarded_client);
+        let oauth_http_client = OAuthMetadataHttpClient::new((*http_client).clone());
         let redirect_uri = public.metadata["redirect_uris"][0]
             .as_str()
             .ok_or_else(|| "OAuth client metadata has no redirect URI".to_owned())?
             .to_owned();
-        let make_resolver = || OAuthResolverConfig {
-            did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
-                plc_directory_url: plc_directory_url.to_owned(),
-                http_client: http_client.clone(),
-            }),
-            handle_resolver: AtprotoHandleResolver::new(AtprotoHandleResolverConfig {
-                dns_txt_resolver: CloudflareDnsTxtResolver {
-                    client: (*http_client).clone(),
-                },
-                http_client: http_client.clone(),
-            }),
-            authorization_server_metadata: Default::default(),
-            protected_resource_metadata: Default::default(),
+        let make_resolver = || {
+            let mut resolver = OAuthResolverConfig {
+                did_resolver: CommonDidResolver::new(CommonDidResolverConfig {
+                    plc_directory_url: plc_directory_url.to_owned(),
+                    http_client: http_client.clone(),
+                }),
+                handle_resolver: AtprotoHandleResolver::new(AtprotoHandleResolverConfig {
+                    dns_txt_resolver: CloudflareDnsTxtResolver {
+                        client: (*http_client).clone(),
+                    },
+                    http_client: http_client.clone(),
+                }),
+                authorization_server_metadata: Default::default(),
+                protected_resource_metadata: Default::default(),
+            };
+            // Atrium's private resolver cache must not hide refreshed transport-cache values.
+            resolver.authorization_server_metadata.cache.time_to_live =
+                Some(OAUTH_METADATA_RESOLVER_CACHE_TTL);
+            resolver.protected_resource_metadata.cache.time_to_live =
+                Some(OAUTH_METADATA_RESOLVER_CACHE_TTL);
+            resolver
         };
         let client = match public.mode {
             OAuthClientMode::Loopback => OAuthClient::new(OAuthClientConfig {
@@ -1589,7 +1866,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                 state_store: store.clone(),
                 session_store: store.clone(),
                 resolver: make_resolver(),
-                http_client: (*http_client).clone(),
+                http_client: oauth_http_client.clone(),
             }),
             OAuthClientMode::Confidential => {
                 let metadata = AtprotoClientMetadata {
@@ -1611,7 +1888,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                     state_store: store.clone(),
                     session_store: store.clone(),
                     resolver: make_resolver(),
-                    http_client: (*http_client).clone(),
+                    http_client: oauth_http_client.clone(),
                 })
             }
         }
@@ -1628,32 +1905,133 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                 .build()
                 .map_err(|error| error.to_string())?,
             video_service_url: VIDEO_SERVICE_URL.to_owned(),
+            session_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            session_restores: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             saved_feed_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             saved_feed_refreshes: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             service_auth_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             feed_page_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             feed_skeleton_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             muted_actor_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            muted_actor_refreshes: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             labeler_preference_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            account_label_page_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            labeler_preference_refreshes: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            account_label_actor_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            account_label_refreshes: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             labeler_presentation_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
     }
 
-    async fn saved_feed_preferences(&self, did: &str) -> Result<Vec<SavedFeedPreference>, String> {
-        if let Some((expires, preferences)) = self.saved_feed_cache.lock().await.get(did).cloned()
-            && expires > tokio::time::Instant::now()
+    async fn restored_session(&self, did: &Did) -> Result<SharedOAuthSession, String> {
+        let key = did.to_string();
+        let now = tokio::time::Instant::now();
+        if let Some((expires, session)) = self.session_cache.lock().await.get(&key).cloned()
+            && expires > now
         {
-            return Ok(preferences);
+            return Ok(SharedOAuthSession {
+                inner: session,
+                did: key,
+                cache: self.session_cache.clone(),
+                restores: self.session_restores.clone(),
+            });
         }
-        let did = did
+
+        let restore = {
+            let mut pending = self.session_restores.lock().await;
+            pending
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
+        };
+        let result = restore
+            .get_or_init(|| async {
+                self.client
+                    .restore(did)
+                    .await
+                    .map(Arc::new)
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .clone();
+
+        if let Ok(session) = &result {
+            let now = tokio::time::Instant::now();
+            let mut cache = self.session_cache.lock().await;
+            cache.retain(|_, (expires, _)| *expires > now);
+            if cache.len() >= OAUTH_SESSION_CACHE_CAPACITY
+                && let Some(oldest) = cache.keys().next().cloned()
+            {
+                cache.remove(&oldest);
+            }
+            cache.insert(
+                key.clone(),
+                (now + OAUTH_SESSION_CACHE_TTL, Arc::clone(session)),
+            );
+        }
+        self.session_restores.lock().await.remove(&key);
+        result.map(|inner| SharedOAuthSession {
+            inner,
+            did: key,
+            cache: self.session_cache.clone(),
+            restores: self.session_restores.clone(),
+        })
+    }
+
+    async fn evict_restored_session(&self, did: &str) {
+        self.session_cache.lock().await.remove(did);
+        self.session_restores.lock().await.remove(did);
+    }
+
+    fn session_agent(session: &SharedOAuthSession) -> Agent<SharedOAuthSession> {
+        Agent::new(session.clone())
+    }
+
+    async fn revoke_session(&self, did: &Did) -> Result<(), String> {
+        self.evict_restored_session(did.as_ref()).await;
+        self.client
+            .revoke(did)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn cached_saved_feed_preferences(
+        &self,
+        did: &str,
+    ) -> Option<(Vec<SavedFeedPreference>, bool)> {
+        let now = tokio::time::Instant::now();
+        if let Some((expires, preferences)) = self.saved_feed_cache.lock().await.get(did).cloned() {
+            return Some((preferences, expires <= now));
+        }
+        let Ok(Some((json, stored_at_ms))) = self.store.web_cache_get(&saved_feed_cache_key(did))
+        else {
+            return None;
+        };
+        let Ok(preferences) = serde_json::from_str::<Vec<SavedFeedPreference>>(&json) else {
+            return None;
+        };
+        let age_ms = unix_time_ms().saturating_sub(stored_at_ms).max(0) as u64;
+        let ttl_ms = SAVED_FEED_PREFERENCE_CACHE_TTL.as_millis() as u64;
+        let stale = age_ms >= ttl_ms;
+        let expires = now + Duration::from_millis(ttl_ms.saturating_sub(age_ms));
+        let mut cache = self.saved_feed_cache.lock().await;
+        cache.retain(|_, (expires, _)| *expires > now);
+        if cache.len() >= 4096
+            && let Some(oldest) = cache.keys().next().cloned()
+        {
+            cache.remove(&oldest);
+        }
+        cache.insert(did.to_owned(), (expires, preferences.clone()));
+        Some((preferences, stale))
+    }
+
+    async fn refresh_saved_feed_preferences(
+        &self,
+        did: &str,
+    ) -> Result<Vec<SavedFeedPreference>, String> {
+        let parsed_did = did
             .parse::<Did>()
             .map_err(|_| "viewer DID is invalid".to_owned())?;
-        let session = self
-            .client
-            .restore(&did)
-            .await
-            .map_err(|_| "OAuth session could not be restored".to_owned())?;
+        let session = self.restored_session(&parsed_did).await?;
         let request = XrpcRequest {
             method: http::Method::GET,
             nsid: "app.bsky.actor.getPreferences".to_owned(),
@@ -1675,7 +2053,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             }
         };
         let preferences = parse_saved_feed_preferences(&response);
-        let cache_key = saved_feed_cache_key(&did);
+        let cache_key = saved_feed_cache_key(did);
         if let Ok(value_json) = serde_json::to_string(&preferences)
             && let Err(error) = self.store.web_cache_set(&cache_key, &value_json)
         {
@@ -1689,43 +2067,67 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             cache.remove(&oldest);
         }
         cache.insert(
-            did.to_string(),
+            did.to_owned(),
             (
-                tokio::time::Instant::now() + Duration::from_secs(5 * 60),
+                tokio::time::Instant::now() + SAVED_FEED_PREFERENCE_CACHE_TTL,
                 preferences.clone(),
             ),
         );
         Ok(preferences)
     }
 
-    async fn saved_feed_preferences_for_tabs(&self, did: &str) -> Vec<SavedFeedPreference> {
-        if let Some((expires, preferences)) = self.saved_feed_cache.lock().await.get(did).cloned()
-            && expires > tokio::time::Instant::now()
-        {
-            return preferences;
+    async fn schedule_saved_feed_refresh(&self, did: &str) {
+        let mut pending = self.saved_feed_refreshes.lock().await;
+        if !pending.insert(did.to_owned()) {
+            return;
         }
-        let mut cached_preferences = None;
-        let mut refresh = true;
-        if let Ok(Some((json, stored_at_ms))) = self.store.web_cache_get(&saved_feed_cache_key(did))
-            && let Ok(preferences) = serde_json::from_str::<Vec<SavedFeedPreference>>(&json)
-        {
-            let age_ms = unix_time_ms().saturating_sub(stored_at_ms).max(0) as u64;
-            refresh = age_ms > 60 * 60 * 1000;
-            cached_preferences = Some(preferences);
-        }
-        if refresh {
-            let mut pending = self.saved_feed_refreshes.lock().await;
-            if pending.insert(did.to_owned()) {
-                drop(pending);
-                let flow = self.clone();
-                let did = did.to_owned();
-                tokio::spawn(async move {
-                    let _ = flow.saved_feed_preferences(&did).await;
-                    flow.saved_feed_refreshes.lock().await.remove(&did);
-                });
+        drop(pending);
+        let flow = self.clone();
+        let did = did.to_owned();
+        tokio::spawn(async move {
+            if let Err(error) = flow.refresh_saved_feed_preferences(&did).await {
+                tracing::debug!(%error, %did, "saved feed preferences refresh failed");
             }
+            flow.saved_feed_refreshes.lock().await.remove(&did);
+        });
+    }
+
+    async fn saved_feed_preferences_for_tabs(&self, did: &str) -> Vec<SavedFeedPreference> {
+        self.saved_feed_preferences(did).await.unwrap_or_default()
+    }
+
+    async fn saved_feed_preferences(&self, did: &str) -> Result<Vec<SavedFeedPreference>, String> {
+        if let Some((preferences, stale)) = self.cached_saved_feed_preferences(did).await {
+            if stale {
+                self.schedule_saved_feed_refresh(did).await;
+            }
+            return Ok(preferences);
         }
-        cached_preferences.unwrap_or_default()
+
+        let mut pending = self.saved_feed_refreshes.lock().await;
+        if pending.insert(did.to_owned()) {
+            drop(pending);
+            let refresh = tokio::time::timeout(
+                PAGE_PROFILE_BUDGET,
+                self.refresh_saved_feed_preferences(did),
+            )
+            .await
+            .unwrap_or_else(|_| Err("PDS getPreferences request timed out".to_owned()));
+            self.saved_feed_refreshes.lock().await.remove(did);
+            return refresh;
+        }
+        drop(pending);
+
+        let deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
+        loop {
+            if let Some((preferences, _)) = self.cached_saved_feed_preferences(did).await {
+                return Ok(preferences);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("PDS getPreferences request timed out".to_owned());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     async fn list_repo_collection(
@@ -1736,11 +2138,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         let parsed_did = did
             .parse::<Did>()
             .map_err(|_| "viewer DID is invalid".to_owned())?;
-        let session = self
-            .client
-            .restore(&parsed_did)
-            .await
-            .map_err(|_| "OAuth session could not be restored".to_owned())?;
+        let session = self.restored_session(&parsed_did).await?;
         let mut records = Vec::new();
         let mut cursor: Option<String> = None;
         for _ in 0..100 {
@@ -1787,23 +2185,91 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
     }
 
     async fn fetch_muted_actor_dids(&self, did: &str) -> Result<HashSet<String>, String> {
-        if let Some((expires, actors)) = self.muted_actor_cache.lock().await.get(did).cloned()
-            && expires > tokio::time::Instant::now()
-        {
+        did.parse::<Did>()
+            .map_err(|_| "viewer DID is invalid".to_owned())?;
+        let now = tokio::time::Instant::now();
+        if let Some((expires, actors)) = self.muted_actor_cache.lock().await.get(did).cloned() {
+            if expires > now {
+                return Ok(actors);
+            }
+            self.schedule_muted_actor_refresh(did).await;
             return Ok(actors);
         }
+        if let Ok(Some((json, stored_at_ms))) =
+            self.store.web_cache_get(&muted_actor_cache_key(did))
+            && let Ok(actor_list) = serde_json::from_str::<Vec<String>>(&json)
+        {
+            let actors = actor_list.into_iter().collect::<HashSet<_>>();
+            let age_ms = unix_time_ms().saturating_sub(stored_at_ms).max(0) as u64;
+            let ttl_ms = MUTED_ACTOR_CACHE_TTL.as_millis() as u64;
+            let stale = age_ms >= ttl_ms;
+            let expires = now + Duration::from_millis(ttl_ms.saturating_sub(age_ms));
+            let mut cache = self.muted_actor_cache.lock().await;
+            cache.retain(|_, (expires, _)| *expires > now);
+            if cache.len() < 4096 {
+                cache.insert(did.to_owned(), (expires, actors.clone()));
+            }
+            drop(cache);
+            if stale {
+                self.schedule_muted_actor_refresh(did).await;
+            }
+            return Ok(actors);
+        }
+
+        let mut pending = self.muted_actor_refreshes.lock().await;
+        if !pending.insert(did.to_owned()) {
+            drop(pending);
+            let deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
+            loop {
+                if let Some((_, actors)) = self.muted_actor_cache.lock().await.get(did).cloned() {
+                    return Ok(actors);
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err("Bluesky getMutes request timed out".to_owned());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        drop(pending);
+        let result = self.refresh_muted_actor_dids_with_deadline(did).await;
+        self.muted_actor_refreshes.lock().await.remove(did);
+        result
+    }
+
+    async fn schedule_muted_actor_refresh(&self, did: &str) {
+        let mut pending = self.muted_actor_refreshes.lock().await;
+        if !pending.insert(did.to_owned()) {
+            return;
+        }
+        drop(pending);
+        let flow = self.clone();
+        let did = did.to_owned();
+        tokio::spawn(async move {
+            if let Err(error) = flow.refresh_muted_actor_dids_with_deadline(&did).await {
+                tracing::debug!(%error, %did, "muted actor list refresh failed");
+            }
+            flow.muted_actor_refreshes.lock().await.remove(&did);
+        });
+    }
+
+    async fn refresh_muted_actor_dids_with_deadline(
+        &self,
+        did: &str,
+    ) -> Result<HashSet<String>, String> {
+        tokio::time::timeout(PAGE_PROFILE_BUDGET, self.refresh_muted_actor_dids(did))
+            .await
+            .map_err(|_| "Bluesky getMutes request timed out".to_owned())?
+    }
+
+    async fn refresh_muted_actor_dids(&self, did: &str) -> Result<HashSet<String>, String> {
         let parsed_did = did
             .parse::<Did>()
             .map_err(|_| "viewer DID is invalid".to_owned())?;
-        let session = self
-            .client
-            .restore(&parsed_did)
-            .await
-            .map_err(|_| "OAuth session could not be restored".to_owned())?;
+        let session = self.restored_session(&parsed_did).await?;
         let proxy_did = BSKY_APPVIEW_DID
             .parse::<Did>()
             .map_err(|_| "Bluesky AppView service DID is invalid".to_owned())?;
-        let api = Agent::new(session).api_with_proxy(proxy_did, BSKY_APPVIEW_SERVICE);
+        let api = Self::session_agent(&session).api_with_proxy(proxy_did, BSKY_APPVIEW_SERVICE);
         let mut actors = HashSet::new();
         let mut cursor: Option<String> = None;
         for _ in 0..100 {
@@ -1827,8 +2293,22 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             );
             cursor = page.data.cursor;
             if cursor.is_none() {
+                let mut actor_list = actors.iter().cloned().collect::<Vec<_>>();
+                actor_list.sort();
+                if let Ok(value_json) = serde_json::to_string(&actor_list)
+                    && let Err(error) = self
+                        .store
+                        .web_cache_set(&muted_actor_cache_key(did), &value_json)
+                {
+                    tracing::warn!(%error, "could not persist muted actor list");
+                }
                 let mut cache = self.muted_actor_cache.lock().await;
                 cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
+                if cache.len() >= 4096
+                    && let Some(oldest) = cache.keys().next().cloned()
+                {
+                    cache.remove(&oldest);
+                }
                 cache.insert(
                     did.to_owned(),
                     (
@@ -1844,18 +2324,63 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
 
     async fn labeler_dids_for_viewer(&self, did: &str) -> Result<Vec<String>, String> {
         if let Some((expires, dids)) = self.labeler_preference_cache.lock().await.get(did).cloned()
-            && expires > tokio::time::Instant::now()
         {
+            if expires > tokio::time::Instant::now() {
+                return Ok(dids);
+            }
+            self.schedule_labeler_preference_refresh(did).await;
             return Ok(dids);
         }
+        let mut pending = self.labeler_preference_refreshes.lock().await;
+        if !pending.insert(did.to_owned()) {
+            drop(pending);
+            let deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
+            loop {
+                if let Some((_, dids)) =
+                    self.labeler_preference_cache.lock().await.get(did).cloned()
+                {
+                    return Ok(dids);
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err("PDS getPreferences request timed out".to_owned());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        drop(pending);
+        let result =
+            tokio::time::timeout(PAGE_PROFILE_BUDGET, self.refresh_labeler_preferences(did))
+                .await
+                .unwrap_or_else(|_| Err("PDS getPreferences request timed out".to_owned()));
+        self.labeler_preference_refreshes.lock().await.remove(did);
+        result
+    }
+
+    async fn schedule_labeler_preference_refresh(&self, did: &str) {
+        let mut pending = self.labeler_preference_refreshes.lock().await;
+        if !pending.insert(did.to_owned()) {
+            return;
+        }
+        drop(pending);
+        let flow = self.clone();
+        let did = did.to_owned();
+        tokio::spawn(async move {
+            if let Err(error) =
+                tokio::time::timeout(PAGE_PROFILE_BUDGET, flow.refresh_labeler_preferences(&did))
+                    .await
+                    .unwrap_or_else(|_| Err("PDS getPreferences request timed out".to_owned()))
+            {
+                tracing::debug!(%error, %did, "labeler preferences refresh failed");
+            }
+            flow.labeler_preference_refreshes.lock().await.remove(&did);
+        });
+    }
+
+    async fn refresh_labeler_preferences(&self, did: &str) -> Result<Vec<String>, String> {
         let parsed_did = did
             .parse::<Did>()
             .map_err(|_| "viewer DID is invalid".to_owned())?;
-        let session = self
-            .client
-            .restore(&parsed_did)
-            .await
-            .map_err(|_| "OAuth session could not be restored".to_owned())?;
+        let session = self.restored_session(&parsed_did).await?;
         let request = XrpcRequest {
             method: http::Method::GET,
             nsid: "app.bsky.actor.getPreferences".to_owned(),
@@ -2082,21 +2607,101 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         if actors.is_empty() {
             return Ok(PageAccountData::default());
         }
-        let cache_key = (viewer_did.to_owned(), actors.join(","));
-        if let Some((expires, data)) = self
-            .account_label_page_cache
-            .lock()
-            .await
-            .get(&cache_key)
-            .cloned()
-            && expires > tokio::time::Instant::now()
+        let now = tokio::time::Instant::now();
+        let mut stale = Vec::new();
+        let mut cold = Vec::new();
         {
-            return Ok(data);
+            let cache = self.account_label_actor_cache.lock().await;
+            for actor in &actors {
+                let key = (viewer_did.to_owned(), actor.clone());
+                match cache.get(&key) {
+                    Some((expires, _)) if *expires <= now => stale.push(actor.clone()),
+                    Some(_) => {}
+                    None => cold.push(actor.clone()),
+                }
+            }
         }
+        if !stale.is_empty() {
+            self.schedule_account_actor_refresh(viewer_did, stale).await;
+        }
+        if !cold.is_empty() {
+            let mut pending = self.account_label_refreshes.lock().await;
+            let refresh = cold
+                .into_iter()
+                .filter(|actor| pending.insert((viewer_did.to_owned(), actor.clone())))
+                .collect::<Vec<_>>();
+            drop(pending);
+            if !refresh.is_empty() {
+                let refresh_result = match tokio::time::timeout(
+                    PAGE_PROFILE_BUDGET,
+                    self.refresh_account_actor_data(viewer_did, refresh.clone()),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err("Bluesky account profile request timed out".to_owned()),
+                };
+                self.clear_account_actor_refreshes(viewer_did, &refresh)
+                    .await;
+                refresh_result?;
+            }
+        }
+
+        let cache = self.account_label_actor_cache.lock().await;
+        let mut data = PageAccountData::default();
+        for actor in actors {
+            if let Some((_, actor_data)) = cache.get(&(viewer_did.to_owned(), actor)) {
+                data.labels.extend(actor_data.labels.iter().cloned());
+                if let Some(profile) = &actor_data.profile {
+                    data.profiles.push(profile.clone());
+                }
+            }
+        }
+        Ok(data)
+    }
+
+    async fn schedule_account_actor_refresh(&self, viewer_did: &str, actors: Vec<String>) {
+        let mut pending = self.account_label_refreshes.lock().await;
+        let refresh = actors
+            .into_iter()
+            .filter(|actor| pending.insert((viewer_did.to_owned(), actor.clone())))
+            .collect::<Vec<_>>();
+        drop(pending);
+        if refresh.is_empty() {
+            return;
+        }
+        let flow = self.clone();
+        let viewer_did = viewer_did.to_owned();
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(
+                PAGE_PROFILE_BUDGET,
+                flow.refresh_account_actor_data(&viewer_did, refresh.clone()),
+            )
+            .await
+            .unwrap_or_else(|_| Err("Bluesky account profile request timed out".to_owned()));
+            if let Err(error) = result {
+                tracing::debug!(%error, %viewer_did, "account labels refresh failed");
+            }
+            flow.clear_account_actor_refreshes(&viewer_did, &refresh)
+                .await;
+        });
+    }
+
+    async fn clear_account_actor_refreshes(&self, viewer_did: &str, actors: &[String]) {
+        let mut pending = self.account_label_refreshes.lock().await;
+        for actor in actors {
+            pending.remove(&(viewer_did.to_owned(), actor.clone()));
+        }
+    }
+
+    async fn refresh_account_actor_data(
+        &self,
+        viewer_did: &str,
+        actors: Vec<String>,
+    ) -> Result<(), String> {
         let labeler_dids = self.labeler_dids_for_viewer(viewer_did).await?;
         let accepted_labelers = labeler_dids.join(",");
-        let mut account_raw_labels = Vec::new();
-        let mut profile_views = Vec::new();
+        let mut requests = Vec::new();
         for batch in actors.chunks(ACCOUNT_LABEL_PROFILE_BATCH_SIZE) {
             let mut url = url::Url::parse(&format!(
                 "{}app.bsky.actor.getProfiles",
@@ -2115,16 +2720,22 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                 HeaderValue::from_str(&accepted_labelers)
                     .map_err(|_| "labeler preference header is invalid".to_owned())?,
             );
-            let response = self.public_appview_json(url, headers).await?;
-            if let Some(profiles) = response.get("profiles").and_then(Value::as_array) {
-                for profile in profiles {
+            requests.push(self.public_appview_json(url, headers));
+        }
+        let responses = futures_util::future::join_all(requests).await;
+        let mut profiles = HashMap::new();
+        let mut account_raw_labels = HashMap::<String, Vec<(String, String)>>::new();
+        for response in responses {
+            let response = response?;
+            if let Some(profile_values) = response.get("profiles").and_then(Value::as_array) {
+                for profile in profile_values {
                     let Some(subject_did) = profile.get("did").and_then(Value::as_str) else {
                         continue;
                     };
                     if actors.iter().any(|actor| actor == subject_did)
                         && let Some(profile_view) = crate::feeds::parse_public_profile_view(profile)
                     {
-                        profile_views.push(profile_view);
+                        profiles.insert(subject_did.to_owned(), profile_view);
                     }
                     for label in profile
                         .get("labels")
@@ -2143,62 +2754,68 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                             && label.get("neg").and_then(Value::as_bool) != Some(true)
                             && labeler_dids.iter().any(|accepted| accepted == labeler_did)
                         {
-                            account_raw_labels.push((
-                                subject_did.to_owned(),
-                                labeler_did.to_owned(),
-                                value.to_owned(),
-                            ));
+                            account_raw_labels
+                                .entry(subject_did.to_owned())
+                                .or_default()
+                                .push((labeler_did.to_owned(), value.to_owned()));
                         }
                     }
                 }
             }
         }
         let presentations = self.labeler_presentations(&labeler_dids).await?;
-        let labels = account_raw_labels
-            .into_iter()
-            .map(|(subject_did, labeler_did, value)| {
-                let presentation = presentations.get(&labeler_did);
-                let global = label_value_default(&value);
-                let definition =
-                    presentation.and_then(|presentation| presentation.definitions.get(&value));
-                AccountLabel {
-                    subject_did,
-                    labeler_did: labeler_did.clone(),
-                    labeler_name: presentation
-                        .map(|presentation| presentation.name.clone())
-                        .unwrap_or_else(|| labeler_did.clone()),
-                    value,
-                    display_name: definition
-                        .map(|definition| definition.name.clone())
-                        .unwrap_or(global.name),
-                    severity: definition
-                        .map(|definition| definition.severity.clone())
-                        .unwrap_or(global.severity),
-                    blurs: definition
-                        .map(|definition| definition.blurs.clone())
-                        .unwrap_or(global.blurs),
-                }
-            })
-            .collect::<Vec<_>>();
-        let data = PageAccountData {
-            labels,
-            profiles: profile_views,
-        };
-        let mut cache = self.account_label_page_cache.lock().await;
-        cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
-        if cache.len() >= 4096
-            && let Some(oldest) = cache.keys().next().cloned()
-        {
-            cache.remove(&oldest);
+        let mut fetched = HashMap::new();
+        for actor in &actors {
+            let labels = account_raw_labels
+                .remove(actor)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(labeler_did, value)| {
+                    let presentation = presentations.get(&labeler_did);
+                    let global = label_value_default(&value);
+                    let definition =
+                        presentation.and_then(|presentation| presentation.definitions.get(&value));
+                    AccountLabel {
+                        subject_did: actor.clone(),
+                        labeler_did: labeler_did.clone(),
+                        labeler_name: presentation
+                            .map(|presentation| presentation.name.clone())
+                            .unwrap_or_else(|| labeler_did.clone()),
+                        value,
+                        display_name: definition
+                            .map(|definition| definition.name.clone())
+                            .unwrap_or(global.name),
+                        severity: definition
+                            .map(|definition| definition.severity.clone())
+                            .unwrap_or(global.severity),
+                        blurs: definition
+                            .map(|definition| definition.blurs.clone())
+                            .unwrap_or(global.blurs),
+                    }
+                })
+                .collect();
+            fetched.insert(
+                actor.clone(),
+                AccountActorData {
+                    labels,
+                    profile: profiles.remove(actor),
+                },
+            );
         }
-        cache.insert(
-            cache_key,
-            (
-                tokio::time::Instant::now() + ACCOUNT_LABEL_CACHE_TTL,
-                data.clone(),
-            ),
-        );
-        Ok(data)
+        let now = tokio::time::Instant::now();
+        let mut cache = self.account_label_actor_cache.lock().await;
+        cache.retain(|_, (expires, _)| *expires > now);
+        for (actor, actor_data) in fetched {
+            let key = (viewer_did.to_owned(), actor);
+            if cache.len() >= 8192
+                && !cache.contains_key(&key)
+                && let Some(oldest) = cache.keys().next().cloned()
+            {
+                cache.remove(&oldest);
+            }
+            cache.insert(key, (now + ACCOUNT_LABEL_CACHE_TTL, actor_data));
+        }
+        Ok(())
     }
 
     async fn set_muted_actor(&self, did: &str, subject: &str, muted: bool) -> Result<(), String> {
@@ -2209,15 +2826,11 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             .parse::<Did>()
             .map(AtIdentifier::Did)
             .map_err(|_| "profile DID is invalid".to_owned())?;
-        let session = self
-            .client
-            .restore(&parsed_did)
-            .await
-            .map_err(|_| "OAuth session could not be restored".to_owned())?;
+        let session = self.restored_session(&parsed_did).await?;
         let proxy_did = BSKY_APPVIEW_DID
             .parse::<Did>()
             .map_err(|_| "Bluesky AppView service DID is invalid".to_owned())?;
-        let api = Agent::new(session).api_with_proxy(proxy_did, BSKY_APPVIEW_SERVICE);
+        let api = Self::session_agent(&session).api_with_proxy(proxy_did, BSKY_APPVIEW_SERVICE);
         if muted {
             api.app
                 .bsky
@@ -2236,6 +2849,9 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                 .map_err(|error| format!("Bluesky unmute request failed: {error:?}"))?;
         }
         self.muted_actor_cache.lock().await.remove(did);
+        if let Err(error) = self.store.web_cache_delete(&muted_actor_cache_key(did)) {
+            tracing::warn!(%error, "could not invalidate persisted muted actor list");
+        }
         Ok(())
     }
 
@@ -2243,11 +2859,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         let did = viewer_did
             .parse::<Did>()
             .map_err(|_| "viewer DID is invalid".to_owned())?;
-        let session = self
-            .client
-            .restore(&did)
-            .await
-            .map_err(|_| "OAuth session could not be restored".to_owned())?;
+        let session = self.restored_session(&did).await?;
         service_auth_audience_from_url(&session.base_uri())
     }
 
@@ -2295,11 +2907,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         let did = viewer_did
             .parse::<Did>()
             .map_err(|_| "viewer DID is invalid".to_owned())?;
-        let session = self
-            .client
-            .restore(&did)
-            .await
-            .map_err(|_| "OAuth session could not be restored".to_owned())?;
+        let session = self.restored_session(&did).await?;
         let exp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|_| "system clock is before the epoch".to_owned())?
@@ -2455,12 +3063,8 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             .as_micros()
             .min(u64::MAX as u128) as u64;
         let did = did.parse::<Did>().map_err(|error| error.to_string())?;
-        let session = self
-            .client
-            .restore(&did)
-            .await
-            .map_err(|error| error.to_string())?;
-        let agent = Agent::new(session);
+        let session = self.restored_session(&did).await?;
+        let agent = Self::session_agent(&session);
         let input = atrium_api::com::atproto::repo::create_record::InputData {
             collection: collection
                 .parse()
@@ -2502,11 +3106,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         quote: Option<PostStrongRef>,
     ) -> Result<PdsCreatedRecord, String> {
         let parsed_did = did.parse::<Did>().map_err(|error| error.to_string())?;
-        let session = self
-            .client
-            .restore(&parsed_did)
-            .await
-            .map_err(|error| error.to_string())?;
+        let session = self.restored_session(&parsed_did).await?;
         let mut blobs = Vec::with_capacity(images.len());
         for image in &images {
             let request = XrpcRequest {
@@ -2593,11 +3193,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         }
 
         let parsed_did = did.parse::<Did>().map_err(|error| error.to_string())?;
-        let session = self
-            .client
-            .restore(&parsed_did)
-            .await
-            .map_err(|error| error.to_string())?;
+        let session = self.restored_session(&parsed_did).await?;
         let thumb = if let Some(thumbnail) = external.thumbnail.as_ref() {
             let request = XrpcRequest {
                 method: http::Method::POST,
@@ -2688,12 +3284,8 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                 "record URI does not belong to this account and collection".to_owned()
             })?;
         let did = did.parse::<Did>().map_err(|error| error.to_string())?;
-        let session = self
-            .client
-            .restore(&did)
-            .await
-            .map_err(|error| error.to_string())?;
-        let agent = Agent::new(session);
+        let session = self.restored_session(&did).await?;
+        let agent = Self::session_agent(&session);
         let input = atrium_api::com::atproto::repo::delete_record::InputData {
             collection: collection
                 .parse()
@@ -2783,7 +3375,7 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
             let did = did.as_ref().to_owned();
             let parsed_did = did.parse::<Did>().map_err(|error| error.to_string())?;
             if params.browser_binding.as_deref() != Some(expected.browser_binding.as_str()) {
-                let _ = self.client.revoke(&parsed_did).await;
+                let _ = self.revoke_session(&parsed_did).await;
                 let _ = self.store.del(&parsed_did).await;
                 return Err("OAuth browser binding does not match the authorization state".into());
             }
@@ -2795,12 +3387,12 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
                 .ok_or_else(|| "OAuth callback did not persist its session".to_owned())?;
             let granted_scope = stored_session.token_set.scope;
             if !has_atproto_scope(granted_scope.as_deref()) {
-                let _ = self.client.revoke(&parsed_did).await;
+                let _ = self.revoke_session(&parsed_did).await;
                 let _ = self.store.del(&parsed_did).await;
                 return Err("OAuth token response did not grant the atproto scope".into());
             }
             if did != expected.did {
-                let _ = self.client.revoke(&parsed_did).await;
+                let _ = self.revoke_session(&parsed_did).await;
                 let _ = self.store.del(&parsed_did).await;
                 return Err("OAuth subject DID does not match the verified login identity".into());
             }
@@ -2818,10 +3410,7 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
             let did = did.parse::<Did>().map_err(|error| error.to_string())?;
-            self.client
-                .revoke(&did)
-                .await
-                .map_err(|error| error.to_string())
+            self.revoke_session(&did).await
         })
     }
 
@@ -3283,12 +3872,8 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Value>, String>> + Send + 'a>> {
         Box::pin(async move {
             let did = did.parse::<Did>().map_err(|error| error.to_string())?;
-            let session = self
-                .client
-                .restore(&did)
-                .await
-                .map_err(|error| error.to_string())?;
-            let agent = Agent::new(session);
+            let session = self.restored_session(&did).await?;
+            let agent = Self::session_agent(&session);
             let params = atrium_api::app::bsky::feed::get_timeline::ParametersData {
                 algorithm: None,
                 cursor: None,
@@ -4066,6 +4651,10 @@ impl<F: OAuthFlow, S: Storage + 'static> ProfileRefreshWorker<F, S> {
     }
 
     pub async fn refresh_once(&self) -> Result<usize, StorageError> {
+        crate::net::with_background_request_pool(self.refresh_once_inner()).await
+    }
+
+    async fn refresh_once_inner(&self) -> Result<usize, StorageError> {
         let pending = self
             .storage
             .pending_profile_fetches(PAGE_PROFILE_CONCURRENCY)?;
@@ -11041,15 +11630,6 @@ mod tests {
             actors,
             ["did:plc:authora", "did:plc:authorb", "did:plc:authorc"]
         );
-        let overlap_query = profile_calls[1].0.split_once('?').unwrap().1;
-        let overlap_actors = url::form_urlencoded::parse(overlap_query.as_bytes())
-            .filter_map(|(name, value)| (name == "actors").then(|| value.into_owned()))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            overlap_actors,
-            ["did:plc:authorc"],
-            "the shared author should come from its per-DID cache"
-        );
         let accepted = profile_calls[0].1.as_deref().unwrap();
         assert!(accepted.contains(BSKY_MODERATION_LABELER_DID), "{accepted}");
         assert!(accepted.contains("did:plc:customlabeler"), "{accepted}");
@@ -12965,6 +13545,63 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(180)).await;
         assert_eq!(state.lock().unwrap().mutes_calls, 1);
         assert!(flow.fetch_muted_actor_dids(&did).await.unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stale_oauth_metadata_returns_immediately_and_refreshes_in_background() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = calls.clone();
+        let app = Router::new().route(
+            "/.well-known/oauth-authorization-server",
+            get(move || {
+                let calls = server_calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                    Json(json!({"issuer":"new"}))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = OAuthMetadataHttpClient::new(
+            SafeHttpClient::new().with_http_test_hosts(["127.0.0.1".to_owned()]),
+        );
+        let uri = format!("http://{address}/.well-known/oauth-authorization-server");
+        let key = format!("GET {uri}");
+        client.cache.lock().await.insert(
+            key,
+            CachedOAuthMetadataResponse {
+                expires: tokio::time::Instant::now() - Duration::from_secs(1),
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                body: br#"{"issuer":"old"}"#.to_vec(),
+            },
+        );
+        let request = http::Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Vec::new())
+            .unwrap();
+
+        for _ in 0..2 {
+            let response =
+                tokio::time::timeout(Duration::from_millis(50), client.send_http(request.clone()))
+                    .await
+                    .expect("stale OAuth metadata waited for the upstream")
+                    .unwrap();
+            let body: Value = serde_json::from_slice(response.body()).unwrap();
+            assert_eq!(body["issuer"], "old");
+        }
+        tokio::time::sleep(Duration::from_millis(160)).await;
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let refreshed = client.send_http(request).await.unwrap();
+        let body: Value = serde_json::from_slice(refreshed.body()).unwrap();
+        assert_eq!(body["issuer"], "new");
         server.abort();
     }
 

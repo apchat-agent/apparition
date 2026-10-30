@@ -21,6 +21,14 @@ static OUTBOUND_REQUESTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 // A separate pool keeps this background work from occupying interactive request capacity.
 static BACKGROUND_REQUESTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
+tokio::task_local! {
+    static USE_BACKGROUND_REQUEST_POOL: bool;
+}
+
+pub(crate) async fn with_background_request_pool<F: Future>(future: F) -> F::Output {
+    USE_BACKGROUND_REQUEST_POOL.scope(true, future).await
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct OutboundCallSnapshot {
     pub total_calls: usize,
@@ -187,10 +195,16 @@ fn is_dpop_nonce_challenge(
 }
 
 fn request_pool(background: bool) -> Arc<Semaphore> {
+    let background = background
+        || USE_BACKGROUND_REQUEST_POOL
+            .try_with(|use_background| *use_background)
+            .unwrap_or(false);
     if background {
         BACKGROUND_REQUESTS.get_or_init(|| Arc::new(Semaphore::new(6)))
     } else {
-        OUTBOUND_REQUESTS.get_or_init(|| Arc::new(Semaphore::new(8)))
+        // Page hydration fans out across several independent services; 32 keeps those
+        // concurrent reads from forming permit waves while still bounding connection use.
+        OUTBOUND_REQUESTS.get_or_init(|| Arc::new(Semaphore::new(32)))
     }
     .clone()
 }
@@ -668,7 +682,40 @@ mod tests {
             interactive.is_ok(),
             "interactive request waited on background permits"
         );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            while !line.trim().is_empty() {
+                line.clear();
+                reader.read_line(&mut line).await.unwrap();
+            }
+            let mut stream = reader.into_inner();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        });
+        let client = SafeHttpClient::new().with_http_test_hosts(["127.0.0.1".to_owned()]);
+        let request = http::Request::builder()
+            .method("GET")
+            .uri(format!("http://{address}/page-call"))
+            .body(Vec::new())
+            .unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            client.send(request, 1024),
+        )
+        .await
+        .expect("page outbound call waited for background capacity")
+        .unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
         drop(held);
+        server.await.unwrap();
     }
 
     #[derive(Clone)]

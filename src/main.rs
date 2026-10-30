@@ -54,8 +54,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             config.jetstream_stale_cursor_threshold_secs,
         ));
     let jetstream_urls = config.jetstream_urls.clone();
-    let resolver = IdentityResolver::new(HttpIdentityBackend::default(), Duration::from_secs(1800))
-        .with_persistent_cache(identity_cache.clone());
+    let resolver = IdentityResolver::new(
+        HttpIdentityBackend::for_background_work(),
+        Duration::from_secs(1800),
+    )
+    .with_persistent_cache(identity_cache.clone());
     let jwt_resolver = Arc::new(
         IdentityResolver::new(HttpIdentityBackend::default(), Duration::from_secs(1800))
             .with_persistent_cache(identity_cache.clone()),
@@ -99,8 +102,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     let handle_refresh_worker = HandleRefreshWorker::new(
         storage.clone(),
-        IdentityResolver::new(HttpIdentityBackend::default(), Duration::from_secs(1800))
-            .with_persistent_cache(identity_cache),
+        IdentityResolver::new(
+            HttpIdentityBackend::for_background_work(),
+            Duration::from_secs(1800),
+        )
+        .with_persistent_cache(identity_cache),
         Duration::from_secs(1800),
         Duration::from_secs(30),
     );

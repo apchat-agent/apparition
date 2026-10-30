@@ -999,6 +999,18 @@ impl Default for HttpIdentityBackend {
     }
 }
 
+impl HttpIdentityBackend {
+    /// Build an identity client whose requests cannot occupy page request permits.
+    pub fn for_background_work() -> Self {
+        Self::with_client(
+            "https://plc.directory/",
+            "https://cloudflare-dns.com/dns-query",
+            SafeHttpClient::new().background(),
+        )
+        .expect("built-in identity service URLs are valid")
+    }
+}
+
 #[derive(Deserialize)]
 struct DohResponse {
     #[serde(default, rename = "Answer")]
