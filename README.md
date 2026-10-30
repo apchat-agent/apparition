@@ -1,6 +1,9 @@
-# appview-rs
+# apparition
 
-A small, self-hostable AT Protocol AppView written in Rust. It indexes selected Jetstream events into SQLite, serves Bluesky read XRPCs, and includes a browser UI that signs in with ATProto OAuth and writes records to the user's PDS.
+An app that is mostly a ghost: every line here was written by AI coding agents (OpenAI Codex lanes, briefed and
+reviewed by a Claude agent), with a human choosing what to build and trying it on his phone. No human wrote the code.
+
+apparition (crate name `appview-rs`) is a small, self-hostable AT Protocol AppView written in Rust. It indexes selected Jetstream events into SQLite, serves Bluesky read XRPCs, and includes a browser UI that signs in with ATProto OAuth and writes records to the user's PDS.
 
 This is an early implementation, not a feature-complete replacement for Bluesky's hosted AppView. See [DESIGN.md](DESIGN.md) for implemented routes, scope rules, and current limits.
 
