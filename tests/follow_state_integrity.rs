@@ -21,6 +21,7 @@ use tower::ServiceExt;
 const VIEWER: &str = "did:plc:viewer";
 const SUBJECT: &str = "did:plc:subject";
 const SUBJECT_TWO: &str = "did:plc:subject-two";
+const OAUTH_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.graph.getMutes?aud=*";
 
 struct TempDirGuard(PathBuf);
 
@@ -80,7 +81,7 @@ impl OAuthFlow for AcceptingFlow {
             Ok(OAuthAccount {
                 did: VIEWER.to_owned(),
                 verified_handle: Some("viewer.test".to_owned()),
-                granted_scope: Some("atproto".to_owned()),
+                granted_scope: Some(OAUTH_SCOPE.to_owned()),
             })
         })
     }
@@ -169,21 +170,18 @@ async fn request_html(router: &Router, uri: &str, cookie: &str) -> String {
 #[tokio::test]
 async fn profile_page_shows_unfollow_when_viewer_has_only_a_follow_record() {
     let storage = Arc::new(MemoryStorage::default());
-    storage
-        .put_record(&follow_record(VIEWER, SUBJECT, "follow-subject"))
-        .unwrap();
     let app = OAuthPublic::new("https://appview.example")
         .unwrap()
         .router_with_flow(AcceptingFlow, storage.clone());
     let cookie = login(&app).await;
+    // Seeded after login so the viewer really has the record without a
+    // `follows` row: registration rebuilds rows from existing records.
+    storage
+        .put_record(&follow_record(VIEWER, SUBJECT, "follow-subject"))
+        .unwrap();
     assert!(!storage.is_following(VIEWER, SUBJECT).unwrap());
 
-    let html = request_html(
-        &app,
-        "/profile?did=did%3Aplc%3Asubject",
-        &cookie,
-    )
-    .await;
+    let html = request_html(&app, "/profile?did=did%3Aplc%3Asubject", &cookie).await;
     assert!(
         html.contains("name=\"action\" value=\"unfollow\""),
         "follow record without a follows row must show Unfollow: {html}"

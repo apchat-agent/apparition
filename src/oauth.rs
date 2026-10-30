@@ -8017,9 +8017,22 @@ async fn profile_action_panel<F: OAuthFlow, S: Storage>(
     subject_did: &str,
     timing: &mut ProfileActionTiming,
 ) -> Result<String, String> {
-    let following = storage
+    let projected_following = storage
         .is_following(viewer_did, subject_did)
         .map_err(|error| error.to_string())?;
+    // The viewer's own follow records are the source of truth: an emptied or
+    // stale `follows` projection must not flip a real follow back to "Follow".
+    let following = projected_following
+        || storage
+            .has_follow_record(viewer_did, subject_did)
+            .map_err(|error| error.to_string())?;
+    if following && !projected_following {
+        tracing::debug!(
+            viewer = %viewer_did,
+            subject = %subject_did,
+            "Follow state answered from the viewer's own follow records; the follows row was missing",
+        );
+    }
     let blocked = storage
         .records_for_actor_collection(viewer_did, "app.bsky.graph.block", 10_000)
         .map_err(|error| error.to_string())?

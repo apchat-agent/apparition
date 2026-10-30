@@ -479,6 +479,9 @@ pub trait Storage: Send + Sync {
     fn delete_web_session(&self, did: &str, session_id: &str) -> Result<(), StorageError>;
     fn set_follow(&self, actor: &str, subject: &str, following: bool) -> Result<(), StorageError>;
     fn is_following(&self, actor: &str, subject: &str) -> Result<bool, StorageError>;
+    /// Whether the actor's own `app.bsky.graph.follow` records in `records`
+    /// name this subject, independent of the `follows` projection table.
+    fn has_follow_record(&self, actor: &str, subject: &str) -> Result<bool, StorageError>;
     fn tracked_follow_count(&self, did: &str) -> Result<u32, StorageError>;
     fn is_followed_by_registered(&self, did: &str) -> Result<bool, StorageError>;
     fn enqueue_backfill(&self, did: &str) -> Result<(), StorageError>;
@@ -1394,6 +1397,24 @@ impl Storage for MemoryStorage {
     fn register_user(&self, did: &str) -> Result<(), StorageError> {
         let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
         if inner.tracked.registered.insert(did.to_owned()) {
+            let record_subjects = inner
+                .records
+                .values()
+                .filter_map(|record| {
+                    (record.collection == "app.bsky.graph.follow" && record.did == did)
+                        .then(|| {
+                            record
+                                .record
+                                .get("subject")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .flatten()
+                })
+                .collect::<Vec<_>>();
+            for subject in &record_subjects {
+                inner.follows.insert((did.to_owned(), subject.clone()));
+            }
             let subjects = inner
                 .follows
                 .iter()
@@ -1402,6 +1423,17 @@ impl Storage for MemoryStorage {
                 .collect::<Vec<_>>();
             for subject in subjects {
                 inner.tracked.apply_follow_delta(&subject, 1);
+            }
+            for subject in &record_subjects {
+                if inner.backfill_queue.contains(subject.as_str())
+                    || inner.backfill_queue.len() < MAX_BACKFILL_QUEUE
+                {
+                    inner
+                        .backfill_owners
+                        .insert((did.to_owned(), subject.clone()));
+                    inner.backfill_queue.insert(subject.clone());
+                    inner.backfill_completed.remove(subject.as_str());
+                }
             }
         }
         if inner.backfill_queue.contains(did) || inner.backfill_queue.len() < MAX_BACKFILL_QUEUE {
@@ -1471,7 +1503,6 @@ impl Storage for MemoryStorage {
             }
             inner.tracked.registered.remove(did);
         }
-        inner.follows.retain(|(actor, _)| actor != did);
         inner.backfill_owners.retain(|(owner, _)| owner != did);
         if !inner
             .follows
@@ -1510,6 +1541,20 @@ impl Storage for MemoryStorage {
             .map_err(|_| StorageError::Poisoned)?
             .follows
             .contains(&(actor.to_owned(), subject.to_owned())))
+    }
+
+    fn has_follow_record(&self, actor: &str, subject: &str) -> Result<bool, StorageError> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .records
+            .values()
+            .any(|record| {
+                record.collection == "app.bsky.graph.follow"
+                    && record.did == actor
+                    && record.record.get("subject").and_then(Value::as_str) == Some(subject)
+            }))
     }
 
     fn tracked_follow_count(&self, did: &str) -> Result<u32, StorageError> {
@@ -2076,6 +2121,90 @@ impl Drop for SqliteStorage {
     }
 }
 
+fn repair_startup_follow_edges(connection: &Connection) -> Result<(), StorageError> {
+    let mut registered = connection.prepare("SELECT did FROM registered_users ORDER BY did")?;
+    let dids = registered
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(registered);
+    for did in dids {
+        let follow_records: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM records
+             WHERE collection='app.bsky.graph.follow' AND did=?1",
+            [&did],
+            |row| row.get(0),
+        )?;
+        let following_rows: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM follows WHERE actor=?1 AND following=1",
+            [&did],
+            |row| row.get(0),
+        )?;
+        tracing::info!(
+            did = %did,
+            follow_records,
+            following_rows,
+            "Checked a registered user's follow rows against their follow records",
+        );
+        if follow_records == following_rows {
+            continue;
+        }
+        let mut rebuilt_rows = 0_u64;
+        let transaction = connection.unchecked_transaction()?;
+        {
+            let mut statement = transaction.prepare(
+                "SELECT DISTINCT json_extract(record_json, '$.subject') FROM records
+                 WHERE collection='app.bsky.graph.follow' AND did=?1
+                   AND json_extract(record_json, '$.subject') IS NOT NULL",
+            )?;
+            let subjects = statement
+                .query_map([&did], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(statement);
+            for subject in &subjects {
+                rebuilt_rows = rebuilt_rows.saturating_add(transaction.execute(
+                    "INSERT OR IGNORE INTO follows(actor,subject,following) VALUES(?1,?2,1)",
+                    params![did, subject],
+                )? as u64);
+                transaction.execute(
+                    "INSERT OR IGNORE INTO backfill_queue(did)
+                     SELECT ?1 WHERE (SELECT COUNT(*) FROM backfill_queue) < ?2
+                        OR EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
+                    params![subject, MAX_BACKFILL_QUEUE],
+                )?;
+                transaction.execute(
+                    "INSERT OR IGNORE INTO backfill_scope(owner_did,target_did)
+                     SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM backfill_queue WHERE did=?2)",
+                    params![did, subject],
+                )?;
+                transaction.execute(
+                    "INSERT INTO backfill_status(did,done) VALUES(?1,0)
+                     ON CONFLICT(did) DO UPDATE SET done=0
+                     WHERE EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
+                    [subject],
+                )?;
+            }
+        }
+        let stale_rows = transaction.execute(
+            "DELETE FROM follows WHERE actor=?1 AND following=1
+             AND subject NOT IN (
+                 SELECT json_extract(record_json, '$.subject') FROM records
+                 WHERE collection='app.bsky.graph.follow' AND did=?1
+             )",
+            [&did],
+        )?;
+        transaction.commit()?;
+        tracing::warn!(
+            did = %did,
+            follow_records,
+            following_rows_before = following_rows,
+            follow_rows_inserted = rebuilt_rows,
+            follow_rows_deleted = stale_rows as u64,
+            "Rebuilt a registered user's follow rows from their follow records after a mismatch",
+        );
+    }
+    Ok(())
+}
+
 fn build_tracked_set(connection: &Connection) -> Result<(TrackedSet, u64), StorageError> {
     let mut tracked = TrackedSet::default();
     let mut registered = connection.prepare("SELECT did FROM registered_users")?;
@@ -2315,6 +2444,7 @@ impl SqliteStorage {
             "CREATE INDEX IF NOT EXISTS follows_active_subject_actor
              ON follows(subject, actor) WHERE following=1;",
         )?;
+        repair_startup_follow_edges(&connection)?;
         connection.execute(
             "DELETE FROM backfill_queue
              WHERE did NOT IN (
@@ -3597,6 +3727,52 @@ impl Storage for SqliteStorage {
                 [&writer_did],
                 |row| row.get(0),
             )?;
+            if !was_registered {
+                // A re-login after the `follows` rows were emptied (logout, an
+                // interrupted snapshot) must not wait for a re-backfill: rebuild
+                // the rows from the follow records this database already holds,
+                // with the same backfill-queue side effects the snapshot insert
+                // path has.
+                let mut statement = transaction.prepare(
+                    "SELECT DISTINCT json_extract(record_json, '$.subject') FROM records
+                     WHERE collection='app.bsky.graph.follow' AND did=?1
+                       AND json_extract(record_json, '$.subject') IS NOT NULL",
+                )?;
+                let subjects = statement
+                    .query_map([&writer_did], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                drop(statement);
+                for subject in &subjects {
+                    let inserted = transaction.execute(
+                        "INSERT OR IGNORE INTO follows(actor,subject,following) VALUES(?1,?2,1)",
+                        params![writer_did, subject],
+                    )?;
+                    if inserted > 0 {
+                        tracing::debug!(
+                            actor = %writer_did,
+                            %subject,
+                            "Rebuilt a follows row from an existing follow record at registration",
+                        );
+                    }
+                    transaction.execute(
+                        "INSERT OR IGNORE INTO backfill_queue(did)
+                         SELECT ?1 WHERE (SELECT COUNT(*) FROM backfill_queue) < ?2
+                            OR EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
+                        params![subject, MAX_BACKFILL_QUEUE],
+                    )?;
+                    transaction.execute(
+                        "INSERT OR IGNORE INTO backfill_scope(owner_did,target_did)
+                         SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM backfill_queue WHERE did=?2)",
+                        params![writer_did, subject],
+                    )?;
+                    transaction.execute(
+                        "INSERT INTO backfill_status(did,done) VALUES(?1,0)
+                         ON CONFLICT(did) DO UPDATE SET done=0
+                         WHERE EXISTS(SELECT 1 FROM backfill_queue WHERE did=?1)",
+                        [subject],
+                    )?;
+                }
+            }
             let active_subjects = if was_registered {
                 Vec::new()
             } else {
@@ -3659,7 +3835,6 @@ impl Storage for SqliteStorage {
                 Vec::new()
             };
             transaction.execute("DELETE FROM registered_users WHERE did=?1", [&writer_did])?;
-            transaction.execute("DELETE FROM follows WHERE actor=?1", [&writer_did])?;
             transaction.execute(
                 "DELETE FROM backfill_scope WHERE owner_did=?1",
                 [&writer_did],
@@ -3736,6 +3911,16 @@ impl Storage for SqliteStorage {
     fn is_following(&self, actor: &str, subject: &str) -> Result<bool, StorageError> {
         Ok(self.read_conn()?.query_row(
             "SELECT EXISTS(SELECT 1 FROM follows WHERE actor=?1 AND subject=?2 AND following=1)",
+            params![actor, subject],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn has_follow_record(&self, actor: &str, subject: &str) -> Result<bool, StorageError> {
+        Ok(self.read_conn()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM records
+             WHERE collection='app.bsky.graph.follow' AND did=?1
+               AND json_extract(record_json, '$.subject')=?2)",
             params![actor, subject],
             |row| row.get(0),
         )?)
