@@ -41,6 +41,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 use tower::ServiceExt;
+use tracing::instrument::WithSubscriber;
 use tracing_subscriber::fmt::MakeWriter;
 
 const DID: &str = "did:plc:abcdefghijklmnopqrstuvwx";
@@ -92,6 +93,8 @@ struct FakeServerState {
     token_sub: Option<String>,
     token_scope: Option<String>,
     create_count: usize,
+    create_nonce_required: bool,
+    create_nonce_challenges: usize,
     upload_count: usize,
     upload_fail_on: Option<usize>,
     upload_missing_ref_on: Option<usize>,
@@ -485,6 +488,85 @@ async fn production_post_with_two_images_uploads_blobs_before_creating_record() 
         json!({"width":2000,"height":1000})
     );
     drop(state);
+    server.abort();
+}
+
+#[tokio::test]
+async fn write_timing_line_counts_a_fake_pds_dpop_nonce_retry() {
+    let public = OAuthPublic::new("https://appview.example").unwrap();
+    let (flow, _, shared, server) =
+        production_flow_with_public(public.clone(), None, Some(EXPECTED_OAUTH_SCOPE)).await;
+    let app = public.router_with_flow(flow, Arc::new(MemoryStorage::default()));
+    let cookie = finish_production_login(&app, &shared).await;
+    shared.lock().unwrap().create_nonce_required = true;
+
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(CapturedMakeWriter(output.clone()))
+        .finish();
+    let before = shared.lock().unwrap().requests.len();
+    let boundary = "nonce-write";
+    let body = picture_multipart(boundary, "nonce accounting", None, None, &[]);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/post")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", cookie)
+                .header(
+                    "content-type",
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let requests = shared.lock().unwrap().requests.clone();
+    let write_requests = &requests[before..];
+    let create_requests = write_requests
+        .iter()
+        .filter(|request| {
+            request
+                .path
+                .starts_with("/xrpc/com.atproto.repo.createRecord")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        create_requests.len(),
+        2,
+        "fake PDS challenges createRecord once"
+    );
+    assert_eq!(
+        create_requests[1]
+            .headers
+            .get("dpop")
+            .and_then(|proof| jwt_claim(proof, "nonce"))
+            .as_deref(),
+        Some("write-nonce")
+    );
+
+    let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    let lines = logs
+        .lines()
+        .filter(|line| line.contains("web write"))
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1, "one timing line per write: {logs}");
+    let line = lines[0];
+    assert!(line.contains("route=\"post\""), "{line}");
+    assert!(line.contains("dpop_nonce_retry=true"), "{line}");
+    assert!(
+        line.contains(&format!("outbound_call_count={}", write_requests.len())),
+        "{line}"
+    );
     server.abort();
 }
 
@@ -1564,6 +1646,17 @@ async fn serve_one(mut stream: TcpStream, origin: &str, state: Arc<Mutex<FakeSer
                 }
             }
             path if path.starts_with("/xrpc/com.atproto.repo.createRecord") => {
+                if state.create_nonce_required && state.create_nonce_challenges == 0 {
+                    state.create_nonce_challenges += 1;
+                    (
+                        401,
+                        vec![
+                            ("DPoP-Nonce", "write-nonce"),
+                            ("WWW-Authenticate", "DPoP error=\"use_dpop_nonce\""),
+                        ],
+                        json!({"error":"use_dpop_nonce"}).to_string(),
+                    )
+                } else {
                 state.create_count += 1;
                 let body: Value = serde_json::from_str(&request.body).unwrap();
                 state.create_bodies.push(body.clone());
@@ -1579,6 +1672,7 @@ async fn serve_one(mut stream: TcpStream, origin: &str, state: Arc<Mutex<FakeSer
                     })
                     .to_string(),
                 )
+                }
             }
             path if path.starts_with("/xrpc/com.atproto.repo.deleteRecord") => {
                 (

@@ -21,6 +21,39 @@ static OUTBOUND_REQUESTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 // A separate pool keeps this background work from occupying interactive request capacity.
 static BACKGROUND_REQUESTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OutboundCallSnapshot {
+    pub total_calls: usize,
+    pub total_ms: u64,
+    pub dpop_nonce_retries: usize,
+    pub by_kind: HashMap<String, (usize, u64)>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct RequestOutboundAccounting {
+    snapshot: Arc<Mutex<OutboundCallSnapshot>>,
+}
+
+impl RequestOutboundAccounting {
+    pub(crate) fn snapshot(&self) -> OutboundCallSnapshot {
+        self.snapshot
+            .lock()
+            .map(|snapshot| snapshot.clone())
+            .unwrap_or_default()
+    }
+}
+
+tokio::task_local! {
+    static REQUEST_OUTBOUND_ACCOUNTING: RequestOutboundAccounting;
+}
+
+pub(crate) async fn with_request_outbound_accounting<F: Future>(
+    accounting: RequestOutboundAccounting,
+    future: F,
+) -> F::Output {
+    REQUEST_OUTBOUND_ACCOUNTING.scope(accounting, future).await
+}
+
 fn request_pool(background: bool) -> Arc<Semaphore> {
     if background {
         BACKGROUND_REQUESTS.get_or_init(|| Arc::new(Semaphore::new(6)))
@@ -667,6 +700,67 @@ mod tests {
             )
             .await;
         assert!(too_large.is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn outbound_call_accounting_counts_request_calls_but_not_spawned_background_calls() {
+        use super::{RequestOutboundAccounting, with_request_outbound_accounting};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let app = Router::new().route(
+            "/{*path}",
+            get(move || {
+                let requests = server_requests.clone();
+                async move {
+                    requests.fetch_add(1, Ordering::Relaxed);
+                    "ok"
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = SafeHttpClient::with_resolver(FakeResolver::new(
+            (0..3).map(|_| vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]),
+        ))
+        .with_http_test_hosts(["safe.example".to_owned()]);
+        let request_url = |path: &str| {
+            Url::parse(&format!("http://safe.example:{}/{path}", address.port())).unwrap()
+        };
+        let accounting = RequestOutboundAccounting::default();
+        with_request_outbound_accounting(accounting.clone(), async {
+            for path in ["xrpc/com.atproto.repo.getRecord", "xrpc/other"] {
+                client
+                    .get(&request_url(path), http::HeaderMap::new(), 16)
+                    .await
+                    .unwrap();
+            }
+
+            let background_client = client.clone();
+            let background_url = request_url("background");
+            tokio::spawn(async move {
+                background_client
+                    .get(&background_url, http::HeaderMap::new(), 16)
+                    .await
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+        })
+        .await;
+
+        let snapshot = accounting.snapshot();
+        assert_eq!(requests.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            snapshot.total_calls, 2,
+            "spawned work is outside the request scope"
+        );
+        assert_eq!(snapshot.by_kind.get("pds_get_record").unwrap().0, 1);
+        assert_eq!(snapshot.by_kind.get("other").unwrap().0, 1);
         server.abort();
     }
 

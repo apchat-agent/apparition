@@ -10794,6 +10794,105 @@ mod tests {
         server.abort();
     }
 
+    #[derive(Clone)]
+    struct SlowMutesTestFlow;
+
+    impl OAuthFlow for SlowMutesTestFlow {
+        fn authorize<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async { Err("test flow does not authorize".to_owned()) })
+        }
+
+        fn callback<'a>(
+            &'a self,
+            _: OAuthCallback,
+        ) -> Pin<Box<dyn Future<Output = Result<OAuthAccount, String>> + Send + 'a>> {
+            Box::pin(async { Err("test flow does not callback".to_owned()) })
+        }
+
+        fn logout<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn muted_actor_dids<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<HashSet<String>, String>> + Send + 'a>> {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                Ok(HashSet::new())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn web_page_phase_coverage_accounts_for_a_slow_mutes_wait() {
+        let storage = Arc::new(MemoryStorage::default());
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let viewer = "did:plc:slow-mutes-viewer";
+        let generation = storage
+            .rotate_web_session(viewer, "slow-mutes-session")
+            .unwrap();
+        let token = public.issue_session_cookie(
+            viewer,
+            "slow-mutes-session",
+            generation,
+            SessionPermissions {
+                write: false,
+                feed: false,
+                blob: false,
+                video: false,
+                follow: false,
+                block: false,
+                mute: false,
+                list: false,
+            },
+        );
+        let app = public.router_with_flow(SlowMutesTestFlow, storage);
+        let logs = FeedTestLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(logs.clone())
+            .finish();
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/app")
+                    .header("cookie", format!("{SESSION_COOKIE}={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        let line = output
+            .lines()
+            .find(|line| line.contains("web page phases"))
+            .unwrap_or_else(|| panic!("missing web page phase log: {output}"));
+        let metric = |name: &str| -> u64 {
+            line.split_whitespace()
+                .find_map(|field| {
+                    field
+                        .strip_prefix(&format!("{name}="))
+                        .and_then(|value| value.parse().ok())
+                })
+                .unwrap_or_else(|| panic!("missing {name} in {line}"))
+        };
+        assert!(metric("mutes_ms") >= 30, "{line}");
+        assert!(metric("phase_gap_ms") <= 5, "{line}");
+    }
+
     #[test]
     fn external_post_record_has_the_atproto_shape_with_optional_thumbnail() {
         let external = PostExternal {
