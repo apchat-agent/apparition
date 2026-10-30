@@ -17,6 +17,7 @@
   --label-alert-ink: #80591c;
   --label-alert-surface: #f5f0e5;
   --label-alert-line: #e5d8bd;
+  --label-alert-ring: #e11d48;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -35,6 +36,7 @@
     --label-alert-ink: #dbc48e;
     --label-alert-surface: #28251f;
     --label-alert-line: #574a30;
+    --label-alert-ring: #fb7185;
   }
 }
 
@@ -2709,60 +2711,125 @@ body {
   overflow: visible;
 }
 
-.account-label-chip {
+.account-labels {
   position: relative;
   display: inline-flex;
   flex: 0 0 auto;
-  color: var(--muted);
-  font-size: 0.65rem;
-  line-height: 1.3;
   vertical-align: middle;
 }
 
-.account-label-chip summary {
-  max-width: 10rem;
-  padding: 0.08rem 0.35rem;
-  overflow: hidden;
-  border: 1px solid var(--line);
+.account-labels summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.18rem;
+  padding: 0.05rem 0.2rem;
   border-radius: 999px;
-  background: var(--surface-raised);
   color: var(--muted);
   cursor: pointer;
   list-style: none;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.2;
 }
 
-.account-label-chip.severity-alert summary {
-  border-color: var(--label-alert-line);
-  background: var(--label-alert-surface);
-  color: var(--label-alert-ink);
-}
-
-.account-label-chip.severity-inform summary {
-  border-color: color-mix(in srgb, var(--accent) 24%, var(--line));
-  background: color-mix(in srgb, var(--accent) 5%, var(--surface));
-}
-
-.account-label-chip summary::-webkit-details-marker {
+.account-labels summary::-webkit-details-marker {
   display: none;
 }
 
-.account-label-details {
+.account-label-emoji {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.1rem;
+  height: 1.1rem;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  line-height: 1;
+}
+
+.account-label-emoji.severity-inform {
+  border-color: var(--line);
+}
+
+.account-label-emoji.severity-alert {
+  border-color: var(--label-alert-ring);
+}
+
+.account-label-more {
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-weight: 750;
+}
+
+.account-labels .account-label-groups {
   position: absolute;
   z-index: 5;
-  top: calc(100% + 0.2rem);
+  top: calc(100% + 0.25rem);
   left: 0;
-  width: max-content;
-  max-width: min(18rem, 80vw);
+  width: min(19rem, calc(100vw - 1.5rem));
+  max-height: 60vh;
+  margin: 0;
   padding: 0.55rem 0.7rem;
-  border: 1px solid var(--border);
+  overflow-y: auto;
+  border: 1px solid var(--line);
   border-radius: 0.65rem;
   background: var(--surface);
   box-shadow: 0 4px 14px rgb(0 0 0 / 18%);
   color: var(--text);
   font-size: 0.75rem;
-  white-space: normal;
+  list-style: none;
+  overflow-wrap: anywhere;
+}
+
+.account-label-group + .account-label-group {
+  margin-top: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--line);
+}
+
+.account-label-group-name {
+  margin: 0 0 0.3rem;
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-weight: 800;
+}
+
+.account-label-rows {
+  display: grid;
+  gap: 0.45rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.account-label-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.4rem;
+}
+
+.account-label-copy {
+  display: grid;
+  min-width: 0;
+  flex: 1 1 auto;
+  gap: 0.1rem;
+}
+
+.account-label-name {
+  font-weight: 750;
+}
+
+.account-label-description {
+  color: var(--muted);
+}
+
+.account-label-by {
+  flex: 0 0 auto;
+  max-width: 40%;
+  overflow-wrap: anywhere;
+  color: var(--accent);
+  font-size: 0.68rem;
+  font-weight: 700;
+  text-decoration: none;
 }
 
 .block-confirm-dialog {
@@ -2784,7 +2851,7 @@ body {
   box-shadow: var(--shadow);
 }
 
-.account-label-chip[open] {
+.account-labels[open] {
   z-index: 6;
 }
 

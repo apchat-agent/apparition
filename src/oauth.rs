@@ -104,9 +104,9 @@ const OAUTH_STORE_WRITER_BATCH_SIZE: usize = 64;
 const OAUTH_STORE_WRITER_BATCH_DELAY: Duration = Duration::from_millis(5);
 const OAUTH_STORE_WRITER_METRICS_INTERVAL: Duration = Duration::from_secs(60);
 static NEXT_OAUTH_MEMORY_DATABASE_ID: AtomicUsize = AtomicUsize::new(1);
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m30";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m31";
 const WEB_SCRIPT_URL: &str = "/static/app.js?v=js20";
-const WEB_NOJS_STYLESHEET_URL: &str = "/static/nojs.css?v=m30";
+const WEB_NOJS_STYLESHEET_URL: &str = "/static/nojs.css?v=m31";
 const HLS_SCRIPT_URL: &str = "/static/vendor/hls.min.js?v=1.7.3";
 const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
 const SAVED_FEED_CACHE_PREFIX: &str = "saved-feed-preferences:";
@@ -248,8 +248,10 @@ pub struct AccountLabel {
     pub subject_did: String,
     pub labeler_did: String,
     pub labeler_name: String,
+    pub labeler_handle: String,
     pub value: String,
     pub display_name: String,
+    pub description: String,
     pub severity: String,
     pub blurs: String,
 }
@@ -1579,12 +1581,14 @@ impl CloneWithProxy for SharedOAuthSession {
 #[derive(Clone, Debug, Default)]
 struct LabelerPresentation {
     name: String,
+    handle: String,
     definitions: HashMap<String, LabelValuePresentation>,
 }
 
 #[derive(Clone, Debug)]
 struct LabelValuePresentation {
     name: String,
+    description: String,
     severity: String,
     blurs: String,
 }
@@ -2878,6 +2882,12 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                     .or_else(|| creator.get("handle").and_then(Value::as_str))
                     .unwrap_or(did)
                     .to_owned();
+                let handle = creator
+                    .get("handle")
+                    .and_then(Value::as_str)
+                    .filter(|handle| !handle.trim().is_empty())
+                    .unwrap_or(did)
+                    .to_owned();
                 let mut definitions = HashMap::new();
                 if let Some(values) = view
                     .get("policies")
@@ -2908,6 +2918,11 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                                     .filter(|name| !name.trim().is_empty())
                                     .unwrap_or(&default_name)
                                     .to_owned(),
+                                description: locale
+                                    .and_then(|locale| locale.get("description"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_owned(),
                                 severity: definition
                                     .get("severity")
                                     .and_then(Value::as_str)
@@ -2922,13 +2937,21 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                         );
                     }
                 }
-                fetched.insert(did.to_owned(), LabelerPresentation { name, definitions });
+                fetched.insert(
+                    did.to_owned(),
+                    LabelerPresentation {
+                        name,
+                        handle,
+                        definitions,
+                    },
+                );
             }
             for did in &missing {
                 fetched
                     .entry(did.clone())
                     .or_insert_with(|| LabelerPresentation {
                         name: did.clone(),
+                        handle: did.clone(),
                         definitions: HashMap::new(),
                     });
             }
@@ -3150,10 +3173,16 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                         labeler_name: presentation
                             .map(|presentation| presentation.name.clone())
                             .unwrap_or_else(|| labeler_did.clone()),
+                        labeler_handle: presentation
+                            .map(|presentation| presentation.handle.clone())
+                            .unwrap_or_else(|| labeler_did.clone()),
                         value,
                         display_name: definition
                             .map(|definition| definition.name.clone())
                             .unwrap_or(global.name),
+                        description: definition
+                            .map(|definition| definition.description.clone())
+                            .unwrap_or_default(),
                         severity: definition
                             .map(|definition| definition.severity.clone())
                             .unwrap_or(global.severity),
@@ -7106,6 +7135,7 @@ fn label_value_default(value: &str) -> LabelValuePresentation {
                 .join(" ");
             return LabelValuePresentation {
                 name,
+                description: String::new(),
                 severity: "none".to_owned(),
                 blurs: "none".to_owned(),
             };
@@ -7113,8 +7143,47 @@ fn label_value_default(value: &str) -> LabelValuePresentation {
     };
     LabelValuePresentation {
         name: name.to_owned(),
+        description: String::new(),
         severity: severity.to_owned(),
         blurs: blurs.to_owned(),
+    }
+}
+
+// The compact icon for one account label, picked from the label value (lowercased) by the first
+// matching keyword in this fixed table:
+//   "url"                        🔗  the same URL posted repeatedly   (posted-same-url-high)
+//   "gap" / "break"              ⏱️  activity without meaningful breaks (no-gap-more-than-one-hours)
+//   "metadata" / "profile"       🪪  profile/metadata changes          (high-metadata-changes-ten)
+//   "follow"                     👥  follows and unfollows ("unfollow" contains "follow") (monthly-high-unfollows-*)
+//   "repl"                       💬  replies and quote-replies         (made-over-hundred-replies-yesterday)
+//   "post"                       📝  posting volume                    (made-over-hundred-posts-yesterday)
+//   anything else                🏷️  a generic label tag               (spider)
+// "url" is checked before "post" so "posted-same-url-*" reads as the link it tracks, and "repl"
+// before "post" so reply counts never show the memo icon.
+fn label_emoji(value: &str) -> &'static str {
+    let value = value.to_ascii_lowercase();
+    if value.contains("url") {
+        "🔗"
+    } else if value.contains("gap") || value.contains("break") {
+        "⏱️"
+    } else if value.contains("metadata") || value.contains("profile") {
+        "🪪"
+    } else if value.contains("follow") {
+        "👥"
+    } else if value.contains("repl") {
+        "💬"
+    } else if value.contains("post") {
+        "📝"
+    } else {
+        "🏷️"
+    }
+}
+
+fn account_label_severity_class(severity: &str) -> &'static str {
+    match severity {
+        "alert" => "severity-alert",
+        "inform" => "severity-inform",
+        _ => "severity-neutral",
     }
 }
 
@@ -7122,26 +7191,85 @@ fn render_account_label_chips(
     labels_by_actor: &HashMap<String, Vec<AccountLabel>>,
     actor_did: &str,
 ) -> String {
-    labels_by_actor
+    let Some(labels) = labels_by_actor
         .get(actor_did)
-        .into_iter()
-        .flatten()
-        .map(|label| {
-            let severity_class = match label.severity.as_str() {
-                "alert" => "severity-alert",
-                "inform" => "severity-inform",
-                _ => "severity-neutral",
+        .filter(|labels| !labels.is_empty())
+    else {
+        return String::new();
+    };
+    let count = format!(
+        "{} account label{}",
+        labels.len(),
+        if labels.len() == 1 { "" } else { "s" }
+    );
+    let mut summary = String::new();
+    for label in labels.iter().take(4) {
+        summary.push_str(&format!(
+            "<span class=\"account-label-emoji {}\" aria-hidden=\"true\">{}</span>",
+            account_label_severity_class(&label.severity),
+            label_emoji(&label.value),
+        ));
+    }
+    if let Some(hidden) = labels.len().checked_sub(4) {
+        summary.push_str(&format!(
+            "<span class=\"account-label-more\">+{hidden}</span>"
+        ));
+    }
+    let mut groups: Vec<(&AccountLabel, Vec<&AccountLabel>)> = Vec::new();
+    for label in labels {
+        if let Some((_, rows)) = groups
+            .iter_mut()
+            .find(|(first, _)| first.labeler_did == label.labeler_did)
+        {
+            rows.push(label);
+        } else {
+            groups.push((label, vec![label]));
+        }
+    }
+    let grouped = groups.len() > 1;
+    let groups_markup = groups
+        .iter()
+        .map(|(first, rows)| {
+            let heading = if grouped {
+                format!(
+                    "<p class=\"account-label-group-name\">{}</p>",
+                    html_escape(&first.labeler_name)
+                )
+            } else {
+                String::new()
             };
-            format!(
-                "<details class=\"account-label-chip {severity_class}\"><summary aria-label=\"Account label: {}\">{}</summary><span class=\"account-label-details\">{} · severity: {} · blurs: {}</span></details>",
-                html_escape(&label.display_name),
-                html_escape(&label.display_name),
-                html_escape(&label.labeler_name),
-                html_escape(&label.severity),
-                html_escape(&label.blurs),
-            )
+            let rows_markup = rows
+                .iter()
+                .map(|label| {
+                    let severity = account_label_severity_class(&label.severity);
+                    let description = if label.description.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "<span class=\"account-label-description\">{}</span>",
+                            html_escape(&label.description)
+                        )
+                    };
+                    let labeler_uri = format!(
+                        "/profile?did={}",
+                        url::form_urlencoded::byte_serialize(label.labeler_did.as_bytes())
+                            .collect::<String>()
+                    );
+                    format!(
+                        "<li class=\"account-label-row {severity}\"><span class=\"account-label-emoji {severity}\" aria-hidden=\"true\">{}</span><span class=\"account-label-copy\"><span class=\"account-label-name\">{}</span>{description}</span><a class=\"account-label-by\" href=\"{labeler_uri}\" title=\"@{}\">by {}</a></li>",
+                        label_emoji(&label.value),
+                        html_escape(&label.display_name),
+                        html_escape(&label.labeler_handle),
+                        html_escape(&label.labeler_name),
+                    )
+                })
+                .collect::<String>();
+            format!("<li class=\"account-label-group\">{heading}<ul class=\"account-label-rows\">{rows_markup}</ul></li>")
         })
-        .collect()
+        .collect::<String>();
+    format!(
+        "<details class=\"account-labels\"><summary class=\"account-labels-summary\" aria-label=\"{count}\" title=\"{count}\">{summary}</summary><ul class=\"account-label-groups\">{groups_markup}</ul></details>"
+    )
 }
 
 async fn profile_action_panel<F: OAuthFlow, S: Storage>(
@@ -11792,8 +11920,9 @@ fn render_web_quote<S: Storage>(
         })
         .unwrap_or_default();
     let fill = author_fill(&profile, &quoted.did);
+    let label_chips = render_account_label_chips(&quote_index.account_labels, &quoted.did);
     format!(
-        "<article class=\"quoted-post-card\"><a class=\"quoted-card-main\" href=\"/app/thread?uri={encoded_uri}\" aria-label=\"Open quoted post thread\">{}<div class=\"quoted-card-body\"><header{}><strong{}>{}</strong><span class=\"quoted-card-handle\"{}>@{}</span>{time}</header><p>{}</p></div></a>{nested}</article>",
+        "<article class=\"quoted-post-card\"><a class=\"quoted-card-main\" href=\"/app/thread?uri={encoded_uri}\" aria-label=\"Open quoted post thread\">{}<div class=\"quoted-card-body\"><header{}><strong{}>{}</strong><span class=\"quoted-card-handle\"{}>@{}</span>{time}</header><p>{}</p></div></a>{label_chips}{nested}</article>",
         avatar_markup_with_priority_and_attrs(&profile, "small-avatar", false, &fill.avatar_attrs),
         fill.container,
         fill.name,
@@ -12122,8 +12251,11 @@ mod tests {
                 subject_did: subject_did.to_owned(),
                 labeler_did: "did:plc:careful-labeler".to_owned(),
                 labeler_name: "Careful Labeler".to_owned(),
+                labeler_handle: "careful.example".to_owned(),
                 value: "spider".to_owned(),
                 display_name: "Spider Warning".to_owned(),
+                description: "This account posted content the labeler flagged as spider-like."
+                    .to_owned(),
                 severity: "alert".to_owned(),
                 blurs: "media".to_owned(),
             }],
@@ -14909,8 +15041,10 @@ mod tests {
             subject_did: actor_did.to_owned(),
             labeler_did: labeler_did.to_owned(),
             labeler_name: "Old labeler".to_owned(),
+            labeler_handle: "old.labeler.test".to_owned(),
             value: "old".to_owned(),
             display_name: "Old account label".to_owned(),
+            description: "Old description kept from the stale cache.".to_owned(),
             severity: "none".to_owned(),
             blurs: "none".to_owned(),
         };
@@ -14918,8 +15052,10 @@ mod tests {
             subject_did: actor_did.to_owned(),
             labeler_did: labeler_did.to_owned(),
             labeler_name: "Fresh labeler".to_owned(),
+            labeler_handle: labeler_did.to_owned(),
             value: "spider".to_owned(),
             display_name: "Fresh spider label".to_owned(),
+            description: String::new(),
             severity: "alert".to_owned(),
             blurs: "media".to_owned(),
         };
@@ -15046,6 +15182,7 @@ mod tests {
         subject_did: &str,
         labeler_did: &str,
         labeler_name: &str,
+        labeler_handle: &str,
         identifier: &str,
     ) -> AccountLabel {
         let definition = definitions
@@ -15057,8 +15194,10 @@ mod tests {
             subject_did: subject_did.to_owned(),
             labeler_did: labeler_did.to_owned(),
             labeler_name: labeler_name.to_owned(),
+            labeler_handle: labeler_handle.to_owned(),
             value: identifier.to_owned(),
             display_name: definition.1,
+            description: definition.2,
             severity: definition.3,
             blurs: definition.4,
         }
@@ -15077,6 +15216,7 @@ mod tests {
                     subject_did,
                     CORNELL_FIXTURE_DID,
                     CORNELL_FIXTURE_NAME,
+                    "stechlab-labels.bsky.social",
                     identifier,
                 )
             })
@@ -15263,6 +15403,7 @@ mod tests {
             subject,
             "did:plc:second-labeler",
             "Steady Watcher",
+            "steady.watch",
             "high-follow-churn-fifty",
         ));
         let mut labels_by_actor = HashMap::new();
@@ -15328,8 +15469,10 @@ mod tests {
                 subject_did: subject.to_owned(),
                 labeler_did: "did:plc:careful-labeler".to_owned(),
                 labeler_name: "Careful Labeler".to_owned(),
+                labeler_handle: "careful.example".to_owned(),
                 value: "spider".to_owned(),
                 display_name: "Spider Warning".to_owned(),
+                description: String::new(),
                 severity: "alert".to_owned(),
                 blurs: "content".to_owned(),
             }],
