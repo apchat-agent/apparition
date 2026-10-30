@@ -1416,3 +1416,95 @@ Deno.test("profile fill runs on cards appended by infinite scroll", async () => 
     globalThis.fetch = originalFetch;
   }
 });
+
+Deno.test("bar debug overlay shows bottom-bar metrics only when ?bar-debug=1", async () => {
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  const css = await Deno.readTextFile(new URL("../static/app.css", import.meta.url));
+  const start = source.indexOf("function installBarDebugOverlay");
+  assert(start >= 0, "app.js must define installBarDebugOverlay for ?bar-debug=1 pages");
+  const call = source.indexOf("installBarDebugOverlay();", start);
+  assert(call > start, "app.js must run the bar debug guard on load");
+  const overlay = new Function(`${source.slice(start, call)}; return installBarDebugOverlay;`)();
+
+  assert(/\.bar-debug-probe\s*\{[^}]*padding-top:\s*env\(safe-area-inset-top/.test(css));
+  assert(/\.bar-debug-probe\s*\{[^}]*padding-bottom:\s*env\(safe-area-inset-bottom/.test(css));
+  assert(/\.bar-debug-box\s*\{[^}]*position:\s*fixed/.test(css), "the debug box must be fixed to the viewport");
+  assert(/\.bar-debug-box\s*\{[^}]*top:/.test(css) && !/\.bar-debug-box\s*\{[^}]*bottom:/.test(css),
+    "the debug box must sit at the top and never cover the bottom bar");
+  assert(/\.bar-debug-box\s*\{[^}]*z-index:\s*(\d{3,}|[6-9]\d)/.test(css), "the debug box needs a high z-index");
+
+  const makeHarness = (search) => {
+    const bodyChildren = [];
+    const windowListeners = new Map();
+    const documentMock = {
+      createElement() {
+        return {
+          className: "",
+          textContent: "",
+          attributes: new Map(),
+          setAttribute(name, value) { this.attributes.set(name, String(value)); },
+        };
+      },
+      body: { append: (...nodes) => bodyChildren.push(...nodes) },
+      documentElement: { clientHeight: 844 },
+      querySelector() {
+        return {
+          getBoundingClientRect: () => ({ top: 792, bottom: 844, height: 52 }),
+          querySelector: (selector) =>
+            selector === ".icon" ? { getBoundingClientRect: () => ({ top: 800, bottom: 840, height: 40 }) } : null,
+        };
+      },
+    };
+    const windowMock = {
+      location: { search },
+      innerHeight: 844,
+      devicePixelRatio: 3,
+      screen: { height: 926 },
+      visualViewport: { height: 802, offsetTop: 42, addEventListener() {} },
+      matchMedia() { return { matches: false }; },
+      getComputedStyle() { return { paddingTop: "47px", paddingBottom: "34px" }; },
+      addEventListener(name, listener) { windowListeners.set(name, listener); },
+    };
+    return { bodyChildren, documentMock, windowListeners, windowMock };
+  };
+
+  const withParam = makeHarness("?bar-debug=1");
+  overlay(withParam.windowMock, withParam.documentMock);
+  const box = withParam.bodyChildren.find((node) => node.className === "bar-debug-box");
+  assert(box, "?bar-debug=1 must add a fixed debug box");
+  assert(withParam.bodyChildren.some((node) => node.className === "bar-debug-probe"),
+    "?bar-debug=1 must add the safe-area probe element");
+  const lines = Object.fromEntries(
+    box.textContent.split("\n").map((line) => {
+      const at = line.indexOf(":");
+      return [line.slice(0, at).trim(), line.slice(at + 1).trim()];
+    }),
+  );
+  assertEquals(lines["innerHeight"], "844");
+  assertEquals(lines["vv.height"], "802");
+  assertEquals(lines["vv.offsetTop"], "42");
+  assertEquals(lines["clientHeight"], "844");
+  assertEquals(lines["screen.height"], "926");
+  assertEquals(lines["devicePixelRatio"], "3");
+  assertEquals(lines["standalone"], "no");
+  assertEquals(lines["safe-area-inset-top"], "47px");
+  assertEquals(lines["safe-area-inset-bottom"], "34px");
+  assertEquals(lines["bar.top"], "792");
+  assertEquals(lines["bar.bottom"], "844");
+  assertEquals(lines["bar.height"], "52");
+  assertEquals(lines["icon.top"], "800");
+  assertEquals(lines["icon.bottom"], "840");
+  assertEquals(lines["gap bar.top->icon.top"], "8");
+  assertEquals(lines["gap icon.bottom->bar.bottom"], "4");
+  assertEquals(lines["gap bar.bottom->innerHeight"], "0");
+  assert(withParam.windowListeners.has("resize") && withParam.windowListeners.has("scroll"),
+    "the debug box must refresh on resize and scroll");
+  withParam.windowMock.innerHeight = 700;
+  withParam.windowListeners.get("resize")();
+  assert(box.textContent.includes("innerHeight: 700"), "the box must refresh when the viewport changes");
+
+  const withoutParam = makeHarness("?ref=share");
+  overlay(withoutParam.windowMock, withoutParam.documentMock);
+  assertEquals(withoutParam.bodyChildren.length, 0);
+  assertEquals(withoutParam.windowListeners.size, 0);
+});

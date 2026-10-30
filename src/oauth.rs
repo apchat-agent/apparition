@@ -13315,6 +13315,71 @@ mod tests {
     }
 
     #[test]
+    fn empty_compact_composers_paint_collapsed_before_app_js_runs() {
+        let css = include_str!("../static/app.css");
+        let nojs = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/static/nojs.css"))
+            .expect("static/nojs.css must exist for visitors without JavaScript");
+        let gate = ".composer[data-compact-composer]:not(.is-expanded):not(:has(.reply-context, .quoted-post-preview)):not(:has(textarea:not(:placeholder-shown)))";
+
+        let default_textarea =
+            css_rule_bodies(css, &format!("{gate} .composer-input-row textarea"))
+                .into_iter()
+                .find(|block| css_declaration(block, "min-height").as_deref() == Some("44px"));
+        let default_textarea = default_textarea.unwrap_or_else(|| {
+            panic!("an empty composer must already render the 44 px collapsed textarea by default")
+        });
+        let collapsed_textarea = css_rule_bodies(
+            css,
+            ".composer.is-enhanced.is-collapsed .composer-input-row textarea",
+        )
+        .pop()
+        .expect("the collapsed rule must stay for when app.js adds the classes");
+        for property in ["min-height", "padding-block"] {
+            assert_eq!(
+                css_declaration(&default_textarea, property).as_deref(),
+                css_declaration(&collapsed_textarea, property).as_deref(),
+                "adding is-enhanced is-collapsed must not change the {property} of the textarea"
+            );
+        }
+        for child in [".composer-toolbar", ".composer-fields"] {
+            assert!(
+                css_rule_bodies(css, &format!("{gate} {child}"))
+                    .iter()
+                    .any(|block| css_declaration(block, "display").as_deref() == Some("none")),
+                "{child} must be hidden on first paint of an empty composer"
+            );
+        }
+
+        assert!(
+            css_rule_bodies(&nojs, &format!("{gate} .composer-input-row textarea"))
+                .iter()
+                .any(|block| {
+                    css_declaration(block, "min-height").as_deref() == Some("3rem")
+                        && css_declaration(block, "padding-block").as_deref() == Some("0.55rem")
+                }),
+            "nojs.css must hand no-JS visitors the tall textarea back"
+        );
+        assert!(
+            css_rule_bodies(&nojs, &format!("{gate} .composer-toolbar"))
+                .iter()
+                .any(|block| css_declaration(block, "display").as_deref() == Some("flex"))
+        );
+        assert!(
+            css_rule_bodies(&nojs, &format!("{gate} .composer-fields"))
+                .iter()
+                .any(|block| css_declaration(block, "display").as_deref() == Some("grid"))
+        );
+
+        let head = page_shell("Write a post", "", true);
+        assert!(
+            head.contains(
+                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m29\"></noscript>"
+            ),
+            "the head must restore the full form for no-JS visitors: {head}"
+        );
+    }
+
+    #[test]
     fn phone_frame_orders_the_early_mobile_navigation_back_to_the_bottom() {
         let css = include_str!("../static/app.css");
 

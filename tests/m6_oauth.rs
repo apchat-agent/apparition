@@ -1473,6 +1473,76 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
 }
 
 #[tokio::test]
+async fn no_js_stylesheet_is_served_same_origin_and_linked_from_every_page_head() {
+    let storage = Arc::new(MemoryStorage::default());
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage);
+
+    let stylesheet = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/static/nojs.css?v=m29")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stylesheet.status(), StatusCode::OK);
+    assert!(
+        stylesheet.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/css")
+    );
+    assert!(
+        stylesheet.headers()["cache-control"]
+            .to_str()
+            .unwrap()
+            .contains("max-age=")
+    );
+    let css = String::from_utf8(
+        stylesheet
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(css.contains(".composer[data-compact-composer]"));
+    assert!(css.contains("display: grid;"));
+
+    for path in ["/login"] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let html = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            html.contains(
+                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m29\"></noscript>"
+            ),
+            "{path}"
+        );
+        assert!(!html.contains("style="), "{path}");
+    }
+}
+
+#[tokio::test]
 async fn bsky_style_shell_renders_navigation_pinned_feed_tabs_and_post_actions() {
     let storage = Arc::new(MemoryStorage::default());
     storage
