@@ -54,7 +54,7 @@ fn sqlite_memory_storage_does_not_create_a_disk_file() {
 fn sqlite_ingest_follow_scope_queries_do_not_scan_follows() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let path = root.join(format!(
-        "target/av15b-query-plan-{}.sqlite3",
+        "target/case15b-query-plan-{}.sqlite3",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&path);
@@ -138,7 +138,7 @@ fn post(text: &str) -> serde_json::Value {
 #[ignore = "large SQLite ingest benchmark; creates a multi-million-row database under target/"]
 fn jetstream_large_database_batch_ingest_benchmark() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let path = root.join("target/av15b-synthetic.sqlite3");
+    let path = root.join("target/case15b-synthetic.sqlite3");
     let generated = synthetic_db::ensure_database(&path).unwrap();
     let (records, follows, notifications) = synthetic_db::row_counts(&path).unwrap();
     println!(
@@ -375,7 +375,7 @@ fn tracked_follow_count_keeps_a_did_tracked_until_its_last_local_follower_unfoll
 #[test]
 fn failed_jetstream_batch_does_not_change_tracked_follow_counts() {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
-        "target/av17-rollback-{}-{}.sqlite3",
+        "target/case17-rollback-{}-{}.sqlite3",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -390,8 +390,8 @@ fn failed_jetstream_batch_does_not_change_tracked_follow_counts() {
     Connection::open(&path)
         .unwrap()
         .execute_batch(
-            "CREATE TRIGGER reject_av17_record BEFORE INSERT ON records
-             BEGIN SELECT RAISE(ABORT, 'injected av17 batch failure'); END;",
+            "CREATE TRIGGER reject_case17_record BEFORE INSERT ON records
+             BEGIN SELECT RAISE(ABORT, 'injected case17 batch failure'); END;",
         )
         .unwrap();
 
@@ -429,7 +429,7 @@ fn failed_jetstream_batch_does_not_change_tracked_follow_counts() {
 #[test]
 fn tracked_set_rebuild_matches_after_seeded_registration_follow_and_rollback_operations() {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
-        "target/av17-random-{}-{}.sqlite3",
+        "target/case17-random-{}-{}.sqlite3",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -440,8 +440,8 @@ fn tracked_set_rebuild_matches_after_seeded_registration_follow_and_rollback_ope
     Connection::open(&path)
         .unwrap()
         .execute_batch(
-            "CREATE TRIGGER reject_av17_record BEFORE INSERT ON records
-             BEGIN SELECT RAISE(ABORT, 'injected av17 batch failure'); END;",
+            "CREATE TRIGGER reject_case17_record BEFORE INSERT ON records
+             BEGIN SELECT RAISE(ABORT, 'injected case17 batch failure'); END;",
         )
         .unwrap();
     let actors = (0..5)
@@ -501,7 +501,7 @@ fn tracked_set_rebuild_matches_after_seeded_registration_follow_and_rollback_ope
 #[test]
 fn profile_index_rebuild_matches_after_seeded_profile_mutations() {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
-        "target/av19-profile-index-{}-{}.sqlite3",
+        "target/case19-profile-index-{}-{}.sqlite3",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -961,7 +961,7 @@ async fn websocket_event_batch_rolls_back_records_and_cursor_on_failed_commit() 
 fn jetstream_sqlite_batch_throughput_benchmark() {
     let event_count = 5_000_u64;
     let old_path = std::env::temp_dir().join(format!(
-        "appview-rs-av15-before-{}-{}.db",
+        "appview-rs-case15-before-{}-{}.db",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1127,7 +1127,7 @@ async fn event_processing_timeout_releases_connection_and_logs_event_identity() 
     let _tracing_test_guard = TRACING_TEST_LOCK.lock().await;
     let db_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
-        .join(format!("av9-event-timeout-{}.db", std::process::id()));
+        .join(format!("case9-event-timeout-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&db_path);
     let storage = Arc::new(SqliteStorage::open(&db_path).unwrap());
     let writer_connection = Connection::open(&db_path).unwrap();

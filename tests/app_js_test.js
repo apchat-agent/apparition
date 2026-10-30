@@ -951,7 +951,7 @@ async function createInfiniteScrollHarness({ cards = ["post-1", "post-2"], mobil
   };
 }
 
-Deno.test("av33: a video in an appended card gets a native HLS source", async () => {
+Deno.test("case33: a video in an appended card gets a native HLS source", async () => {
   const pages = {};
   const harness = await createInfiniteScrollHarness({
     responses: [{ ok: true, text: async () => "page-two" }],
@@ -981,7 +981,7 @@ Deno.test("av33: a video in an appended card gets a native HLS source", async ()
   assertEquals(video.dataset.videoInitialized, "true", "the appended video should initialize only once");
 });
 
-Deno.test("av33: a pending quote replaces its loading placeholder with the fetched card", async () => {
+Deno.test("case33: a pending quote replaces its loading placeholder with the fetched card", async () => {
   const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
   const start = source.indexOf("function fillDeferredQuotes(");
   const end = source.indexOf("\nfillDeferredQuotes();", start);

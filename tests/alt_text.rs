@@ -18,7 +18,7 @@ fn temporary_model_directory() -> PathBuf {
         .unwrap()
         .as_nanos();
     std::env::temp_dir().join(format!(
-        "appview-av27-models-{}-{nonce}",
+        "appview-case27-models-{}-{nonce}",
         std::process::id()
     ))
 }

@@ -1725,9 +1725,8 @@ impl Write for CapturedWriter {
     }
 }
 
-// Hotfix 2026-10-29 (live report): a reply typed without a video still carries the composer's empty
-// `video` file input in its multipart body; the server rejected every such post with
-// "Enable JavaScript to validate and upload videos."
+// A reply form may submit an empty video file input when no video is selected; ignore that part
+// and continue to create the post.
 #[tokio::test]
 async fn production_post_with_an_empty_video_input_is_accepted() {
     let public = OAuthPublic::new("https://appview.example").unwrap();

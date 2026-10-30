@@ -16,7 +16,7 @@ cp appview.example.toml appview.toml
 APPVIEW_CONFIG=./appview.toml ./target/release/appview-rs
 ```
 
-The sample config uses the public east Jetstream and indexes in `scoped` mode. The server binds to `127.0.0.1:3000`; put it behind a TLS reverse proxy for a public deployment. Keep the SQLite database and OAuth key in a persistent, private data directory. Back up `appview.db`, `oauth.db` (sign-in sessions, kept separate so backfill writes cannot lock sign-in out) and `oauth-client-key.json` together. The key is created with owner-only permissions on Unix and must remain stable across restarts. Confidential mode uses it for client assertions; loopback mode uses it only to sign local browser cookies.
+The sample config uses the public east Jetstream and indexes in `scoped` mode. The server binds to `127.0.0.1:3000`; put it behind a TLS reverse proxy for a public deployment. Per-peer rate limits use the TCP peer address. When all traffic comes through one proxy, clients share that proxy's rate-limit bucket; forwarded client-IP headers are not used. Keep the app's listener private to the proxy and account for the shared bucket. Keep the SQLite databases and OAuth key in a persistent, private data directory. Back up `appview.db`, `oauth.db` (sign-in sessions, kept separate so backfill writes cannot lock sign-in out), `identity-cache.db`, and `oauth-client-key.json` together. The key is created with owner-only permissions on Unix and must remain stable across restarts. Confidential mode uses it for client assertions; loopback mode uses it only to sign local browser cookies.
 
 Check the server and public service documents:
 
@@ -50,7 +50,7 @@ Replace the example URL and DID with the public HTTPS origin and its matching `d
 
 ## Try it locally
 
-On the same Mac that runs the browser, start the app in loopback OAuth mode. It uses the default public east Jetstream and indexes registered accounts and their network in `scoped` mode:
+On the same computer that runs the browser, start the app in loopback OAuth mode. It uses the default public east Jetstream and indexes registered accounts and their network in `scoped` mode:
 
 ```sh
 APPVIEW_LISTEN=127.0.0.1:3000 APPVIEW_SCOPE=scoped APPVIEW_OAUTH_MODE=loopback cargo run --locked --offline -- --dev
@@ -68,6 +68,8 @@ Open [http://127.0.0.1:3000/login](http://127.0.0.1:3000/login), enter an AT Pro
 | `data_dir` | `APPVIEW_DATA_DIR` | `./data` | `appview.db` records, `oauth.db` sessions, `identity-cache.db` identities, and the OAuth client key |
 | `log_filter` | `APPVIEW_LOG_FILTER` | `info` | `tracing` filter |
 | `scope_mode` | `APPVIEW_SCOPE` | `scoped` | `scoped` or `full` indexing |
+| `backfill_enabled` | `APPVIEW_BACKFILL_ENABLED` | `false` | Opt in to repository backfill for registered and followed accounts |
+| `backfill_records_per_second` | `APPVIEW_BACKFILL_RECORDS_PER_SECOND` | `300` | Maximum repository records imported per second |
 | `jetstream_urls` | `APPVIEW_JETSTREAM_URLS` | east Jetstream URL | TOML string array, or comma-separated URLs in the environment |
 | `jetstream_idle_timeout_secs` | `APPVIEW_JETSTREAM_IDLE_TIMEOUT_SECS` | `60` | Reconnect when a Jetstream connection sends no websocket messages for this long |
 | `jetstream_event_timeout_secs` | `APPVIEW_JETSTREAM_EVENT_TIMEOUT_SECS` | `60` | Drop and reconnect if one event takes longer than this to process |
@@ -78,6 +80,8 @@ Open [http://127.0.0.1:3000/login](http://127.0.0.1:3000/login), enter an AT Pro
 | `alt_model_dir` | `APPVIEW_ALT_MODEL_DIR` | unset | Parent directory containing `alt-caption-v1/` model files for on-device alt-text suggestions; fetch them with `scripts/fetch-alt-model.sh` |
 
 Use `scoped` for a small self-hosted instance. It indexes registered users, their follows, and interactions on their posts. `full` indexes every supported account and will use substantially more disk as the firehose continues. Neither mode currently has a retention or compaction policy.
+
+Repository backfill is off by default. To import existing records for registered accounts and their follows, set `backfill_enabled = true` in `appview.toml` or `APPVIEW_BACKFILL_ENABLED=true`. The worker fetches each repository from its PDS and imports it at up to `backfill_records_per_second` records per second (default 300). Backfill uses network bandwidth and database space; keep it off if you only want to index events observed after startup.
 
 In scoped mode, incoming likes and reposts are indexed when their subject is a registered or followed DID's post. Replies, quotes, and facet mentions are also indexed when they point to a registered or followed DID. This makes counts and notifications accurate for events seen from the current Jetstream cursor onward; older likes, reposts, and replies are not backfilled.
 
@@ -99,7 +103,30 @@ The API also publishes the `did:web` document with the `#bsky_appview` service e
 
 The upstream Bluesky social-app currently points public reads at its hosted AppView. A social-app fork or development build must configure both its AppView host and AppView DID to use this service; setting only the host does not configure service-proxy authentication. The current source has a development URL override named `EXPO_PUBLIC_DEV_ENV_APPVIEW_URL`; production builds can change the `PUBLIC_APPVIEW` and `PUBLIC_APPVIEW_DID` constants and the proxy DID configuration in the fork. This repo does not build or patch the social-app client.
 
-The built-in UI is available at `/login`. It resolves a handle or DID, starts OAuth, and shows the signed-in account's timeline from this AppView's local index. The initial account and its followed accounts are backfilled from their PDS repos; while the timeline is empty, `/app` reports backfill progress. Posting, liking, and reposting send records to the user's PDS. Replies create indexed reply records with root and parent references; `/app/thread` shows the parent chain and locally indexed replies. The signed-in UI has a responsive three-column desktop layout and a single-column mobile layout, with the current account's pinned feeds in its navigation. If the authorization server grants `atproto` but omits a requested write or feed RPC permission, the UI explains which access is unavailable. Existing sessions created before the feed RPC permissions were added must sign in again to allow feeds.
+The built-in UI is available at `/login`. It resolves a handle or DID, starts OAuth, and shows the signed-in account's timeline from this AppView's local index. When backfill is enabled, the worker imports the signed-in account and its followed accounts; while the timeline is empty, `/app` reports backfill progress. Posting, liking, and reposting send records to the user's PDS. Replies create indexed reply records with root and parent references; `/app/thread` shows the parent chain and locally indexed replies. The signed-in UI has a responsive three-column desktop layout and a single-column mobile layout, with the current account's pinned feeds in its navigation. If the authorization server grants `atproto` but omits a requested write or feed RPC permission, the UI explains which access is unavailable. Existing sessions created before the feed RPC permissions were added must sign in again to allow feeds.
+
+## OAuth permissions
+
+The built-in UI requests these scopes in both confidential and loopback OAuth modes. `atproto` identifies the account; the other scopes enable the specific actions and views provided by the UI.
+
+| Scope | Purpose |
+| --- | --- |
+| `atproto` | Sign in and identify the account. |
+| `repo:app.bsky.feed.post?action=create` | Create posts and replies. |
+| `repo:app.bsky.feed.like?action=create&action=delete` | Like and unlike posts. |
+| `repo:app.bsky.feed.repost?action=create&action=delete` | Repost and undo reposts. |
+| `blob:image/*` | Upload images attached to posts. |
+| `rpc:app.bsky.actor.getPreferences?aud=*` | Read account preferences used for pinned feeds. |
+| `rpc:app.bsky.feed.getFeedSkeleton?aud=*` | Load the skeleton for a selected custom feed. |
+| `blob:video/*`, `rpc:app.bsky.video.getUploadLimits?aud=*`, `rpc:com.atproto.repo.uploadBlob?aud=*` | Check video limits and upload video posts. |
+| `repo:app.bsky.graph.follow?action=create&action=delete` | Follow and unfollow accounts. |
+| `repo:app.bsky.graph.block?action=create&action=delete` | Block and unblock accounts. |
+| `repo:app.bsky.graph.listitem?action=create&action=delete` | Add and remove accounts from lists. |
+| `rpc:app.bsky.graph.muteActor?aud=*`, `rpc:app.bsky.graph.unmuteActor?aud=*`, `rpc:app.bsky.graph.getMutes?aud=*` | Mute, unmute, and check muted accounts. |
+
+The UI uses these permissions for its visible write and account-management features. An authorization server may grant only a subset: sign-in still works with `atproto`, while unavailable actions are disabled or prompt for a new sign-in.
+
+The optional on-device alt-text model is [SmolVLM-256M-Instruct](https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct), released under Apache-2.0. The fetch script pins a revision and verifies each downloaded file's SHA-256.
 
 ## Checks
 
@@ -107,6 +134,7 @@ Run the offline suite and static checks with:
 
 ```sh
 cargo test --locked --offline
+deno test --allow-read=static
 cargo fmt --all -- --check
 cargo clippy --locked --offline -- -D warnings
 cargo deny check licenses

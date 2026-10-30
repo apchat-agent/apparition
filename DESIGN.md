@@ -2,15 +2,15 @@
 
 ## Architecture
 
-The binary runs an Axum HTTP server, a Jetstream WebSocket consumer, and a repo backfill worker. `Storage` isolates indexed protocol data; the HTTP API and OAuth state/session storage share one SQLite database. `IdentityBackend` isolates DID and handle lookups so network resolution can be replaced by deterministic test fixtures.
+The binary runs an Axum HTTP server, a Jetstream WebSocket consumer, and an optional repo backfill worker. `Storage` isolates indexed protocol data. Application records and OAuth state/session storage use separate SQLite databases, and the persistent identity cache has its own database. `IdentityBackend` isolates DID and handle lookups so network resolution can be replaced by deterministic test fixtures.
 
 The AppView DID document advertises the `#bsky_appview` service. The XRPC service verifies inter-service JWT signatures using the issuer's DID document, then checks audience, expiry, issued-at time, and lexicon method. Anonymous public reads are accepted on methods that do not require account context; timeline and notification methods require a service JWT.
 
 ## Storage
 
-SQLite is the embedded store. It needs no separate service and has a small idle footprint. Records use a composite `(did, collection, rkey)` primary key with a collection/time index. Cursors, registered accounts, verified handles, follow edges, backfill requests, OAuth authorization state, and OAuth sessions are stored alongside records. WAL mode allows readers while ingestion writes. `MemoryStorage` provides deterministic API and integration tests. `Storage` is the production boundary if a different engine is needed after load measurements.
+SQLite is the embedded store. It needs no separate service and has a small idle footprint. `appview.db` stores records under a composite `(did, collection, rkey)` primary key with a collection/time index, plus cursors, registered accounts, verified handles, follow edges, and backfill requests. `oauth.db` stores OAuth authorization state and refreshable sessions. `identity-cache.db` stores cached DID documents and handle resolutions. WAL mode allows readers while ingestion writes. `MemoryStorage` provides deterministic API and integration tests. `Storage` is the production boundary if a different engine is needed after load measurements.
 
-OAuth client signing material is stored separately as `oauth-client-key.json` under the configured data directory, created with Unix mode `0600`. OAuth state and session rows share `appview.db` with the application records.
+OAuth client signing material is stored separately as `oauth-client-key.json` under the configured data directory, created with Unix mode `0600`. Keep the data directory private, including backups of all three databases and the signing key.
 
 ## Scope and ingestion
 
@@ -20,7 +20,7 @@ The consumer subscribes to posts, likes, reposts, follows, blocks, and profiles;
 
 ## Backfill
 
-Accounts entering scope are queued for `com.atproto.sync.getRepo`. The worker gets the PDS from the account's DID document, spaces requests per PDS host, and rejects oversized CAR responses. The CAR reader checks block hashes and MST completeness; the signed commit is checked against the document's `#atproto` key and DID. A verified snapshot replaces that DID's local records and follow edges in one SQLite transaction.
+Accounts entering scope are queued for `com.atproto.sync.getRepo` only when `backfill_enabled` is true; it defaults to false. Set `APPVIEW_BACKFILL_ENABLED=true` (or the TOML field) to opt in. `backfill_records_per_second` defaults to 300 and limits import work. The worker gets the PDS from the account's DID document, spaces requests per PDS host, and rejects oversized CAR responses. The CAR reader checks block hashes and MST completeness; the signed commit is checked against the document's `#atproto` key and DID. A verified snapshot replaces that DID's local records and follow edges in one SQLite transaction.
 
 ## XRPC API
 
@@ -35,11 +35,11 @@ Response shapes are checked against recorded public API fixtures. The API is a s
 
 ## OAuth and web UI
 
-The web client publishes confidential OAuth metadata with a stable P-256 key. It resolves the login handle or DID and PDS, discovers OAuth metadata, then delegates PAR, PKCE, DPoP proofs and nonce retries, code exchange, issuer validation, and token refresh to Atrium OAuth. Authorization state and refreshable sessions are persisted in SQLite. The callback validates the returned token scope and subject DID before registering the account. Browser sessions use an HMAC-signed, HttpOnly, SameSite cookie; HTTPS deployments also mark it Secure. Each browser login gets a random session ID and its own generation counter, so signing in on another device does not invalidate existing sessions. Logout advances only the current session's counter.
+The web client publishes confidential OAuth metadata with a stable P-256 key. It resolves the login handle or DID and PDS, discovers OAuth metadata, then delegates PAR, PKCE, DPoP proofs and nonce retries, code exchange, issuer validation, and token refresh to Atrium OAuth. Authorization state and refreshable sessions are persisted in `oauth.db`. The callback validates the returned token scope and subject DID before registering the account. Browser sessions use an HMAC-signed, HttpOnly, SameSite cookie; HTTPS deployments also mark it Secure. Each browser login gets a random session ID and its own generation counter, so signing in on another device does not invalidate existing sessions. Logout advances only the current session's counter.
 
 The `/app` timeline uses the same local indexed-record query as `app.bsky.feed.getTimeline`; profile and thread pages also read only the local index. An empty timeline reports the number of in-scope accounts and completed repo backfills. Successful login registers the account and queues its repo; importing that repo queues each followed account for backfill.
 
-OAuth requests `atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete` in both confidential and loopback modes. `atproto` supplies the AT Protocol account identity; the other scopes grant only the repo record actions used by the UI. The callback accepts a valid `atproto` session with partial repo grants as read-only. Posting, liking, and reposting are enabled only when every requested repo scope was granted. Record writes go through the logged-in user's OAuth session to their PDS.
+OAuth requests `atproto`, the post/like/repost repo scopes, `blob:image/*`, the feed preference and skeleton RPC scopes, the video blob/upload RPC scopes, follow and block repo scopes, the list-item repo scope, and mute/unmute/get-mutes RPC scopes. These permissions cover the built-in UI's post and media creation, custom-feed preferences, follow/block/list/mute controls, and feed selection. The callback accepts a valid `atproto` session when optional permissions are only partly granted; features whose scopes were not granted remain unavailable until the user signs in again. Record writes go through the logged-in user's OAuth session to their PDS.
 
 ## Current limits
 

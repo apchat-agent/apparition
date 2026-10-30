@@ -453,9 +453,8 @@ fn parse_rfc3339_micros(value: &str) -> Option<u64> {
     u64::try_from(parsed.unix_timestamp_nanos() / 1_000).ok()
 }
 
-/// WAL frames (4 KiB pages) the backfill may run ahead of the checkpointer: on
-/// appview-host's disk an unthrottled backfill grew the WAL past 1.5 GB and every
-/// write, sign-in included, queued behind the flush.
+/// WAL frames (4 KiB pages) the backfill may run ahead of the checkpointer. This
+/// bound keeps a large backlog from delaying interactive writes during a flush.
 pub const MAX_WRITE_BACKLOG: u64 = 16_384;
 
 /// Waits while `backlog()` exceeds `limit`, or until shutdown.

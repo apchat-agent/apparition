@@ -62,7 +62,7 @@ impl IdentityBackend for FakeIdentityBackend {
 #[test]
 fn stale_sqlite_handle_remains_available_until_refresh_verifies_a_change() {
     let path =
-        std::env::temp_dir().join(format!("appview-rs-av11-stale-{}.db", std::process::id()));
+        std::env::temp_dir().join(format!("appview-rs-case11-stale-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let storage = SqliteStorage::open(&path).unwrap();
     storage

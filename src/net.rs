@@ -17,9 +17,8 @@ const HTTP_CLIENT_CACHE_CAPACITY: usize = 512;
 const HTTP_CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 static OUTBOUND_REQUESTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
-// Repository backfill downloads are large and keep their permits for up to REQUEST_TIMEOUT each.
-// They get their own pool so a running backfill can never queue a browser's sign-in behind it
-// (2026-10-28: logins hung until the browser gave up while a follow backfill ran).
+// Repository backfill downloads are large and keep permits for up to REQUEST_TIMEOUT each.
+// A separate pool keeps this background work from occupying interactive request capacity.
 static BACKGROUND_REQUESTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 fn request_pool(background: bool) -> Arc<Semaphore> {

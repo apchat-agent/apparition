@@ -1982,9 +1982,8 @@ impl SqliteStorage {
             [MAX_BACKFILL_QUEUE],
         )?;
         migrate_notification_events(&connection)?;
-        // SQLite's automatic checkpoint runs inside a commit, i.e. under our one
-        // connection lock; on appview-host's disk a 1 GB WAL took minutes and froze every
-        // request. A side connection checkpoints instead (PASSIVE never blocks writers).
+        // SQLite's automatic checkpoint runs inside a commit under the connection
+        // lock. A side connection checkpoints instead; PASSIVE does not block writers.
         connection.execute_batch(
             "PRAGMA wal_autocheckpoint = 0; PRAGMA busy_timeout = 5000;
              PRAGMA journal_size_limit = 67108864;",

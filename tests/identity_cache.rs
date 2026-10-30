@@ -81,7 +81,7 @@ fn database_path() -> PathBuf {
         .as_nanos();
     let sequence = NEXT_DATABASE_PATH.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "appview-rs-av22-identity-{}-{timestamp}-{sequence}.sqlite",
+        "appview-rs-case22-identity-{}-{timestamp}-{sequence}.sqlite",
         std::process::id(),
     ))
 }
@@ -326,7 +326,7 @@ async fn account_event_evicts_identity_cache_immediately_while_sqlite_is_locked(
 #[tokio::test(flavor = "current_thread")]
 async fn records_database_write_lock_does_not_affect_identity_resolution() {
     let data_dir = std::env::temp_dir().join(format!(
-        "appview-rs-av22-db-isolation-{}-{}",
+        "appview-rs-case22-db-isolation-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)

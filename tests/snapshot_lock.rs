@@ -305,7 +305,7 @@ fn session_writes_can_run_between_batches_while_a_snapshot_rebuilds_many_follows
 }
 
 // A big repository snapshot used to hold the one connection lock for its whole
-// write (70 s for an 82k-record repo on appview-host), freezing every page and sign-in.
+// write, delaying page reads and session updates.
 #[test]
 fn large_snapshot_lets_other_storage_calls_in_between_batches() {
     let storage = SqliteStorage::open(":memory:").unwrap();
@@ -362,8 +362,8 @@ fn large_snapshot_lets_other_storage_calls_in_between_batches() {
     );
 }
 
-// SQLite's automatic checkpoint runs inside the committing write, i.e. under the
-// connection lock; on appview-host's disk a 1 GB WAL checkpoint held it for minutes.
+// SQLite's automatic checkpoint runs inside the committing write, under the
+// connection lock, and a large WAL can delay concurrent requests.
 #[test]
 fn record_writes_never_run_the_wal_checkpoint_under_the_lock() {
     let dir = std::env::temp_dir().join(format!("appview-ckpt-{}", std::process::id()));

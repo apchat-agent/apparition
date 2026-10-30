@@ -197,13 +197,10 @@ fn take_rate_slot_with_state(
 fn with_headers(mut response: Response<Body>, public_https: bool) -> Response<Body> {
     let headers = response.headers_mut();
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
-    // Not "no-referrer": under it browsers send `Origin: null` on our own form POSTs, and the
-    // same-origin check on /oauth/authorize then refuses every real login. "same-origin" still
-    // sends nothing to other sites.
+    // Preserve referrers on same-origin requests while omitting them on cross-origin requests.
     headers.insert(header::REFERRER_POLICY, "same-origin".parse().unwrap());
-    // form-action must allow https: because the sign-in form's answer is a redirect to the
-    // user's authorization server (any origin), and Safari/Chrome apply form-action to that
-    // redirect: with 'self' alone they stopped on our login page (Firefox doesn't, 2026-10-28).
+    // The sign-in form redirects to the user's authorization server, so form-action must allow
+    // HTTPS destinations beyond this origin.
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
         "default-src 'none'; base-uri 'none'; form-action 'self' https:; img-src 'self' blob: https://cdn.bsky.app https://video.bsky.app https://video.cdn.bsky.app; media-src 'self' blob: https://video.bsky.app https://video.cdn.bsky.app; style-src 'self'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self' https://video.bsky.app https://video.cdn.bsky.app; object-src 'none'; frame-ancestors 'none'"
@@ -243,7 +240,7 @@ mod tests {
     use tower::ServiceExt;
 
     #[tokio::test]
-    async fn av33_csp_allows_the_video_cdn_redirect_origin_for_playback_and_thumbnails() {
+    async fn case33_csp_allows_the_video_cdn_redirect_origin_for_playback_and_thumbnails() {
         let router = protect(
             axum::Router::new().route("/", get(|| async { "ok" })),
             false,

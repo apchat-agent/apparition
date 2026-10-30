@@ -1621,7 +1621,7 @@ async fn fifty_post_app_page_stays_under_the_compressed_page_weight_budget() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["content-encoding"], "gzip");
     let compressed = response.into_body().collect().await.unwrap().to_bytes();
-    eprintln!("av21 /app 50-post gzip body: {} bytes", compressed.len());
+    eprintln!("case21 /app 50-post gzip body: {} bytes", compressed.len());
     assert!(
         compressed.len() < 60 * 1024,
         "compressed /app body was {} bytes (budget 61440 bytes)",
@@ -1684,8 +1684,8 @@ async fn authorization_and_callback_reject_missing_protocol_parameters() {
 
 #[tokio::test]
 async fn authorize_normalizes_the_typed_handle_but_not_a_did() {
-    // A phone keyboard sent "Owner.Example.Test"; atproto handles are case-insensitive but the
-    // DID-document check downstream compares them exactly, so sign-in failed (2026-10-28).
+    // Normalize typed handles before checking them against the DID document because
+    // AT Protocol handles are case-insensitive.
     let app = OAuthPublic::new("https://appview.example")
         .unwrap()
         .router_with_flow(FakeOAuthFlow::default(), Arc::new(MemoryStorage::default()));
@@ -2431,7 +2431,7 @@ async fn old_scope_session_keeps_text_and_picture_composer_and_requires_video_re
         .unwrap();
     assert_eq!(text_post.status(), StatusCode::SEE_OTHER);
 
-    let video_boundary = "av31-video";
+    let video_boundary = "case31-video";
     let video_post = app
         .clone()
         .oneshot(
@@ -2460,7 +2460,7 @@ async fn old_scope_session_keeps_text_and_picture_composer_and_requires_video_re
             .unwrap();
     assert_eq!(video_message["message"], "sign in again to post videos");
 
-    let boundary = "av26-picture";
+    let boundary = "case26-picture";
     let body = multipart_post_body(
         boundary,
         "caption",
@@ -2504,7 +2504,7 @@ async fn overlong_video_is_rejected_before_the_oauth_flow_is_called() {
         .unwrap()
         .router_with_flow(flow.clone(), Arc::new(MemoryStorage::default()));
     let cookie = finish_login(&app).await;
-    let boundary = "av31-too-long";
+    let boundary = "case31-too-long";
     let response = app
         .oneshot(
             Request::builder()
@@ -2541,7 +2541,7 @@ async fn invalid_images_are_rejected_before_the_oauth_flow_is_called() {
         ("image/jpeg", "large.jpg", vec![0x55; 1_000_001]),
     ];
     for (mime, filename, bytes) in cases {
-        let boundary = "av26-invalid";
+        let boundary = "case26-invalid";
         let body = multipart_post_body(
             boundary,
             "caption",
@@ -2592,7 +2592,7 @@ async fn multipart_text_only_post_still_works_without_javascript() {
         .unwrap()
         .router_with_flow(flow.clone(), Arc::new(MemoryStorage::default()));
     let cookie = finish_login(&app).await;
-    let boundary = "av26-no-script";
+    let boundary = "case26-no-script";
     let response = app
         .oneshot(
             Request::builder()
@@ -2630,7 +2630,7 @@ async fn native_media_input_accepts_images_skips_empty_parts_and_refuses_video()
     let png =
         b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00";
 
-    let image_boundary = "av37-native-image";
+    let image_boundary = "case37-native-image";
     let image = app
         .clone()
         .oneshot(
@@ -2655,7 +2655,7 @@ async fn native_media_input_accepts_images_skips_empty_parts_and_refuses_video()
         .unwrap();
     assert_eq!(image.status(), StatusCode::SEE_OTHER);
 
-    let empty_boundary = "av37-native-empty";
+    let empty_boundary = "case37-native-empty";
     let empty = app
         .clone()
         .oneshot(
@@ -2680,7 +2680,7 @@ async fn native_media_input_accepts_images_skips_empty_parts_and_refuses_video()
         .unwrap();
     assert_eq!(empty.status(), StatusCode::SEE_OTHER);
 
-    let video_boundary = "av37-native-video";
+    let video_boundary = "case37-native-video";
     let mp4 = b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00";
     let video = app
         .oneshot(
@@ -4169,36 +4169,36 @@ async fn authenticated_pages_render_unread_count_in_both_navigation_bells() {
 #[test]
 fn sqlite_notification_last_seen_persists_and_filters_unread_events() {
     let path = std::path::PathBuf::from(format!(
-        "target/av25-notification-seen-{}.sqlite3",
+        "target/case25-notification-seen-{}.sqlite3",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&path);
-    let viewer = "did:plc:av25viewer";
+    let viewer = "did:plc:case25viewer";
     let last_seen = 2_000_000_000_000_000;
     {
         let storage = SqliteStorage::open(&path).unwrap();
         storage.mark_notifications_seen(viewer, last_seen).unwrap();
         storage
             .put_record(&IndexedRecord {
-                did: "did:plc:av25actor".into(),
+                did: "did:plc:case25actor".into(),
                 collection: "app.bsky.feed.like".into(),
                 rkey: "old".into(),
-                uri: "at://did:plc:av25actor/app.bsky.feed.like/old".into(),
+                uri: "at://did:plc:case25actor/app.bsky.feed.like/old".into(),
                 cid: None,
                 time_us: last_seen - 1,
-                record: serde_json::json!({"subject":{"uri":"at://did:plc:av25viewer/app.bsky.feed.post/p"}}),
+                record: serde_json::json!({"subject":{"uri":"at://did:plc:case25viewer/app.bsky.feed.post/p"}}),
             })
             .unwrap();
         assert_eq!(storage.unread_notification_count(viewer).unwrap(), 0);
         storage
             .put_record(&IndexedRecord {
-                did: "did:plc:av25actor".into(),
+                did: "did:plc:case25actor".into(),
                 collection: "app.bsky.feed.like".into(),
                 rkey: "new".into(),
-                uri: "at://did:plc:av25actor/app.bsky.feed.like/new".into(),
+                uri: "at://did:plc:case25actor/app.bsky.feed.like/new".into(),
                 cid: None,
                 time_us: last_seen + 1,
-                record: serde_json::json!({"subject":{"uri":"at://did:plc:av25viewer/app.bsky.feed.post/p"}}),
+                record: serde_json::json!({"subject":{"uri":"at://did:plc:case25viewer/app.bsky.feed.post/p"}}),
             })
             .unwrap();
         assert_eq!(storage.unread_notification_count(viewer).unwrap(), 1);

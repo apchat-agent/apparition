@@ -10715,7 +10715,7 @@ mod tests {
 
     #[test]
     fn write_profile_capture_fixture_when_requested() {
-        let Some(output_dir) = std::env::var_os("AV36B_CAPTURE_DIR") else {
+        let Some(output_dir) = std::env::var_os("APPVIEW_CAPTURE_DIR") else {
             return;
         };
         let output_dir = PathBuf::from(output_dir);
@@ -10991,11 +10991,11 @@ mod tests {
         let storage = MemoryStorage::default();
         let rendered = render_web_embed(
             &storage,
-            "did:plc:av31author",
+            "did:plc:case31author",
             &json!({
                 "$type":"app.bsky.embed.video#view",
-                "playlist":"https://video.bsky.app/watch/did%3Aplc%3Aav31author/bafk-video/playlist.m3u8",
-                "thumbnail":"https://video.bsky.app/watch/did%3Aplc%3Aav31author/bafk-video/thumbnail.jpg",
+                "playlist":"https://video.bsky.app/watch/did%3Aplc%3Acase31author/bafk-video/playlist.m3u8",
+                "thumbnail":"https://video.bsky.app/watch/did%3Aplc%3Acase31author/bafk-video/thumbnail.jpg",
                 "alt":"A red bicycle rides past a park",
                 "aspectRatio":{"width":1920,"height":1080}
             }),
@@ -11015,7 +11015,7 @@ mod tests {
     }
 
     #[test]
-    fn av33_pending_quote_renders_a_deferred_fragment_placeholder() {
+    fn case33_pending_quote_renders_a_deferred_fragment_placeholder() {
         let storage = MemoryStorage::default();
         let uri = "at://did:plc:quoted-author/app.bsky.feed.post/quoted";
         let embed = quote_embed(uri);
@@ -11033,7 +11033,7 @@ mod tests {
     }
 
     #[test]
-    fn av33_nested_quote_link_keeps_its_label_and_adds_the_known_author_handle() {
+    fn case33_nested_quote_link_keeps_its_label_and_adds_the_known_author_handle() {
         let storage = MemoryStorage::default();
         let did = "did:plc:nested-author";
         storage
@@ -11048,13 +11048,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn av33_timeline_group_ancestor_quote_uses_the_page_quote_hydration_batch() {
+    async fn case33_timeline_group_ancestor_quote_uses_the_page_quote_hydration_batch() {
         let storage = Arc::new(MemoryStorage::default());
-        let viewer = "did:plc:av33-viewer";
-        let author = "did:plc:av33-thread-author";
+        let viewer = "did:plc:case33-viewer";
+        let author = "did:plc:case33-thread-author";
         let root = test_web_post(author, "root", 1, "Thread group ancestor", None);
         let quote = test_web_post(
-            "did:plc:av33-quoted-author",
+            "did:plc:case33-quoted-author",
             "quoted",
             1,
             "Hydrated ancestor quote body",
@@ -11087,11 +11087,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn av33_quote_fragment_endpoint_returns_the_fetched_quoted_post_card() {
+    async fn case33_quote_fragment_endpoint_returns_the_fetched_quoted_post_card() {
         let storage = Arc::new(MemoryStorage::default());
-        let viewer = "did:plc:av33-fragment-viewer";
+        let viewer = "did:plc:case33-fragment-viewer";
         let quoted = test_web_post(
-            "did:plc:av33-fragment-author",
+            "did:plc:case33-fragment-author",
             "fragment",
             1,
             "Fetched quote fragment body",
@@ -11099,7 +11099,7 @@ mod tests {
         );
         let flow = QuoteHydrationTestFlow::new([quoted.clone()]);
         let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
-        let session_id = "av33-quote-fragment-session";
+        let session_id = "case33-quote-fragment-session";
         let generation = storage.rotate_web_session(viewer, session_id).unwrap();
         let token = public.issue_session_cookie(
             viewer,
@@ -11361,8 +11361,8 @@ mod tests {
     async fn alt_test_page_requires_and_accepts_a_verified_session_cookie() {
         let public = OAuthPublic::new("https://appview.example").unwrap();
         let storage = Arc::new(MemoryStorage::default());
-        let did = "did:plc:av27viewer";
-        let session_id = "av27-session";
+        let did = "did:plc:case27viewer";
+        let session_id = "case27-session";
         let generation = storage.rotate_web_session(did, session_id).unwrap();
         let token = public.issue_session_cookie(
             did,
@@ -11407,19 +11407,20 @@ mod tests {
         assert!(page.contains("never uploaded"));
     }
 
-    const FEED_VIEWER_DID: &str = "did:plc:av23viewer";
-    const FEED_CREATOR_DID: &str = "did:plc:av23creator";
-    const FEED_SERVICE_DID: &str = "did:plc:av23service";
-    const FEED_URI: &str = "at://did:plc:av23creator/app.bsky.feed.generator/av23-authenticated";
+    const FEED_VIEWER_DID: &str = "did:plc:case23viewer";
+    const FEED_CREATOR_DID: &str = "did:plc:case23creator";
+    const FEED_SERVICE_DID: &str = "did:plc:case23service";
+    const FEED_URI: &str =
+        "at://did:plc:case23creator/app.bsky.feed.generator/case23-authenticated";
     const FAILURE_FEED_URI: &str =
-        "at://did:plc:av23creator/app.bsky.feed.generator/av23-auth-failure";
-    const PLACEHOLDER_URI: &str = "at://did:plc:av23author/app.bsky.feed.post/placeholder";
+        "at://did:plc:case23creator/app.bsky.feed.generator/case23-auth-failure";
+    const PLACEHOLDER_URI: &str = "at://did:plc:case23author/app.bsky.feed.post/placeholder";
     const REAL_POST_URIS: [&str; 3] = [
-        "at://did:plc:av23author/app.bsky.feed.post/real-one",
-        "at://did:plc:av23author/app.bsky.feed.post/real-two",
-        "at://did:plc:av23author/app.bsky.feed.post/real-three",
+        "at://did:plc:case23author/app.bsky.feed.post/real-one",
+        "at://did:plc:case23author/app.bsky.feed.post/real-two",
+        "at://did:plc:case23author/app.bsky.feed.post/real-three",
     ];
-    const SERVICE_JWT: &str = "av23-service-jwt";
+    const SERVICE_JWT: &str = "case23-service-jwt";
 
     #[test]
     fn icon_symbols_leave_fill_to_css_so_liked_hearts_can_be_filled() {
@@ -12189,7 +12190,7 @@ mod tests {
         flow: F,
     ) -> String {
         let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
-        let session_id = "av28-timeline-session";
+        let session_id = "case28-timeline-session";
         let generation = storage.rotate_web_session(viewer, session_id).unwrap();
         let token = public.issue_session_cookie(
             viewer,
@@ -12504,7 +12505,7 @@ mod tests {
                     if query.contains("collection=app.bsky.feed.generator") {
                         Json(json!({
                             "uri": FEED_URI,
-                            "cid": "bafyreav23generator",
+                            "cid": "bafyrecase23generator",
                             "value": {"did": FEED_SERVICE_DID, "displayName": "For you"}
                         }))
                         .into_response()
@@ -12527,7 +12528,7 @@ mod tests {
                             .unwrap()
                             .skeleton_authorizations
                             .push(authorization.clone());
-                        let feed = if authorization.as_deref() == Some("Bearer av23-service-jwt") {
+                        let feed = if authorization.as_deref() == Some("Bearer case23-service-jwt") {
                             REAL_POST_URIS
                                 .iter()
                                 .map(|post| json!({"post":post}))
@@ -12668,7 +12669,7 @@ mod tests {
         assert_eq!(state.skeleton_authorizations.len(), 1);
         assert_eq!(
             state.skeleton_authorizations[0].as_deref(),
-            Some("Bearer av23-service-jwt")
+            Some("Bearer case23-service-jwt")
         );
         assert_eq!(state.auth_calls, 1);
         server.abort();
@@ -12691,7 +12692,7 @@ mod tests {
             state
                 .skeleton_authorizations
                 .iter()
-                .all(|authorization| authorization.as_deref() == Some("Bearer av23-service-jwt"))
+                .all(|authorization| authorization.as_deref() == Some("Bearer case23-service-jwt"))
         );
         server.abort();
     }
@@ -12803,8 +12804,7 @@ mod tests {
         server.abort();
     }
 
-    // HTTP/2 browsers may send each cookie as its own `cookie` header; the
-    // sign-in cookie was missed when another cookie came first (2026-10-28).
+    // HTTP/2 browsers may send each cookie as its own `cookie` header, so inspect all values.
     #[tokio::test]
     async fn login_page_prefills_the_remembered_handle_safely() {
         let mut headers = HeaderMap::new();
