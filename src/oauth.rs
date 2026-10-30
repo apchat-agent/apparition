@@ -2613,69 +2613,37 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
     }
 
     /// Resolve a block list owned by any account: its display name and member
-    /// DIDs, fetched UNauthenticated from the list owner's PDS (the viewer's
-    /// session cannot read another account's repo).
+    /// DIDs, from the public Bluesky appview's `app.bsky.graph.getList`
+    /// (unauthenticated, paginated by the list itself). Not the owner's PDS:
+    /// listing the owner's `app.bsky.graph.listitem` collection walks EVERY
+    /// list they own; on 2026-10-30 one owner had over 15 000 items of which
+    /// 93 of the first 15 000 belonged to the 546-member list, ~150 s a fetch.
     async fn fetch_block_list_members(&self, list_uri: &str) -> Result<BlockListDetail, String> {
         let mut parts = list_uri
             .strip_prefix("at://")
             .ok_or_else(|| "block list uri is invalid".to_owned())?
             .split('/');
-        let owner_did = parts
-            .next()
-            .filter(|did| !did.is_empty())
-            .ok_or_else(|| "block list uri is invalid".to_owned())?;
+        let owner_did = parts.next().unwrap_or_default();
         let collection = parts.next().unwrap_or_default();
         let rkey = parts.next().unwrap_or_default();
-        if collection != "app.bsky.graph.list" || rkey.is_empty() || parts.next().is_some() {
+        if owner_did.is_empty()
+            || collection != "app.bsky.graph.list"
+            || rkey.is_empty()
+            || parts.next().is_some()
+        {
             return Err("block list uri is invalid".to_owned());
         }
-        let owner_doc = self
-            .identity_resolver
-            .resolve_did_document(owner_did)
-            .await
-            .map_err(|error| format!("block list owner DID resolution failed: {error}"))?;
-        let pds = owner_doc
-            .pds_endpoint()
-            .ok_or_else(|| "block list owner DID document has no PDS endpoint".to_owned())?;
-        let mut record_url = url::Url::parse(&format!("{pds}/xrpc/com.atproto.repo.getRecord"))
-            .map_err(|_| "block list PDS URL is invalid".to_owned())?;
-        {
-            let mut query = record_url.query_pairs_mut();
-            query.append_pair("repo", owner_did);
-            query.append_pair("collection", "app.bsky.graph.list");
-            query.append_pair("rkey", rkey);
-        }
-        let response = self
-            .http_client
-            .get(&record_url, HeaderMap::new(), 1024 * 1024)
-            .await
-            .map_err(|error| format!("block list getRecord request failed: {error}"))?;
-        if !response.status().is_success() {
-            return Err(format!(
-                "block list getRecord returned status {}",
-                response.status()
-            ));
-        }
-        let record: Value = serde_json::from_slice(response.body())
-            .map_err(|_| "block list record was invalid JSON".to_owned())?;
-        let name = record
-            .get("value")
-            .and_then(|value| value.get("name"))
-            .and_then(Value::as_str)
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or("Untitled list")
-            .to_owned();
+        let mut name = None;
         let mut members = HashSet::new();
         let mut cursor: Option<String> = None;
-        let mut total = 0usize;
-        let mut capped = false;
-        for _ in 0..=100 {
-            let mut page_url = url::Url::parse(&format!("{pds}/xrpc/com.atproto.repo.listRecords"))
-                .map_err(|_| "block list PDS URL is invalid".to_owned())?;
+        let mut pages = 0usize;
+        loop {
+            let mut page_url =
+                url::Url::parse(&format!("{PUBLIC_APPVIEW_BASE}app.bsky.graph.getList"))
+                    .map_err(|error| format!("block list getList URL is invalid: {error}"))?;
             {
                 let mut query = page_url.query_pairs_mut();
-                query.append_pair("repo", owner_did);
-                query.append_pair("collection", "app.bsky.graph.listitem");
+                query.append_pair("list", list_uri);
                 query.append_pair("limit", "100");
                 if let Some(value) = cursor.as_deref() {
                     query.append_pair("cursor", value);
@@ -2683,55 +2651,57 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             }
             let response = self
                 .http_client
-                .get(&page_url, HeaderMap::new(), 1024 * 1024)
+                .get(&page_url, HeaderMap::new(), 2 * 1024 * 1024)
                 .await
-                .map_err(|error| format!("block list listRecords request failed: {error}"))?;
+                .map_err(|error| format!("block list getList request failed: {error}"))?;
             if !response.status().is_success() {
                 return Err(format!(
-                    "block list listRecords returned status {}",
-                    response.status()
+                    "block list getList returned status {}: {}",
+                    response.status(),
+                    String::from_utf8_lossy(&response.body()[..response.body().len().min(200)])
                 ));
             }
             let page: Value = serde_json::from_slice(response.body())
-                .map_err(|_| "block list listRecords was invalid JSON".to_owned())?;
-            let Some(page_records) = page.get("records").and_then(Value::as_array) else {
-                return Err("block list listRecords returned no records array".to_owned());
+                .map_err(|error| format!("block list getList was invalid JSON: {error}"))?;
+            if name.is_none() {
+                name = page
+                    .pointer("/list/name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.trim().is_empty())
+                    .map(str::to_owned);
+            }
+            let Some(items) = page.get("items").and_then(Value::as_array) else {
+                return Err("block list getList returned no items array".to_owned());
             };
-            total += page_records.len();
-            for item in page_records {
-                let Some(value) = item.get("value") else {
-                    continue;
-                };
-                if value.get("list").and_then(Value::as_str) == Some(list_uri)
-                    && let Some(subject) = value.get("subject").and_then(Value::as_str)
-                {
-                    members.insert(subject.to_owned());
+            for item in items {
+                if let Some(did) = item.pointer("/subject/did").and_then(Value::as_str) {
+                    members.insert(did.to_owned());
                 }
             }
+            pages += 1;
             cursor = page
                 .get("cursor")
                 .and_then(Value::as_str)
+                .filter(|cursor| !cursor.is_empty())
                 .map(str::to_owned);
-            if cursor.is_none() || page_records.is_empty() {
+            if cursor.is_none() || items.is_empty() {
                 break;
             }
-            if total >= 10_000 {
-                capped = true;
+            if pages >= 100 {
+                tracing::warn!(
+                    list = %list_uri,
+                    members = members.len(),
+                    "block list member fetch stopped at 100 getList pages; members beyond it stay unknown"
+                );
                 break;
             }
         }
-        if capped {
-            tracing::warn!(
-                list = %list_uri,
-                records = total,
-                "block list member fetch stopped at the 10000 record cap; members beyond it stay unknown"
-            );
-        }
+        tracing::info!(list = %list_uri, members = members.len(), pages, "block list members fetched");
         let mut member_dids = members.into_iter().collect::<Vec<_>>();
         member_dids.sort();
         Ok(BlockListDetail {
             uri: list_uri.to_owned(),
-            name,
+            name: name.unwrap_or_else(|| "Untitled list".to_owned()),
             member_dids,
         })
     }
