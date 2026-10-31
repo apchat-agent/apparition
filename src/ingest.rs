@@ -1827,12 +1827,15 @@ pub struct StatementWork {
 }
 
 impl StatementWork {
+    /// Adds what the statement did since the last observation: `reset_status`
+    /// returns the counter and zeroes it, so a statement run several times in
+    /// one call is counted exactly once per run.
     fn observe(&mut self, statement: &rusqlite::Statement<'_>) {
         self.fullscan_steps += statement
-            .get_status(rusqlite::StatementStatus::FullscanStep)
+            .reset_status(rusqlite::StatementStatus::FullscanStep)
             .max(0) as u64;
         self.vm_steps += statement
-            .get_status(rusqlite::StatementStatus::VmStep)
+            .reset_status(rusqlite::StatementStatus::VmStep)
             .max(0) as u64;
     }
 }
@@ -2631,6 +2634,16 @@ impl SqliteStorage {
         Ok((records, work))
     }
 
+    /// One page of the home timeline, assembled from per-author index walks.
+    ///
+    /// The single statement this replaced planned, without `sqlite_stat` rows, as
+    /// `SEARCH records USING INDEX records_collection_time (collection=?)`: it walked EVERY post
+    /// newest-first and tested the author, so a viewer whose follows posted little never filled
+    /// the LIMIT and the page read the whole post table. One walk per followed author on
+    /// `records_author_time`, each capped at one page, bounds the work by the viewer's follows;
+    /// merging in Rust keeps the exact rows, order (time_us DESC, uri DESC) and cursor
+    /// tie-break of the old query, because every candidate for the global page is within the
+    /// first `limit` rows of its own author.
     fn timeline_posts_page(
         &self,
         actor: &str,
@@ -2638,32 +2651,58 @@ impl SqliteStorage {
         limit: usize,
         mut work: Option<&mut StatementWork>,
     ) -> Result<Vec<IndexedRecord>, StorageError> {
+        let limit = limit.clamp(1, 101);
         let conn = self.read_conn()?;
+        let mut followed = conn.prepare(
+            "SELECT DISTINCT json_extract(record_json, '$.subject') FROM records
+             WHERE collection='app.bsky.graph.follow' AND did=?1
+               AND json_extract(record_json, '$.subject') IS NOT NULL",
+        )?;
+        let mut authors = followed
+            .query_map([actor], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(counted) = work.as_mut() {
+            counted.observe(&followed);
+        }
+        drop(followed);
+        authors.sort_unstable();
+        authors.dedup();
+        authors.retain(|subject| subject != actor);
         let mut statement = conn.prepare(
             "SELECT did, collection, rkey, uri, cid, time_us, record_json FROM records
-             WHERE collection='app.bsky.feed.post'
-               AND (did=?1 OR did IN (
-                   SELECT json_extract(record_json, '$.subject') FROM records
-                   WHERE collection='app.bsky.graph.follow' AND did=?1
-               ))
+             WHERE collection='app.bsky.feed.post' AND did=?1
                AND (?2 IS NULL OR time_us < ?2 OR (time_us=?2 AND uri < ?3))
              ORDER BY time_us DESC, uri DESC LIMIT ?4",
         )?;
-        let records = statement
-            .query_map(
-                params![
-                    actor,
-                    cursor.map(|cursor| cursor.time_us.min(i64::MAX as u64) as i64),
-                    cursor.map(|cursor| cursor.uri.as_str()).unwrap_or(""),
-                    limit.clamp(1, 101) as i64,
-                ],
-                row_to_record,
-            )?
-            .collect::<Result<Vec<_>, _>>()?;
-        if let Some(work) = work.as_mut() {
-            work.observe(&statement);
+        let mut page = Vec::new();
+        for author in std::iter::once(actor).chain(authors.iter().map(String::as_str)) {
+            page.extend(
+                statement
+                    .query_map(
+                        params![
+                            author,
+                            cursor.map(|cursor| cursor.time_us.min(i64::MAX as u64) as i64),
+                            cursor.map(|cursor| cursor.uri.as_str()).unwrap_or(""),
+                            limit as i64,
+                        ],
+                        row_to_record,
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            if let Some(counted) = work.as_mut() {
+                counted.observe(&statement);
+            }
         }
-        Ok(records)
+        drop(statement);
+        drop(conn);
+        page.sort_by(|left, right| {
+            right
+                .time_us
+                .cmp(&left.time_us)
+                .then_with(|| right.uri.cmp(&left.uri))
+        });
+        page.truncate(limit);
+        Ok(page)
     }
 
     fn pace_snapshot_writes(
