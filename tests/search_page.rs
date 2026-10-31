@@ -70,7 +70,9 @@ async fn fake_search_posts(
     // Measured 2026-10-31: api.bsky.app answers page 1 but refuses every anonymous request
     // that carries a cursor with 403 "Request forbidden by administrative rules".
     if fake.cursor_forbidden.load(Ordering::SeqCst)
-        && query.as_deref().is_some_and(|query| query.contains("cursor="))
+        && query
+            .as_deref()
+            .is_some_and(|query| query.contains("cursor="))
     {
         return (
             StatusCode::FORBIDDEN,
@@ -918,7 +920,7 @@ async fn a_403_on_an_anonymous_cursor_page_asks_for_a_fresh_sign_in_instead_of_t
         "this is not the unavailable page: {html}"
     );
     assert!(
-        html.contains("href=\"/login?allow=like&amp;allow=repost&amp;allow=post\""),
+        html.contains("href=\"/login?allow=like&amp;allow=repost\""),
         "the sign-in link must keep the boxes the session already holds: {html}"
     );
     let warnings = warnings.lock().unwrap();

@@ -7902,7 +7902,11 @@ where
         Ok(Some(body)) => crate::search::parse_search_posts_body(&body),
         Ok(None) => match state.search.search_posts(&term, cursor).await {
             Ok(page) => page,
-            Err(failure) => return search_unavailable_response(&failure, heading, &form, options),
+            Err(failure) => {
+                return anonymous_posts_search_failure_response(
+                    &failure, cursor, &state, &headers, heading, &form, options,
+                );
+            }
         },
         Err(error) => {
             // Owner's logging rule: the fallback names the real underlying error.
@@ -7914,7 +7918,9 @@ where
             match state.search.search_posts(&term, cursor).await {
                 Ok(page) => page,
                 Err(failure) => {
-                    return search_unavailable_response(&failure, heading, &form, options);
+                    return anonymous_posts_search_failure_response(
+                        &failure, cursor, &state, &headers, heading, &form, options,
+                    );
                 }
             }
         }
@@ -8084,6 +8090,43 @@ fn search_unavailable_response(
         options,
     ))
     .into_response()
+}
+
+/// An anonymous `searchPosts` request that carries a cursor is refused with 403 "Request
+/// forbidden by administrative rules" (measured on api.bsky.app, 2026-10-31), so paging needs
+/// the viewer's own session. That failure gets its own readable page: the error-card wording
+/// asks for a fresh sign-in and links through the `allow_more_href` box-keeping logic (plain
+/// `/login` when the session holds no boxes). The real status and cursor-carrying URL are in
+/// SearchClient's own warning.
+fn anonymous_posts_search_failure_response<F, S>(
+    failure: &SearchCallError,
+    cursor: Option<&str>,
+    state: &OAuthWebState<F, S>,
+    headers: &HeaderMap,
+    heading: &str,
+    form: &str,
+    options: PageShellOptions<'_>,
+) -> Response
+where
+    F: OAuthFlow,
+    S: Storage + 'static,
+{
+    if cursor.is_some() && failure.status == Some(403) {
+        let href = html_escape(
+            &verified_cookie_allow_more(&state.public, headers, state.storage.as_ref())
+                .unwrap_or_else(|| "/login".to_owned()),
+        );
+        return Html(page_shell_with_options(
+            "Search",
+            &format!(
+                "{heading}{form}<section class=\"error-card\"><p class=\"eyebrow\">Search</p><h1>More results need a fresh sign-in</h1><p>Bluesky will not page an anonymous search. <a class=\"pagination-link\" href=\"{href}\">Sign in again</a> and the next pages come through your own account.</p></section>"
+            ),
+            true,
+            options,
+        ))
+        .into_response();
+    }
+    search_unavailable_response(failure, heading, form, options)
 }
 
 fn render_block_list_setting(index: usize, list: &BlockListDetail) -> String {
