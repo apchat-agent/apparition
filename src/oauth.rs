@@ -6723,7 +6723,8 @@ where
     let browser_binding = URL_SAFE_NO_PAD.encode(binding_bytes);
     // The client metadata still advertises the full list; per request we ask for either the full
     // list (checkbox ticked) or the read-only list (owner: read-only login by default).
-    let scopes = if form.get("write").is_some_and(|value| value == "1") {
+    let write_requested = form.get("write").is_some_and(|value| value == "1");
+    let scopes = if write_requested {
         requested_scopes()
     } else {
         read_only_scopes()
@@ -6731,6 +6732,11 @@ where
     .into_iter()
     .map(|scope| scope.as_ref().to_owned())
     .collect::<Vec<_>>();
+    tracing::info!(
+        write = write_requested,
+        scopes = %scopes.join(" "),
+        "oauth sign-in started"
+    );
     let authorize_result = std::panic::AssertUnwindSafe(state.flow.authorize(
         &normalize_login(form.get("handle").expect("validated above")),
         &browser_binding,
@@ -6844,6 +6850,13 @@ where
             return login_retry_page();
         }
     };
+    // Visibility (owner's rule): which scopes the token response granted (scope strings only,
+    // never tokens).
+    tracing::info!(
+        did = %account.did,
+        scopes = %account.granted_scope.as_deref().unwrap_or(""),
+        "oauth token response granted scopes"
+    );
     if !state.public.login_is_allowed(&account.did) {
         tracing::info!(did = %account.did, "OAuth account is not in the login allowlist");
         if let Err(error) = state.flow.logout(&account.did).await {

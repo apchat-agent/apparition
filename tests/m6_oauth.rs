@@ -6860,9 +6860,9 @@ async fn sign_in_logs_its_kind_and_the_granted_scopes_at_info() {
         "no with-changes sign-in kind logged: {lines:?}"
     );
     assert!(
-        lines.iter().any(|line| {
-            line.contains("granted scopes") && line.contains(EXPECTED_OAUTH_SCOPE)
-        }),
+        lines
+            .iter()
+            .any(|line| { line.contains("granted scopes") && line.contains(EXPECTED_OAUTH_SCOPE) }),
         "the granted scope strings were not logged: {lines:?}"
     );
     assert!(
