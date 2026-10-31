@@ -186,10 +186,20 @@ pub struct FeedTimelineTiming {
 
 const LIVE_POST_CACHE_ENTRIES: usize = 20_000;
 const LIVE_POST_CACHE_SECS: u64 = 6 * 60 * 60;
+const GONE_POST_CACHE_SECS: u64 = 10 * 60;
 const PUBLIC_POST_BATCH_SIZE: usize = 25;
 const PUBLIC_POST_BATCH_CONCURRENCY: usize = 4;
 const MAX_PUBLIC_POST_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const FEED_GENERATOR_CACHE_PREFIX: &str = "feed-generator:";
+
+#[derive(Clone)]
+enum LivePostCacheValue {
+    Post(Box<FetchedPublicPost>),
+    Gone,
+}
+
+type LivePostCache =
+    tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, LivePostCacheValue)>>;
 
 fn unix_time_us() -> u64 {
     std::time::SystemTime::now()
@@ -199,10 +209,25 @@ fn unix_time_us() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
-async fn cache_live_post(
-    cache: &tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, FetchedPublicPost)>>,
+async fn cache_live_post(cache: &LivePostCache, uri: &str, post: FetchedPublicPost) {
+    cache_post_value(
+        cache,
+        uri,
+        LivePostCacheValue::Post(Box::new(post)),
+        LIVE_POST_CACHE_SECS,
+    )
+    .await;
+}
+
+async fn cache_gone_post(cache: &LivePostCache, uri: &str) {
+    cache_post_value(cache, uri, LivePostCacheValue::Gone, GONE_POST_CACHE_SECS).await;
+}
+
+async fn cache_post_value(
+    cache: &LivePostCache,
     uri: &str,
-    post: FetchedPublicPost,
+    value: LivePostCacheValue,
+    ttl_secs: u64,
 ) {
     let mut cache = cache.lock().await;
     if cache.len() >= LIVE_POST_CACHE_ENTRIES {
@@ -216,8 +241,8 @@ async fn cache_live_post(
     cache.insert(
         uri.to_owned(),
         (
-            tokio::time::Instant::now() + Duration::from_secs(LIVE_POST_CACHE_SECS),
-            post,
+            tokio::time::Instant::now() + Duration::from_secs(ttl_secs),
+            value,
         ),
     );
 }
@@ -426,7 +451,7 @@ pub struct FeedClient<B: IdentityBackend> {
     http: SafeHttpClient,
     public_appview_base: String,
     generator_cache: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, ResolvedFeed)>>,
-    live_post_cache: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, FetchedPublicPost)>>,
+    live_post_cache: LivePostCache,
     // Failed resolutions are remembered too: the layout resolves every pinned feed on every page,
     // so an uncached failure would repeat its full network cost on each request.
     generator_failures: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, String)>>,
@@ -830,10 +855,12 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
                 if !seen.insert(uri.as_str()) {
                     continue;
                 }
-                if let Some((_, post)) = cache.get(uri) {
-                    fetched.insert(uri.clone(), post.clone());
-                } else {
-                    missing.push(uri.clone());
+                match cache.get(uri) {
+                    Some((_, LivePostCacheValue::Post(post))) => {
+                        fetched.insert(uri.clone(), post.as_ref().clone());
+                    }
+                    Some((_, LivePostCacheValue::Gone)) => {}
+                    None => missing.push(uri.clone()),
                 }
             }
         }
@@ -872,21 +899,34 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
 
         let client = self;
         let mut fallback_fetches = stream::iter(unanswered.into_iter().map(|uri| async move {
-            let post = client.fetch_live_post_data(&uri).await.ok();
-            (uri, post)
+            let result = client.fetch_live_post_data(&uri).await;
+            (uri, result)
         }))
         .buffer_unordered(16);
-        while let Some((uri, Some(post))) = fallback_fetches.next().await {
-            fetched.insert(uri, post);
+        while let Some((uri, result)) = fallback_fetches.next().await {
+            match result {
+                Ok(Some(post)) => {
+                    fetched.insert(uri, post);
+                }
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    post_uri = %uri,
+                    error = %error,
+                    "author PDS post lookup failed"
+                ),
+            }
         }
         fetched
     }
 
-    async fn fetch_live_post_data(&self, uri: &str) -> Result<FetchedPublicPost, String> {
-        if let Some((expires, post)) = self.live_post_cache.lock().await.get(uri).cloned()
+    async fn fetch_live_post_data(&self, uri: &str) -> Result<Option<FetchedPublicPost>, String> {
+        if let Some((expires, cached)) = self.live_post_cache.lock().await.get(uri).cloned()
             && expires > tokio::time::Instant::now()
         {
-            return Ok(post);
+            return Ok(match cached {
+                LivePostCacheValue::Post(post) => Some(*post),
+                LivePostCacheValue::Gone => None,
+            });
         }
         let (did, collection, rkey) = parse_post_uri(uri)?;
         let document = self
@@ -905,7 +945,17 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
             .append_pair("rkey", &rkey);
         let response = self.http.get(&url, HeaderMap::new(), 1024 * 1024).await?;
         if !response.status().is_success() {
-            return Err("post could not be fetched from its author PDS".to_owned());
+            let status = response.status().as_u16();
+            let body_excerpt = String::from_utf8_lossy(response.body())
+                .chars()
+                .take(240)
+                .collect::<String>();
+            let error = format!("author PDS getRecord returned HTTP {status}: {body_excerpt}");
+            if gone_reason(status, response.body()).is_some() {
+                cache_gone_post(&self.live_post_cache, uri).await;
+                return Err(format!("{error}; the post is definitely gone"));
+            }
+            return Err(error);
         }
         let body: Value = serde_json::from_slice(response.body())
             .map_err(|_| "post PDS response was invalid JSON".to_owned())?;
@@ -935,7 +985,7 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
             author: None,
         };
         cache_live_post(&self.live_post_cache, uri, post.clone()).await;
-        Ok(post)
+        Ok(Some(post))
     }
 
     pub async fn fetch_post(&self, uri: &str) -> Result<IndexedRecord, String> {
@@ -1153,6 +1203,7 @@ mod tests {
         posts: Arc<HashMap<String, serde_json::Value>>,
         fallback_posts: Arc<HashMap<String, serde_json::Value>>,
         appview_status: StatusCode,
+        fallback_status: StatusCode,
         appview_calls: Arc<Mutex<Vec<usize>>>,
         pds_calls: Arc<Mutex<usize>>,
     }
@@ -1196,14 +1247,15 @@ mod tests {
                 "value":post.get("record").cloned().unwrap_or_default()
             }))
             .into_response(),
-            None => (
-                StatusCode::BAD_REQUEST,
+            None if state.fallback_status == StatusCode::BAD_REQUEST => (
+                state.fallback_status,
                 axum::Json(json!({
                     "error":"RecordNotFound",
                     "message":"Could not locate record"
                 })),
             )
                 .into_response(),
+            None => state.fallback_status.into_response(),
         }
     }
 
@@ -1212,10 +1264,26 @@ mod tests {
         fallback_posts: HashMap<String, serde_json::Value>,
         appview_status: StatusCode,
     ) -> (String, BatchServerState, tokio::task::JoinHandle<()>) {
+        batch_server_with_fallback_status(
+            posts,
+            fallback_posts,
+            appview_status,
+            StatusCode::BAD_REQUEST,
+        )
+        .await
+    }
+
+    async fn batch_server_with_fallback_status(
+        posts: HashMap<String, serde_json::Value>,
+        fallback_posts: HashMap<String, serde_json::Value>,
+        appview_status: StatusCode,
+        fallback_status: StatusCode,
+    ) -> (String, BatchServerState, tokio::task::JoinHandle<()>) {
         let state = BatchServerState {
             posts: Arc::new(posts),
             fallback_posts: Arc::new(fallback_posts),
             appview_status,
+            fallback_status,
             appview_calls: Arc::new(Mutex::new(Vec::new())),
             pds_calls: Arc::new(Mutex::new(0)),
         };
@@ -1716,6 +1784,55 @@ mod tests {
             assert_eq!(page.dropped_count, 1);
         }
         assert_eq!(*state.pds_calls.lock().unwrap(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn transient_post_pds_errors_are_logged_and_not_cached() {
+        use crate::ingest::MemoryStorage;
+
+        let uri = "at://did:plc:temporary/app.bsky.feed.post/slow";
+        let (pds, state, server) = batch_server_with_fallback_status(
+            HashMap::new(),
+            HashMap::new(),
+            StatusCode::OK,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .await;
+        let pds_endpoint = pds.trim_end_matches("/xrpc/").to_owned();
+        let identity = fake_batch_identity(["did:plc:temporary".to_owned()], &pds_endpoint);
+        let client = test_client_with_appview(identity, pds);
+        let logs = LogBuffer::default();
+        for _ in 0..2 {
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(logs.clone())
+                .finish();
+            let page = client
+                .hydrate_skeleton(
+                    super::FeedSkeletonPage {
+                        feed: vec![super::FeedSkeletonEntry {
+                            post_uri: uri.to_owned(),
+                            reason: None,
+                        }],
+                        cursor: None,
+                    },
+                    &MemoryStorage::default(),
+                )
+                .with_subscriber(subscriber)
+                .await
+                .unwrap();
+            assert!(page.feed.is_empty());
+            assert_eq!(page.dropped_count, 1);
+        }
+        assert_eq!(*state.pds_calls.lock().unwrap(), 2);
+        assert!(
+            String::from_utf8(logs.0.lock().unwrap().clone())
+                .unwrap()
+                .contains("HTTP 500"),
+            "the warning must preserve the real PDS status"
+        );
         server.abort();
     }
 

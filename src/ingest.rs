@@ -2459,7 +2459,13 @@ impl SqliteStorage {
                  quote_count INTEGER NOT NULL DEFAULT 0
              );
              CREATE TRIGGER IF NOT EXISTS records_post_counts_insert
-             AFTER INSERT ON records BEGIN
+             AFTER INSERT ON records
+             WHEN (NEW.collection IN ('app.bsky.feed.like','app.bsky.feed.repost')
+                       AND instr(NEW.record_json, char(34) || 'subject' || char(34)) > 0)
+                  OR (NEW.collection='app.bsky.feed.post'
+                       AND (instr(NEW.record_json, char(34) || 'reply' || char(34)) > 0
+                            OR instr(NEW.record_json, char(34) || 'embed' || char(34)) > 0))
+             BEGIN
                  UPDATE post_counts SET
                      like_count = like_count + CASE WHEN NEW.collection='app.bsky.feed.like'
                          AND uri=json_extract(NEW.record_json, '$.subject.uri') THEN 1 ELSE 0 END,
@@ -2479,7 +2485,13 @@ impl SqliteStorage {
                  );
              END;
              CREATE TRIGGER IF NOT EXISTS records_post_counts_delete
-             AFTER DELETE ON records BEGIN
+             AFTER DELETE ON records
+             WHEN (OLD.collection IN ('app.bsky.feed.like','app.bsky.feed.repost')
+                       AND instr(OLD.record_json, char(34) || 'subject' || char(34)) > 0)
+                  OR (OLD.collection='app.bsky.feed.post'
+                       AND (instr(OLD.record_json, char(34) || 'reply' || char(34)) > 0
+                            OR instr(OLD.record_json, char(34) || 'embed' || char(34)) > 0))
+             BEGIN
                  UPDATE post_counts SET
                      like_count = like_count - CASE WHEN OLD.collection='app.bsky.feed.like'
                          AND uri=json_extract(OLD.record_json, '$.subject.uri') THEN 1 ELSE 0 END,
@@ -2499,7 +2511,18 @@ impl SqliteStorage {
                  );
              END;
              CREATE TRIGGER IF NOT EXISTS records_post_counts_update
-             AFTER UPDATE ON records BEGIN
+             AFTER UPDATE ON records
+             WHEN (NEW.collection IN ('app.bsky.feed.like','app.bsky.feed.repost')
+                       AND instr(NEW.record_json, char(34) || 'subject' || char(34)) > 0)
+                  OR (NEW.collection='app.bsky.feed.post'
+                       AND (instr(NEW.record_json, char(34) || 'reply' || char(34)) > 0
+                            OR instr(NEW.record_json, char(34) || 'embed' || char(34)) > 0))
+                  OR (OLD.collection IN ('app.bsky.feed.like','app.bsky.feed.repost')
+                       AND instr(OLD.record_json, char(34) || 'subject' || char(34)) > 0)
+                  OR (OLD.collection='app.bsky.feed.post'
+                       AND (instr(OLD.record_json, char(34) || 'reply' || char(34)) > 0
+                            OR instr(OLD.record_json, char(34) || 'embed' || char(34)) > 0))
+             BEGIN
                  UPDATE post_counts SET
                      like_count = like_count
                          + CASE WHEN NEW.collection='app.bsky.feed.like'
