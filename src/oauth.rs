@@ -14060,6 +14060,352 @@ mod tests {
         );
     }
 
+    #[derive(Clone)]
+    struct TimingConsoleTestFlow {
+        client: SafeHttpClient,
+        base: String,
+    }
+
+    impl OAuthFlow for TimingConsoleTestFlow {
+        fn authorize<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async { Err("test flow does not authorize".to_owned()) })
+        }
+
+        fn callback<'a>(
+            &'a self,
+            _: OAuthCallback,
+        ) -> Pin<Box<dyn Future<Output = Result<OAuthAccount, String>> + Send + 'a>> {
+            Box::pin(async { Err("test flow does not callback".to_owned()) })
+        }
+
+        fn logout<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn muted_actor_dids<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<HashSet<String>, String>> + Send + 'a>> {
+            let client = self.client.clone();
+            let base = self.base.clone();
+            Box::pin(async move {
+                client
+                    .get(
+                        &url::Url::parse(&format!(
+                            "{base}/xrpc/com.atproto.repo.getRecord?token=SECRET"
+                        ))
+                        .unwrap(),
+                        HeaderMap::new(),
+                        4096,
+                    )
+                    .await?;
+                client
+                    .get(
+                        &url::Url::parse(&format!("{base}/xrpc/app.bsky.actor.getProfile")).unwrap(),
+                        HeaderMap::new(),
+                        4096,
+                    )
+                    .await?;
+                Ok(HashSet::new())
+            })
+        }
+    }
+
+    fn read_only_session_permissions() -> SessionPermissions {
+        SessionPermissions {
+            write: false,
+            feed: true,
+            blob: false,
+            video: false,
+            follow: false,
+            block: false,
+            mute: true,
+            list: true,
+        }
+    }
+
+    async fn collect_body(response: axum::response::Response) -> Vec<u8> {
+        http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn the_timing_console_shows_a_page_record_with_phases_and_call_details_to_its_viewer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = Router::new().route(
+            "/{*path}",
+            get(|| async {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                Json(json!({"ok": true}))
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let storage = Arc::new(MemoryStorage::default());
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let viewer = "did:plc:timing-console-viewer";
+        let generation = storage
+            .rotate_web_session(viewer, "timing-console-session")
+            .unwrap();
+        let token = public.issue_session_cookie(
+            viewer,
+            "timing-console-session",
+            generation,
+            read_only_session_permissions(),
+        );
+        let app = public.router_with_flow(
+            TimingConsoleTestFlow {
+                client: SafeHttpClient::new().with_http_test_hosts(["127.0.0.1".to_owned()]),
+                base: format!("http://{address}"),
+            },
+            storage,
+        );
+
+        let logs = FeedTestLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(logs.clone())
+            .finish();
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/app")
+                    .header("cookie", format!("{SESSION_COOKIE}={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let header_id = response.headers()["x-timing-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(header_id.len(), 16, "16 unguessable hex chars: {header_id}");
+        let html = String::from_utf8(collect_body(response).await).unwrap();
+        assert!(
+            html.contains(&format!("<body data-timing-id=\"{header_id}\">")),
+            "the page body must carry the same id as the response header"
+        );
+
+        let phase_line = String::from_utf8(logs.0.lock().unwrap().clone())
+            .unwrap()
+            .lines()
+            .find(|line| line.contains("web page phases"))
+            .expect("the page still logs its phases")
+            .to_owned();
+        for field in [
+            "page=",
+            "session_token_refresh_ms=",
+            "saved_feeds_ms=",
+            "preferences_ms=",
+            "tabs_ms=",
+            "timeline_fetch_index_ms=",
+            "timeline_fetch_live_ms=",
+            "feed_timeline_ms=",
+            "mutes_ms=",
+            "list_blocks_ms=",
+            "list_blocked_posts=",
+            "parent_hydration_ms=",
+            "content_hydration_ms=",
+            "profile_hydration_ms=",
+            "quote_hydration_ms=",
+            "account_labels_ms=",
+            "profile_counts_ms=",
+            "relationship_ms=",
+            "relationship_requests=",
+            "relationship_rows_written=",
+            "relationship_answer=",
+            "profile_action_panel_ms=",
+            "profile_action_mutes_ms=",
+            "profile_list_choices_ms=",
+            "render_ms=",
+            "ancestors_from_index=",
+            "ancestors_live=",
+            "ancestors_timed_out=",
+            "outbound_call_count=",
+            "outbound_call_ms=",
+            "outbound_calls=",
+            "dpop_nonce_retries=",
+            "phase_sum_ms=",
+            "phase_gap_ms=",
+            "total_ms=",
+        ] {
+            assert!(phase_line.contains(field), "{field} must stay in {phase_line}");
+        }
+
+        let response = app
+            .oneshot(
+                axum::http::Request::get("/timing/recent")
+                    .header("cookie", format!("{SESSION_COOKIE}={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let body = collect_body(response).await;
+        let body_text = String::from_utf8(body.clone()).unwrap();
+        assert!(!body_text.contains("SECRET"), "query strings never leak: {body_text}");
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        let records = payload["records"].as_array().expect("a records array");
+        assert_eq!(records.len(), 1, "one record: {body_text}");
+        let record = &records[0];
+        assert_eq!(record["id"], json!(header_id));
+        assert_eq!(record["viewer"], json!(viewer));
+        assert_eq!(record["method"], json!("GET"));
+        assert_eq!(record["path"], json!("/app"));
+        assert_eq!(record["status"], json!(200));
+        assert_eq!(record["page"], json!("app"));
+        let mutes_ms = record["phases"]["mutes_ms"].as_u64().expect("mutes_ms phase");
+        assert!(mutes_ms >= 20, "the two fake calls ran inside mutes_ms: {record}");
+        let calls = record["calls"].as_array().expect("call details");
+        assert_eq!(calls.len(), 2, "{record}");
+        assert_eq!(calls[0]["kind"], json!("pds_get_record"));
+        assert_eq!(calls[0]["method"], json!("GET"));
+        assert_eq!(calls[0]["host"], json!("127.0.0.1"));
+        assert_eq!(calls[0]["path"], json!("/xrpc/com.atproto.repo.getRecord"));
+        assert_eq!(calls[0]["status"], json!(200));
+        assert!(calls[0]["error"].is_null());
+        assert!(calls[0]["duration_ms"].as_u64().unwrap_or_default() >= 15, "{record}");
+        assert!(calls[0]["start_ms"].as_u64().unwrap_or_default() < mutes_ms, "{record}");
+        assert_eq!(calls[1]["kind"], json!("public_appview"));
+        assert_eq!(calls[1]["path"], json!("/xrpc/app.bsky.actor.getProfile"));
+        assert!(
+            calls[1]["start_ms"].as_u64().unwrap_or_default()
+                >= calls[0]["duration_ms"].as_u64().unwrap_or_default().saturating_sub(10),
+            "the second call started after the first had run: {record}"
+        );
+        assert_eq!(record["calls_overflow"], json!(0));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn the_timing_console_history_is_per_viewer_keeps_30_newest_and_counts_evictions() {
+        let storage = Arc::new(MemoryStorage::default());
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let viewer_a = "did:plc:timing-console-a";
+        let viewer_b = "did:plc:timing-console-b";
+        let token_a = public.issue_session_cookie(
+            viewer_a,
+            "timing-console-a-session",
+            storage.rotate_web_session(viewer_a, "timing-console-a-session").unwrap(),
+            read_only_session_permissions(),
+        );
+        let token_b = public.issue_session_cookie(
+            viewer_b,
+            "timing-console-b-session",
+            storage.rotate_web_session(viewer_b, "timing-console-b-session").unwrap(),
+            read_only_session_permissions(),
+        );
+        let console = Arc::new(TimingConsole::with_report_interval(Duration::ZERO));
+        let app = public.router_with_flow_and_timing_console(DisabledOAuthFlow, storage, console);
+        let get = |uri: &'static str, cookie: Option<String>| {
+            let app = app.clone();
+            async move {
+                let mut builder = axum::http::Request::get(uri);
+                if let Some(cookie) = cookie {
+                    builder = builder.header("cookie", cookie);
+                }
+                app.oneshot(builder.body(Body::empty()).unwrap()).await.unwrap()
+            }
+        };
+
+        assert_eq!(
+            get("/timing/recent", None).await.status(),
+            StatusCode::UNAUTHORIZED,
+            "a stranger may not read any history"
+        );
+
+        let logs = FeedTestLogs::default();
+        let metrics_subscriber = || {
+            tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(logs.clone())
+                .finish()
+        };
+        let mut ids_a = Vec::new();
+        for _ in 0..2 {
+            let response = get("/login", Some(format!("{SESSION_COOKIE}={token_a}")))
+                .with_subscriber(metrics_subscriber())
+                .await;
+            ids_a.push(response.headers()["x-timing-id"].to_str().unwrap().to_owned());
+        }
+        let response = get("/login", Some(format!("{SESSION_COOKIE}={token_b}"))).await;
+        let id_b = response.headers()["x-timing-id"].to_str().unwrap().to_owned();
+        assert!(get("/login", None).await.status().is_success());
+
+        let response = get("/timing/recent", Some(format!("{SESSION_COOKIE}={token_a}"))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: Value =
+            serde_json::from_slice(&collect_body(response).await).unwrap();
+        let records = payload["records"].as_array().unwrap();
+        assert_eq!(records.len(), 2, "viewer A sees exactly their own records");
+        assert!(records.iter().all(|record| record["viewer"] == json!(viewer_a)));
+        assert_eq!(records[0]["id"], json!(ids_a[1]), "newest first");
+        assert_eq!(records[1]["id"], json!(ids_a[0]));
+        assert!(!records.iter().any(|record| record["id"] == json!(id_b)), "B stays hidden");
+
+        let response = get("/timing/recent", Some(format!("{SESSION_COOKIE}={token_b}"))).await;
+        let payload: Value =
+            serde_json::from_slice(&collect_body(response).await).unwrap();
+        let records = payload["records"].as_array().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["id"], json!(id_b), "B sees only their own record");
+
+        for _ in 0..35 {
+            let response = get("/login", Some(format!("{SESSION_COOKIE}={token_a}"))).await;
+            ids_a.push(response.headers()["x-timing-id"].to_str().unwrap().to_owned());
+        }
+        let response = get("/timing/recent", Some(format!("{SESSION_COOKIE}={token_a}"))).await;
+        let payload: Value =
+            serde_json::from_slice(&collect_body(response).await).unwrap();
+        let records = payload["records"].as_array().unwrap();
+        assert_eq!(records.len(), 30, "at most 30 records are returned");
+        assert_eq!(records[0]["id"], json!(ids_a[36]));
+        assert_eq!(records[29]["id"], json!(ids_a[7]), "the 30 newest, oldest last");
+
+        for _ in 0..200 {
+            get("/login", None).await;
+        }
+        let response = get("/timing/recent", Some(format!("{SESSION_COOKIE}={token_a}"))).await;
+        let payload: Value =
+            serde_json::from_slice(&collect_body(response).await).unwrap();
+        assert!(
+            payload["records"].as_array().unwrap().is_empty(),
+            "A's records are evicted once 200 newer ones exist, and anonymous records are never returned"
+        );
+        assert_eq!(console.held_count(), 200, "the ring keeps the newest 200 records");
+        assert_eq!(console.evicted_count(), 39, "2+1+1+2+35+200 stored minus 200 held");
+
+        let metrics = String::from_utf8(logs.0.lock().unwrap().clone())
+            .unwrap()
+            .lines()
+            .find(|line| line.contains("timing console metrics"))
+            .expect("a timing console metrics line is logged")
+            .to_owned();
+        assert!(metrics.contains("timing_records_stored="), "{metrics}");
+        assert!(metrics.contains("timing_records_evicted="), "{metrics}");
+    }
+
     #[test]
     fn external_post_record_has_the_atproto_shape_with_optional_thumbnail() {
         let external = PostExternal {
