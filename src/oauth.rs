@@ -5573,7 +5573,7 @@ fn render_feed_tabs(
         ""
     };
     let mut tabs = format!(
-        "<nav class=\"feed-tabs\" aria-label=\"Feed tabs\"><a class=\"feed-tab{}\" href=\"/app\"{following_current}>Following</a>",
+        "<nav class=\"feed-tabs\" aria-label=\"Feed tabs\"><a class=\"feed-tab{}\" href=\"/app?tab=following\"{following_current}>Following</a>",
         if following_active { " is-active" } else { "" }
     );
     for feed in feeds {
@@ -7647,6 +7647,33 @@ where
     page_timing.preferences_ms = tabs.preferences_ms;
     page_timing.tabs_ms = tabs.tabs_ms;
     let pinned_feeds = tabs.feeds;
+    if query.is_empty() {
+        match state.storage.last_active_feed_tab(&did) {
+            Ok(Some(tab)) if tab != "following" => {
+                if let Some(feed) = pinned_feeds.iter().find(|feed| feed.uri == tab) {
+                    return Redirect::to(&feed_link_href(feed)).into_response();
+                }
+                if let Err(error) = state.storage.set_last_active_feed_tab(&did, "following") {
+                    tracing::error!(%error, viewer_did = %did, "could not reset an unavailable remembered feed tab");
+                    return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if let Err(error) = state.storage.set_last_active_feed_tab(&did, "following") {
+                    tracing::error!(%error, viewer_did = %did, "could not remember the Following feed tab");
+                    return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, viewer_did = %did, "could not load the remembered feed tab");
+                return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+            }
+        }
+    } else if let Err(error) = state.storage.set_last_active_feed_tab(&did, "following") {
+        tracing::error!(%error, viewer_did = %did, "could not remember the Following feed tab");
+        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+    }
     let limit = query
         .get("limit")
         .and_then(|value| value.parse::<usize>().ok())
@@ -8407,6 +8434,10 @@ where
     let Some(uri) = query.get("uri").filter(|uri| !uri.is_empty()) else {
         return oauth_error(StatusCode::BAD_REQUEST, "feed uri is required");
     };
+    if let Err(error) = state.storage.set_last_active_feed_tab(&did, uri) {
+        tracing::error!(%error, viewer_did = %did, feed_uri = %uri, "could not remember the active feed tab");
+        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+    }
     let page_key = (
         did.clone(),
         uri.to_owned(),

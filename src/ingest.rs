@@ -433,6 +433,8 @@ pub trait Storage: Send + Sync {
     ) -> Result<(), StorageError>;
     fn recent_profiles_for_viewer(&self, viewer_did: &str) -> Result<Vec<String>, StorageError>;
     fn clear_recent_profiles_for_viewer(&self, viewer_did: &str) -> Result<(), StorageError>;
+    fn set_last_active_feed_tab(&self, viewer_did: &str, tab: &str) -> Result<(), StorageError>;
+    fn last_active_feed_tab(&self, viewer_did: &str) -> Result<Option<String>, StorageError>;
     fn profile_index_snapshot(&self) -> Result<HashMap<String, ProfileIndexEntry>, StorageError>;
     fn set_profile_index_entry(
         &self,
@@ -664,6 +666,7 @@ struct MemoryState {
     handle_refresh_order: VecDeque<String>,
     profile_index: HashMap<String, ProfileIndexEntry>,
     recent_profiles: HashMap<String, Vec<String>>,
+    last_active_feed_tabs: HashMap<String, String>,
     profile_fetch_queue: VecDeque<String>,
     notification_last_seen: HashMap<String, u64>,
 }
@@ -1156,6 +1159,25 @@ impl Storage for MemoryStorage {
             .recent_profiles
             .remove(viewer_did);
         Ok(())
+    }
+
+    fn set_last_active_feed_tab(&self, viewer_did: &str, tab: &str) -> Result<(), StorageError> {
+        self.inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .last_active_feed_tabs
+            .insert(viewer_did.to_owned(), tab.to_owned());
+        Ok(())
+    }
+
+    fn last_active_feed_tab(&self, viewer_did: &str) -> Result<Option<String>, StorageError> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .last_active_feed_tabs
+            .get(viewer_did)
+            .cloned())
     }
 
     fn profile_index_snapshot(&self) -> Result<HashMap<String, ProfileIndexEntry>, StorageError> {
@@ -4632,6 +4654,31 @@ impl Storage for SqliteStorage {
         })
     }
 
+    fn set_last_active_feed_tab(&self, viewer_did: &str, tab: &str) -> Result<(), StorageError> {
+        let key = format!("last-active-feed-tab:{viewer_did}");
+        let tab = tab.to_owned();
+        self.writer.call(move |connection| {
+            connection.execute(
+                "INSERT INTO appview_state(key,value) VALUES(?1,?2)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![key, tab],
+            )?;
+            Ok(())
+        })
+    }
+
+    fn last_active_feed_tab(&self, viewer_did: &str) -> Result<Option<String>, StorageError> {
+        let key = format!("last-active-feed-tab:{viewer_did}");
+        Ok(self
+            .read_conn()?
+            .query_row(
+                "SELECT value FROM appview_state WHERE key=?1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     fn bytes_on_disk(&self) -> u64 {
         let bytes = fs::metadata(&self.path).map(|meta| meta.len()).unwrap_or(0);
         let wal_path = PathBuf::from(format!("{}-wal", self.path.display()));
@@ -5983,6 +6030,62 @@ mod recent_profile_storage_tests {
                     .recent_profiles_for_viewer("did:plc:viewer")
                     .unwrap(),
                 ["did:plc:profile"]
+            );
+        }
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{}-wal", path.display()));
+        let _ = fs::remove_file(format!("{}-shm", path.display()));
+    }
+}
+
+#[cfg(test)]
+mod remembered_feed_tab_storage_tests {
+    use super::*;
+
+    #[test]
+    fn remembered_feed_tab_is_viewer_scoped_and_persistent() {
+        let memory = MemoryStorage::default();
+        memory
+            .set_last_active_feed_tab("did:plc:one", "following")
+            .unwrap();
+        memory
+            .set_last_active_feed_tab("did:plc:two", "at://did:plc:feed/app.bsky.feed.generator/x")
+            .unwrap();
+        assert_eq!(
+            memory.last_active_feed_tab("did:plc:one").unwrap(),
+            Some("following".to_owned())
+        );
+        assert_eq!(
+            memory.last_active_feed_tab("did:plc:two").unwrap(),
+            Some("at://did:plc:feed/app.bsky.feed.generator/x".to_owned())
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "appview-remembered-feed-{}-{}.sqlite3",
+            std::process::id(),
+            epoch_millis()
+        ));
+        {
+            let sqlite = SqliteStorage::open(&path).unwrap();
+            sqlite
+                .set_last_active_feed_tab(
+                    "did:plc:one",
+                    "at://did:plc:feed/app.bsky.feed.generator/x",
+                )
+                .unwrap();
+        }
+        {
+            let sqlite = SqliteStorage::open(&path).unwrap();
+            assert_eq!(
+                sqlite.last_active_feed_tab("did:plc:one").unwrap(),
+                Some("at://did:plc:feed/app.bsky.feed.generator/x".to_owned())
+            );
+            sqlite
+                .set_last_active_feed_tab("did:plc:one", "following")
+                .unwrap();
+            assert_eq!(
+                sqlite.last_active_feed_tab("did:plc:one").unwrap(),
+                Some("following".to_owned())
             );
         }
         let _ = fs::remove_file(&path);
