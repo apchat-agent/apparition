@@ -209,6 +209,15 @@ impl SearchClient {
                 .chars()
                 .take(MAX_LOG_BODY_EXCERPT_CHARS)
                 .collect();
+            // Owner's logging rule: name the real failure — status, URL (no secrets) and a
+            // capped body excerpt — never a bare "request failed".
+            tracing::warn!(
+                method,
+                status,
+                url = %url,
+                body = %excerpt,
+                "search request failed"
+            );
             return Err(SearchCallError {
                 status: Some(status),
                 detail: excerpt,
