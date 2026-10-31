@@ -30,7 +30,7 @@ use tower::ServiceExt;
 use tracing::{Event, Subscriber, field::Visit};
 use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
-const EXPECTED_OAUTH_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.graph.getMutes?aud=* rpc:app.bsky.actor.putPreferences?aud=*";
+const EXPECTED_OAUTH_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.graph.getMutes?aud=* rpc:app.bsky.actor.putPreferences?aud=did:web:api.bsky.app%23bsky_appview";
 
 #[derive(Clone)]
 struct ProfileHydrationTiming(Arc<Mutex<Option<u64>>>);
@@ -7642,7 +7642,10 @@ async fn own_profile_links_to_the_block_list_settings_and_other_profiles_do_not(
 const GONE_FEED_URI: &str = "at://did:plc:dead/app.bsky.feed.generator/gone-feed";
 
 fn scope_without_preferences() -> String {
-    let scope = EXPECTED_OAUTH_SCOPE.replace(" rpc:app.bsky.actor.putPreferences?aud=*", "");
+    let scope = EXPECTED_OAUTH_SCOPE.replace(
+        " rpc:app.bsky.actor.putPreferences?aud=did:web:api.bsky.app%23bsky_appview",
+        "",
+    );
     assert_ne!(scope, EXPECTED_OAUTH_SCOPE);
     scope
 }

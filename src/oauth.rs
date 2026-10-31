@@ -135,7 +135,7 @@ const OAUTH_METADATA_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const OAUTH_METADATA_RESOLVER_CACHE_TTL: Duration = Duration::from_secs(1);
 const VIDEO_SERVICE_DID: &str = "did:web:video.bsky.app";
 const VIDEO_SERVICE_URL: &str = "https://video.bsky.app";
-const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.graph.getMutes?aud=* rpc:app.bsky.actor.putPreferences?aud=*";
+const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.graph.getMutes?aud=* rpc:app.bsky.actor.putPreferences?aud=did:web:api.bsky.app%23bsky_appview";
 const BLOB_SCOPE: &str = "blob:image/*";
 const VIDEO_BLOB_SCOPE: &str = "blob:video/*";
 const VIDEO_SCOPES: [&str; 3] = [
@@ -152,7 +152,10 @@ const MUTE_SCOPES: [&str; 3] = [
     "rpc:app.bsky.graph.getMutes?aud=*",
 ];
 /// Removing a dead saved feed rewrites the viewer's preferences (owner, 2026-10-31).
-const PREFERENCES_SCOPES: [&str; 1] = ["rpc:app.bsky.actor.putPreferences?aud=*"];
+/// The audience must be named exactly: bsky.social grants `aud=*` for putPreferences but its PDS
+/// then rejects the call with ScopeMissingError naming this audience (measured 2026-10-31).
+const PREFERENCES_SCOPES: [&str; 1] =
+    ["rpc:app.bsky.actor.putPreferences?aud=did:web:api.bsky.app%23bsky_appview"];
 const WRITE_SCOPES: [&str; 3] = [
     "repo:app.bsky.feed.post?action=create",
     "repo:app.bsky.feed.like?action=create&action=delete",
@@ -12727,6 +12730,23 @@ fn feed_avatar_markup(feed: &ResolvedFeed, width: u16, height: u16) -> String {
 }
 
 #[cfg(test)]
+mod preferences_scope_tests {
+    use super::has_all_preferences_scopes;
+
+    #[test]
+    fn preferences_scope_matches_either_fragment_spelling_but_not_the_wildcard() {
+        let encoded =
+            "atproto rpc:app.bsky.actor.putPreferences?aud=did:web:api.bsky.app%23bsky_appview";
+        let decoded =
+            "atproto rpc:app.bsky.actor.putPreferences?aud=did:web:api.bsky.app#bsky_appview";
+        let wildcard = "atproto rpc:app.bsky.actor.putPreferences?aud=*";
+        assert!(has_all_preferences_scopes(Some(encoded)));
+        assert!(has_all_preferences_scopes(Some(decoded)));
+        assert!(!has_all_preferences_scopes(Some(wildcard)));
+    }
+}
+
+#[cfg(test)]
 mod feed_html_tests {
     use super::{render_feed_card, render_feed_heading};
     use crate::feeds::ResolvedFeed;
@@ -14070,8 +14090,15 @@ fn has_all_scopes(scope: Option<&str>, required: &[&str]) -> bool {
     let Some(scope) = scope else {
         return false;
     };
-    let granted = scope.split_whitespace().collect::<HashSet<_>>();
-    required.iter().all(|required| granted.contains(required))
+    // An authorization server may echo an audience fragment as `#` or as `%23`; treat them alike.
+    let normalize = |s: &str| s.replace("%23", "#");
+    let granted = scope
+        .split_whitespace()
+        .map(normalize)
+        .collect::<HashSet<_>>();
+    required
+        .iter()
+        .all(|required| granted.contains(&normalize(required)))
 }
 
 fn has_all_follow_scopes(scope: Option<&str>) -> bool {
