@@ -313,3 +313,53 @@ fn cached_counts_track_record_writes_and_lazy_reads_match_the_count_queries() {
     drop(storage);
     remove_database(&path);
 }
+
+#[test]
+fn moving_an_interaction_into_a_warm_post_updates_both_cached_rows() {
+    let path = database_path("move-into-warm");
+    remove_database(&path);
+    let storage = SqliteStorage::open(&path).unwrap();
+    let from = post_uri(200);
+    let to = post_uri(201);
+    for (index, uri) in [from.as_str(), to.as_str()].into_iter().enumerate() {
+        storage
+            .put_record(&IndexedRecord {
+                did: format!("did:plc:move-post-{index}"),
+                collection: "app.bsky.feed.post".to_owned(),
+                rkey: "post".to_owned(),
+                uri: uri.to_owned(),
+                cid: Some(format!("cid-move-{index}")),
+                time_us: now_us(),
+                record: json!({"text":"root"}),
+            })
+            .unwrap();
+        // Both rows exist before the moves, so only the UPDATE trigger can keep them right.
+        storage.post_interaction_summary(uri, None).unwrap();
+    }
+    let mut like = record("did:plc:mover", "app.bsky.feed.like", "like", &from);
+    let mut repost = record("did:plc:mover", "app.bsky.feed.repost", "repost", &from);
+    let mut reply = record("did:plc:mover", "app.bsky.feed.post", "reply", &from);
+    let mut quote = record("did:plc:mover", "app.bsky.feed.post", "quote", &from);
+    for interaction in [&like, &repost, &reply, &quote] {
+        storage.put_record(interaction).unwrap();
+    }
+    like.record = json!({"subject":{"uri":to}});
+    repost.record = json!({"subject":{"uri":to}});
+    reply.record = json!({"text":"r","reply":{"root":{"uri":to},"parent":{"uri":to}}});
+    quote.record =
+        json!({"text":"q","embed":{"$type":"app.bsky.embed.record","record":{"uri":to}}});
+    for interaction in [&like, &repost, &reply, &quote] {
+        storage.put_record(interaction).unwrap();
+    }
+
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(cached_counts(&connection, &from), (0, 0, 0, 0));
+    assert_eq!(cached_counts(&connection, &to), (1, 1, 1, 1));
+    assert_eq!(
+        cached_counts(&connection, &to),
+        sql_counts(&connection, &to)
+    );
+    drop(connection);
+    drop(storage);
+    remove_database(&path);
+}
