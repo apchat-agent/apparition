@@ -802,6 +802,80 @@ async fn the_page_cursor_is_forwarded_to_the_signed_search() {
 }
 
 #[tokio::test]
+async fn a_signed_search_failure_warns_with_the_real_error_and_falls_back_to_anonymous() {
+    // Owner's logging rule: the fallback must name the real underlying error, never a bare
+    // "signed search failed".
+    #[derive(Clone)]
+    struct SignedFailingFlow;
+    impl OAuthFlow for SignedFailingFlow {
+        fn authorize<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: Vec<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async { Ok("https://auth.example/authorize".to_owned()) })
+        }
+        fn callback<'a>(
+            &'a self,
+            _: OAuthCallback,
+        ) -> Pin<Box<dyn Future<Output = Result<OAuthAccount, String>> + Send + 'a>> {
+            Box::pin(async {
+                Ok(OAuthAccount {
+                    did: ALICE.to_owned(),
+                    verified_handle: Some("alice.test".to_owned()),
+                    granted_scope: Some(WRITE_SCOPE.to_owned()),
+                })
+            })
+        }
+        fn logout<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn signed_search_posts<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: Option<&'a str>,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<Value>, String>> + Send + 'a>> {
+            Box::pin(async {
+                Err(
+                    "Bluesky searchPosts request failed: InvalidResponseHttp(403, \"Request forbidden by administrative rules\")"
+                        .to_owned(),
+                )
+            })
+        }
+    }
+    let (base, fake, server) = start_fake_search(search_posts_body(None)).await;
+    let router = router_with_any_search(SignedFailingFlow, search_client(&base));
+    let cookie = login(&router).await;
+    let warnings = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(WarningCapture(warnings.clone()));
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let html = get_html(&router, "/search?q=minc", &cookie).await;
+    drop(_guard);
+    assert_eq!(
+        fake.calls.load(Ordering::SeqCst),
+        1,
+        "a failed signed search must spend exactly one anonymous call"
+    );
+    assert!(
+        html.contains("mincy post"),
+        "the anonymous posts must still render: {html}"
+    );
+    let warnings = warnings.lock().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("Request forbidden by administrative rules")),
+        "the warning must name the real underlying error: {warnings:?}"
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn a_blank_query_shows_the_form_and_makes_no_outbound_call() {
     let (base, fake, server) = start_fake_search(search_posts_body(None)).await;
     let router = router_with_search(AcceptingFlow, search_client(&base));
