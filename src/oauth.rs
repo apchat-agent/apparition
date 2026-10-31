@@ -51,7 +51,7 @@ use axum::{
     body::{Body, Bytes},
     extract::{
         DefaultBodyLimit, Form, FromRequest, Multipart, OriginalUri, Path as AxumPath, Query,
-        Request, State,
+        RawQuery, Request, State,
     },
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     middleware::{Next, from_fn, from_fn_with_state},
@@ -173,6 +173,16 @@ const READ_ONLY_SCOPES: [&str; 3] = [
     "rpc:app.bsky.actor.getPreferences?aud=*",
     "rpc:app.bsky.feed.getFeedSkeleton?aud=*",
     "rpc:app.bsky.graph.getMutes?aud=*",
+];
+/// The sign-in checkboxes (owner, msgd 2026-10-31: "multiple checkboxes describing activities
+/// that a user would like to do ... with 'like' being checked by default"). Each value is the
+/// `allow` parameter the box sends; reading always works and needs no box.
+const ALLOW_BOXES: [(&str, &str); 5] = [
+    ("like", "Like posts"),
+    ("repost", "Repost"),
+    ("post", "Write posts and replies (with pictures and video)"),
+    ("social", "Follow, block, mute and manage lists"),
+    ("feeds", "Edit your saved feeds"),
 ];
 const MAX_VIDEO_BYTES: u64 = 300_000_000;
 const MAX_VIDEO_DURATION_SECONDS: f64 = 600.0;
@@ -6665,29 +6675,48 @@ fn remember_handle_cookie(handle: &str, secure: bool) -> Option<String> {
     })
 }
 
-async fn login(headers: HeaderMap, Query(query): Query<HashMap<String, String>>) -> Html<String> {
+async fn login(headers: HeaderMap, RawQuery(raw_query): RawQuery) -> Html<String> {
     let value = cookie_value_named(&headers, HANDLE_COOKIE)
         .filter(|handle| handle_shaped(handle))
         .map(|handle| format!(" value=\"{}\"", html_escape(handle)))
         .unwrap_or_default();
-    let notice = if query
-        .get("session_expired")
-        .is_some_and(|value| value == "1")
+    let mut session_expired = false;
+    let mut requested_boxes: Vec<String> = Vec::new();
+    for (key, value) in
+        url::form_urlencoded::parse(raw_query.as_deref().unwrap_or_default().as_bytes())
     {
+        match &*key {
+            "session_expired" => session_expired |= &*value == "1",
+            "allow" => requested_boxes.push(value.into_owned()),
+            _ => {}
+        }
+    }
+    let notice = if session_expired {
         "<p class=\"intro notice\" role=\"alert\">Your Bluesky sign-in expired; please sign in again.</p>"
     } else {
         ""
     };
-    // Read-only by default (owner, 2026-10-31); ?write=1 re-signs the user in with changes allowed.
-    let write_checked = if query.get("write").is_some_and(|value| value == "1") {
-        " checked"
-    } else {
-        ""
-    };
+    // Per-activity boxes (owner, msgd 2026-10-31): with no `allow` parameter only "like" is
+    // ticked; repeated ?allow=<box> parameters pre-tick exactly those boxes, so a re-sign-in
+    // link names the boxes to keep ticked and nothing else sneaks in.
+    let boxes = ALLOW_BOXES
+        .iter()
+        .map(|(value, label)| {
+            let ticked = if requested_boxes.is_empty() {
+                *value == "like"
+            } else {
+                requested_boxes.iter().any(|requested| requested == value)
+            };
+            let checked = if ticked { " checked" } else { "" };
+            format!(
+                "<label class=\"login-allow-option\" for=\"allow-{value}\"><input type=\"checkbox\" id=\"allow-{value}\" name=\"allow\" value=\"{value}\"{checked}> {label}</label>"
+            )
+        })
+        .collect::<String>();
     Html(page_shell(
         "Sign in",
         &format!(
-            "<section class=\"login-card\"><p class=\"eyebrow\">Your network, your view</p><h1>Sign in to AppView</h1>{notice}<p class=\"intro\">Use your AT Protocol handle or DID to continue securely with your account provider.</p><form action=\"/oauth/authorize\" method=\"post\" class=\"login-form\"><label for=\"handle\">AT Protocol handle or DID</label><input id=\"handle\" name=\"handle\" autocomplete=\"username\" autocapitalize=\"none\" placeholder=\"you.bsky.social\"{value} required><label class=\"login-write-option\" for=\"write\"><input type=\"checkbox\" id=\"write\" name=\"write\" value=\"1\"{write_checked}> Allow changes (post, like, follow, edit feeds)</label><button type=\"submit\">Continue</button></form></section>"
+            "<section class=\"login-card\"><p class=\"eyebrow\">Your network, your view</p><h1>Sign in to AppView</h1>{notice}<p class=\"intro\">Use your AT Protocol handle or DID to continue securely with your account provider.</p><form action=\"/oauth/authorize\" method=\"post\" class=\"login-form\"><label for=\"handle\">AT Protocol handle or DID</label><input id=\"handle\" name=\"handle\" autocomplete=\"username\" autocapitalize=\"none\" placeholder=\"you.bsky.social\"{value} required><fieldset class=\"login-allow-options\"><legend>What do you want to do here?</legend>{boxes}<p class=\"login-allow-note\">Reading always works. Tick only the activities you want this appview to do for you.</p></fieldset><button type=\"submit\">Continue</button></form></section>"
         ),
         false,
     ))
@@ -19102,7 +19131,7 @@ mod tests {
             header::COOKIE,
             "appview_handle=owner.example.test".parse().unwrap(),
         );
-        let Html(body) = login(headers, Query(HashMap::new())).await;
+        let Html(body) = login(headers, RawQuery(None)).await;
         assert!(body.contains("value=\"owner.example.test\""), "{body}");
 
         let mut headers = HeaderMap::new();
@@ -19110,7 +19139,7 @@ mod tests {
             header::COOKIE,
             "appview_handle=x\"onfocus=alert(1)".parse().unwrap(),
         );
-        let Html(body) = login(headers, Query(HashMap::new())).await;
+        let Html(body) = login(headers, RawQuery(None)).await;
         assert!(!body.contains("onfocus"), "{body}");
     }
 
