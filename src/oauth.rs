@@ -16265,6 +16265,73 @@ mod tests {
     }
 
     #[test]
+    fn pre_split_write_cookie_grants_every_activity_right() {
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        // A cookie minted before the per-activity split carries nine permission values; its single
+        // write flag stood for the whole old scope set, so it must stand for like/repost/post too.
+        let payload = URL_SAFE_NO_PAD.encode(
+            format!(
+                "did:plc:oldsess\n{}\nold-session\n4\ntrue\nfalse\nfalse\nfalse\nfalse\nfalse\nfalse\nfalse\nfalse",
+                unix_time().saturating_add(SESSION_TTL_SECONDS)
+            )
+            .as_bytes(),
+        );
+        let token = signed_legacy_token(&public, &payload);
+        let permissions = public.verify_session_cookie(&token).unwrap().3;
+        assert!(permissions.write);
+        assert!(permissions.like, "an old write session can still like");
+        assert!(permissions.repost, "an old write session can still repost");
+        assert!(permissions.post, "an old write session can still post");
+    }
+
+    #[test]
+    fn pre_split_read_only_cookie_keeps_activity_rights_off() {
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        let payload = URL_SAFE_NO_PAD.encode(
+            format!(
+                "did:plc:oldread\n{}\nold-session\n4\nfalse\ntrue\nfalse\nfalse\nfalse\nfalse\nfalse\nfalse\nfalse",
+                unix_time().saturating_add(SESSION_TTL_SECONDS)
+            )
+            .as_bytes(),
+        );
+        let token = signed_legacy_token(&public, &payload);
+        let permissions = public.verify_session_cookie(&token).unwrap().3;
+        assert!(!permissions.write);
+        assert!(!permissions.like);
+        assert!(!permissions.repost);
+        assert!(!permissions.post);
+    }
+
+    #[test]
+    fn split_cookie_reads_activity_rights_from_their_own_flags() {
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        // New twelve-value format: the activity rights are independent of the write flag.
+        let payload = URL_SAFE_NO_PAD.encode(
+            format!(
+                "did:plc:splitsess\n{}\nsplit-session\n9\ntrue\ntrue\ntrue\nfalse\nfalse\nfalse\nfalse\nfalse\nfalse\nfalse\ntrue\nfalse",
+                unix_time().saturating_add(SESSION_TTL_SECONDS)
+            )
+            .as_bytes(),
+        );
+        let token = signed_legacy_token(&public, &payload);
+        let permissions = public.verify_session_cookie(&token).unwrap().3;
+        assert!(permissions.write);
+        assert!(!permissions.like, "the like flag is read verbatim, not from write");
+        assert!(permissions.repost);
+        assert!(!permissions.post);
+    }
+
+    fn signed_legacy_token(public: &OAuthPublic, payload: &str) -> String {
+        let mut mac = HmacSha256::new_from_slice(&public.cookie_key()).unwrap();
+        mac.update(b"session:");
+        mac.update(payload.as_bytes());
+        format!(
+            "{payload}.{}",
+            URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+        )
+    }
+
+    #[test]
     fn video_file_constraints_reject_oversize_and_overlong_uploads() {
         assert!(validate_video_properties(MAX_VIDEO_BYTES + 1, 30.0, "video/mp4").is_err());
         assert!(

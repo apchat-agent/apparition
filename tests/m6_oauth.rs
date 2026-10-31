@@ -7050,6 +7050,127 @@ async fn a_read_only_session_loads_the_home_feed_page() {
 }
 
 #[tokio::test]
+async fn a_like_only_session_shows_the_like_button_but_hides_repost_and_compose() {
+    let flow = FakeOAuthFlow::with_granted_scope(Some(EXPECTED_LIKE_ONLY_SCOPE));
+    let storage = Arc::new(MemoryStorage::default());
+    storage
+        .set_follow("did:plc:alice", "did:plc:author", true)
+        .unwrap();
+    storage
+        .put_record(&fake_feed_post(
+            "did:plc:author",
+            "one",
+            10,
+            "a post a like-only reader can like",
+        ))
+        .unwrap();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage);
+    let cookie = finish_login(&app).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        html.contains("a post a like-only reader can like"),
+        "{html}"
+    );
+    assert!(
+        html.contains("action=\"/like\""),
+        "a like-only session must get a working like button: {html}"
+    );
+    assert!(
+        !html.contains("class=\"repost-menu\""),
+        "no repost box was ticked, so no repost menu: {html}"
+    );
+    assert!(!html.contains("action=\"/repost\""), "{html}");
+    assert!(
+        !html.contains("action=\"/post\""),
+        "no post box was ticked, so no compose box: {html}"
+    );
+    assert!(
+        !html.contains("write permissions were not granted"),
+        "a session that can like is not told it is fully read-only: {html}"
+    );
+}
+
+#[tokio::test]
+async fn a_like_only_session_can_like_from_the_thread_page_but_sees_no_repost_or_reply_composer()
+{
+    let flow = FakeOAuthFlow::with_granted_scope(Some(EXPECTED_LIKE_ONLY_SCOPE));
+    let storage = Arc::new(MemoryStorage::default());
+    storage
+        .set_follow("did:plc:alice", "did:plc:author", true)
+        .unwrap();
+    storage
+        .put_record(&fake_feed_post(
+            "did:plc:author",
+            "one",
+            10,
+            "the thread focus a like-only reader can like",
+        ))
+        .unwrap();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage);
+    let cookie = finish_login(&app).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(
+                    "/app/thread?uri=at%3A%2F%2Fdid%3Aplc%3Aauthor%2Fapp.bsky.feed.post%2Fone",
+                )
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        html.contains("action=\"/like\""),
+        "a like-only session must still be able to like on a thread: {html}"
+    );
+    assert!(
+        !html.contains("class=\"repost-menu\""),
+        "no repost box was ticked, so no repost menu: {html}"
+    );
+    assert!(!html.contains("action=\"/repost\""), "{html}");
+    assert!(
+        !html.contains("reply-composer"),
+        "no post box was ticked, so no reply composer: {html}"
+    );
+}
+
+#[tokio::test]
 async fn sign_in_logs_its_ticked_boxes_and_the_granted_scopes_at_info() {
     let infos = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::registry().with(InfoCapture(infos.clone()));
