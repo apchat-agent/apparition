@@ -1646,6 +1646,106 @@ function setLocalStorageForTest(mock) {
   return () => Object.defineProperty(globalThis, "localStorage", original);
 }
 
+async function createComposerLinkHarness({ hash = "", withComposer = true, composerTop = 200, scrolledTo = 900 } = {}) {
+  const documentListeners = new Map();
+  const scroller = {
+    className: "app-layout",
+    scrollTop: scrolledTo,
+    scrollHeight: 3000,
+    clientHeight: 600,
+    parentElement: null,
+    getBoundingClientRect: () => ({ top: 0, bottom: 600 }),
+  };
+  const textarea = {
+    id: "new-post",
+    tagName: "TEXTAREA",
+    parentElement: scroller,
+    focusCount: 0,
+    scrollIntoViewCalls: 0,
+    focus() { this.focusCount += 1; },
+    scrollIntoView() { this.scrollIntoViewCalls += 1; },
+    getBoundingClientRect: () => ({
+      top: composerTop - scroller.scrollTop,
+      bottom: composerTop - scroller.scrollTop + 60,
+    }),
+  };
+  const anchor = {
+    tagName: "A",
+    hash: "#new-post",
+    className: "mobile-compose",
+    attributes: new Map([["href", "/app#new-post"]]),
+    parentElement: null,
+    getAttribute(name) { return this.attributes.get(name) ?? null; },
+  };
+  const icon = { tagName: "svg", parentElement: anchor };
+  const visualViewport = { height: 600, offsetTop: 0, addEventListener() {} };
+  const windowMock = {
+    location: { hash },
+    scrollY: 0,
+    scrollX: 0,
+    scrollTo() {},
+    getComputedStyle(element) { return { overflowY: element === scroller ? "auto" : "visible" }; },
+    matchMedia() { return { matches: true }; },
+    visualViewport,
+    addEventListener() {},
+  };
+  const documentMock = {
+    activeElement: null,
+    addEventListener(name, listener) {
+      if (!documentListeners.has(name)) documentListeners.set(name, []);
+      documentListeners.get(name).push(listener);
+    },
+    querySelector(selector) { return selector === ".mobile-nav" ? {} : null; },
+    querySelectorAll() { return []; },
+    getElementById(id) { return withComposer && id === "new-post" ? textarea : null; },
+  };
+  globalThis.document = documentMock;
+  globalThis.window = windowMock;
+  globalThis.HTMLFormElement = class {};
+  globalThis.Node = { TEXT_NODE: 3 };
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  new Function(source)();
+  const clickComposeLink = async () => {
+    const event = {
+      target: icon,
+      button: 0,
+      defaultPrevented: false,
+      preventDefault() { this.defaultPrevented = true; },
+    };
+    for (const listener of documentListeners.get("click") || []) await listener(event);
+    return event;
+  };
+  return { anchor, clickComposeLink, documentMock, scroller, textarea, windowMock };
+}
+
+Deno.test("tapping + while #new-post is already in the URL scrolls the composer into view instead of navigating", async () => {
+  const harness = await createComposerLinkHarness({ hash: "#new-post" });
+  harness.scroller.scrollTop = 900;
+  harness.textarea.focusCount = 0;
+  const event = await harness.clickComposeLink();
+  assert(event.defaultPrevented, "with the composer on the page the + link must not navigate");
+  assert(
+    harness.scroller.scrollTop === 200 || harness.textarea.scrollIntoViewCalls > 0,
+    "the inner scroller (or scrollIntoView) must bring the composer back into view, even though the URL already ends in #new-post",
+  );
+  assertEquals(harness.textarea.focusCount, 1, "the #new-post textarea must be focused (which expands it)");
+});
+
+Deno.test("the + link navigates on pages without the composer, and arriving at /app#new-post reveals it", async () => {
+  const away = await createComposerLinkHarness({ hash: "", withComposer: false, scrolledTo: 0 });
+  const event = await away.clickComposeLink();
+  assert(!event.defaultPrevented, "a page without the composer must keep the plain navigation to /app#new-post");
+  assertEquals(away.textarea.focusCount, 0, "nothing may be focused on a page that has no composer");
+  assertEquals(away.scroller.scrollTop, 0, "nothing may scroll on a page that has no composer");
+
+  const arrival = await createComposerLinkHarness({ hash: "#new-post", composerTop: 800, scrolledTo: 0 });
+  assert(
+    arrival.scroller.scrollTop === 800 || arrival.textarea.scrollIntoViewCalls > 0,
+    "arrival at /app#new-post must scroll the composer into view without any click",
+  );
+  assertEquals(arrival.textarea.focusCount, 1, "arrival at /app#new-post must focus the composer textarea");
+});
+
 Deno.test("list-blocked posts stay hidden at pct 0 or with no stored value", async () => {
   const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
   const { applyListBlockLeak } = extractListBlockLeak(source);
