@@ -195,8 +195,9 @@ const READ_ONLY_SCOPES: [&str; 3] = [
     "rpc:app.bsky.graph.getMutes?aud=*",
 ];
 /// The sign-in checkboxes (owner, msgd 2026-10-31: "multiple checkboxes describing activities
-/// that a user would like to do ... with 'like' being checked by default"). Each value is the
-/// `allow` parameter the box sends; reading always works and needs no box.
+/// that a user would like to do ... with 'like' being checked by default", then again
+/// 2026-10-31: "for the checkboxes at login, check the ones that people would expect normally").
+/// Each value is the `allow` parameter the box sends; reading always works and needs no box.
 const ALLOW_BOXES: [(&str, &str); 5] = [
     ("like", "Like posts"),
     ("repost", "Repost"),
@@ -6790,14 +6791,16 @@ async fn login(headers: HeaderMap, RawQuery(raw_query): RawQuery) -> Html<String
     } else {
         ""
     };
-    // Per-activity boxes (owner, msgd 2026-10-31): with no `allow` parameter only "like" is
-    // ticked; repeated ?allow=<box> parameters pre-tick exactly those boxes, so a re-sign-in
-    // link names the boxes to keep ticked and nothing else sneaks in.
+    // Per-activity boxes (owner, msgd 2026-10-31: "for the checkboxes at login, check the ones
+    // that people would expect normally"): with no `allow` parameter Like, Repost, Write posts
+    // and replies, and Follow/block/mute are ticked and "Edit your saved feeds" stays unticked;
+    // repeated ?allow=<box> parameters pre-tick exactly those boxes, so a re-sign-in link names
+    // the boxes to keep ticked and nothing else sneaks in.
     let boxes = ALLOW_BOXES
         .iter()
         .map(|(value, label)| {
             let ticked = if requested_boxes.is_empty() {
-                *value == "like"
+                matches!(*value, "like" | "repost" | "post" | "social")
             } else {
                 requested_boxes.iter().any(|requested| requested == value)
             };
