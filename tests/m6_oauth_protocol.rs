@@ -47,6 +47,13 @@ use tracing_subscriber::fmt::MakeWriter;
 const DID: &str = "did:plc:abcdefghijklmnopqrstuvwx";
 const EXPECTED_OAUTH_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.graph.getMutes?aud=* rpc:app.bsky.actor.putPreferences?aud=did:web:api.bsky.app%23bsky_appview";
 
+fn full_oauth_scopes() -> Vec<String> {
+    EXPECTED_OAUTH_SCOPE
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
 #[derive(Clone)]
 struct FakeDidResolver {
     pds: String,
@@ -322,7 +329,9 @@ async fn oauth_protocol_checks_state_issuer_nonce_and_refresh_against_fake_pds()
 #[tokio::test]
 async fn production_oauth_flow_accepts_standard_callback_and_binds_subject_and_scope() {
     let (flow, _, shared, server) = production_flow(None, None).await;
-    flow.authorize(DID, "browser-binding-one").await.unwrap();
+    flow.authorize(DID, "browser-binding-one", full_oauth_scopes())
+        .await
+        .unwrap();
     let confidential_par = shared
         .lock()
         .unwrap()
@@ -359,7 +368,9 @@ async fn production_oauth_flow_accepts_standard_callback_and_binds_subject_and_s
 
     let (flow, _, shared, server) =
         production_flow(Some("did:plc:zyxwvutsrqponmlkjihgfedcba"), Some("atproto")).await;
-    flow.authorize(DID, "browser-binding-two").await.unwrap();
+    flow.authorize(DID, "browser-binding-two", full_oauth_scopes())
+        .await
+        .unwrap();
     let state = latest_state(&shared);
     let result = flow
         .callback(OAuthCallback {
@@ -374,7 +385,9 @@ async fn production_oauth_flow_accepts_standard_callback_and_binds_subject_and_s
     server.abort();
 
     let (flow, _, shared, server) = production_flow(Some(DID), Some("profile")).await;
-    flow.authorize(DID, "browser-binding-three").await.unwrap();
+    flow.authorize(DID, "browser-binding-three", full_oauth_scopes())
+        .await
+        .unwrap();
     let state = latest_state(&shared);
     let result = flow
         .callback(OAuthCallback {
@@ -917,7 +930,7 @@ async fn quote_with_an_image_uses_record_with_media() {
 #[tokio::test(flavor = "current_thread")]
 async fn pds_4xx_logs_safe_error_details_without_credentials() {
     let (flow, _, shared, server) = production_flow(None, None).await;
-    flow.authorize(DID, "browser-binding-log-test")
+    flow.authorize(DID, "browser-binding-log-test", full_oauth_scopes())
         .await
         .unwrap();
     let state = latest_state(&shared);
@@ -1060,7 +1073,9 @@ async fn old_granted_scope_in_production_session_shows_feed_reauthorization_page
 #[tokio::test]
 async fn fake_pds_receives_correct_reply_root_and_parent_strong_refs() {
     let (flow, _, shared, server) = production_flow(None, Some(EXPECTED_OAUTH_SCOPE)).await;
-    flow.authorize(DID, "reply-test-binding").await.unwrap();
+    flow.authorize(DID, "reply-test-binding", full_oauth_scopes())
+        .await
+        .unwrap();
     let state = latest_state(&shared);
     flow.callback(OAuthCallback {
         code: "valid-code".to_owned(),
@@ -1117,7 +1132,9 @@ async fn fake_pds_receives_correct_reply_root_and_parent_strong_refs() {
 #[tokio::test]
 async fn fake_pds_receives_quote_post_with_record_embed_strong_ref() {
     let (flow, _, shared, server) = production_flow(None, Some(EXPECTED_OAUTH_SCOPE)).await;
-    flow.authorize(DID, "quote-test-binding").await.unwrap();
+    flow.authorize(DID, "quote-test-binding", full_oauth_scopes())
+        .await
+        .unwrap();
     let state = latest_state(&shared);
     flow.callback(OAuthCallback {
         code: "valid-code".to_owned(),
@@ -1164,7 +1181,7 @@ async fn fake_pds_receives_quote_post_with_record_embed_strong_ref() {
 #[tokio::test]
 async fn fake_pds_records_profile_graph_shapes_and_proxy_mute_rpc() {
     let (flow, _, shared, server) = production_flow(None, Some(EXPECTED_OAUTH_SCOPE)).await;
-    flow.authorize(DID, "profile-actions-binding")
+    flow.authorize(DID, "profile-actions-binding", full_oauth_scopes())
         .await
         .unwrap();
     let state = latest_state(&shared);
@@ -1313,7 +1330,10 @@ async fn loopback_production_oauth_completes_a_public_client_login() {
     let (flow, _, shared, server) = production_loopback_flow().await;
     let callback_uri = "http://127.0.0.1:43123/oauth/callback";
     let browser_binding = "loopback-browser-binding";
-    let authorize_url = flow.authorize(DID, browser_binding).await.unwrap();
+    let authorize_url = flow
+        .authorize(DID, browser_binding, full_oauth_scopes())
+        .await
+        .unwrap();
     assert!(authorize_url.starts_with(&format!("{}/authorize?", server_origin(&shared))));
 
     let par = shared
@@ -1379,7 +1399,7 @@ async fn loopback_production_oauth_completes_a_public_client_login() {
 #[tokio::test]
 async fn production_oauth_flow_rejects_a_foreign_browser_binding() {
     let (flow, store, shared, server) = production_flow(None, Some("atproto")).await;
-    flow.authorize(DID, "browser-binding-expected")
+    flow.authorize(DID, "browser-binding-expected", full_oauth_scopes())
         .await
         .unwrap();
     let state = latest_state(&shared);

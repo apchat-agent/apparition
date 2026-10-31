@@ -161,6 +161,7 @@ impl OAuthFlow for AcceptingFlow {
         &'a self,
         _: &'a str,
         _: &'a str,
+        _: Vec<String>,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async { Ok("https://auth.example/authorize".to_owned()) })
     }

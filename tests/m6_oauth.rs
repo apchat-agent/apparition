@@ -261,9 +261,11 @@ impl OAuthFlow for FakeOAuthFlow {
         &'a self,
         login: &'a str,
         browser_binding: &'a str,
+        scopes: Vec<String>,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async move {
             *self.browser_binding.lock().unwrap() = Some(browser_binding.to_owned());
+            *self.authorize_scopes.lock().unwrap() = Some(scopes.join(" "));
             Ok(format!("https://auth.example/authorize?login={login}"))
         })
     }
@@ -1281,6 +1283,7 @@ impl OAuthFlow for PanicCallbackFlow {
         &'a self,
         _: &'a str,
         _: &'a str,
+        _: Vec<String>,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async { Ok("https://auth.example/authorize".to_owned()) })
     }
@@ -1308,6 +1311,7 @@ impl OAuthFlow for PanicAuthorizeFlow {
         &'a self,
         _: &'a str,
         _: &'a str,
+        _: Vec<String>,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async { panic!("simulated upstream authorize panic") })
     }
@@ -1335,6 +1339,7 @@ impl OAuthFlow for AcceptingOAuthFlow {
         &'a self,
         _: &'a str,
         _: &'a str,
+        _: Vec<String>,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async { Ok("https://auth.example/authorize".to_owned()) })
     }

@@ -165,6 +165,15 @@ const FEED_SCOPES: [&str; 2] = [
     "rpc:app.bsky.actor.getPreferences?aud=*",
     "rpc:app.bsky.feed.getFeedSkeleton?aud=*",
 ];
+/// "make it an option for user to login without these rights ... This way we retain the way to do
+/// a read-only login by default" (owner, 2026-10-31). What a sign-in without the "Allow changes"
+/// checkbox requests: atproto plus the read rpc scopes the read pages need. The client metadata
+/// `scope` (REQUESTED_SCOPE) stays the FULL list: it is the maximum a request may ask for.
+const READ_ONLY_SCOPES: [&str; 3] = [
+    "rpc:app.bsky.actor.getPreferences?aud=*",
+    "rpc:app.bsky.feed.getFeedSkeleton?aud=*",
+    "rpc:app.bsky.graph.getMutes?aud=*",
+];
 const MAX_VIDEO_BYTES: u64 = 300_000_000;
 const MAX_VIDEO_DURATION_SECONDS: f64 = 600.0;
 const MAX_VIDEO_ALT_CHARS: usize = 2000;
@@ -530,10 +539,13 @@ pub struct BlockListDetail {
 }
 
 pub trait OAuthFlow: Clone + Send + Sync + 'static {
+    /// `scopes` is the scope list chosen for this sign-in: the full `REQUESTED_SCOPE` list when
+    /// the login form ticked "Allow changes", or the read-only list when it did not.
     fn authorize<'a>(
         &'a self,
         login: &'a str,
         browser_binding: &'a str,
+        scopes: Vec<String>,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
     fn callback<'a>(
         &'a self,
@@ -850,6 +862,7 @@ impl OAuthFlow for DisabledOAuthFlow {
         &'a self,
         _: &'a str,
         _: &'a str,
+        _: Vec<String>,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async { Err("OAuth flow is not configured".to_owned()) })
     }
@@ -4288,6 +4301,7 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
         &'a self,
         login: &'a str,
         browser_binding: &'a str,
+        scopes: Vec<String>,
     ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
         Box::pin(async move {
             let identity = if login.starts_with("did:") {
@@ -4312,7 +4326,7 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
                     login,
                     AuthorizeOptions {
                         state: Some(state),
-                        scopes: requested_scopes(),
+                        scopes: scopes_from_strings(scopes),
                         ..Default::default()
                     },
                 )
@@ -6707,9 +6721,20 @@ where
     let mut binding_bytes = [0u8; 32];
     thread_rng().fill_bytes(&mut binding_bytes);
     let browser_binding = URL_SAFE_NO_PAD.encode(binding_bytes);
+    // The client metadata still advertises the full list; per request we ask for either the full
+    // list (checkbox ticked) or the read-only list (owner: read-only login by default).
+    let scopes = if form.get("write").is_some_and(|value| value == "1") {
+        requested_scopes()
+    } else {
+        read_only_scopes()
+    }
+    .into_iter()
+    .map(|scope| scope.as_ref().to_owned())
+    .collect::<Vec<_>>();
     let authorize_result = std::panic::AssertUnwindSafe(state.flow.authorize(
         &normalize_login(form.get("handle").expect("validated above")),
         &browser_binding,
+        scopes,
     ))
     .catch_unwind()
     .await;
@@ -14127,6 +14152,28 @@ fn has_all_preferences_scopes(scope: Option<&str>) -> bool {
     has_all_scopes(scope, &PREFERENCES_SCOPES)
 }
 
+fn read_only_scopes() -> Vec<Scope> {
+    std::iter::once(Scope::Known(KnownScope::Atproto))
+        .chain(
+            READ_ONLY_SCOPES
+                .iter()
+                .map(|scope| Scope::Unknown((*scope).to_owned())),
+        )
+        .collect()
+}
+
+fn scopes_from_strings(values: Vec<String>) -> Vec<Scope> {
+    values
+        .into_iter()
+        .map(|value| match value.as_str() {
+            "atproto" => Scope::Known(KnownScope::Atproto),
+            "transition:generic" => Scope::Known(KnownScope::TransitionGeneric),
+            "transition:chat.bsky" => Scope::Known(KnownScope::TransitionChatBsky),
+            _ => Scope::Unknown(value.clone()),
+        })
+        .collect()
+}
+
 fn requested_scopes() -> Vec<Scope> {
     std::iter::once(Scope::Known(KnownScope::Atproto))
         .chain(
@@ -14871,6 +14918,7 @@ mod tests {
             &'a self,
             _: &'a str,
             _: &'a str,
+            _: Vec<String>,
         ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
             Box::pin(async { Err("test flow does not authorize".to_owned()) })
         }
@@ -15035,6 +15083,7 @@ mod tests {
             &'a self,
             _: &'a str,
             _: &'a str,
+            _: Vec<String>,
         ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
             Box::pin(async { Err("test flow does not authorize".to_owned()) })
         }
@@ -15746,6 +15795,7 @@ mod tests {
             &'a self,
             _: &'a str,
             _: &'a str,
+            _: Vec<String>,
         ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
             Box::pin(async { Err("test flow does not authorize".to_owned()) })
         }
@@ -17038,6 +17088,7 @@ mod tests {
             &'a self,
             _: &'a str,
             _: &'a str,
+            _: Vec<String>,
         ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
             Box::pin(async { Err("test flow does not authorize".to_owned()) })
         }
@@ -17231,6 +17282,7 @@ mod tests {
             &'a self,
             _: &'a str,
             _: &'a str,
+            _: Vec<String>,
         ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
             Box::pin(async { Err("test flow does not authorize".to_owned()) })
         }
