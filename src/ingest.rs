@@ -2767,6 +2767,86 @@ impl SqliteStorage {
         Ok(connection)
     }
 
+    /// A post's interaction summary and the SQLite work performed by its
+    /// statements. Kept public for bounded-work regression tests and
+    /// investigations.
+    pub fn post_interaction_summary_counted(
+        &self,
+        uri: &str,
+        viewer_did: Option<&str>,
+    ) -> Result<(PostInteractionSummary, StatementWork), StorageError> {
+        let mut work = StatementWork::default();
+        let summary = self.post_interaction_summary_with_work(uri, viewer_did, Some(&mut work))?;
+        Ok((summary, work))
+    }
+
+    fn post_interaction_summary_with_work(
+        &self,
+        uri: &str,
+        viewer_did: Option<&str>,
+        mut work: Option<&mut StatementWork>,
+    ) -> Result<PostInteractionSummary, StorageError> {
+        let conn = self.read_conn()?;
+        let mut summary = PostInteractionSummary::default();
+        for (collection, path, count) in [
+            (
+                "app.bsky.feed.like",
+                "$.subject.uri",
+                &mut summary.like_count,
+            ),
+            (
+                "app.bsky.feed.repost",
+                "$.subject.uri",
+                &mut summary.repost_count,
+            ),
+            (
+                "app.bsky.feed.post",
+                "$.reply.parent.uri",
+                &mut summary.reply_count,
+            ),
+            (
+                "app.bsky.feed.post",
+                "$.embed.record.uri",
+                &mut summary.quote_count,
+            ),
+        ] {
+            let mut statement = conn.prepare(&format!(
+                "SELECT COUNT(*) FROM records WHERE collection=?1 AND json_extract(record_json, '{path}')=?2"
+            ))?;
+            *count = statement.query_row(params![collection, uri], |row| row.get(0))?;
+            if let Some(work) = work.as_deref_mut() {
+                work.observe(&statement);
+            }
+        }
+        if let Some(viewer_did) = viewer_did {
+            let mut statement = conn.prepare(
+                "SELECT uri FROM records INDEXED BY records_author_subject_uri
+                 WHERE collection='app.bsky.feed.like' AND did=?1
+                   AND json_extract(record_json, '$.subject.uri')=?2
+                 ORDER BY time_us DESC LIMIT 1",
+            )?;
+            summary.viewer_like = statement
+                .query_row(params![viewer_did, uri], |row| row.get(0))
+                .optional()?;
+            if let Some(work) = work.as_deref_mut() {
+                work.observe(&statement);
+            }
+            let mut statement = conn.prepare(
+                "SELECT uri FROM records INDEXED BY records_author_subject_uri
+                 WHERE collection='app.bsky.feed.repost' AND did=?1
+                   AND json_extract(record_json, '$.subject.uri')=?2
+                 ORDER BY time_us DESC LIMIT 1",
+            )?;
+            summary.viewer_repost = statement
+                .query_row(params![viewer_did, uri], |row| row.get(0))
+                .optional()?;
+            if let Some(work) = work.as_deref_mut() {
+                work.observe(&statement);
+            }
+        }
+        Ok(summary)
+    }
+
     /// Head-of-line pressure on the read pool; the running service logs these
     /// on the per-minute `SQLite writer minute metrics` line.
     pub fn read_pool_metrics(&self) -> Arc<ReadPoolMetrics> {
@@ -3943,44 +4023,7 @@ impl Storage for SqliteStorage {
         uri: &str,
         viewer_did: Option<&str>,
     ) -> Result<PostInteractionSummary, StorageError> {
-        let conn = self.read_conn()?;
-        let count = |collection: &str, path: &str| -> Result<usize, rusqlite::Error> {
-            conn.query_row(
-                &format!("SELECT COUNT(*) FROM records WHERE collection=?1 AND json_extract(record_json, '{path}')=?2"),
-                params![collection, uri],
-                |row| row.get(0),
-            )
-        };
-        let mut summary = PostInteractionSummary {
-            like_count: count("app.bsky.feed.like", "$.subject.uri")?,
-            repost_count: count("app.bsky.feed.repost", "$.subject.uri")?,
-            reply_count: count("app.bsky.feed.post", "$.reply.parent.uri")?,
-            quote_count: count("app.bsky.feed.post", "$.embed.record.uri")?,
-            ..PostInteractionSummary::default()
-        };
-        if let Some(viewer_did) = viewer_did {
-            summary.viewer_like = conn
-                .query_row(
-                    "SELECT uri FROM records INDEXED BY records_author_subject_uri
-                 WHERE collection='app.bsky.feed.like' AND did=?1
-                   AND json_extract(record_json, '$.subject.uri')=?2
-                 ORDER BY time_us DESC LIMIT 1",
-                    params![viewer_did, uri],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            summary.viewer_repost = conn
-                .query_row(
-                    "SELECT uri FROM records INDEXED BY records_author_subject_uri
-                 WHERE collection='app.bsky.feed.repost' AND did=?1
-                   AND json_extract(record_json, '$.subject.uri')=?2
-                 ORDER BY time_us DESC LIMIT 1",
-                    params![viewer_did, uri],
-                    |row| row.get(0),
-                )
-                .optional()?;
-        }
-        Ok(summary)
+        self.post_interaction_summary_with_work(uri, viewer_did, None)
     }
 
     fn records(&self) -> Result<Vec<IndexedRecord>, StorageError> {
