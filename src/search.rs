@@ -27,6 +27,28 @@ pub struct SearchPostsPage {
     pub posts: Vec<FetchedPublicPost>,
 }
 
+#[derive(Debug)]
+pub struct SearchActor {
+    pub did: String,
+    pub handle: Option<String>,
+    pub display_name: Option<String>,
+    pub avatar: Option<String>,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct SearchActorsPage {
+    pub actors: Vec<SearchActor>,
+}
+
+fn optional_str(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+}
+
 fn unix_time_us() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -101,6 +123,36 @@ impl SearchClient {
                     record,
                 },
                 author,
+            });
+        }
+        Ok(page)
+    }
+
+    pub async fn search_actors(
+        &self,
+        query: &str,
+        cursor: Option<&str>,
+    ) -> Result<SearchActorsPage, SearchCallError> {
+        let body = self
+            .fetch("app.bsky.actor.searchActors", query, cursor)
+            .await?;
+        let mut page = SearchActorsPage::default();
+        let Some(actors) = body.get("actors").and_then(Value::as_array) else {
+            return Ok(page);
+        };
+        for actor in actors {
+            let Some(did) = actor.get("did").and_then(Value::as_str).map(str::to_owned) else {
+                continue;
+            };
+            if !did.starts_with("did:") {
+                continue;
+            }
+            page.actors.push(SearchActor {
+                handle: optional_str(actor, "handle"),
+                display_name: optional_str(actor, "displayName"),
+                avatar: optional_str(actor, "avatar"),
+                description: optional_str(actor, "description"),
+                did,
             });
         }
         Ok(page)

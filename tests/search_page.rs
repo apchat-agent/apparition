@@ -320,19 +320,25 @@ async fn people_search_renders_actor_rows_linking_to_the_profile_page() {
         "description": "First line.\nSecond line hides.",
         "avatar": "https://cdn.bsky.app/img/avatar/plain/did:plc:finder/bafkfinder@jpeg"
     }]});
-    let (base, fake, server) =
-        start_fake_search_with(search_posts_body(None), actors).await;
+    let (base, fake, server) = start_fake_search_with(search_posts_body(None), actors).await;
     let router = router_with_search(AcceptingFlow, search_client(&base));
     let cookie = login(&router).await;
     let html = get_html(&router, "/search?q=fin&type=people", &cookie).await;
     let requests = fake.requests.lock().unwrap().clone();
-    assert_eq!(requests.len(), 1, "people search must hit the people endpoint once");
+    assert_eq!(
+        requests.len(),
+        1,
+        "people search must hit the people endpoint once"
+    );
     assert_eq!(requests[0].0, "/xrpc/app.bsky.actor.searchActors");
     assert!(requests[0].1.contains("q=fin"), "{}", requests[0].1);
     assert!(requests[0].1.contains("limit=25"), "{}", requests[0].1);
     assert!(html.contains("Finder"), "display name missing: {html}");
     assert!(html.contains("@finder.test"), "handle missing: {html}");
-    assert!(html.contains("First line."), "description first line missing: {html}");
+    assert!(
+        html.contains("First line."),
+        "description first line missing: {html}"
+    );
     assert!(
         !html.contains("Second line"),
         "only the description's first line may show: {html}"
@@ -342,7 +348,9 @@ async fn people_search_renders_actor_rows_linking_to_the_profile_page() {
         "the row must link to the app's profile page: {html}"
     );
     assert!(
-        html.contains("https://cdn.bsky.app/img/avatar_thumbnail/plain/did:plc:finder/bafkfinder@jpeg"),
+        html.contains(
+            "https://cdn.bsky.app/img/avatar_thumbnail/plain/did:plc:finder/bafkfinder@jpeg"
+        ),
         "the row must show the avatar: {html}"
     );
     server.abort();

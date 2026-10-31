@@ -19,7 +19,7 @@ use crate::{
         RELATIONSHIP_CONFIRMATION_TTL, RelationshipClient, apply_profile_counts, now_millis,
         relationship_cache_key,
     },
-    search::{SearchCallError, SearchClient},
+    search::{SearchActor, SearchCallError, SearchClient},
     timing_console::{
         TIMING_PAGE_LIMIT, TIMING_RECENT_PATH, TimingConsole, TimingRecord, new_timing_id,
         now_unix_ms,
@@ -7845,11 +7845,29 @@ where
         .into_response();
     };
     if people {
+        let page = match state.search.search_actors(&term, None).await {
+            Ok(page) => page,
+            Err(failure) => return search_unavailable_response(&failure, heading, &form, options),
+        };
+        let hidden_actors =
+            match timeline_hidden_actor_dids(&state.flow, state.storage.as_ref(), &did).await {
+                Ok(hidden) => hidden,
+                Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+            };
+        let rows = page
+            .actors
+            .iter()
+            .filter(|actor| !hidden_actors.contains(&actor.did))
+            .map(render_search_actor_row)
+            .collect::<String>();
+        let rows = if rows.is_empty() {
+            "<li class=\"empty-state\">No people matched that search.</li>".to_owned()
+        } else {
+            rows
+        };
         return Html(page_shell_with_options(
             "Search",
-            &format!(
-                "{heading}{form}<ol class=\"search-actor-list\"><li class=\"empty-state\">No people found.</li></ol>"
-            ),
+            &format!("{heading}{form}<ol class=\"search-actor-list\">{rows}</ol>"),
             true,
             options,
         ))
@@ -7959,6 +7977,36 @@ fn render_search_form(term: Option<&str>, people: bool) -> String {
     format!(
         "<form class=\"search-page-form\" action=\"/search\" method=\"get\" role=\"search\"><label class=\"sr-only\" for=\"search-input\">Search</label><input id=\"search-input\" type=\"search\" name=\"q\" value=\"{value}\" placeholder=\"Search posts and people\"><input type=\"hidden\" name=\"type\" value=\"{active_type}\"><button type=\"submit\">Search</button></form><nav class=\"search-type-tabs\" aria-label=\"Search type\"><a class=\"search-type-tab{}\" href=\"/search?type=posts{kept_query}\"{}>Posts</a><a class=\"search-type-tab{}\" href=\"/search?type=people{kept_query}\"{}>People</a></nav>",
         posts_state.0, posts_state.1, people_state.0, people_state.1
+    )
+}
+
+fn render_search_actor_row(actor: &SearchActor) -> String {
+    let handle = actor.handle.clone().unwrap_or_else(|| actor.did.clone());
+    let display_name = actor.display_name.clone().unwrap_or_else(|| handle.clone());
+    let profile = json!({
+        "did": actor.did,
+        "handle": handle,
+        "avatar": actor.avatar,
+    });
+    let description = actor
+        .description
+        .as_deref()
+        .and_then(|description| description.lines().next())
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            format!(
+                "<span class=\"search-actor-description\">{}</span>",
+                html_escape(line.trim())
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "<li class=\"search-actor\"><a class=\"search-actor-link\" href=\"/profile?did={}\">{}<span class=\"search-actor-name\">{}</span><span class=\"search-actor-handle\">@{}</span>{}</a></li>",
+        form_encoded(&actor.did),
+        avatar_markup(&profile, "small-avatar"),
+        html_escape(&display_name),
+        html_escape(&handle),
+        description,
     )
 }
 
