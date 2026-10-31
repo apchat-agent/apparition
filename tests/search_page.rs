@@ -545,3 +545,32 @@ async fn a_search_api_failure_shows_a_readable_page_and_logs_status_and_body_exc
     );
     server.abort();
 }
+
+#[tokio::test]
+async fn a_response_cursor_becomes_a_more_results_link_and_is_sent_back_on_the_next_page() {
+    let (base, fake, server) = start_fake_search(search_posts_body(Some("cursor-page-2"))).await;
+    let router = router_with_search(AcceptingFlow, search_client(&base));
+    let cookie = login(&router).await;
+    let html = get_html(&router, "/search?q=minc", &cookie).await;
+    assert!(
+        html.contains(
+            "<a class=\"pagination-link\" rel=\"next\" href=\"/search?q=minc&amp;type=posts&amp;cursor=cursor-page-2\">More results</a>"
+        ),
+        "the More results link must carry cursor, q and type: {html}"
+    );
+    let html = get_html(
+        &router,
+        "/search?q=minc&type=posts&cursor=cursor-page-2",
+        &cookie,
+    )
+    .await;
+    let requests = fake.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1].1.contains("cursor=cursor-page-2"),
+        "the next page must forward the cursor upstream: {}",
+        requests[1].1
+    );
+    assert!(html.contains("mincy post"), "the second page renders too: {html}");
+    server.abort();
+}
