@@ -575,9 +575,19 @@ function enhanceCompactComposer(form) {
     // scrollHeight never falls below the box's own height, so measuring at the CURRENT rows turned the rounding
     // of a fractional (or "normal") line height into one extra row per keystroke. Collapse to the smallest box
     // first: then scrollHeight reflects the text itself and the row count only follows the number of lines.
+    // Collapsing can shorten a scroller's content, and the browser then clamps its scroll position for good
+    // (a reply box at the bottom of a thread jumped on every keystroke), so put every scrolled ancestor back.
+    // scrollHeight is a whole number of pixels, so lines * 21.6 px comes back up to a pixel high: round, not ceil.
+    const scrolled = [];
+    for (let element = textarea.parentElement; element; element = element.parentElement) {
+      if (element.scrollTop) scrolled.push([element, element.scrollTop]);
+    }
+    const windowY = window.scrollY;
     textarea.rows = 1;
     const contentHeight = Math.max(0, textarea.scrollHeight - verticalPadding);
-    textarea.rows = Math.min(10, Math.max(expanded ? 2 : 1, Math.ceil(contentHeight / lineHeight)));
+    textarea.rows = Math.min(10, Math.max(expanded ? 2 : 1, Math.round(contentHeight / lineHeight)));
+    for (const [element, top] of scrolled) element.scrollTop = top;
+    if (windowY !== undefined && window.scrollY !== windowY) window.scrollTo?.(window.scrollX, windowY);
   };
   const expand = () => {
     form.classList.add("is-expanded");

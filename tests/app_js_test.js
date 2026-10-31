@@ -123,6 +123,72 @@ Deno.test("composer expands, opens link entry, grows its text area, and warns ne
   }
 });
 
+Deno.test("measuring the composer textarea never scrolls a reply box at the bottom of its scroller", async () => {
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  const start = source.indexOf("function enhanceCompactComposer");
+  const end = source.indexOf("function attachMediaComposer", start);
+  const enhance = new Function(`${source.slice(start, end)}; return enhanceCompactComposer;`)();
+  const names = new Set();
+  const events = new Map();
+  // The thread page scroller: 1000 px of posts above the reply box, 500 px visible, scrolled to the very end.
+  // Like a browser, it clamps scrollTop whenever its content gets shorter than scrollTop + clientHeight.
+  const scroller = {
+    clientHeight: 500,
+    parentElement: null,
+    textarea: null,
+    get scrollHeight() { return 1000 + Math.ceil(this.textarea.rows * 21.6 + 16); },
+    _top: 0,
+    get scrollTop() { return this._top; },
+    set scrollTop(value) { this._top = Math.max(0, Math.min(value, this.scrollHeight - this.clientHeight)); },
+  };
+  const textarea = {
+    value: "",
+    _rows: 1,
+    get rows() { return this._rows; },
+    // Layout runs when the box changes size: a shorter box clamps the scroller's position for good.
+    set rows(value) { this._rows = value; scroller.scrollTop = scroller._top; },
+    parentElement: scroller,
+    get scrollHeight() {
+      const lines = Math.max(1, this.value.split("\n").length);
+      return Math.ceil(Math.max(lines * 21.6 + 16, this.rows * 21.6 + 16));
+    },
+    addEventListener(name, listener) { events.set(name, listener); },
+  };
+  scroller.textarea = textarea;
+  const form = {
+    classList: {
+      add(name) { names.add(name); },
+      remove(name) { names.delete(name); },
+      contains(name) { return names.has(name); },
+      toggle(name, force) { if (force ?? !names.has(name)) names.add(name); else names.delete(name); },
+    },
+    querySelector(selector) { return selector === "[data-compose-input]" ? textarea : null; },
+  };
+  const originalWindow = globalThis.window;
+  globalThis.window = {
+    scrollX: 0,
+    scrollY: 0,
+    scrollTo() {},
+    getComputedStyle() { return { lineHeight: "21.6px", paddingTop: "8px", paddingBottom: "8px" }; },
+  };
+  try {
+    enhance(form);
+    textarea.value = "first line\nsecond line\nthird line";
+    events.get("input")();
+    assertEquals(textarea.rows, 3);
+    scroller.scrollTop = 100000; // scrolled to the bottom, reply box in view
+    const bottom = scroller.scrollTop;
+    for (let typed = 1; typed <= 5; typed += 1) {
+      textarea.value = `first line\nsecond line\nthird line${"x".repeat(typed)}`;
+      events.get("input")();
+      assertEquals(textarea.rows, 3);
+      assertEquals(scroller.scrollTop, bottom, `keystroke ${typed} must not move the scroller (the box was collapsed to measure it)`);
+    }
+  } finally {
+    globalThis.window = originalWindow;
+  }
+});
+
 Deno.test("the composer textarea keeps one row count per text line instead of growing one row per keystroke", async () => {
   const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
   const start = source.indexOf("function enhanceCompactComposer");
@@ -180,9 +246,13 @@ Deno.test("the composer textarea keeps one row count per text line instead of gr
       harness.events.get("textarea:input")();
       assertEquals(harness.textarea.rows, 2, `typing ${typed} characters on ONE line must keep rows at the expanded minimum`);
     }
+    // Review fix: two lines fit the expanded two-row minimum; the old expectation (3) encoded a ceil off-by-one.
     harness.textarea.value = `${"x".repeat(20)}\nsecond line`;
     harness.events.get("textarea:input")();
-    assertEquals(harness.textarea.rows, 3, "a second text line must add exactly one more row");
+    assertEquals(harness.textarea.rows, 2, "two text lines fit the expanded two-row minimum");
+    harness.textarea.value = `${"x".repeat(20)}\nsecond line\nthird line`;
+    harness.events.get("textarea:input")();
+    assertEquals(harness.textarea.rows, 3, "a third text line must add exactly one more row");
     harness.textarea.value = "x".repeat(20);
     harness.events.get("textarea:input")();
     assertEquals(harness.textarea.rows, 2, "deleting the second line must shrink back down");
