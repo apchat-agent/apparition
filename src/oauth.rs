@@ -6664,10 +6664,16 @@ async fn login(headers: HeaderMap, Query(query): Query<HashMap<String, String>>)
     } else {
         ""
     };
+    // Read-only by default (owner, 2026-10-31); ?write=1 re-signs the user in with changes allowed.
+    let write_checked = if query.get("write").is_some_and(|value| value == "1") {
+        " checked"
+    } else {
+        ""
+    };
     Html(page_shell(
         "Sign in",
         &format!(
-            "<section class=\"login-card\"><p class=\"eyebrow\">Your network, your view</p><h1>Sign in to AppView</h1>{notice}<p class=\"intro\">Use your AT Protocol handle or DID to continue securely with your account provider.</p><form action=\"/oauth/authorize\" method=\"post\" class=\"login-form\"><label for=\"handle\">AT Protocol handle or DID</label><input id=\"handle\" name=\"handle\" autocomplete=\"username\" autocapitalize=\"none\" placeholder=\"you.bsky.social\"{value} required><button type=\"submit\">Continue</button></form></section>"
+            "<section class=\"login-card\"><p class=\"eyebrow\">Your network, your view</p><h1>Sign in to AppView</h1>{notice}<p class=\"intro\">Use your AT Protocol handle or DID to continue securely with your account provider.</p><form action=\"/oauth/authorize\" method=\"post\" class=\"login-form\"><label for=\"handle\">AT Protocol handle or DID</label><input id=\"handle\" name=\"handle\" autocomplete=\"username\" autocapitalize=\"none\" placeholder=\"you.bsky.social\"{value} required><label class=\"login-write-option\" for=\"write\"><input type=\"checkbox\" id=\"write\" name=\"write\" value=\"1\"{write_checked}> Allow changes (post, like, follow, edit feeds)</label><button type=\"submit\">Continue</button></form></section>"
         ),
         false,
     ))
