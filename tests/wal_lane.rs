@@ -24,7 +24,7 @@ fn temp_db(label: &str) -> PathBuf {
 }
 
 #[test]
-fn passive_probe() {
+fn passive_catches_up_and_reuses_wal_with_short_readers() {
     let path = temp_db("passive");
     let writer = Connection::open(&path).unwrap();
     writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA journal_size_limit=65536; CREATE TABLE t(k INTEGER PRIMARY KEY, v BLOB);").unwrap();
@@ -84,8 +84,13 @@ fn passive_probe() {
         .execute("INSERT INTO t VALUES (2001, zeroblob(2048))", [])
         .unwrap();
     let after_next_write = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+    let reused: (i64, i64, i64) = writer
+        .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap();
     eprintln!(
-        "A measurement: passive_rounds={rounds} fully_caught_up={caught_up} final={latest:?} wal_peak={wal_peak} before_final={before_final} after_passive={after_passive} after_next_write={after_next_write}"
+        "A measurement: passive_rounds={rounds} fully_caught_up={caught_up} final={latest:?} wal_peak={wal_peak} before_final={before_final} after_passive={after_passive} after_next_write={after_next_write} reused={reused:?}"
     );
     drop(writer);
     let _ = std::fs::remove_file(&path);
@@ -201,7 +206,8 @@ fn clean_shutdown_truncates_the_wal() {
 }
 
 #[test]
-fn crash_child() {
+#[ignore = "subprocess helper for crash checkpoint test"]
+fn crash_checkpoint_child() {
     let Ok(path) = std::env::var("AV68C_CRASH_DB") else {
         return;
     };
@@ -225,12 +231,13 @@ fn crash_child() {
 }
 
 #[test]
-fn crash_probe() {
+fn first_passive_after_crash_reports_checkpointed_frames() {
     let path = temp_db("crash");
     let mut child = Command::new(std::env::current_exe().unwrap())
         .arg("--exact")
-        .arg("crash_child")
+        .arg("crash_checkpoint_child")
         .arg("--nocapture")
+        .arg("--ignored")
         .env("AV68C_CRASH_DB", &path)
         .stdout(Stdio::piped())
         .spawn()
@@ -286,7 +293,7 @@ fn crash_probe() {
 }
 
 #[test]
-fn production_index_bytes_per_event_probe() {
+fn production_index_bytes_per_event() {
     let path = temp_db("events");
     let storage = SqliteStorage::open(&path).unwrap();
     let probe = Connection::open(&path).unwrap();

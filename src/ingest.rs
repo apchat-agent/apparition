@@ -2572,6 +2572,10 @@ fn wal_file_bytes(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+fn should_skip_checkpoint_for_pressure(pressure_active: bool, file_bytes: u64) -> bool {
+    pressure_active && file_bytes < WAL_PRESSURE_CHECKPOINT_BYTES
+}
+
 fn spawn_checkpointer(
     path: PathBuf,
     stop: Arc<AtomicBool>,
@@ -2596,9 +2600,9 @@ fn spawn_checkpointer(
                 // and the last small number would let the backfill pile on meanwhile.
                 backlog.store(u64::MAX, Ordering::Relaxed);
                 let file_bytes = wal_file_bytes(&path);
-                if pressure.is_active() && file_bytes < WAL_PRESSURE_CHECKPOINT_BYTES {
+                if should_skip_checkpoint_for_pressure(pressure.is_active(), file_bytes) {
                     // PASSIVE has no page-count budget. Skip while interactive work is
-                    // queued, then force a round before the WAL reaches the 4x limit.
+                    // queued, then run every round after the WAL reaches 3x the limit.
                     wal_metrics.record_skipped_checkpoint(file_bytes);
                     continue;
                 }
@@ -3760,7 +3764,10 @@ impl Storage for SqliteStorage {
             return Ok(BatchApplyTiming::default());
         }
         let writer_updates = updates.to_vec();
-        let (timing, tracked_follow_deltas, affected) = self.writer.call(move |connection| {
+        // Jetstream updates share the writer with snapshots. Mark them urgent so
+        // the writer can pick live events ahead of queued backfill batches.
+        let (timing, tracked_follow_deltas, affected) =
+            self.writer.call_live(move |connection| {
             let apply_started = Instant::now();
             let transaction = connection.transaction()?;
             let mut tracked_follow_deltas = HashMap::<String, i64>::new();
@@ -6177,12 +6184,35 @@ mod sqlite_writer_tests {
         let read_metrics = ReadPoolMetrics::default();
         read_metrics.record_wait(Duration::from_millis(7));
         read_metrics.record_wait(Duration::from_millis(3));
-        SqliteWriterMetrics::default().report(&read_metrics, &WalMetrics::default());
+        let wal_metrics = WalMetrics::default();
+        wal_metrics.record_checkpoint(8_192, 3, 2, true);
+        wal_metrics
+            .backfill_wait_ns
+            .store(1_500_000, Ordering::Relaxed);
+        SqliteWriterMetrics::default().report(&read_metrics, &wal_metrics);
 
         let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
         assert!(text.contains("SQLite writer minute metrics"), "{text}");
         assert!(text.contains("read_wait_count=2"), "{text}");
         assert!(text.contains("read_wait_max_ms=7"), "{text}");
+        assert!(text.contains("wal_bytes=8192"), "{text}");
+        assert!(text.contains("wal_frames=3"), "{text}");
+        assert!(text.contains("ckpt_frames=2"), "{text}");
+        assert!(text.contains("wal_reset=true"), "{text}");
+        assert!(text.contains("backfill_wait_ms=1.5"), "{text}");
+    }
+
+    #[test]
+    fn checkpoint_pressure_gate_forces_rounds_at_three_journal_limits() {
+        assert!(should_skip_checkpoint_for_pressure(
+            true,
+            WAL_PRESSURE_CHECKPOINT_BYTES - 1
+        ));
+        assert!(!should_skip_checkpoint_for_pressure(
+            true,
+            WAL_PRESSURE_CHECKPOINT_BYTES
+        ));
+        assert!(!should_skip_checkpoint_for_pressure(false, 0));
     }
 
     #[test]
