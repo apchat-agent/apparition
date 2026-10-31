@@ -18167,6 +18167,8 @@ mod tests {
         profiles_calls: usize,
         profiles_delay: Duration,
         profiles_response: Option<Value>,
+        search_posts_calls: usize,
+        search_posts_requests: Vec<(String, Option<String>)>,
     }
 
     #[derive(Clone, Default)]
@@ -18250,6 +18252,7 @@ mod tests {
         let mutes_state = state.clone();
         let preferences_state = state.clone();
         let profiles_state = state.clone();
+        let search_posts_state = state.clone();
         let app = Router::new()
             .route(
                 "/.well-known/oauth-authorization-server",
@@ -18360,6 +18363,42 @@ mod tests {
                         };
                         tokio::time::sleep(delay).await;
                         Json(json!({"mutes":[]}))
+                    }
+                }),
+            )
+            .route(
+                "/xrpc/app.bsky.feed.searchPosts",
+                get(move |uri: Uri, headers: HeaderMap| {
+                    let state = search_posts_state.clone();
+                    async move {
+                        {
+                            let mut state = state.lock().unwrap();
+                            state.search_posts_calls += 1;
+                            state.search_posts_requests.push((
+                                uri.query().unwrap_or_default().to_owned(),
+                                headers
+                                    .get("atproto-proxy")
+                                    .and_then(|value| value.to_str().ok())
+                                    .map(str::to_owned),
+                            ));
+                        }
+                        Json(json!({
+                            "posts": [{
+                                "uri": "at://did:plc:searched/app.bsky.feed.post/signed-hit",
+                                "cid": "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+                                "author": {"did": "did:plc:searched", "handle": "searched.test"},
+                                "record": {
+                                    "$type": "app.bsky.feed.post",
+                                    "text": "signed mincy post",
+                                    "createdAt": "2026-10-31T12:00:00.000Z"
+                                },
+                                "indexedAt": "2026-10-31T12:00:01.000Z",
+                                "replyCount": 0,
+                                "repostCount": 0,
+                                "likeCount": 0
+                            }],
+                            "cursor": "signed-next"
+                        }))
                     }
                 }),
             )
@@ -18554,6 +18593,76 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(240)).await;
         assert_eq!(state.lock().unwrap().mutes_calls, 1);
         assert!(flow.fetch_muted_actor_dids(&did).await.unwrap().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn signed_posts_search_proxies_through_the_viewers_session_to_the_appview() {
+        let (flow, state, server) = feed_test_flow(false).await;
+        let viewer_did: Did = FEED_VIEWER_DID.parse().unwrap();
+        let mut stored = flow
+            .store
+            .get(&viewer_did)
+            .await
+            .unwrap()
+            .expect("the test session is stored");
+        stored.token_set.scope = Some("atproto rpc:app.bsky.feed.searchPosts?aud=*".to_owned());
+        flow.store.set(viewer_did.clone(), stored).await.unwrap();
+
+        let answer = tokio::time::timeout(
+            Duration::from_secs(5),
+            flow.signed_search_posts(FEED_VIEWER_DID, "minc", Some("cursor-page-2")),
+        )
+        .await
+        .expect("the signed search finishes within its budget")
+        .expect("no failure on the way to the fake PDS")
+        .expect("a session granted the searchPosts scope gets a signed answer");
+        assert_eq!(
+            answer
+                .get("posts")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or_default(),
+            1,
+            "the fake PDS answer arrives as JSON: {answer}"
+        );
+        let requests = state.lock().unwrap().search_posts_requests.clone();
+        assert_eq!(requests.len(), 1, "exactly one GET on the fake PDS");
+        let (query, proxy) = &requests[0];
+        assert_eq!(
+            proxy.as_deref(),
+            Some("did:web:api.bsky.app#bsky_appview"),
+            "the call must carry the Bluesky AppView proxy header"
+        );
+        let parameters = url::form_urlencoded::parse(query.as_bytes())
+            .into_owned()
+            .collect::<Vec<_>>();
+        for (key, value) in [
+            ("q", "minc"),
+            ("limit", "25"),
+            ("cursor", "cursor-page-2"),
+        ] {
+            assert!(
+                parameters
+                    .iter()
+                    .any(|(name, got)| name == key && got == value),
+                "{key}={value} missing from {parameters:?}"
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn signed_posts_search_skips_a_session_without_the_granted_search_scope() {
+        let (flow, state, server) = feed_test_flow(false).await;
+        // feed_test_flow stores its session with the bare `atproto` scope, the shape of a
+        // sign-in made before the searchPosts scope existed: no failing call may be spent.
+        let answer = flow
+            .signed_search_posts(FEED_VIEWER_DID, "minc", None)
+            .await
+            .expect("skipping is not a failure");
+        assert!(answer.is_none(), "old sign-ins get no signed search");
+        assert_eq!(state.lock().unwrap().search_posts_calls, 0);
         server.abort();
     }
 
