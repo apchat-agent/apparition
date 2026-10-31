@@ -113,6 +113,9 @@ struct FakeServerState {
     // When set, the refresh_token grant answers this status with
     // {"error":<error>,"error_description":..} instead of a new token set.
     refresh_failure: Option<(u16, String)>,
+    // When set, com.atproto.repo.createRecord answers DPoP error="invalid_token" unless the
+    // request carries one of these access tokens.
+    create_required_access_tokens: Option<Vec<String>>,
     // Access token issued by the first (authorization-code) token exchange; defaults to
     // "access-expired".
     initial_access_token: Option<String>,
@@ -1836,7 +1839,25 @@ async fn serve_one(mut stream: TcpStream, origin: &str, state: Arc<Mutex<FakeSer
                     .headers
                     .get("dpop")
                     .and_then(|proof| jwt_claim(proof, "nonce"));
-                if let Some((status, message)) = state.create_failure.clone() {
+                let token_gate = state
+                    .create_required_access_tokens
+                    .as_ref()
+                    .is_some_and(|valid| {
+                        let authorization = request
+                            .headers
+                            .get("authorization")
+                            .map(String::as_str)
+                            .unwrap_or_default();
+                        let token = authorization.trim_start_matches("DPoP ").trim();
+                        !valid.iter().any(|valid| valid == token)
+                    });
+                if token_gate {
+                    (
+                        401,
+                        vec![("WWW-Authenticate", "DPoP error=\"invalid_token\"")],
+                        json!({"error":"invalid_token"}).to_string(),
+                    )
+                } else if let Some((status, message)) = state.create_failure.clone() {
                     (
                         status,
                         vec![],
@@ -2332,8 +2353,7 @@ async fn a_failed_like_names_the_pds_error_in_the_response_and_the_logs() {
         production_flow_with_public(public.clone(), None, Some(EXPECTED_OAUTH_SCOPE)).await;
     let app = public.router_with_flow(flow, Arc::new(MemoryStorage::default()));
     let cookie = finish_production_login(&app, &shared).await;
-    shared.lock().unwrap().create_failure =
-        Some((500, "fake PDS refused the like".to_owned()));
+    shared.lock().unwrap().create_failure = Some((500, "fake PDS refused the like".to_owned()));
 
     let output = Arc::new(Mutex::new(Vec::new()));
     let capture = tracing_subscriber::fmt()
@@ -2410,6 +2430,72 @@ async fn a_failed_like_names_the_pds_error_in_the_response_and_the_logs() {
     assert!(
         write_line.contains("fake PDS refused the like"),
         "the web write line must count the failure with its real text: {write_line}"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_refresh_rejected_with_invalid_grant_is_logged_with_the_authorization_servers_reason() {
+    let public = OAuthPublic::new("https://appview.example").unwrap();
+    let (flow, _store, shared, server) =
+        production_flow_with_public(public.clone(), None, Some(EXPECTED_OAUTH_SCOPE)).await;
+    let app = public.router_with_flow(flow, Arc::new(MemoryStorage::default()));
+    let cookie = finish_production_login(&app, &shared).await;
+    let issuer = server_origin(&shared);
+    // The PDS rejects the stored access token, and the authorization server now refuses the
+    // refresh token outright: exactly the 2026-10-31 incident, where this was invisible.
+    shared.lock().unwrap().create_required_access_tokens = Some(vec![]);
+    shared.lock().unwrap().refresh_failure = Some((400, "invalid_grant".to_owned()));
+
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let capture = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(CapturedMakeWriter(output.clone()))
+        .finish();
+    let _capture_guard = tracing::subscriber::set_default(capture);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/like")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", cookie)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "uri=at%3A%2F%2Fdid%3Aplc%3Aauthor%2Fapp.bsky.feed.post%2Fr1&cid=bafyreifake",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    drop(_capture_guard);
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+    let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    let refresh_line = logs
+        .lines()
+        .find(|line| line.contains("invalid_grant"))
+        .unwrap_or_else(|| panic!("a warn line naming the authorization server's reason: {logs}"));
+    assert!(refresh_line.contains("WARN"), "{refresh_line}");
+    assert!(refresh_line.contains(DID), "{refresh_line}");
+    assert!(refresh_line.contains(&issuer), "{refresh_line}");
+    assert!(refresh_line.contains("400"), "{refresh_line}");
+    assert!(
+        refresh_line.contains("refresh=true"),
+        "the line must say it was a refresh: {refresh_line}"
+    );
+    let state = shared.lock().unwrap();
+    assert!(
+        state
+            .requests
+            .iter()
+            .any(|request| request.path == "/token"
+                && request.body.contains("grant_type=refresh_token")),
+        "the refresh must actually have been attempted"
     );
     server.abort();
 }
