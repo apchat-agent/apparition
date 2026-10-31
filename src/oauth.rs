@@ -7654,25 +7654,21 @@ where
                     return Redirect::to(&feed_link_href(feed)).into_response();
                 }
                 if let Err(error) = state.storage.set_last_active_feed_tab(&did, "following") {
-                    tracing::error!(%error, viewer_did = %did, "could not reset an unavailable remembered feed tab");
-                    return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+                    tracing::warn!(%error, viewer_did = %did, "could not reset an unavailable remembered feed tab; showing the page anyway");
                 }
             }
             Ok(Some(_)) => {}
             Ok(None) => {
                 if let Err(error) = state.storage.set_last_active_feed_tab(&did, "following") {
-                    tracing::error!(%error, viewer_did = %did, "could not remember the Following feed tab");
-                    return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+                    tracing::warn!(%error, viewer_did = %did, "could not remember the Following feed tab; showing the page anyway");
                 }
             }
             Err(error) => {
-                tracing::error!(%error, viewer_did = %did, "could not load the remembered feed tab");
-                return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+                tracing::warn!(%error, viewer_did = %did, "could not load the remembered feed tab; showing the page anyway");
             }
         }
     } else if let Err(error) = state.storage.set_last_active_feed_tab(&did, "following") {
-        tracing::error!(%error, viewer_did = %did, "could not remember the Following feed tab");
-        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+        tracing::warn!(%error, viewer_did = %did, "could not remember the Following feed tab; showing the page anyway");
     }
     let limit = query
         .get("limit")
@@ -8435,8 +8431,7 @@ where
         return oauth_error(StatusCode::BAD_REQUEST, "feed uri is required");
     };
     if let Err(error) = state.storage.set_last_active_feed_tab(&did, uri) {
-        tracing::error!(%error, viewer_did = %did, feed_uri = %uri, "could not remember the active feed tab");
-        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+        tracing::warn!(%error, viewer_did = %did, feed_uri = %uri, "could not remember the active feed tab; showing the page anyway");
     }
     let page_key = (
         did.clone(),
@@ -9815,8 +9810,7 @@ where
         && query.contains_key("did")
         && let Err(error) = state.storage.remember_recent_profile(&did, subject)
     {
-        tracing::error!(%error, viewer_did = %did, profile_did = %subject, "could not remember a search profile visit");
-        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+        tracing::warn!(%error, viewer_did = %did, profile_did = %subject, "could not remember a search profile visit; showing the page anyway");
     }
     let limit = query
         .get("limit")
