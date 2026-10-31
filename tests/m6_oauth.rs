@@ -30,6 +30,7 @@ use tower::ServiceExt;
 use tracing::{Event, Subscriber, field::Visit};
 use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
+const EXPECTED_READ_ONLY_SCOPE: &str = "atproto rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* rpc:app.bsky.graph.getMutes?aud=*";
 const EXPECTED_OAUTH_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.graph.getMutes?aud=* rpc:app.bsky.actor.putPreferences?aud=did:web:api.bsky.app%23bsky_appview";
 
 #[derive(Clone)]
@@ -144,6 +145,7 @@ struct FakeOAuthFlow {
     granted_scope: Option<String>,
     callback_did: Option<String>,
     browser_binding: Arc<Mutex<Option<String>>>,
+    authorize_scopes: Arc<Mutex<Option<String>>>,
     callback_failure: Option<String>,
     action_failure: Option<String>,
     pinned_feeds: Vec<ResolvedFeed>,
@@ -177,6 +179,7 @@ impl Default for FakeOAuthFlow {
             granted_scope: Some(EXPECTED_OAUTH_SCOPE.to_owned()),
             callback_did: None,
             browser_binding: Arc::new(Mutex::new(None)),
+            authorize_scopes: Arc::new(Mutex::new(None)),
             callback_failure: None,
             action_failure: None,
             pinned_feeds: Vec::new(),
@@ -1511,6 +1514,62 @@ async fn login_page_accepts_an_atproto_handle_or_did() {
     assert!(html.contains("name=\"handle\""));
     assert!(html.contains("/oauth/authorize"));
     assert!(html.contains("method=\"post\""));
+}
+
+#[tokio::test]
+async fn authorize_without_write_requested_sends_the_read_only_scope_list() {
+    let flow = FakeOAuthFlow::default();
+    let captured = flow.authorize_scopes.clone();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, Arc::new(MemoryStorage::default()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/authorize")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("handle=alice.test"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        captured.lock().unwrap().as_deref(),
+        Some(EXPECTED_READ_ONLY_SCOPE),
+        "an unticked login form must request the read-only scope list"
+    );
+}
+
+#[tokio::test]
+async fn authorize_with_write_requested_sends_the_full_scope_list() {
+    let flow = FakeOAuthFlow::default();
+    let captured = flow.authorize_scopes.clone();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, Arc::new(MemoryStorage::default()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/authorize")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("handle=alice.test&write=1"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        captured.lock().unwrap().as_deref(),
+        Some(EXPECTED_OAUTH_SCOPE),
+        "a ticked login form must request the full scope list as today"
+    );
 }
 
 #[tokio::test]
