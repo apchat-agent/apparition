@@ -577,3 +577,81 @@ async fn a_response_cursor_becomes_a_more_results_link_and_is_sent_back_on_the_n
     );
     server.abort();
 }
+
+// Added by claude-helper at review (2026-10-31): mutants M1, M5, M6 and M8 survived the lane's suite.
+
+#[tokio::test]
+async fn people_the_viewer_muted_are_hidden_from_people_search() {
+    let actors = json!({"actors": [
+        {"did": HIT_AUTHOR, "handle": "muted.test", "displayName": "Muted Person"},
+        {"did": "did:plc:finder", "handle": "finder.test", "displayName": "Finder"}
+    ]});
+    let (base, _fake, server) = start_fake_search_with(search_posts_body(None), actors).await;
+    let router = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow_and_shutdown_and_profile_counts_and_relationships_and_search(
+            MutingFlow {
+                muted: [HIT_AUTHOR.to_owned()].into_iter().collect(),
+            },
+            Arc::new(MemoryStorage::default()),
+            WebShutdown::new(),
+            ProfileCountsClient::local_only(),
+            RelationshipClient::local_only(),
+            search_client(&base),
+        );
+    let cookie = login(&router).await;
+    let html = get_html(&router, "/search?q=per&type=people", &cookie).await;
+    assert!(
+        !html.contains("Muted Person") && !html.contains("@muted.test"),
+        "a muted person must not be listed: {html}"
+    );
+    assert!(
+        html.contains("@finder.test"),
+        "the other person must stay: {html}"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn people_search_escapes_names_and_descriptions_from_upstream() {
+    let actors = json!({"actors": [{
+        "did": "did:plc:finder",
+        "handle": "finder.test",
+        "displayName": "<b>Bold</b> Finder",
+        "description": "<img src=x onerror=alert(1)> hi"
+    }]});
+    let (base, _fake, server) = start_fake_search_with(search_posts_body(None), actors).await;
+    let router = router_with_search(AcceptingFlow, search_client(&base));
+    let cookie = login(&router).await;
+    let html = get_html(&router, "/search?q=fin&type=people", &cookie).await;
+    assert!(
+        !html.contains("<b>Bold</b>"),
+        "a display name must not reach the page as markup: {html}"
+    );
+    assert!(
+        html.contains("&lt;b&gt;Bold&lt;/b&gt; Finder"),
+        "the display name must be shown escaped: {html}"
+    );
+    assert!(
+        !html.contains("<img src=x"),
+        "a description must not reach the page as markup: {html}"
+    );
+    assert!(
+        html.contains("&lt;img src=x onerror=alert(1)&gt; hi"),
+        "the description must be shown escaped: {html}"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_blank_query_shows_the_form_and_makes_no_outbound_call() {
+    let (base, fake, server) = start_fake_search(search_posts_body(None)).await;
+    let router = router_with_search(AcceptingFlow, search_client(&base));
+    let cookie = login(&router).await;
+    for uri in ["/search?q=", "/search?q=%20%20", "/search?q=&type=people"] {
+        let html = get_html(&router, uri, &cookie).await;
+        assert!(html.contains("name=\"q\""), "{uri}: form missing: {html}");
+    }
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+    server.abort();
+}
