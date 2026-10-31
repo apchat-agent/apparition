@@ -6651,6 +6651,85 @@ async fn callback_keeps_partial_write_grants_read_only_and_blocks_actions() {
 }
 
 #[tokio::test]
+async fn a_read_only_session_is_shown_a_sign_in_page_not_a_json_error_for_every_write() {
+    let flow = FakeOAuthFlow::with_granted_scope(Some(EXPECTED_READ_ONLY_SCOPE));
+    let actions = flow.actions.clone();
+    let storage = Arc::new(MemoryStorage::default());
+    storage
+        .put_record(&fake_feed_post("did:plc:author", "one", 10, "a post to act on"))
+        .unwrap();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage);
+    let cookie = finish_login(&app).await;
+
+    let writes = [
+        (
+            "like",
+            "/like",
+            "uri=at%3A%2F%2Fdid%3Aplc%3Aauthor%2Fapp.bsky.feed.post%2Fone&cid=one-cid",
+            "like posts",
+        ),
+        (
+            "follow",
+            "/profile/action",
+            "subject=did%3Aplc%3Afriend&action=follow",
+            "follow",
+        ),
+        ("post", "/post", "text=must+not+write", "post"),
+    ];
+    for (name, uri, body, wording) in writes {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("origin", "https://appview.example")
+                    .header("sec-fetch-site", "same-origin")
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let content_type = response.headers()[axum::http::header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let html = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(content_type.starts_with("text/html"), "{name}: {content_type}");
+        assert!(
+            html.contains("href=\"/login?write=1\""),
+            "{name} must link to the write sign-in: {html}"
+        );
+        assert!(
+            html.contains(&format!("Sign in with changes allowed to {wording}")),
+            "{name}: {html}"
+        );
+        assert!(
+            !html.contains("\"error\":") && !html.contains("\"message\":"),
+            "{name} must not answer with a raw JSON error: {html}"
+        );
+    }
+    assert!(
+        actions.lock().unwrap().is_empty(),
+        "a read-only session must never reach the PDS write: {:?}",
+        actions.lock().unwrap()
+    );
+}
+
+#[tokio::test]
 async fn empty_timeline_reports_backfill_progress_for_registered_account() {
     let storage = Arc::new(MemoryStorage::default());
     let app = OAuthPublic::new("https://appview.example")
