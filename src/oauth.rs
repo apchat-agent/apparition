@@ -5325,6 +5325,7 @@ fn page_shell_with_feeds_and_badge(
             show_feed_tabs: true,
             mobile_navigation_override: None,
             unread_count,
+            allow_more: None,
         },
     )
 }
@@ -5336,6 +5337,7 @@ struct PageShellOptions<'a> {
     show_feed_tabs: bool,
     mobile_navigation_override: Option<&'a str>,
     unread_count: usize,
+    allow_more: Option<&'a str>,
 }
 
 fn page_shell_with_options(
@@ -5351,10 +5353,15 @@ fn page_shell_with_options(
         show_feed_tabs,
         mobile_navigation_override,
         unread_count,
+        allow_more,
     } = options;
+    let allow_more_link = match allow_more {
+        Some(href) => format!("<a class=\"allow-more\" href=\"{href}\">Allow more</a>"),
+        None => String::new(),
+    };
     let navigation = if authenticated {
         format!(
-            "<nav class=\"primary-nav\" aria-label=\"Main navigation\"><a href=\"/app\">{}<span>Home</span></a><a href=\"/feeds\">{}<span>Feeds</span></a><a class=\"notification-nav-link\" href=\"/notifications\">{}<span>Notifications</span>{}</a><a href=\"/profile\">{}<span>Profile</span></a><a href=\"/app/block-lists\">{}<span>Block lists</span></a><a class=\"compose-link\" href=\"/app#new-post\">{}<span>New post</span></a><form action=\"/logout\" method=\"post\"><button type=\"submit\">Sign out</button></form></nav>",
+            "<nav class=\"primary-nav\" aria-label=\"Main navigation\"><a href=\"/app\">{}<span>Home</span></a><a href=\"/feeds\">{}<span>Feeds</span></a><a class=\"notification-nav-link\" href=\"/notifications\">{}<span>Notifications</span>{}</a><a href=\"/profile\">{}<span>Profile</span></a><a href=\"/app/block-lists\">{}<span>Block lists</span></a><a class=\"compose-link\" href=\"/app#new-post\">{}<span>New post</span></a>{allow_more_link}<form action=\"/logout\" method=\"post\"><button type=\"submit\">Sign out</button></form></nav>",
             icon_svg("home"),
             icon_svg("feeds"),
             icon_svg("notifications"),
@@ -7692,16 +7699,22 @@ where
     } else {
         String::new()
     };
-    let response = Html(page_shell_with_feeds_and_badge(
+    let allow_more = verified_cookie_allow_more(&state.public, &headers, state.storage.as_ref());
+    let response = Html(page_shell_with_options(
         "Timeline",
         &format!(
             "<header class=\"page-heading\"><p class=\"eyebrow\">Your feed</p><h1>Timeline</h1><p class=\"page-subtitle\">Posts from accounts in your local view.</p></header>{read_only_message}{indexing_status}{post_form}<ol class=\"post-list\">{posts}</ol>{older}",
         ),
         true,
-        &pinned_feeds,
-        None,
-        true,
-        unread_badge_count(state.storage.as_ref(), &did),
+        PageShellOptions {
+            feeds: &pinned_feeds,
+            active_feed: None,
+            following_active: true,
+            show_feed_tabs: true,
+            mobile_navigation_override: None,
+            unread_count: unread_badge_count(state.storage.as_ref(), &did),
+            allow_more: allow_more.as_deref(),
+        },
     ))
     .into_response();
     page_timing.render_ms = posts_render_ms + rest_render_started.elapsed().as_millis() as u64;
@@ -8022,7 +8035,8 @@ where
     page_timing.preferences_ms = tabs.preferences_ms;
     page_timing.tabs_ms = tabs.tabs_ms;
     let shell_render_started = std::time::Instant::now();
-    let response = Html(page_shell_with_feeds_and_badge(
+    let allow_more = verified_cookie_allow_more(&state.public, &headers, state.storage.as_ref());
+    let response = Html(page_shell_with_options(
         &page.generator.display_name,
         &format!(
             "{}{}<ol class=\"post-list\">{posts}</ol>{older}",
@@ -8030,10 +8044,15 @@ where
             skipped
         ),
         true,
-        &tabs.feeds,
-        Some(&page.generator.uri),
-        false,
-        unread_badge_count(state.storage.as_ref(), &did),
+        PageShellOptions {
+            feeds: &tabs.feeds,
+            active_feed: Some(&page.generator.uri),
+            following_active: false,
+            show_feed_tabs: true,
+            mobile_navigation_override: None,
+            unread_count: unread_badge_count(state.storage.as_ref(), &did),
+            allow_more: allow_more.as_deref(),
+        },
     ))
     .into_response();
     page_timing.render_ms = pre_tabs_render_ms + shell_render_started.elapsed().as_millis() as u64;
@@ -8459,16 +8478,22 @@ where
     } else {
         String::new()
     };
-    let response = Html(page_shell_with_feeds_and_badge(
+    let allow_more = verified_cookie_allow_more(&state.public, &headers, state.storage.as_ref());
+    let response = Html(page_shell_with_options(
         "Notifications",
         &format!(
             "<header class=\"page-heading\"><p class=\"eyebrow\">What’s happening</p><h1>Notifications</h1><p class=\"page-subtitle\">Recent activity around your posts and profile.</p></header><ol class=\"notification-list\">{items}</ol>{older}"
         ),
         true,
-        &tabs.feeds,
-        None,
-        false,
-        unread_badge_count(state.storage.as_ref(), &did),
+        PageShellOptions {
+            feeds: &tabs.feeds,
+            active_feed: None,
+            following_active: false,
+            show_feed_tabs: true,
+            mobile_navigation_override: None,
+            unread_count: unread_badge_count(state.storage.as_ref(), &did),
+            allow_more: allow_more.as_deref(),
+        },
     ))
     .into_response();
     page_timing.render_ms = render_started.elapsed().as_millis() as u64;
@@ -9375,14 +9400,20 @@ where
         posts: &posts,
         older: &older,
     });
-    let response = Html(page_shell_with_feeds_and_badge(
+    let allow_more = verified_cookie_allow_more(&state.public, &headers, state.storage.as_ref());
+    let response = Html(page_shell_with_options(
         display_name,
         &content,
         true,
-        &tabs.feeds,
-        None,
-        false,
-        unread_badge_count(state.storage.as_ref(), &did),
+        PageShellOptions {
+            feeds: &tabs.feeds,
+            active_feed: None,
+            following_active: false,
+            show_feed_tabs: true,
+            mobile_navigation_override: None,
+            unread_count: unread_badge_count(state.storage.as_ref(), &did),
+            allow_more: allow_more.as_deref(),
+        },
     ))
     .into_response();
     page_timing.render_ms = render_started.elapsed().as_millis() as u64;
@@ -10173,6 +10204,7 @@ where
     let badge_count = unread_badge_count(state.storage.as_ref(), &viewer_did);
     let mobile_navigation =
         render_thread_mobile_navigation(state.storage.as_ref(), &viewer_did, badge_count);
+    let allow_more = verified_cookie_allow_more(&state.public, &headers, state.storage.as_ref());
     let response = Html(page_shell_with_options(
         "Thread",
         &format!(
@@ -10194,6 +10226,7 @@ where
             show_feed_tabs: false,
             mobile_navigation_override: Some(&mobile_navigation),
             unread_count: badge_count,
+            allow_more: allow_more.as_deref(),
         },
     ))
     .into_response();
@@ -12478,6 +12511,42 @@ fn verified_cookie_form_rights<S: Storage>(
             like: permissions.like,
         })
         .unwrap_or_default()
+}
+
+/// The sign-in link that lets a session add boxes without losing the ones it already holds: it
+/// repeats `allow=` for every box the session has (so those stay ticked), and returns `None` once
+/// the session holds all five, so the link disappears for a fully-granted account.
+fn allow_more_href(permissions: &SessionPermissions) -> Option<String> {
+    let social = permissions.follow && permissions.block && permissions.mute && permissions.list;
+    let held = [
+        ("like", permissions.like),
+        ("repost", permissions.repost),
+        ("post", permissions.post),
+        ("social", social),
+        ("feeds", permissions.preferences),
+    ];
+    let present = held
+        .iter()
+        .filter(|(_, held)| *held)
+        .map(|(value, _)| format!("allow={value}"))
+        .collect::<Vec<_>>();
+    if present.len() == held.len() {
+        return None;
+    }
+    if present.is_empty() {
+        Some("/login".to_owned())
+    } else {
+        Some(format!("/login?{}", present.join("&")))
+    }
+}
+
+fn verified_cookie_allow_more<S: Storage>(
+    public: &OAuthPublic,
+    headers: &HeaderMap,
+    storage: &S,
+) -> Option<String> {
+    verified_cookie_session(public, headers, storage)
+        .and_then(|(_, _, _, permissions)| allow_more_href(&permissions))
 }
 
 fn verified_cookie_post_access<S: Storage>(
@@ -16352,6 +16421,54 @@ mod tests {
             "{payload}.{}",
             URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
         )
+    }
+
+    fn permissions_with(
+        like: bool,
+        repost: bool,
+        post: bool,
+        social: bool,
+        feeds: bool,
+    ) -> SessionPermissions {
+        SessionPermissions {
+            write: false,
+            feed: true,
+            blob: post,
+            video: false,
+            follow: social,
+            block: social,
+            mute: social,
+            list: social,
+            preferences: feeds,
+            like,
+            repost,
+            post,
+        }
+    }
+
+    #[test]
+    fn allow_more_link_pre_ticks_the_boxes_a_session_already_holds() {
+        assert_eq!(
+            allow_more_href(&permissions_with(true, false, false, false, false)).as_deref(),
+            Some("/login?allow=like")
+        );
+        assert_eq!(
+            allow_more_href(&permissions_with(true, false, false, true, false)).as_deref(),
+            Some("/login?allow=like&allow=social")
+        );
+        assert_eq!(
+            allow_more_href(&permissions_with(false, false, false, false, false)).as_deref(),
+            Some("/login"),
+            "a read-only session still gets a link, to a blank sign-in"
+        );
+    }
+
+    #[test]
+    fn allow_more_link_disappears_once_all_five_boxes_are_held() {
+        assert_eq!(
+            allow_more_href(&permissions_with(true, true, true, true, true)),
+            None
+        );
     }
 
     #[test]

@@ -209,6 +209,51 @@ textarea:focus-visible {
   color: var(--accent-contrast);
 }
 
+.primary-nav .allow-more {
+  justify-content: center;
+  padding: 0.35rem 1rem;
+  color: var(--accent);
+  font-size: 0.85rem;
+  font-weight: 650;
+}
+
+.primary-nav .allow-more:hover {
+  color: var(--accent-hover);
+  text-decoration: underline;
+}
+
+.login-allow-options {
+  display: grid;
+  gap: 0.35rem;
+  margin: 1rem 0;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+}
+
+.login-allow-options legend {
+  padding: 0 0.35rem;
+  font-weight: 750;
+}
+
+.login-allow-option {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  font-size: 0.95rem;
+}
+
+.login-allow-option input {
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.login-allow-note {
+  margin: 0.5rem 0 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
 .primary-nav form,
 .post-action-form {
   display: contents;
