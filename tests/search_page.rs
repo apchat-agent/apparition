@@ -1,5 +1,5 @@
 use appview_rs::{
-    ingest::MemoryStorage,
+    ingest::{IndexedRecord, MemoryStorage, Storage},
     net::SafeHttpClient,
     oauth::{OAuthAccount, OAuthCallback, OAuthFlow, OAuthPublic, WebShutdown},
     profile_counts::{ProfileCountsClient, RelationshipClient},
@@ -27,6 +27,7 @@ use tokio::net::TcpListener;
 use tower::ServiceExt;
 
 const ALICE: &str = "did:plc:alice";
+const HIT_AUTHOR: &str = "did:plc:searched";
 const HIT_URI: &str = "at://did:plc:searched/app.bsky.feed.post/hit1";
 const WRITE_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete";
 
@@ -353,5 +354,107 @@ async fn people_search_renders_actor_rows_linking_to_the_profile_page() {
         ),
         "the row must show the avatar: {html}"
     );
+    server.abort();
+}
+
+#[derive(Clone)]
+struct MutingFlow {
+    muted: std::collections::HashSet<String>,
+}
+
+impl OAuthFlow for MutingFlow {
+    fn authorize<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+        _: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async { Ok("https://auth.example/authorize".to_owned()) })
+    }
+    fn callback<'a>(
+        &'a self,
+        _: OAuthCallback,
+    ) -> Pin<Box<dyn Future<Output = Result<OAuthAccount, String>> + Send + 'a>> {
+        Box::pin(async {
+            Ok(OAuthAccount {
+                did: ALICE.to_owned(),
+                verified_handle: Some("alice.test".to_owned()),
+                granted_scope: Some(WRITE_SCOPE.to_owned()),
+            })
+        })
+    }
+    fn logout<'a>(
+        &'a self,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn muted_actor_dids<'a>(
+        &'a self,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<std::collections::HashSet<String>, String>> + Send + 'a>>
+    {
+        let muted = self.muted.clone();
+        Box::pin(async move { Ok(muted) })
+    }
+}
+
+#[tokio::test]
+async fn posts_by_a_muted_author_are_hidden_from_search_results() {
+    let (base, _fake, server) = start_fake_search(search_posts_body(None)).await;
+    let router = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow_and_shutdown_and_profile_counts_and_relationships_and_search(
+            MutingFlow {
+                muted: [HIT_AUTHOR.to_owned()].into_iter().collect(),
+            },
+            Arc::new(MemoryStorage::default()),
+            WebShutdown::new(),
+            ProfileCountsClient::local_only(),
+            RelationshipClient::local_only(),
+            search_client(&base),
+        );
+    let cookie = login(&router).await;
+    let html = get_html(&router, "/search?q=minc", &cookie).await;
+    assert!(
+        !html.contains("mincy post"),
+        "a muted author's post must not be shown: {html}"
+    );
+    assert!(html.contains("empty-state"), "the page needs its empty message: {html}");
+    server.abort();
+}
+
+#[tokio::test]
+async fn posts_by_a_blocked_author_are_hidden_from_search_results() {
+    let (base, _fake, server) = start_fake_search(search_posts_body(None)).await;
+    let storage = Arc::new(MemoryStorage::default());
+    storage
+        .put_record(&IndexedRecord {
+            did: ALICE.into(),
+            collection: "app.bsky.graph.block".into(),
+            rkey: "block-hit".into(),
+            uri: "at://did:plc:alice/app.bsky.graph.block/block-hit".into(),
+            cid: None,
+            time_us: 1,
+            record: json!({"subject": HIT_AUTHOR, "createdAt": "2026-10-30T09:00:00Z"}),
+        })
+        .unwrap();
+    let router = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow_and_shutdown_and_profile_counts_and_relationships_and_search(
+            AcceptingFlow,
+            storage,
+            WebShutdown::new(),
+            ProfileCountsClient::local_only(),
+            RelationshipClient::local_only(),
+            search_client(&base),
+        );
+    let cookie = login(&router).await;
+    let html = get_html(&router, "/search?q=minc", &cookie).await;
+    assert!(
+        !html.contains("mincy post"),
+        "a blocked author's post must not be shown: {html}"
+    );
+    assert!(html.contains("empty-state"), "the page needs its empty message: {html}");
     server.abort();
 }

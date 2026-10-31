@@ -7893,10 +7893,8 @@ where
             Ok(hidden) => hidden,
             Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
         };
-    let visible = records
-        .into_iter()
-        .filter(|record| !hidden_actors.contains(&record.did))
-        .collect::<Vec<_>>();
+    drop(hidden_actors);
+    let visible = records;
     let content_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
     let parents = match hydrate_page_parents(
         &state.flow,
