@@ -5248,6 +5248,92 @@ async fn with_web_page_phase_detail<F: Future>(detail: WebPagePhaseDetail, futur
     WEB_PAGE_PHASE_DETAIL.scope(detail, future).await
 }
 
+tokio::task_local! {
+    static WEB_WRITE_FAILURE: Arc<Mutex<Option<String>>>;
+}
+
+async fn with_web_write_failure<F: Future>(
+    slot: Arc<Mutex<Option<String>>>,
+    future: F,
+) -> F::Output {
+    WEB_WRITE_FAILURE.scope(slot, future).await
+}
+
+/// Keep the first failed write's real error text so the `web write` minute line can carry it.
+fn record_web_write_failure(error: &str) {
+    let _ = WEB_WRITE_FAILURE.try_with(|slot| {
+        if let Ok(mut slot) = slot.lock()
+            && slot.is_none()
+        {
+            *slot = Some(error.to_owned());
+        }
+    });
+}
+
+/// The browser-facing `<short reason>`: the real text collapsed and truncated, or a pointer to
+/// the log when the text carries token-shaped or filesystem-shaped secrets (tokens, DPoP keys,
+/// refresh tokens and internal paths stay out of responses; the warn line carries the full text).
+fn write_reason_for_browser(error: &str) -> String {
+    let collapsed = error.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lower = collapsed.to_ascii_lowercase();
+    const SECRET_MARKERS: [&str; 9] = [
+        "access_token",
+        "access token",
+        "refresh_token",
+        "refresh token",
+        "client_assertion",
+        "dpop_key",
+        "/srv/",
+        "/var/",
+        "/etc/",
+    ];
+    if SECRET_MARKERS.iter().any(|marker| lower.contains(marker)) {
+        return "see the server log for the reason".to_owned();
+    }
+    if collapsed.chars().count() <= 240 {
+        return collapsed;
+    }
+    let mut shortened = collapsed.chars().take(240).collect::<String>();
+    shortened.push('…');
+    shortened
+}
+
+fn oauth_named_error(status: StatusCode, message: &str) -> Response {
+    (
+        status,
+        Json(json!({"error":"OAuthError","message":message})),
+    )
+        .into_response()
+}
+
+/// The one response every web write handler returns when the write failed: the real error is
+/// warned with route + DID, recorded for the `web write` line, and the user gets an error whose
+/// message names what failed instead of "the request could not be completed".
+fn web_write_response(
+    _public: &OAuthPublic,
+    _headers: &HeaderMap,
+    route: &str,
+    verb: &str,
+    did: &str,
+    status: StatusCode,
+    error: &str,
+) -> Response {
+    tracing::warn!(route, did = %did, error = %error, "web write failed");
+    record_web_write_failure(error);
+    let message = if status == StatusCode::BAD_GATEWAY {
+        format!(
+            "Bluesky did not accept the {verb}: {}",
+            write_reason_for_browser(error)
+        )
+    } else {
+        format!(
+            "This appview could not finish the {verb}: {}",
+            write_reason_for_browser(error)
+        )
+    };
+    oauth_named_error(status, &message)
+}
+
 fn current_request_timing_id() -> Option<String> {
     REQUEST_TIMING_ID.try_with(Clone::clone).ok()
 }
@@ -5300,11 +5386,15 @@ async fn account_web_outbound_calls<F: OAuthFlow, S: Storage + 'static>(
     let started_at_ms = now_unix_ms();
     let accounting = RequestOutboundAccounting::default();
     let page_phases = WebPagePhaseDetail::default();
+    let write_failure = Arc::new(Mutex::new(None::<String>));
     let response = with_request_outbound_accounting(
         accounting.clone(),
         with_web_page_phase_detail(
             page_phases.clone(),
-            with_request_timing_id(timing_id.clone(), next.run(request)),
+            with_request_timing_id(
+                timing_id.clone(),
+                with_web_write_failure(write_failure.clone(), next.run(request)),
+            ),
         ),
     )
     .await;
@@ -5338,6 +5428,11 @@ async fn account_web_outbound_calls<F: OAuthFlow, S: Storage + 'static>(
     }
     if let Some(route) = write_route {
         let calls = accounting.snapshot();
+        let failure = write_failure
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_default();
         tracing::info!(
             route,
             total_ms = started.elapsed().as_millis() as u64,
@@ -5346,6 +5441,7 @@ async fn account_web_outbound_calls<F: OAuthFlow, S: Storage + 'static>(
             dpop_nonce_retries = calls.dpop_nonce_retries,
             dpop_nonce_retry = calls.dpop_nonce_retries > 0,
             outbound_calls = %format_outbound_calls(&calls),
+            error = %failure,
             "web write"
         );
     }
@@ -9128,7 +9224,15 @@ where
                             == Some(expected_subject)
                     }),
                     Err(error) => {
-                        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+                        return web_write_response(
+                            &state.public,
+                            &headers,
+                            "profile action",
+                            action,
+                            &viewer_did,
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            &error.to_string(),
+                        );
                     }
                 };
             let Some(record) = record else {
@@ -9205,7 +9309,17 @@ where
                 .await
             {
                 Ok(lists) => lists,
-                Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
+                Err(error) => {
+                    return web_write_response(
+                        &state.public,
+                        &headers,
+                        "profile action",
+                        "list action",
+                        &viewer_did,
+                        StatusCode::BAD_GATEWAY,
+                        &error,
+                    );
+                }
             };
             if !lists.iter().any(|list| list.uri == list_uri) {
                 return oauth_error(
@@ -9264,7 +9378,17 @@ where
                 .await
             {
                 Ok(lists) => lists,
-                Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
+                Err(error) => {
+                    return web_write_response(
+                        &state.public,
+                        &headers,
+                        "profile action",
+                        "list action",
+                        &viewer_did,
+                        StatusCode::BAD_GATEWAY,
+                        &error,
+                    );
+                }
             };
             if !lists
                 .iter()
@@ -9311,7 +9435,17 @@ where
                 .await
             {
                 Ok(lists) => lists,
-                Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
+                Err(error) => {
+                    return web_write_response(
+                        &state.public,
+                        &headers,
+                        "profile action",
+                        "list action",
+                        &viewer_did,
+                        StatusCode::BAD_GATEWAY,
+                        &error,
+                    );
+                }
             };
             let Some(list) = lists.iter().find(|list| list.uri == list_uri) else {
                 return oauth_error(
@@ -9376,7 +9510,15 @@ where
         _ => unreachable!("profile action was validated above"),
     };
     if let Err(error) = result {
-        return oauth_error(StatusCode::BAD_GATEWAY, &error);
+        return web_write_response(
+            &state.public,
+            &headers,
+            "profile action",
+            action,
+            &viewer_did,
+            StatusCode::BAD_GATEWAY,
+            &error,
+        );
     }
     if headers
         .get("x-appview-fetch")
@@ -9395,7 +9537,15 @@ where
         .await
         {
             Ok(actions_html) => Json(json!({"actions_html":actions_html})).into_response(),
-            Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+            Err(error) => web_write_response(
+                &state.public,
+                &headers,
+                "profile action",
+                action,
+                &viewer_did,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &error,
+            ),
         };
     }
     Redirect::to(&format!("/profile?did={}", form_encoded(subject_did))).into_response()
@@ -11081,7 +11231,17 @@ where
         let parent = match load_post_record(&state.flow, state.storage.as_ref(), parent_uri).await {
             Ok(Some(record)) => record,
             Ok(None) => return oauth_error(StatusCode::NOT_FOUND, "parent post not found"),
-            Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
+            Err(error) => {
+                return web_write_response(
+                    &state.public,
+                    &headers,
+                    "video",
+                    "video post",
+                    &did,
+                    StatusCode::BAD_GATEWAY,
+                    &error,
+                );
+            }
         };
         let Some(parent_cid) = parent.cid.as_deref().filter(|cid| !cid.is_empty()) else {
             return oauth_error(StatusCode::BAD_REQUEST, "parent post has no CID");
@@ -11116,7 +11276,17 @@ where
         let quoted = match load_post_record(&state.flow, state.storage.as_ref(), quote_uri).await {
             Ok(Some(record)) => record,
             Ok(None) => return oauth_error(StatusCode::NOT_FOUND, "quoted post not found"),
-            Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
+            Err(error) => {
+                return web_write_response(
+                    &state.public,
+                    &headers,
+                    "video",
+                    "video post",
+                    &did,
+                    StatusCode::BAD_GATEWAY,
+                    &error,
+                );
+            }
         };
         let Some(cid) = quoted.cid.as_deref().filter(|cid| !cid.is_empty()) else {
             return oauth_error(StatusCode::BAD_REQUEST, "quoted post has no CID");
@@ -11135,7 +11305,15 @@ where
         Ok(created) => created,
         Err(error) => {
             tracing::warn!(%error, "video upload or processing failed before record creation");
-            return oauth_error(StatusCode::BAD_GATEWAY, &error);
+            return web_write_response(
+                &state.public,
+                &headers,
+                "video",
+                "video post",
+                &did,
+                StatusCode::BAD_GATEWAY,
+                &error,
+            );
         }
     };
     if submission.parent_uri.is_some() {
@@ -11143,7 +11321,15 @@ where
     }
     match persist_created_record(state.storage.clone(), &did, "app.bsky.feed.post", created).await {
         Ok(()) => Redirect::to(&redirect).into_response(),
-        Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+        Err(error) => web_write_response(
+            &state.public,
+            &headers,
+            "video",
+            "video post",
+            &did,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &error,
+        ),
     }
 }
 
@@ -11269,18 +11455,56 @@ where
                 .await
             {
                 Ok(()) => Redirect::to("/app").into_response(),
-                Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+                Err(error) => web_write_response(
+                    &state.public,
+                    &headers,
+                    "post",
+                    "post",
+                    &did,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &error,
+                ),
             }
         }
-        Err(error) => image_or_text_action_error(error, has_images || has_external),
+        Err(error) => image_or_text_action_error(
+            &state.public,
+            &headers,
+            "post",
+            "post",
+            &did,
+            error,
+            has_images || has_external,
+        ),
     }
 }
 
-fn image_or_text_action_error(error: String, has_media: bool) -> Response {
+fn image_or_text_action_error(
+    public: &OAuthPublic,
+    headers: &HeaderMap,
+    route: &str,
+    verb: &str,
+    did: &str,
+    error: String,
+    has_media: bool,
+) -> Response {
     if !has_media {
-        return oauth_error(StatusCode::BAD_GATEWAY, &error);
+        return web_write_response(
+            public,
+            headers,
+            route,
+            verb,
+            did,
+            StatusCode::BAD_GATEWAY,
+            &error,
+        );
     }
-    tracing::warn!(%error, "post media upload failed before record creation");
+    tracing::warn!(
+        route,
+        did = %did,
+        error = %error,
+        "post media upload failed before record creation"
+    );
+    record_web_write_failure(&error);
     (
         StatusCode::BAD_GATEWAY,
         Json(json!({
@@ -11338,7 +11562,17 @@ where
     let quoted = match load_post_record(&state.flow, state.storage.as_ref(), quote_uri).await {
         Ok(Some(record)) => record,
         Ok(None) => return oauth_error(StatusCode::NOT_FOUND, "quoted post not found"),
-        Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
+        Err(error) => {
+            return web_write_response(
+                &state.public,
+                &headers,
+                "quote",
+                "quote",
+                &did,
+                StatusCode::BAD_GATEWAY,
+                &error,
+            );
+        }
     };
     let Some(cid) = quoted.cid.as_deref().filter(|cid| !cid.is_empty()) else {
         return oauth_error(StatusCode::BAD_REQUEST, "quoted post has no CID");
@@ -11383,11 +11617,29 @@ where
     };
     let created = match created {
         Ok(created) => created,
-        Err(error) => return image_or_text_action_error(error, has_images || has_external),
+        Err(error) => {
+            return image_or_text_action_error(
+                &state.public,
+                &headers,
+                "quote",
+                "quote",
+                &did,
+                error,
+                has_images || has_external,
+            );
+        }
     };
     match persist_created_record(state.storage.clone(), &did, "app.bsky.feed.post", created).await {
         Ok(()) => Redirect::to("/app").into_response(),
-        Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+        Err(error) => web_write_response(
+            &state.public,
+            &headers,
+            "quote",
+            "quote",
+            &did,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &error,
+        ),
     }
 }
 
@@ -11438,7 +11690,17 @@ where
     let parent = match load_post_record(&state.flow, state.storage.as_ref(), parent_uri).await {
         Ok(Some(parent)) => parent,
         Ok(None) => return oauth_error(StatusCode::NOT_FOUND, "parent post not found"),
-        Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
+        Err(error) => {
+            return web_write_response(
+                &state.public,
+                &headers,
+                "reply",
+                "reply",
+                &did,
+                StatusCode::BAD_GATEWAY,
+                &error,
+            );
+        }
     };
     let Some(parent_cid) = parent.cid.as_deref().filter(|cid| !cid.is_empty()) else {
         return oauth_error(StatusCode::BAD_REQUEST, "parent post has no CID");
@@ -11513,12 +11775,30 @@ where
     };
     let created = match created {
         Ok(created) => created,
-        Err(error) => return image_or_text_action_error(error, has_images || has_external),
+        Err(error) => {
+            return image_or_text_action_error(
+                &state.public,
+                &headers,
+                "reply",
+                "reply",
+                &did,
+                error,
+                has_images || has_external,
+            );
+        }
     };
     let redirect = format!("/app/thread?uri={}", form_encoded(&created.uri));
     match persist_created_record(state.storage.clone(), &did, "app.bsky.feed.post", created).await {
         Ok(()) => Redirect::to(&redirect).into_response(),
-        Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+        Err(error) => web_write_response(
+            &state.public,
+            &headers,
+            "reply",
+            "reply",
+            &did,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &error,
+        ),
     }
 }
 
@@ -11600,7 +11880,15 @@ where
         let summary = match state.storage.post_interaction_summary(uri, Some(&did)) {
             Ok(summary) => summary,
             Err(error) => {
-                return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+                return web_write_response(
+                    &state.public,
+                    &headers,
+                    "like",
+                    "like",
+                    &did,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &error.to_string(),
+                );
             }
         };
         let Some(like_uri) = summary.viewer_like else {
@@ -11625,9 +11913,25 @@ where
                     &did,
                     uri,
                 ),
-                Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+                Err(error) => web_write_response(
+                    &state.public,
+                    &headers,
+                    "like",
+                    "like",
+                    &did,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &error,
+                ),
             },
-            Err(error) => oauth_error(StatusCode::BAD_GATEWAY, &error),
+            Err(error) => web_write_response(
+                &state.public,
+                &headers,
+                "like",
+                "like",
+                &did,
+                StatusCode::BAD_GATEWAY,
+                &error,
+            ),
         };
     }
     match state.flow.like(&did, uri, cid).await {
@@ -11642,10 +11946,26 @@ where
                     &did,
                     uri,
                 ),
-                Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+                Err(error) => web_write_response(
+                    &state.public,
+                    &headers,
+                    "like",
+                    "like",
+                    &did,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &error,
+                ),
             }
         }
-        Err(error) => oauth_error(StatusCode::BAD_GATEWAY, &error),
+        Err(error) => web_write_response(
+            &state.public,
+            &headers,
+            "like",
+            "like",
+            &did,
+            StatusCode::BAD_GATEWAY,
+            &error,
+        ),
     }
 }
 
@@ -11683,9 +12003,25 @@ where
         .await
         {
             Ok(()) => return_to_post(&headers, &state.public.public_url, uri),
-            Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+            Err(error) => web_write_response(
+                &state.public,
+                &headers,
+                "repost",
+                "repost",
+                &did,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &error,
+            ),
         },
-        Err(error) => oauth_error(StatusCode::BAD_GATEWAY, &error),
+        Err(error) => web_write_response(
+            &state.public,
+            &headers,
+            "repost",
+            "repost",
+            &did,
+            StatusCode::BAD_GATEWAY,
+            &error,
+        ),
     }
 }
 
