@@ -507,7 +507,10 @@ async fn production_post_with_two_images_uploads_blobs_before_creating_record() 
     server.abort();
 }
 
-#[tokio::test]
+// current_thread + a thread-local capture guard around each awaited request: the task-scoped
+// `.with_subscriber` guard alone loses events to the thread's default dispatcher when the
+// multithreaded runtime polls this future on a worker thread another test left busy.
+#[tokio::test(flavor = "current_thread")]
 async fn write_timing_line_counts_a_fake_pds_dpop_nonce_retry() {
     let public = OAuthPublic::new("https://appview.example").unwrap();
     let (flow, _, shared, server) =
@@ -517,12 +520,16 @@ async fn write_timing_line_counts_a_fake_pds_dpop_nonce_retry() {
     shared.lock().unwrap().create_nonce_required = true;
 
     let output = Arc::new(Mutex::new(Vec::new()));
-    let subscriber = tracing_subscriber::fmt()
-        .without_time()
-        .with_ansi(false)
-        .with_max_level(tracing::Level::INFO)
-        .with_writer(CapturedMakeWriter(output.clone()))
-        .finish();
+    let make_subscriber = || {
+        tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(CapturedMakeWriter(output.clone()))
+            .finish()
+    };
+    let subscriber = make_subscriber();
+    let _thread_capture = tracing::subscriber::set_default(make_subscriber());
     let before = shared.lock().unwrap().requests.len();
     let boundary = "nonce-write";
     let body = picture_multipart(boundary, "nonce accounting", None, None, &[]);
@@ -545,6 +552,7 @@ async fn write_timing_line_counts_a_fake_pds_dpop_nonce_retry() {
         .with_subscriber(subscriber)
         .await
         .unwrap();
+    drop(_thread_capture);
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
 
     let first_write_end = shared.lock().unwrap().requests.len();
@@ -555,6 +563,14 @@ async fn write_timing_line_counts_a_fake_pds_dpop_nonce_retry() {
         .with_max_level(tracing::Level::INFO)
         .with_writer(CapturedMakeWriter(second_output.clone()))
         .finish();
+    let _second_thread_capture = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(CapturedMakeWriter(second_output.clone()))
+            .finish(),
+    );
     let second_before = first_write_end;
     let second_boundary = "nonce-write-second";
     let second_body =
@@ -578,6 +594,7 @@ async fn write_timing_line_counts_a_fake_pds_dpop_nonce_retry() {
         .with_subscriber(second_subscriber)
         .await
         .unwrap();
+    drop(_second_thread_capture);
     assert_eq!(second_response.status(), StatusCode::SEE_OTHER);
 
     let requests = shared.lock().unwrap().requests.clone();
