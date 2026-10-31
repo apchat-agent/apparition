@@ -1897,7 +1897,7 @@ impl SqliteWriterMetrics {
         self.failed_writes.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn report(&self) {
+    fn report(&self, read_metrics: &ReadPoolMetrics) {
         let count = self.transaction_count.swap(0, Ordering::Relaxed);
         let total_ns = self.transaction_total_ns.swap(0, Ordering::Relaxed);
         let max_ns = self.transaction_max_ns.swap(0, Ordering::Relaxed);
@@ -1914,8 +1914,41 @@ impl SqliteWriterMetrics {
             transaction_max_ms = max_ns as f64 / 1_000_000.0,
             dropped_count = self.dropped.swap(0, Ordering::Relaxed),
             failed_write_count = self.failed_writes.swap(0, Ordering::Relaxed),
+            read_wait_count = read_metrics.waits.swap(0, Ordering::Relaxed),
+            read_wait_max_ms =
+                read_metrics.wait_max_ns.swap(0, Ordering::Relaxed) as f64 / 1_000_000.0,
             "SQLite writer minute metrics"
         );
+    }
+}
+
+/// Head-of-line pressure on the read connection pool: how many reads could not
+/// take the connection the round-robin picked first (and had to search or
+/// block), and the longest such wait. The counters are zeroed by the per-minute
+/// `SQLite writer minute metrics` line, which carries both.
+#[derive(Default)]
+pub struct ReadPoolMetrics {
+    waits: AtomicU64,
+    wait_max_ns: AtomicU64,
+}
+
+impl ReadPoolMetrics {
+    fn record_wait(&self, waited: Duration) {
+        self.waits.fetch_add(1, Ordering::Relaxed);
+        self.wait_max_ns.fetch_max(
+            u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Reads that had to wait for a connection since the last metrics line.
+    pub fn waits(&self) -> u64 {
+        self.waits.load(Ordering::Relaxed)
+    }
+
+    /// The longest such wait, in ms, since the last metrics line.
+    pub fn wait_max_ms(&self) -> f64 {
+        self.wait_max_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0
     }
 }
 
@@ -1926,13 +1959,18 @@ struct SqliteWriter {
 }
 
 impl SqliteWriter {
-    fn new(connection: Connection) -> Result<Self, StorageError> {
+    fn new(
+        connection: Connection,
+        read_metrics: Arc<ReadPoolMetrics>,
+    ) -> Result<Self, StorageError> {
         let (sender, receiver) = mpsc::sync_channel(SQLITE_WRITER_QUEUE);
         let metrics = Arc::new(SqliteWriterMetrics::default());
         let thread_metrics = Arc::clone(&metrics);
         let worker = std::thread::Builder::new()
             .name("sqlite-writer".to_owned())
-            .spawn(move || sqlite_writer_loop(connection, receiver, thread_metrics))?;
+            .spawn(move || {
+                sqlite_writer_loop(connection, receiver, thread_metrics, read_metrics)
+            })?;
         Ok(Self {
             sender: Some(sender),
             worker: Some(worker),
@@ -2010,6 +2048,7 @@ fn sqlite_writer_loop(
     mut connection: Connection,
     receiver: Receiver<SqliteWriterMessage>,
     metrics: Arc<SqliteWriterMetrics>,
+    read_metrics: Arc<ReadPoolMetrics>,
 ) {
     let mut next_metrics = Instant::now() + SQLITE_WRITER_METRICS_INTERVAL;
     let mut pending = None;
@@ -2020,7 +2059,7 @@ fn sqlite_writer_loop(
             match receiver.recv_timeout(next_metrics.saturating_duration_since(Instant::now())) {
                 Ok(message) => Some(message),
                 Err(RecvTimeoutError::Timeout) => {
-                    metrics.report();
+                    metrics.report(&read_metrics);
                     next_metrics = Instant::now() + SQLITE_WRITER_METRICS_INTERVAL;
                     continue;
                 }
@@ -2117,7 +2156,7 @@ fn sqlite_writer_loop(
             }
         }
         if Instant::now() >= next_metrics {
-            metrics.report();
+            metrics.report(&read_metrics);
             next_metrics = Instant::now() + SQLITE_WRITER_METRICS_INTERVAL;
         }
     }
@@ -2127,6 +2166,7 @@ pub struct SqliteStorage {
     writer: SqliteWriter,
     read_connections: Vec<Mutex<Connection>>,
     next_read_connection: AtomicU64,
+    read_metrics: Arc<ReadPoolMetrics>,
     path: PathBuf,
     checkpointer_stop: Arc<AtomicBool>,
     checkpoint_backlog: Arc<AtomicU64>,
@@ -2508,6 +2548,7 @@ impl SqliteStorage {
             reader.execute_batch("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON;")?;
             read_connections.push(Mutex::new(reader));
         }
+        let read_metrics = Arc::new(ReadPoolMetrics::default());
         let stop = Arc::new(AtomicBool::new(false));
         let backlog = Arc::new(AtomicU64::new(0));
         if !is_memory {
@@ -2519,9 +2560,10 @@ impl SqliteStorage {
             )?;
         }
         Ok(Self {
-            writer: SqliteWriter::new(connection)?,
+            writer: SqliteWriter::new(connection, Arc::clone(&read_metrics))?,
             read_connections,
             next_read_connection: AtomicU64::new(0),
+            read_metrics,
             path,
             checkpointer_stop: stop,
             checkpoint_backlog: backlog,
@@ -2615,15 +2657,44 @@ impl SqliteStorage {
     /// Picks a read connection. Public so a test (or an investigation) can hold
     /// one connection's guard and watch what the next reader does; production
     /// code should keep using the storage methods.
+    ///
+    /// Tries every connection without waiting, starting at the round-robin
+    /// index, and blocks on that first choice only when all of them are busy —
+    /// one slow query must not stall the readers that land on its connection
+    /// while the others sit idle. A read that could not take its first choice
+    /// is counted, with the longest wait, on the per-minute metrics line.
     pub fn read_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StorageError> {
         if self.read_connections.is_empty() {
             return Err(StorageError::WriterStopped);
         }
-        let index = self.next_read_connection.fetch_add(1, Ordering::Relaxed) as usize
-            % self.read_connections.len();
-        self.read_connections[index]
+        let count = self.read_connections.len();
+        let first = self.next_read_connection.fetch_add(1, Ordering::Relaxed) as usize % count;
+        let started = Instant::now();
+        for offset in 0..count {
+            match self.read_connections[(first + offset) % count].try_lock() {
+                Ok(connection) => {
+                    if offset > 0 {
+                        self.read_metrics.record_wait(started.elapsed());
+                    }
+                    return Ok(connection);
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(StorageError::Poisoned);
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+        }
+        let connection = self.read_connections[first]
             .lock()
-            .map_err(|_| StorageError::Poisoned)
+            .map_err(|_| StorageError::Poisoned)?;
+        self.read_metrics.record_wait(started.elapsed());
+        Ok(connection)
+    }
+
+    /// Head-of-line pressure on the read pool; the running service logs these
+    /// on the per-minute `SQLite writer minute metrics` line.
+    pub fn read_pool_metrics(&self) -> Arc<ReadPoolMetrics> {
+        Arc::clone(&self.read_metrics)
     }
 
     /// One page of a DID's followers plus the index/scan work the statement
@@ -5448,6 +5519,46 @@ mod sqlite_writer_tests {
     }
 
     #[test]
+    fn the_writer_minute_metrics_line_carries_the_read_pool_wait_counters() {
+        struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for CaptureWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        struct CaptureMakeWriter(Arc<Mutex<Vec<u8>>>);
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureMakeWriter {
+            type Writer = CaptureWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                CaptureWriter(self.0.clone())
+            }
+        }
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let _capture = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(CaptureMakeWriter(output.clone()))
+                .finish(),
+        );
+        let read_metrics = ReadPoolMetrics::default();
+        read_metrics.record_wait(Duration::from_millis(7));
+        read_metrics.record_wait(Duration::from_millis(3));
+        SqliteWriterMetrics::default().report(&read_metrics);
+
+        let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("SQLite writer minute metrics"), "{text}");
+        assert!(text.contains("read_wait_count=2"), "{text}");
+        assert!(text.contains("read_wait_max_ms=7"), "{text}");
+    }
+
+    #[test]
     fn page_read_and_refresh_enqueue_finish_while_ingest_holds_the_writer() {
         let path = test_path("writer-latency");
         let storage = Arc::new(SqliteStorage::open(&path).unwrap());
@@ -5581,7 +5692,7 @@ mod sqlite_writer_tests {
         connection
             .execute_batch("CREATE TABLE shutdown_write(value TEXT NOT NULL);")
             .unwrap();
-        let writer = SqliteWriter::new(connection).unwrap();
+        let writer = SqliteWriter::new(connection, Arc::new(ReadPoolMetrics::default())).unwrap();
         writer.fire(|connection| {
             std::thread::sleep(Duration::from_millis(200));
             connection.execute("INSERT INTO shutdown_write(value) VALUES('flushed')", [])?;
@@ -5606,7 +5717,7 @@ mod sqlite_writer_tests {
         connection
             .execute_batch("CREATE TABLE batch_write(value TEXT PRIMARY KEY);")
             .unwrap();
-        let writer = SqliteWriter::new(connection).unwrap();
+        let writer = SqliteWriter::new(connection, Arc::new(ReadPoolMetrics::default())).unwrap();
         writer.fire(|connection| {
             connection.execute("INSERT INTO batch_write(value) VALUES('good-before')", [])?;
             Ok(None)

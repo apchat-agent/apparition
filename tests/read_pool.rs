@@ -50,6 +50,14 @@ fn a_read_does_not_queue_behind_a_busy_connection_while_others_are_free() {
         "a read waited {slowest:?} for a connection whose pool had three idle ones: \
          read_conn must try the other connections before blocking"
     );
+    // Added with the fix: the reads that had to leave their round-robin
+    // connection are counted, and the count rides the per-minute metrics line.
+    let metrics = storage.read_pool_metrics();
+    assert!(
+        metrics.waits() >= 1,
+        "the read that skipped the busy connection must be counted (wait max {} ms)",
+        metrics.wait_max_ms()
+    );
 
     holder.join().unwrap();
     drop(storage);
