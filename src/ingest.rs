@@ -2451,6 +2451,91 @@ impl SqliteStorage {
                  record_json TEXT NOT NULL,
                  PRIMARY KEY (did, collection, rkey)
              );
+             CREATE TABLE IF NOT EXISTS post_counts (
+                 uri TEXT PRIMARY KEY,
+                 like_count INTEGER NOT NULL DEFAULT 0,
+                 repost_count INTEGER NOT NULL DEFAULT 0,
+                 reply_count INTEGER NOT NULL DEFAULT 0,
+                 quote_count INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TRIGGER IF NOT EXISTS records_post_counts_insert
+             AFTER INSERT ON records BEGIN
+                 UPDATE post_counts SET
+                     like_count = like_count + CASE WHEN NEW.collection='app.bsky.feed.like'
+                         AND uri=json_extract(NEW.record_json, '$.subject.uri') THEN 1 ELSE 0 END,
+                     repost_count = repost_count + CASE WHEN NEW.collection='app.bsky.feed.repost'
+                         AND uri=json_extract(NEW.record_json, '$.subject.uri') THEN 1 ELSE 0 END,
+                     reply_count = reply_count + CASE WHEN NEW.collection='app.bsky.feed.post'
+                         AND uri=json_extract(NEW.record_json, '$.reply.parent.uri') THEN 1 ELSE 0 END,
+                     quote_count = quote_count + CASE WHEN NEW.collection='app.bsky.feed.post'
+                         AND uri=json_extract(NEW.record_json, '$.embed.record.uri') THEN 1 ELSE 0 END
+                 WHERE uri IN (
+                     CASE WHEN NEW.collection IN ('app.bsky.feed.like','app.bsky.feed.repost')
+                         THEN json_extract(NEW.record_json, '$.subject.uri') END,
+                     CASE WHEN NEW.collection='app.bsky.feed.post'
+                         THEN json_extract(NEW.record_json, '$.reply.parent.uri') END,
+                     CASE WHEN NEW.collection='app.bsky.feed.post'
+                         THEN json_extract(NEW.record_json, '$.embed.record.uri') END
+                 );
+             END;
+             CREATE TRIGGER IF NOT EXISTS records_post_counts_delete
+             AFTER DELETE ON records BEGIN
+                 UPDATE post_counts SET
+                     like_count = like_count - CASE WHEN OLD.collection='app.bsky.feed.like'
+                         AND uri=json_extract(OLD.record_json, '$.subject.uri') THEN 1 ELSE 0 END,
+                     repost_count = repost_count - CASE WHEN OLD.collection='app.bsky.feed.repost'
+                         AND uri=json_extract(OLD.record_json, '$.subject.uri') THEN 1 ELSE 0 END,
+                     reply_count = reply_count - CASE WHEN OLD.collection='app.bsky.feed.post'
+                         AND uri=json_extract(OLD.record_json, '$.reply.parent.uri') THEN 1 ELSE 0 END,
+                     quote_count = quote_count - CASE WHEN OLD.collection='app.bsky.feed.post'
+                         AND uri=json_extract(OLD.record_json, '$.embed.record.uri') THEN 1 ELSE 0 END
+                 WHERE uri IN (
+                     CASE WHEN OLD.collection IN ('app.bsky.feed.like','app.bsky.feed.repost')
+                         THEN json_extract(OLD.record_json, '$.subject.uri') END,
+                     CASE WHEN OLD.collection='app.bsky.feed.post'
+                         THEN json_extract(OLD.record_json, '$.reply.parent.uri') END,
+                     CASE WHEN OLD.collection='app.bsky.feed.post'
+                         THEN json_extract(OLD.record_json, '$.embed.record.uri') END
+                 );
+             END;
+             CREATE TRIGGER IF NOT EXISTS records_post_counts_update
+             AFTER UPDATE ON records BEGIN
+                 UPDATE post_counts SET
+                     like_count = like_count
+                         + CASE WHEN NEW.collection='app.bsky.feed.like'
+                             AND uri=json_extract(NEW.record_json, '$.subject.uri') THEN 1 ELSE 0 END
+                         - CASE WHEN OLD.collection='app.bsky.feed.like'
+                             AND uri=json_extract(OLD.record_json, '$.subject.uri') THEN 1 ELSE 0 END,
+                     repost_count = repost_count
+                         + CASE WHEN NEW.collection='app.bsky.feed.repost'
+                             AND uri=json_extract(NEW.record_json, '$.subject.uri') THEN 1 ELSE 0 END
+                         - CASE WHEN OLD.collection='app.bsky.feed.repost'
+                             AND uri=json_extract(OLD.record_json, '$.subject.uri') THEN 1 ELSE 0 END,
+                     reply_count = reply_count
+                         + CASE WHEN NEW.collection='app.bsky.feed.post'
+                             AND uri=json_extract(NEW.record_json, '$.reply.parent.uri') THEN 1 ELSE 0 END
+                         - CASE WHEN OLD.collection='app.bsky.feed.post'
+                             AND uri=json_extract(OLD.record_json, '$.reply.parent.uri') THEN 1 ELSE 0 END,
+                     quote_count = quote_count
+                         + CASE WHEN NEW.collection='app.bsky.feed.post'
+                             AND uri=json_extract(NEW.record_json, '$.embed.record.uri') THEN 1 ELSE 0 END
+                         - CASE WHEN OLD.collection='app.bsky.feed.post'
+                             AND uri=json_extract(OLD.record_json, '$.embed.record.uri') THEN 1 ELSE 0 END
+                 WHERE uri IN (
+                     CASE WHEN NEW.collection IN ('app.bsky.feed.like','app.bsky.feed.repost')
+                         THEN json_extract(NEW.record_json, '$.subject.uri') END,
+                     CASE WHEN NEW.collection='app.bsky.feed.post'
+                         THEN json_extract(NEW.record_json, '$.reply.parent.uri') END,
+                     CASE WHEN NEW.collection='app.bsky.feed.post'
+                         THEN json_extract(NEW.record_json, '$.embed.record.uri') END,
+                     CASE WHEN OLD.collection IN ('app.bsky.feed.like','app.bsky.feed.repost')
+                         THEN json_extract(OLD.record_json, '$.subject.uri') END,
+                     CASE WHEN OLD.collection='app.bsky.feed.post'
+                         THEN json_extract(OLD.record_json, '$.reply.parent.uri') END,
+                     CASE WHEN OLD.collection='app.bsky.feed.post'
+                         THEN json_extract(OLD.record_json, '$.embed.record.uri') END
+                 );
+             END;
              CREATE INDEX IF NOT EXISTS records_collection_time ON records(collection, time_us DESC);
              CREATE INDEX IF NOT EXISTS records_collection_uri ON records(collection, uri);
              CREATE INDEX IF NOT EXISTS records_author_time ON records(collection, did, time_us DESC, uri DESC);
@@ -2786,39 +2871,92 @@ impl SqliteStorage {
         viewer_did: Option<&str>,
         mut work: Option<&mut StatementWork>,
     ) -> Result<PostInteractionSummary, StorageError> {
-        let conn = self.read_conn()?;
-        let mut summary = PostInteractionSummary::default();
-        for (collection, path, count) in [
-            (
-                "app.bsky.feed.like",
-                "$.subject.uri",
-                &mut summary.like_count,
-            ),
-            (
-                "app.bsky.feed.repost",
-                "$.subject.uri",
-                &mut summary.repost_count,
-            ),
-            (
-                "app.bsky.feed.post",
-                "$.reply.parent.uri",
-                &mut summary.reply_count,
-            ),
-            (
-                "app.bsky.feed.post",
-                "$.embed.record.uri",
-                &mut summary.quote_count,
-            ),
-        ] {
-            let mut statement = conn.prepare(&format!(
-                "SELECT COUNT(*) FROM records WHERE collection=?1 AND json_extract(record_json, '{path}')=?2"
-            ))?;
-            *count = statement.query_row(params![collection, uri], |row| row.get(0))?;
+        let cached_counts = {
+            let conn = self.read_conn()?;
+            let mut statement = conn.prepare(
+                "SELECT like_count,repost_count,reply_count,quote_count
+                 FROM post_counts WHERE uri=?1",
+            )?;
+            let counts = statement
+                .query_row([uri], |row| {
+                    Ok([row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?])
+                })
+                .optional()?;
             if let Some(work) = work.as_deref_mut() {
                 work.observe(&statement);
             }
-        }
+            counts
+        };
+        let counts = if let Some(counts) = cached_counts {
+            counts
+        } else {
+            // The writer serializes this first-time scan with every record
+            // mutation, so an interaction cannot land between the COUNTs and
+            // the cache insert and be lost from the projection.
+            let writer_uri = uri.to_owned();
+            let (counts, writer_work) = self.writer.call(move |connection| {
+                let transaction = connection.transaction()?;
+                let mut writer_work = StatementWork::default();
+                let cached = {
+                    let mut statement = transaction.prepare(
+                        "SELECT like_count,repost_count,reply_count,quote_count
+                         FROM post_counts WHERE uri=?1",
+                    )?;
+                    let cached = statement
+                        .query_row([writer_uri.as_str()], |row| {
+                            Ok([row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?])
+                        })
+                        .optional()?;
+                    writer_work.observe(&statement);
+                    cached
+                };
+                let counts = if let Some(counts) = cached {
+                    counts
+                } else {
+                    let mut counts = [0_usize; 4];
+                    for (index, (collection, path)) in [
+                        ("app.bsky.feed.like", "$.subject.uri"),
+                        ("app.bsky.feed.repost", "$.subject.uri"),
+                        ("app.bsky.feed.post", "$.reply.parent.uri"),
+                        ("app.bsky.feed.post", "$.embed.record.uri"),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let mut statement = transaction.prepare(&format!(
+                            "SELECT COUNT(*) FROM records WHERE collection=?1
+                             AND json_extract(record_json, '{path}')=?2"
+                        ))?;
+                        counts[index] = statement
+                            .query_row(params![collection, writer_uri], |row| row.get(0))?;
+                        writer_work.observe(&statement);
+                    }
+                    transaction.execute(
+                        "INSERT INTO post_counts
+                         (uri,like_count,repost_count,reply_count,quote_count)
+                         VALUES(?1,?2,?3,?4,?5)",
+                        params![writer_uri, counts[0], counts[1], counts[2], counts[3]],
+                    )?;
+                    counts
+                };
+                transaction.commit()?;
+                Ok((counts, writer_work))
+            })?;
+            if let Some(work) = work.as_deref_mut() {
+                work.fullscan_steps += writer_work.fullscan_steps;
+                work.vm_steps += writer_work.vm_steps;
+            }
+            counts
+        };
+        let mut summary = PostInteractionSummary {
+            like_count: counts[0],
+            repost_count: counts[1],
+            reply_count: counts[2],
+            quote_count: counts[3],
+            ..PostInteractionSummary::default()
+        };
         if let Some(viewer_did) = viewer_did {
+            let conn = self.read_conn()?;
             let mut statement = conn.prepare(
                 "SELECT uri FROM records INDEXED BY records_author_subject_uri
                  WHERE collection='app.bsky.feed.like' AND did=?1
@@ -2840,7 +2978,7 @@ impl SqliteStorage {
             summary.viewer_repost = statement
                 .query_row(params![viewer_did, uri], |row| row.get(0))
                 .optional()?;
-            if let Some(work) = work.as_deref_mut() {
+            if let Some(work) = work {
                 work.observe(&statement);
             }
         }
