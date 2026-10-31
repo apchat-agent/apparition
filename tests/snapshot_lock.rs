@@ -207,6 +207,74 @@ fn page_reads_do_not_wait_for_a_checkpoint_waiting_on_an_open_reader() {
     );
 }
 
+#[test]
+fn checkpointer_skips_a_round_while_page_requests_wait_for_connections() {
+    let dir = std::env::temp_dir().join(format!(
+        "appview-checkpoint-pressure-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let _guard = TempDirGuard::new(&dir);
+    let path = dir.join("appview.db");
+    let storage = std::sync::Arc::new(SqliteStorage::open(&path).unwrap());
+    let writer = Connection::open(&path).unwrap();
+    writer
+        .execute_batch(
+            "PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE checkpoint_payload(k INTEGER PRIMARY KEY, v BLOB);",
+        )
+        .unwrap();
+    for index in 0..128 {
+        writer
+            .execute(
+                "INSERT INTO checkpoint_payload VALUES (?1, zeroblob(32768))",
+                [index],
+            )
+            .unwrap();
+    }
+    drop(writer);
+    let wal_path = PathBuf::from(format!("{}-wal", path.display()));
+    let initial_bytes = std::fs::metadata(&wal_path).unwrap().len();
+    assert!(initial_bytes > 65_536);
+
+    let held_connections = (0..4)
+        .map(|_| storage.read_conn().unwrap())
+        .collect::<Vec<_>>();
+    let waiting_storage = std::sync::Arc::clone(&storage);
+    let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        waiting_tx.send(()).unwrap();
+        drop(waiting_storage.read_conn().unwrap());
+    });
+    waiting_rx.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(2_300));
+    let pressured_bytes = std::fs::metadata(&wal_path).unwrap().len();
+    drop(held_connections);
+    waiter.join().unwrap();
+    assert!(
+        pressured_bytes > 65_536,
+        "checkpointer reset a {initial_bytes} byte WAL during page pressure"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while std::fs::metadata(&wal_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+        > 65_536
+    {
+        assert!(
+            Instant::now() < deadline,
+            "checkpointer did not reset WAL after pressure cleared"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    drop(storage);
+}
+
 #[tokio::test]
 async fn large_repo_backfill_is_spread_across_batches_by_a_record_rate_budget() {
     struct EmptyFetcher;
@@ -480,17 +548,47 @@ async fn backfill_waits_for_the_checkpoint_backlog_to_drain() {
         0 | 1 => 10,
         _ => 0,
     };
-    wait_for_write_backlog(backlog, 5, Duration::from_millis(1), rx.clone()).await;
+    wait_for_write_backlog(backlog, || false, 5, Duration::from_millis(1), rx.clone()).await;
     assert_eq!(calls.load(Ordering::Relaxed), 3);
 
     let (tx, rx) = tokio::sync::watch::channel(false);
     tx.send(true).unwrap();
     tokio::time::timeout(
         Duration::from_secs(1),
-        wait_for_write_backlog(|| 10, 5, Duration::from_millis(1), rx),
+        wait_for_write_backlog(|| 10, || false, 5, Duration::from_millis(1), rx),
     )
     .await
     .expect("shutdown must end the wait");
+}
+
+#[tokio::test]
+async fn backfill_waits_for_interactive_sqlite_pressure_to_clear() {
+    use appview_rs::backfill::wait_for_write_backlog;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    let pressure = Arc::new(AtomicBool::new(true));
+    let task_pressure = Arc::clone(&pressure);
+    let (_tx, shutdown) = tokio::sync::watch::channel(false);
+    let waiter = tokio::spawn(async move {
+        wait_for_write_backlog(
+            || 0,
+            || task_pressure.load(Ordering::Relaxed),
+            5,
+            Duration::from_millis(1),
+            shutdown,
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    pressure.store(false, Ordering::Relaxed);
+    let waited = waiter.await.unwrap();
+    assert!(
+        waited >= Duration::from_millis(10),
+        "pressure wait was only {waited:?}"
+    );
 }
 
 #[test]
@@ -500,11 +598,17 @@ fn write_backlog_reads_as_behind_until_a_checkpoint_reports() {
     let _guard = TempDirGuard::new(&dir);
     let storage = SqliteStorage::open(dir.join("appview.db")).unwrap();
     assert_eq!(storage.write_backlog(), u64::MAX);
+    let started = Instant::now();
     let deadline = Instant::now() + Duration::from_secs(10);
     while storage.write_backlog() == u64::MAX {
         assert!(Instant::now() < deadline, "checkpointer never reported");
         std::thread::sleep(Duration::from_millis(100));
     }
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "small-WAL startup checkpoint took {:?}",
+        started.elapsed()
+    );
     assert!(storage.write_backlog() < 100);
     drop(storage);
 }

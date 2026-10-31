@@ -457,31 +457,44 @@ fn parse_rfc3339_micros(value: &str) -> Option<u64> {
 /// bound keeps a large backlog from delaying interactive writes during a flush.
 pub const MAX_WRITE_BACKLOG: u64 = 16_384;
 
-/// Waits while `backlog()` exceeds `limit`, or until shutdown.
+pub(crate) fn backfill_wait_required(backlog: u64, limit: u64, pressure: bool) -> bool {
+    pressure || backlog > limit
+}
+
+/// Waits while the WAL is behind or interactive SQLite work is waiting, or
+/// until shutdown. Returns the time spent waiting.
 pub async fn wait_for_write_backlog(
     backlog: impl Fn() -> u64,
+    pressure: impl Fn() -> bool,
     limit: u64,
     poll: Duration,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
-) {
+) -> Duration {
     let mut logged = false;
+    let started = Instant::now();
     loop {
         if *shutdown.borrow() {
-            return;
+            return started.elapsed();
         }
         let frames = backlog();
-        if frames <= limit {
-            return;
+        let pressured = pressure();
+        if !backfill_wait_required(frames, limit, pressured) {
+            return started.elapsed();
         }
         if !logged {
-            tracing::info!(frames, limit, "backfill paused until the disk catches up");
+            tracing::info!(
+                frames,
+                limit,
+                pressured,
+                "backfill paused for SQLite pressure"
+            );
             logged = true;
         }
         tokio::select! {
             _ = tokio::time::sleep(poll) => {},
             changed = shutdown.changed() => {
                 if changed.is_err() {
-                    return;
+                    return started.elapsed();
                 }
             }
         }
@@ -531,13 +544,15 @@ where
                 return Ok(());
             }
             for did in self.storage.pending_backfills()? {
-                wait_for_write_backlog(
+                let waited = wait_for_write_backlog(
                     || self.storage.write_backlog(),
+                    || self.storage.write_pressure(),
                     MAX_WRITE_BACKLOG,
                     Duration::from_secs(1),
                     shutdown.clone(),
                 )
                 .await;
+                self.storage.record_backfill_wait(waited);
                 if *shutdown.borrow() {
                     return Ok(());
                 }

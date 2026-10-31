@@ -37,6 +37,7 @@ const SQLITE_WRITER_QUEUE: usize = 256;
 const SQLITE_WRITER_BATCH_SIZE: usize = 64;
 const SQLITE_WRITER_BATCH_DELAY: Duration = Duration::from_millis(5);
 const WAL_JOURNAL_SIZE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+const WAL_PRESSURE_CHECKPOINT_BYTES: u64 = WAL_JOURNAL_SIZE_LIMIT_BYTES * 3;
 const CHECKPOINT_BUSY_TIMEOUT: Duration = Duration::from_millis(50);
 const SQLITE_WRITER_METRICS_INTERVAL: Duration = Duration::from_secs(60);
 static NEXT_MEMORY_DATABASE_ID: AtomicU64 = AtomicU64::new(1);
@@ -360,6 +361,10 @@ pub trait Storage: Send + Sync {
     fn write_backlog(&self) -> u64 {
         0
     }
+    fn write_pressure(&self) -> bool {
+        false
+    }
+    fn record_backfill_wait(&self, _waited: Duration) {}
     fn put_record(&self, record: &IndexedRecord) -> Result<(), StorageError>;
     fn apply_jetstream_batch(
         &self,
@@ -1916,6 +1921,20 @@ type BlockingWrite = Box<dyn FnOnce(&mut Connection) + Send>;
 enum SqliteWriterMessage {
     Fire(FireWrite),
     Blocking(BlockingWrite),
+    Urgent(BlockingWrite),
+}
+
+#[derive(Default)]
+struct StoragePressure {
+    waiting_reads: AtomicU64,
+    waiting_live_ingest: AtomicU64,
+}
+
+impl StoragePressure {
+    fn is_active(&self) -> bool {
+        self.waiting_reads.load(Ordering::Relaxed) > 0
+            || self.waiting_live_ingest.load(Ordering::Relaxed) > 0
+    }
 }
 
 #[derive(Default)]
@@ -1945,6 +1964,11 @@ impl WalMetrics {
         self.frames.store(frames, Ordering::Relaxed);
         self.checkpointed.store(checkpointed, Ordering::Relaxed);
         self.reset.store(reset, Ordering::Relaxed);
+    }
+
+    fn record_skipped_checkpoint(&self, file_bytes: u64) {
+        self.file_bytes.store(file_bytes, Ordering::Relaxed);
+        self.reset.store(false, Ordering::Relaxed);
     }
 }
 
@@ -2048,6 +2072,7 @@ struct SqliteWriter {
     sender: Option<SyncSender<SqliteWriterMessage>>,
     worker: Option<std::thread::JoinHandle<()>>,
     metrics: Arc<SqliteWriterMetrics>,
+    pressure: Arc<StoragePressure>,
 }
 
 impl SqliteWriter {
@@ -2055,11 +2080,13 @@ impl SqliteWriter {
         connection: Connection,
         read_metrics: Arc<ReadPoolMetrics>,
         wal_metrics: Arc<WalMetrics>,
+        pressure: Arc<StoragePressure>,
     ) -> Result<Self, StorageError> {
         let (sender, receiver) = mpsc::sync_channel(SQLITE_WRITER_QUEUE);
         let metrics = Arc::new(SqliteWriterMetrics::default());
         let thread_metrics = Arc::clone(&metrics);
         let thread_wal_metrics = Arc::clone(&wal_metrics);
+        let thread_pressure = Arc::clone(&pressure);
         let worker = std::thread::Builder::new()
             .name("sqlite-writer".to_owned())
             .spawn(move || {
@@ -2069,12 +2096,14 @@ impl SqliteWriter {
                     thread_metrics,
                     read_metrics,
                     thread_wal_metrics,
+                    thread_pressure,
                 )
             })?;
         Ok(Self {
             sender: Some(sender),
             worker: Some(worker),
             metrics,
+            pressure,
         })
     }
 
@@ -2093,6 +2122,35 @@ impl SqliteWriter {
         };
         if sender.send(command).is_err() {
             self.metrics.dequeued();
+            return Err(StorageError::WriterStopped);
+        }
+        result.recv().map_err(|_| StorageError::WriterStopped)?
+    }
+
+    fn call_live<R: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&mut Connection) -> Result<R, StorageError> + Send + 'static,
+    ) -> Result<R, StorageError> {
+        let (reply, result) = mpsc::sync_channel(1);
+        let command = SqliteWriterMessage::Urgent(Box::new(move |connection| {
+            let _ = reply.send(operation(connection));
+        }));
+        self.metrics.queued();
+        self.pressure
+            .waiting_live_ingest
+            .fetch_add(1, Ordering::Relaxed);
+        let Some(sender) = self.sender.as_ref() else {
+            self.metrics.dequeued();
+            self.pressure
+                .waiting_live_ingest
+                .fetch_sub(1, Ordering::Relaxed);
+            return Err(StorageError::WriterStopped);
+        };
+        if sender.send(command).is_err() {
+            self.metrics.dequeued();
+            self.pressure
+                .waiting_live_ingest
+                .fetch_sub(1, Ordering::Relaxed);
             return Err(StorageError::WriterStopped);
         }
         result.recv().map_err(|_| StorageError::WriterStopped)?
@@ -2150,29 +2208,42 @@ fn sqlite_writer_loop(
     metrics: Arc<SqliteWriterMetrics>,
     read_metrics: Arc<ReadPoolMetrics>,
     wal_metrics: Arc<WalMetrics>,
+    pressure: Arc<StoragePressure>,
 ) {
     let mut next_metrics = Instant::now() + SQLITE_WRITER_METRICS_INTERVAL;
-    let mut pending = None;
+    let mut pending = VecDeque::new();
     loop {
-        let message = if let Some(message) = pending.take() {
-            Some(message)
+        while let Ok(message) = receiver.try_recv() {
+            pending.push_back(message);
+        }
+        let urgent_position = pending
+            .iter()
+            .position(|message| matches!(message, SqliteWriterMessage::Urgent(_)));
+        let message = if let Some(position) = urgent_position {
+            pending.remove(position)
         } else {
+            pending.pop_front()
+        };
+        let Some(message) = message else {
             match receiver.recv_timeout(next_metrics.saturating_duration_since(Instant::now())) {
-                Ok(message) => Some(message),
+                Ok(message) => pending.push_back(message),
                 Err(RecvTimeoutError::Timeout) => {
                     metrics.report(&read_metrics, &wal_metrics);
                     next_metrics = Instant::now() + SQLITE_WRITER_METRICS_INTERVAL;
-                    continue;
                 }
-                Err(RecvTimeoutError::Disconnected) => None,
+                Err(RecvTimeoutError::Disconnected) => break,
             }
-        };
-        let Some(message) = message else {
-            break;
+            continue;
         };
         metrics.dequeued();
         match message {
             SqliteWriterMessage::Blocking(operation) => {
+                let started = Instant::now();
+                operation(&mut connection);
+                metrics.record_batch(started.elapsed());
+            }
+            SqliteWriterMessage::Urgent(operation) => {
+                pressure.waiting_live_ingest.fetch_sub(1, Ordering::Relaxed);
                 let started = Instant::now();
                 operation(&mut connection);
                 metrics.record_batch(started.elapsed());
@@ -2187,8 +2258,15 @@ fn sqlite_writer_loop(
                             writes.push(write);
                         }
                         Ok(blocking @ SqliteWriterMessage::Blocking(_)) => {
-                            pending = Some(blocking);
+                            pending.push_back(blocking);
                             break;
+                        }
+                        Ok(SqliteWriterMessage::Urgent(operation)) => {
+                            metrics.dequeued();
+                            pressure.waiting_live_ingest.fetch_sub(1, Ordering::Relaxed);
+                            let started = Instant::now();
+                            operation(&mut connection);
+                            metrics.record_batch(started.elapsed());
                         }
                         Err(TryRecvError::Empty) if Instant::now() < deadline => {
                             std::thread::sleep(Duration::from_micros(100));
@@ -2268,6 +2346,7 @@ pub struct SqliteStorage {
     read_connections: Vec<Mutex<Connection>>,
     next_read_connection: AtomicU64,
     read_metrics: Arc<ReadPoolMetrics>,
+    pressure: Arc<StoragePressure>,
     path: PathBuf,
     checkpointer_stop: Arc<AtomicBool>,
     checkpointer_worker: Option<std::thread::JoinHandle<()>>,
@@ -2498,6 +2577,7 @@ fn spawn_checkpointer(
     stop: Arc<AtomicBool>,
     backlog: Arc<AtomicU64>,
     wal_metrics: Arc<WalMetrics>,
+    pressure: Arc<StoragePressure>,
 ) -> Result<std::thread::JoinHandle<()>, StorageError> {
     let connection = Connection::open(&path)?;
     connection.busy_timeout(CHECKPOINT_BUSY_TIMEOUT)?;
@@ -2515,6 +2595,13 @@ fn spawn_checkpointer(
                 // Unknown counts as behind: a checkpoint of a big WAL runs for minutes,
                 // and the last small number would let the backfill pile on meanwhile.
                 backlog.store(u64::MAX, Ordering::Relaxed);
+                let file_bytes = wal_file_bytes(&path);
+                if pressure.is_active() && file_bytes < WAL_PRESSURE_CHECKPOINT_BYTES {
+                    // PASSIVE has no page-count budget. Skip while interactive work is
+                    // queued, then force a round before the WAL reaches the 4x limit.
+                    wal_metrics.record_skipped_checkpoint(file_bytes);
+                    continue;
+                }
                 match checkpoint_wal(&connection) {
                     Ok(result) => {
                         let file_bytes = wal_file_bytes(&path);
@@ -2862,6 +2949,7 @@ impl SqliteStorage {
         }
         let read_metrics = Arc::new(ReadPoolMetrics::default());
         let wal_metrics = Arc::new(WalMetrics::default());
+        let pressure = Arc::new(StoragePressure::default());
         let stop = Arc::new(AtomicBool::new(false));
         let backlog = Arc::new(AtomicU64::new(0));
         let checkpointer_worker = if !is_memory {
@@ -2871,6 +2959,7 @@ impl SqliteStorage {
                 Arc::clone(&stop),
                 Arc::clone(&backlog),
                 Arc::clone(&wal_metrics),
+                Arc::clone(&pressure),
             )?)
         } else {
             None
@@ -2880,10 +2969,12 @@ impl SqliteStorage {
                 connection,
                 Arc::clone(&read_metrics),
                 Arc::clone(&wal_metrics),
+                Arc::clone(&pressure),
             )?,
             read_connections,
             next_read_connection: AtomicU64::new(0),
             read_metrics,
+            pressure,
             path,
             checkpointer_stop: stop,
             checkpointer_worker,
@@ -3006,9 +3097,10 @@ impl SqliteStorage {
                 Err(std::sync::TryLockError::WouldBlock) => {}
             }
         }
-        let connection = self.read_connections[first]
-            .lock()
-            .map_err(|_| StorageError::Poisoned)?;
+        self.pressure.waiting_reads.fetch_add(1, Ordering::Relaxed);
+        let connection = self.read_connections[first].lock();
+        self.pressure.waiting_reads.fetch_sub(1, Ordering::Relaxed);
+        let connection = connection.map_err(|_| StorageError::Poisoned)?;
         self.read_metrics.record_wait(started.elapsed());
         Ok(connection)
     }
@@ -3297,6 +3389,22 @@ impl SqliteStorage {
         }
     }
 
+    fn wait_for_backfill_batch(&self) {
+        let started = Instant::now();
+        while crate::backfill::backfill_wait_required(
+            self.checkpoint_backlog.load(Ordering::Relaxed),
+            crate::backfill::MAX_WRITE_BACKLOG,
+            self.pressure.is_active(),
+        ) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let waited = started.elapsed();
+        self.wal_metrics.backfill_wait_ns.fetch_add(
+            u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
     fn delete_snapshot_rows(
         &self,
         did: &str,
@@ -3307,6 +3415,7 @@ impl SqliteStorage {
         records_written: &mut u64,
     ) -> Result<(), StorageError> {
         loop {
+            self.wait_for_backfill_batch();
             let writer_did = did.to_owned();
             let writer_sql = sql.to_owned();
             let deleted = self.writer.call(move |connection| {
@@ -3336,6 +3445,7 @@ impl SqliteStorage {
         records_written: &mut u64,
     ) -> Result<(), StorageError> {
         loop {
+            self.wait_for_backfill_batch();
             let writer_did = did.to_owned();
             let (actor_is_registered, subjects, deleted) = self.writer.call(move |connection| {
                 let transaction = connection.transaction()?;
@@ -3446,6 +3556,7 @@ impl SqliteStorage {
         )?;
         let follow_batches = following.chunks(SNAPSHOT_BATCH).collect::<Vec<_>>();
         for (batch_index, batch) in follow_batches.iter().enumerate() {
+            self.wait_for_backfill_batch();
             let writer_did = did.to_owned();
             let writer_batch = batch.iter().map(|did| (*did).clone()).collect::<Vec<_>>();
             let (registered_for_tracker, inserted_subjects, inserted_follow_rows) =
@@ -3549,6 +3660,7 @@ impl SqliteStorage {
             .zip(record_json.chunks(SNAPSHOT_BATCH))
             .enumerate()
         {
+            self.wait_for_backfill_batch();
             let writer_batch = batch.to_vec();
             let writer_json = batch_json.to_vec();
             let inserted_records = self.writer.call(move |connection| {
@@ -3594,6 +3706,17 @@ impl SqliteStorage {
 impl Storage for SqliteStorage {
     fn write_backlog(&self) -> u64 {
         self.checkpoint_backlog.load(Ordering::Relaxed)
+    }
+
+    fn write_pressure(&self) -> bool {
+        self.pressure.is_active()
+    }
+
+    fn record_backfill_wait(&self, waited: Duration) {
+        self.wal_metrics.backfill_wait_ns.fetch_add(
+            u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 
     fn put_record(&self, record: &IndexedRecord) -> Result<(), StorageError> {
@@ -6110,6 +6233,153 @@ mod sqlite_writer_tests {
     }
 
     #[test]
+    fn snapshot_waits_between_batches_while_live_ingest_is_queued() {
+        let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
+        let did = "did:plc:pressure-snapshot";
+        let records = (0..501)
+            .map(|index| IndexedRecord {
+                did: did.to_owned(),
+                collection: "app.bsky.feed.post".to_owned(),
+                rkey: format!("r{index}"),
+                uri: format!("at://{did}/app.bsky.feed.post/r{index}"),
+                cid: None,
+                time_us: index,
+                record: serde_json::json!({"text":"snapshot"}),
+            })
+            .collect::<Vec<_>>();
+        let snapshot_storage = Arc::clone(&storage);
+        let snapshot = std::thread::spawn(move || {
+            snapshot_storage
+                .replace_repo_snapshot_throttled(did, &records, &[], 500)
+                .unwrap();
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while storage.records().unwrap().len() < SNAPSHOT_BATCH {
+            assert!(
+                Instant::now() < deadline,
+                "first snapshot batch did not complete"
+            );
+            std::thread::yield_now();
+        }
+        storage
+            .pressure
+            .waiting_live_ingest
+            .store(1, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            storage.records().unwrap().len(),
+            SNAPSHOT_BATCH,
+            "snapshot opened its next write transaction while live ingest was waiting"
+        );
+        storage
+            .pressure
+            .waiting_live_ingest
+            .store(0, Ordering::Relaxed);
+        snapshot.join().unwrap();
+        assert_eq!(storage.records().unwrap().len(), 501);
+        assert!(storage.wal_metrics.backfill_wait_ns.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn live_ingest_jumps_a_queued_backfill_write() {
+        let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
+        storage
+            .writer
+            .call(|connection| {
+                connection.execute_batch(
+                    "CREATE TABLE writer_order(seq INTEGER PRIMARY KEY, name TEXT NOT NULL);
+                     CREATE TRIGGER log_live_record AFTER INSERT ON records BEGIN
+                         INSERT INTO writer_order(name) VALUES('live');
+                     END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let held_storage = Arc::clone(&storage);
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            held_storage
+                .writer
+                .call(move |connection| {
+                    let transaction = connection
+                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                    held_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    transaction.commit()?;
+                    Ok(())
+                })
+                .unwrap();
+        });
+        held_rx.recv().unwrap();
+
+        let backfill_storage = Arc::clone(&storage);
+        let backfill = std::thread::spawn(move || {
+            backfill_storage
+                .writer
+                .call(|connection| {
+                    connection.execute("INSERT INTO writer_order(name) VALUES('backfill')", [])?;
+                    Ok(())
+                })
+                .unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while storage.writer.metrics.queue_depth.load(Ordering::Relaxed) < 1 {
+            assert!(
+                Instant::now() < deadline,
+                "backfill did not queue behind the held writer"
+            );
+            std::thread::yield_now();
+        }
+
+        let live_storage = Arc::clone(&storage);
+        let live = std::thread::spawn(move || {
+            live_storage
+                .apply_jetstream_batch(&[JetstreamStorageUpdate {
+                    time_us: 1,
+                    upsert: Some(IndexedRecord {
+                        did: "did:plc:live-priority".to_owned(),
+                        collection: "app.bsky.feed.post".to_owned(),
+                        rkey: "post".to_owned(),
+                        uri: "at://did:plc:live-priority/app.bsky.feed.post/post".to_owned(),
+                        cid: None,
+                        time_us: 1,
+                        record: serde_json::json!({"text":"live"}),
+                    }),
+                    ..JetstreamStorageUpdate::default()
+                }])
+                .unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while storage.writer.metrics.queue_depth.load(Ordering::Relaxed) < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "live ingest did not queue behind the held writer"
+            );
+            std::thread::yield_now();
+        }
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        backfill.join().unwrap();
+        live.join().unwrap();
+
+        let order = storage
+            .writer
+            .call(|connection| {
+                let mut statement =
+                    connection.prepare("SELECT name FROM writer_order ORDER BY seq")?;
+                let order = statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(order)
+            })
+            .unwrap();
+        assert_eq!(order, ["live", "backfill"]);
+    }
+
+    #[test]
     fn fire_and_forget_queue_write_is_visible_after_a_writer_barrier() {
         let storage = SqliteStorage::open(":memory:").unwrap();
         storage
@@ -6200,6 +6470,7 @@ mod sqlite_writer_tests {
             connection,
             Arc::new(ReadPoolMetrics::default()),
             Arc::new(WalMetrics::default()),
+            Arc::new(StoragePressure::default()),
         )
         .unwrap();
         writer.fire(|connection| {
@@ -6230,6 +6501,7 @@ mod sqlite_writer_tests {
             connection,
             Arc::new(ReadPoolMetrics::default()),
             Arc::new(WalMetrics::default()),
+            Arc::new(StoragePressure::default()),
         )
         .unwrap();
         writer.fire(|connection| {
