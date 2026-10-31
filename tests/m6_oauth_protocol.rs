@@ -2392,13 +2392,15 @@ async fn a_failed_like_names_the_pds_error_in_the_response_and_the_logs() {
     shared.lock().unwrap().create_failure = Some((500, "fake PDS refused the like".to_owned()));
 
     let output = Arc::new(Mutex::new(Vec::new()));
-    let capture = tracing_subscriber::fmt()
-        .without_time()
-        .with_ansi(false)
-        .with_max_level(tracing::Level::INFO)
-        .with_writer(CapturedMakeWriter(output.clone()))
-        .finish();
-    let _capture_guard = tracing::subscriber::set_default(capture);
+    let make_capture = || {
+        tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(CapturedMakeWriter(output.clone()))
+            .finish()
+    };
+    let _capture_guard = tracing::subscriber::set_default(make_capture());
     let response = app
         .clone()
         .oneshot(
@@ -2414,6 +2416,7 @@ async fn a_failed_like_names_the_pds_error_in_the_response_and_the_logs() {
                 ))
                 .unwrap(),
         )
+        .with_subscriber(make_capture())
         .await
         .unwrap();
     drop(_capture_guard);
