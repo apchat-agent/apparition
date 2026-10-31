@@ -41,6 +41,7 @@ struct FakeSearch {
     actors_body: Arc<Mutex<Value>>,
     fail: Arc<AtomicBool>,
     cursor_forbidden: Arc<AtomicBool>,
+    all_forbidden: Arc<AtomicBool>,
 }
 
 impl FakeSearch {
@@ -69,10 +70,11 @@ async fn fake_search_posts(
     }
     // Measured 2026-10-31: api.bsky.app answers page 1 but refuses every anonymous request
     // that carries a cursor with 403 "Request forbidden by administrative rules".
-    if fake.cursor_forbidden.load(Ordering::SeqCst)
-        && query
-            .as_deref()
-            .is_some_and(|query| query.contains("cursor="))
+    if fake.all_forbidden.load(Ordering::SeqCst)
+        || (fake.cursor_forbidden.load(Ordering::SeqCst)
+            && query
+                .as_deref()
+                .is_some_and(|query| query.contains("cursor=")))
     {
         return (
             StatusCode::FORBIDDEN,
@@ -145,6 +147,7 @@ async fn start_fake_search_with(
         actors_body: Arc::new(Mutex::new(actors_body)),
         fail: Arc::new(AtomicBool::new(false)),
         cursor_forbidden: Arc::new(AtomicBool::new(false)),
+        all_forbidden: Arc::new(AtomicBool::new(false)),
     };
     let app = Router::new()
         .route("/xrpc/app.bsky.feed.searchPosts", get(fake_search_posts))
@@ -931,6 +934,26 @@ async fn a_403_on_an_anonymous_cursor_page_asks_for_a_fresh_sign_in_instead_of_t
                 && warning.contains("cursor=cursor-page-2")
         }),
         "the warning must carry the status and the cursor URL: {warnings:?}"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_403_on_the_first_posts_page_is_the_unavailable_page_not_a_sign_in_request() {
+    // Only a cursor request is the paging refusal; a 403 on page 1 has another cause, and a
+    // fresh sign-in would not fix it, so it gets the ordinary unavailable page with its status.
+    let (base, fake, server) = start_fake_search(search_posts_body(None)).await;
+    fake.all_forbidden.store(true, Ordering::SeqCst);
+    let router = router_with_search(AcceptingFlow, search_client(&base));
+    let cookie = login(&router).await;
+    let html = get_html(&router, "/search?q=minc&type=posts", &cookie).await;
+    assert!(
+        html.contains("Search is unavailable right now (status 403)"),
+        "a first-page 403 shows the unavailable page with its status: {html}"
+    );
+    assert!(
+        !html.contains("More results need a fresh sign-in"),
+        "page 1 is not a paging refusal: {html}"
     );
     server.abort();
 }
