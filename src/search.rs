@@ -100,10 +100,9 @@ impl SearchClient {
         let Some(posts) = body.get("posts").and_then(Value::as_array) else {
             return Ok(page);
         };
-        for item in posts {
-            let Some(view) = item.get("post") else {
-                continue;
-            };
+        // searchPosts lists PostViews directly. There is no "post" wrapper as in getTimeline's
+        // FeedViewPost; reading one dropped every real hit (live, 2026-10-31).
+        for view in posts {
             let Some(uri) = view.get("uri").and_then(Value::as_str) else {
                 continue;
             };
