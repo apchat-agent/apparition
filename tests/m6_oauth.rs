@@ -1690,7 +1690,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
             ),
             "{path}"
         );
-        assert!(html.contains("href=\"/static/app.css?v=m40\""), "{path}");
+        assert!(html.contains("href=\"/static/app.css?v=m41\""), "{path}");
         assert!(!html.contains("style="), "{path}");
         // Both playback and interaction scripts are local, deferred, and never inline.
         assert_eq!(html.matches("<script").count(), 2, "{path}");
@@ -1704,7 +1704,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
     let stylesheet = app
         .oneshot(
             Request::builder()
-                .uri("/static/app.css?v=m40")
+                .uri("/static/app.css?v=m41")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1751,7 +1751,7 @@ async fn no_js_stylesheet_is_served_same_origin_and_linked_from_every_page_head(
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/static/nojs.css?v=m40")
+                .uri("/static/nojs.css?v=m41")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1802,7 +1802,7 @@ async fn no_js_stylesheet_is_served_same_origin_and_linked_from_every_page_head(
         .unwrap();
         assert!(
             html.contains(
-                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m40\"></noscript>"
+                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m41\"></noscript>"
             ),
             "{path}"
         );
@@ -2117,7 +2117,7 @@ async fn sign_in_error_page_uses_the_shared_mobile_document_shell() {
     );
     assert!(html.contains("Login failed, try again"));
     assert!(html.contains("href=\"/login\""));
-    assert!(html.contains("href=\"/static/app.css?v=m40\""));
+    assert!(html.contains("href=\"/static/app.css?v=m41\""));
     assert!(!html.contains("style="));
     // The shared shell loads both local deferred scripts, never inline code.
     assert_eq!(html.matches("<script").count(), 2);
