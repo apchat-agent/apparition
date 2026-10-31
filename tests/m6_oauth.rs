@@ -31,6 +31,8 @@ use tracing::{Event, Subscriber, field::Visit};
 use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
 const EXPECTED_READ_ONLY_SCOPE: &str = "atproto rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* rpc:app.bsky.graph.getMutes?aud=*";
+const EXPECTED_LIKE_ONLY_SCOPE: &str = "atproto rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* rpc:app.bsky.graph.getMutes?aud=* repo:app.bsky.feed.like?action=create&action=delete";
+const EXPECTED_ALL_BOXES_SCOPE: &str = "atproto rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* rpc:app.bsky.graph.getMutes?aud=* repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete repo:app.bsky.feed.post?action=create blob:image/* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.actor.putPreferences?aud=did:web:api.bsky.app%23bsky_appview";
 const EXPECTED_OAUTH_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.graph.getMutes?aud=* rpc:app.bsky.actor.putPreferences?aud=did:web:api.bsky.app%23bsky_appview";
 
 #[derive(Clone)]
@@ -1534,8 +1536,13 @@ async fn login_page_accepts_an_atproto_handle_or_did() {
     assert!(html.contains("method=\"post\""));
 }
 
+// Replaced by the per-box authorize tests below (lane av62q):
+// `authorize_without_write_requested_sends_the_read_only_scope_list` and
+// `authorize_with_write_requested_sends_the_full_scope_list` asked for the single
+// write/no-write scope choice that the per-activity checkboxes replace.
+
 #[tokio::test]
-async fn authorize_without_write_requested_sends_the_read_only_scope_list() {
+async fn authorize_without_ticked_boxes_sends_the_read_only_scope_list() {
     let flow = FakeOAuthFlow::default();
     let captured = flow.authorize_scopes.clone();
     let app = OAuthPublic::new("https://appview.example")
@@ -1558,12 +1565,12 @@ async fn authorize_without_write_requested_sends_the_read_only_scope_list() {
     assert_eq!(
         captured.lock().unwrap().as_deref(),
         Some(EXPECTED_READ_ONLY_SCOPE),
-        "an unticked login form must request the read-only scope list"
+        "a sign-in with every box unticked must request the read-only scope list"
     );
 }
 
 #[tokio::test]
-async fn authorize_with_write_requested_sends_the_full_scope_list() {
+async fn authorize_with_the_default_like_box_sends_read_only_plus_like_scopes() {
     let flow = FakeOAuthFlow::default();
     let captured = flow.authorize_scopes.clone();
     let app = OAuthPublic::new("https://appview.example")
@@ -1577,7 +1584,7 @@ async fn authorize_with_write_requested_sends_the_full_scope_list() {
                 .header("origin", "https://appview.example")
                 .header("sec-fetch-site", "same-origin")
                 .header("content-type", "application/x-www-form-urlencoded")
-                .body(Body::from("handle=alice.test&write=1"))
+                .body(Body::from("handle=alice.test&allow=like"))
                 .unwrap(),
         )
         .await
@@ -1585,8 +1592,74 @@ async fn authorize_with_write_requested_sends_the_full_scope_list() {
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
     assert_eq!(
         captured.lock().unwrap().as_deref(),
-        Some(EXPECTED_OAUTH_SCOPE),
-        "a ticked login form must request the full scope list as today"
+        Some(EXPECTED_LIKE_ONLY_SCOPE),
+        "the default form (only like ticked) must request atproto + read-only + the like scope"
+    );
+}
+
+#[tokio::test]
+async fn authorize_with_all_five_boxes_sends_the_full_scope_union() {
+    let flow = FakeOAuthFlow::default();
+    let captured = flow.authorize_scopes.clone();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, Arc::new(MemoryStorage::default()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/authorize")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "handle=alice.test&allow=like&allow=repost&allow=post&allow=social&allow=feeds",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        captured.lock().unwrap().as_deref(),
+        Some(EXPECTED_ALL_BOXES_SCOPE),
+        "all five boxes must request atproto + read-only + every box's scopes, de-duplicated, in box order"
+    );
+}
+
+#[tokio::test]
+async fn authorize_ignores_an_unknown_allow_value_and_logs_a_warning() {
+    let warnings = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(WarningCapture(warnings.clone()));
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let flow = FakeOAuthFlow::default();
+    let captured = flow.authorize_scopes.clone();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, Arc::new(MemoryStorage::default()));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/authorize")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("handle=alice.test&allow=like&allow=moonwalk"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        captured.lock().unwrap().as_deref(),
+        Some(EXPECTED_LIKE_ONLY_SCOPE),
+        "an unknown allow value must be ignored, not request extra scopes"
+    );
+    let lines = warnings.lock().unwrap();
+    assert!(
+        lines.iter().any(|line| line.contains("moonwalk")),
+        "the ignored allow value must be logged at warn: {lines:?}"
     );
 }
 
@@ -6869,7 +6942,7 @@ async fn a_read_only_session_loads_the_home_feed_page() {
 }
 
 #[tokio::test]
-async fn sign_in_logs_its_kind_and_the_granted_scopes_at_info() {
+async fn sign_in_logs_its_ticked_boxes_and_the_granted_scopes_at_info() {
     let infos = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::registry().with(InfoCapture(infos.clone()));
     let _guard = tracing::subscriber::set_default(subscriber);
@@ -6877,18 +6950,7 @@ async fn sign_in_logs_its_kind_and_the_granted_scopes_at_info() {
         .unwrap()
         .router_with_flow(FakeOAuthFlow::default(), Arc::new(MemoryStorage::default()));
 
-    let read_only_login_cookie = prelogin_cookie(&app).await;
-    app.clone()
-        .oneshot(
-            Request::builder()
-                .uri("/oauth/callback?code=valid-code&state=valid-state&scope=atproto")
-                .header("cookie", read_only_login_cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let write_login_cookie = {
+    let like_only_login_cookie = {
         let authorize = app
             .clone()
             .oneshot(
@@ -6898,7 +6960,43 @@ async fn sign_in_logs_its_kind_and_the_granted_scopes_at_info() {
                     .header("origin", "https://appview.example")
                     .header("sec-fetch-site", "same-origin")
                     .header("content-type", "application/x-www-form-urlencoded")
-                    .body(Body::from("handle=alice.test&write=1"))
+                    .body(Body::from("handle=alice.test&allow=like"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorize.status(), StatusCode::SEE_OTHER);
+        authorize.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?code=valid-code&state=valid-state&scope=atproto")
+                .header("cookie", like_only_login_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let all_boxes_login_cookie = {
+        let authorize = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/oauth/authorize")
+                    .header("origin", "https://appview.example")
+                    .header("sec-fetch-site", "same-origin")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(
+                        "handle=alice.test&allow=like&allow=repost&allow=post&allow=social&allow=feeds",
+                    ))
                     .unwrap(),
             )
             .await
@@ -6915,7 +7013,7 @@ async fn sign_in_logs_its_kind_and_the_granted_scopes_at_info() {
     app.oneshot(
         Request::builder()
             .uri("/oauth/callback?code=valid-code&state=valid-state&scope=atproto")
-            .header("cookie", write_login_cookie)
+            .header("cookie", all_boxes_login_cookie)
             .body(Body::empty())
             .unwrap(),
     )
@@ -6925,14 +7023,15 @@ async fn sign_in_logs_its_kind_and_the_granted_scopes_at_info() {
     assert!(
         lines
             .iter()
-            .any(|line| line.contains("oauth sign-in started") && line.contains("write=false")),
-        "no read-only sign-in kind logged: {lines:?}"
+            .any(|line| line.contains("oauth sign-in started")
+                && line.contains("boxes=like,repost,post,social,feeds ")),
+        "no all-boxes sign-in was logged with its ticked boxes: {lines:?}"
     );
     assert!(
         lines
             .iter()
-            .any(|line| line.contains("oauth sign-in started") && line.contains("write=true")),
-        "no with-changes sign-in kind logged: {lines:?}"
+            .any(|line| line.contains("oauth sign-in started") && line.contains("boxes=like ")),
+        "no like-only sign-in was logged with its ticked boxes: {lines:?}"
     );
     assert!(
         lines
