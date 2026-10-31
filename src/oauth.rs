@@ -135,7 +135,7 @@ const OAUTH_METADATA_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const OAUTH_METADATA_RESOLVER_CACHE_TTL: Duration = Duration::from_secs(1);
 const VIDEO_SERVICE_DID: &str = "did:web:video.bsky.app";
 const VIDEO_SERVICE_URL: &str = "https://video.bsky.app";
-const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.graph.getMutes?aud=*";
+const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.graph.getMutes?aud=* rpc:app.bsky.actor.putPreferences?aud=*";
 const BLOB_SCOPE: &str = "blob:image/*";
 const VIDEO_BLOB_SCOPE: &str = "blob:video/*";
 const VIDEO_SCOPES: [&str; 3] = [
@@ -151,6 +151,8 @@ const MUTE_SCOPES: [&str; 3] = [
     "rpc:app.bsky.graph.unmuteActor?aud=*",
     "rpc:app.bsky.graph.getMutes?aud=*",
 ];
+/// Removing a dead saved feed rewrites the viewer's preferences (owner, 2026-10-31).
+const PREFERENCES_SCOPES: [&str; 1] = ["rpc:app.bsky.actor.putPreferences?aud=*"];
 const WRITE_SCOPES: [&str; 3] = [
     "repo:app.bsky.feed.post?action=create",
     "repo:app.bsky.feed.like?action=create&action=delete",
@@ -230,6 +232,9 @@ struct SessionPermissions {
     block: bool,
     mute: bool,
     list: bool,
+    /// Position 8 in the cookie: cookies issued before it existed read as false, so those users
+    /// stay signed in and are asked to sign in again only when they try to remove a feed.
+    preferences: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -714,6 +719,15 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async { Err("mute action is not available".to_owned()) })
     }
+    /// Removes a saved feed from the viewer's Bluesky preferences (used for feeds whose creator
+    /// deleted them, owner 2026-10-31).
+    fn remove_saved_feed<'a>(
+        &'a self,
+        _did: &'a str,
+        _feed_uri: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Err("removing saved feeds is not available".to_owned()) })
+    }
     fn muted_actor_dids<'a>(
         &'a self,
         _did: &'a str,
@@ -812,6 +826,7 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
                     avatar: None,
                     service_did: String::new(),
                     endpoint: String::new(),
+                    unavailable: false,
                 },
                 timeline: crate::feeds::HydratedFeedPage {
                     feed: Vec::new(),
@@ -1202,6 +1217,7 @@ impl OAuthPublic {
             .route("/quote", post(write_quote::<F, S>))
             .route("/like", post(write_like::<F, S>))
             .route("/repost", post(write_repost::<F, S>))
+            .route("/feeds/remove", post(remove_saved_feed::<F, S>))
             .layer(DefaultBodyLimit::max(MAX_POST_BODY_BYTES))
             .layer(from_fn(log_web_post_client_errors))
             .layer(from_fn_with_state(
@@ -1291,7 +1307,7 @@ impl OAuthPublic {
     ) -> String {
         let expires = unix_time().saturating_add(SESSION_TTL_SECONDS);
         let payload = format!(
-            "{did}\n{expires}\n{session_id}\n{generation}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "{did}\n{expires}\n{session_id}\n{generation}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             permissions.write,
             permissions.feed,
             permissions.blob,
@@ -1299,7 +1315,8 @@ impl OAuthPublic {
             permissions.follow,
             permissions.block,
             permissions.mute,
-            permissions.list
+            permissions.list,
+            permissions.preferences
         );
         let encoded = URL_SAFE_NO_PAD.encode(payload.as_bytes());
         let mut mac = HmacSha256::new_from_slice(&self.cookie_key())
@@ -1383,6 +1400,7 @@ impl OAuthPublic {
                 block: permission(5),
                 mute: permission(6),
                 list: permission(7),
+                preferences: permission(8),
             },
         ))
     }
@@ -3746,6 +3764,67 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         Ok(())
     }
 
+    /// putPreferences replaces the WHOLE preference set, so this reads it fresh from the PDS (never
+    /// from our cache), removes only the one feed and writes everything else back as it came. A
+    /// failed or malformed read writes nothing.
+    async fn remove_saved_feed_preference(&self, did: &str, feed_uri: &str) -> Result<(), String> {
+        let parsed_did = did
+            .parse::<Did>()
+            .map_err(|_| "viewer DID is invalid".to_owned())?;
+        let session = self.restored_session(&parsed_did).await?;
+        let read = XrpcRequest {
+            method: http::Method::GET,
+            nsid: "app.bsky.actor.getPreferences".to_owned(),
+            parameters: Some(json!({})),
+            input: None,
+            encoding: None,
+        };
+        let response: OutputDataOrBytes<Value> = session
+            .send_xrpc::<Value, Value, Value, Value>(&read)
+            .await
+            .map_err(|error| {
+                log_pds_xrpc_failure("app.bsky.actor.getPreferences", &error);
+                format!("PDS getPreferences request failed: {error:?}")
+            })?;
+        let OutputDataOrBytes::Data(response) = response else {
+            return Err("PDS getPreferences returned a non-JSON response".to_owned());
+        };
+        let preferences = response
+            .get("preferences")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "PDS getPreferences response has no preferences array".to_owned())?;
+        let updated = crate::feeds::remove_saved_feed_from_preferences(preferences, feed_uri)
+            .ok_or_else(|| "that feed is not in your saved feeds".to_owned())?;
+        let write = XrpcRequest {
+            method: http::Method::POST,
+            nsid: "app.bsky.actor.putPreferences".to_owned(),
+            parameters: None,
+            input: Some(InputDataOrBytes::Data(json!({ "preferences": updated }))),
+            encoding: Some("application/json".to_owned()),
+        };
+        session
+            .send_xrpc::<(), Value, Value, Value>(&write)
+            .await
+            .map_err(|error| {
+                log_pds_xrpc_failure("app.bsky.actor.putPreferences", &error);
+                format!("PDS putPreferences request failed: {error:?}")
+            })?;
+        tracing::info!(
+            did,
+            feed = feed_uri,
+            "removed a saved feed from preferences"
+        );
+        self.saved_feed_cache.lock().await.remove(did);
+        if let Err(error) = self
+            .store
+            .web_cache_delete(&saved_feed_cache_key(did))
+            .await
+        {
+            tracing::warn!(%error, "could not invalidate persisted saved feed preferences");
+        }
+        Ok(())
+    }
+
     async fn pds_service_did(&self, viewer_did: &str) -> Result<String, String> {
         let did = viewer_did
             .parse::<Did>()
@@ -4671,6 +4750,14 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
         muted: bool,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move { self.set_muted_actor(did, subject, muted).await })
+    }
+
+    fn remove_saved_feed<'a>(
+        &'a self,
+        did: &'a str,
+        feed_uri: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move { self.remove_saved_feed_preference(did, feed_uri).await })
     }
 
     fn muted_actor_dids<'a>(
@@ -6786,6 +6873,7 @@ where
                 block: has_all_block_scopes(account.granted_scope.as_deref()),
                 mute: has_all_mute_scopes(account.granted_scope.as_deref()),
                 list: has_all_list_scopes(account.granted_scope.as_deref()),
+                preferences: has_all_preferences_scopes(account.granted_scope.as_deref()),
             },
         ),
         if state.public.secure_cookies() {
@@ -7624,6 +7712,16 @@ where
             Err(error) => {
                 if take_dead_oauth_session().is_some() {
                     return session_expired_response(&state.public, &headers);
+                }
+                if crate::feeds::feed_is_gone(&error) {
+                    return unavailable_feed_page(
+                        uri,
+                        verified_cookie_preferences_access(
+                            &state.public,
+                            &headers,
+                            state.storage.as_ref(),
+                        ),
+                    );
                 }
                 return oauth_error(StatusCode::BAD_GATEWAY, &error);
             }
@@ -12259,6 +12357,15 @@ fn verified_cookie_feed_access<S: Storage>(
         .is_some_and(|(_, _, _, permissions)| permissions.feed)
 }
 
+fn verified_cookie_preferences_access<S: Storage>(
+    public: &OAuthPublic,
+    headers: &HeaderMap,
+    storage: &S,
+) -> bool {
+    verified_cookie_session(public, headers, storage)
+        .is_some_and(|(_, _, _, permissions)| permissions.preferences)
+}
+
 fn verified_cookie_follow_access<S: Storage>(
     public: &OAuthPublic,
     headers: &HeaderMap,
@@ -12472,6 +12579,74 @@ fn login_retry_page() -> Response {
     .into_response()
 }
 
+/// The page behind an "Unavailable feed" tab: the creator's PDS said the feed is gone, so offer to
+/// remove it from the viewer's saved feeds (owner, 2026-10-31), or to sign in again first when the
+/// session predates the putPreferences permission.
+fn unavailable_feed_page(feed_uri: &str, can_remove: bool) -> Response {
+    let action = if can_remove {
+        format!(
+            "<form method=\"post\" action=\"/feeds/remove\"><input type=\"hidden\" name=\"uri\" value=\"{}\"><button type=\"submit\" class=\"primary-link\">Remove from my saved feeds</button></form>",
+            html_escape(feed_uri)
+        )
+    } else {
+        "<a class=\"primary-link\" href=\"/login\">Sign in again to remove this feed</a>".to_owned()
+    };
+    Html(page_shell(
+        "Unavailable feed",
+        &format!(
+            "<section class=\"error-card\"><p class=\"eyebrow\">Unavailable feed</p><h1>This feed no longer exists</h1><p>Its creator deleted it, or their account is gone, so it cannot be loaded. It is still in your saved feeds.</p><p class=\"feed-uri\">{}</p>{action}</section>",
+            html_escape(feed_uri)
+        ),
+        false,
+    ))
+    .into_response()
+}
+
+async fn remove_saved_feed<F, S>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response
+where
+    F: OAuthFlow,
+    S: Storage + 'static,
+{
+    if !same_origin_request(&headers, &state.public.public_url) {
+        return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
+    }
+    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+        return Redirect::to("/login").into_response();
+    };
+    let Some(uri) = form
+        .get("uri")
+        .filter(|uri| uri.starts_with("at://") && uri.contains("/app.bsky.feed.generator/"))
+    else {
+        return oauth_error(StatusCode::BAD_REQUEST, "a feed generator uri is required");
+    };
+    if !verified_cookie_preferences_access(&state.public, &headers, state.storage.as_ref()) {
+        return unavailable_feed_page(uri, false);
+    }
+    match state.flow.remove_saved_feed(&did, uri).await {
+        Ok(()) => {
+            state
+                .feed_page_cache
+                .lock()
+                .await
+                .retain(|(viewer, _, _), _| viewer != &did);
+            Redirect::to("/app").into_response()
+        }
+        Err(error) => web_write_response(
+            &state.public,
+            &headers,
+            "feeds/remove",
+            "feed removal",
+            &did,
+            StatusCode::BAD_GATEWAY,
+            &error,
+        ),
+    }
+}
+
 fn feed_reauthorization_page() -> Response {
     Html(page_shell(
         "Allow feeds",
@@ -12565,6 +12740,7 @@ mod feed_html_tests {
             avatar: Some("javascript:alert(1)".into()),
             service_did: "did:plc:generator".into(),
             endpoint: "https://feed.example".into(),
+            unavailable: false,
         };
         for html in [render_feed_card(&feed), render_feed_heading(&feed)] {
             assert!(!html.contains("<script>"));
@@ -13914,6 +14090,10 @@ fn has_all_list_scopes(scope: Option<&str>) -> bool {
     has_all_scopes(scope, &LIST_SCOPES)
 }
 
+fn has_all_preferences_scopes(scope: Option<&str>) -> bool {
+    has_all_scopes(scope, &PREFERENCES_SCOPES)
+}
+
 fn requested_scopes() -> Vec<Scope> {
     std::iter::once(Scope::Known(KnownScope::Atproto))
         .chain(
@@ -13949,6 +14129,11 @@ fn requested_scopes() -> Vec<Scope> {
         )
         .chain(
             MUTE_SCOPES
+                .iter()
+                .map(|scope| Scope::Unknown((*scope).to_owned())),
+        )
+        .chain(
+            PREFERENCES_SCOPES
                 .iter()
                 .map(|scope| Scope::Unknown((*scope).to_owned())),
         )
@@ -14718,6 +14903,7 @@ mod tests {
                 block: false,
                 mute: true,
                 list: true,
+                preferences: true,
             },
         );
         let app = public.router_with_flow(SlowMutesTestFlow, storage);
@@ -14874,6 +15060,7 @@ mod tests {
             block: false,
             mute: true,
             list: true,
+            preferences: true,
         }
     }
 
@@ -15432,6 +15619,7 @@ mod tests {
                 block: false,
                 mute: false,
                 list: false,
+                preferences: false,
             },
         );
         let app = public.router_with_flow(flow, storage);
@@ -15603,6 +15791,7 @@ mod tests {
                 block: false,
                 mute: false,
                 list: false,
+                preferences: false,
             },
         );
         let app = public.router_with_flow(flow, storage);
@@ -16979,6 +17168,7 @@ mod tests {
                 block: false,
                 mute: false,
                 list: false,
+                preferences: false,
             },
         );
         let app = public.router_with_flow(flow, storage);

@@ -1,6 +1,9 @@
 use appview_rs::{
     config::Config,
-    feeds::{FeedTimeline, FeedTimelineTiming, HydratedFeedPage, HydratedFeedPost, ResolvedFeed},
+    feeds::{
+        FEED_GONE_PREFIX, FeedTimeline, FeedTimelineTiming, HydratedFeedPage, HydratedFeedPost,
+        ResolvedFeed,
+    },
     ingest::{IndexedRecord, Ingestor, MemoryStorage, ScopeMode, SqliteStorage, Storage},
     oauth::{
         AccountLabel, BlockListDetail, FetchedAuthorProfile, OAuthAccount, OAuthCallback,
@@ -27,7 +30,7 @@ use tower::ServiceExt;
 use tracing::{Event, Subscriber, field::Visit};
 use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
-const EXPECTED_OAUTH_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.graph.getMutes?aud=*";
+const EXPECTED_OAUTH_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.graph.getMutes?aud=* rpc:app.bsky.actor.putPreferences?aud=*";
 
 #[derive(Clone)]
 struct ProfileHydrationTiming(Arc<Mutex<Option<u64>>>);
@@ -516,6 +519,9 @@ impl OAuthFlow for FakeOAuthFlow {
             if delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             }
+            if uri.ends_with("/gone-feed") {
+                return Err(format!("{FEED_GONE_PREFIX}record not found"));
+            }
             Ok(FeedTimeline {
                 generator: ResolvedFeed {
                     uri,
@@ -524,6 +530,7 @@ impl OAuthFlow for FakeOAuthFlow {
                     avatar: None,
                     service_did: "did:plc:service".into(),
                     endpoint: "https://feed.example".into(),
+                    unavailable: false,
                 },
                 timeline: HydratedFeedPage {
                     feed: records
@@ -663,6 +670,23 @@ impl OAuthFlow for FakeOAuthFlow {
                 }
             }
             Ok(())
+        })
+    }
+
+    fn remove_saved_feed<'a>(
+        &'a self,
+        did: &'a str,
+        feed_uri: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.actions
+                .lock()
+                .unwrap()
+                .push(format!("remove-feed:{did}:{feed_uri}"));
+            match &self.action_failure {
+                Some(error) => Err(error.clone()),
+                None => Ok(()),
+            }
         })
     }
 
@@ -1688,6 +1712,7 @@ async fn bsky_style_shell_renders_navigation_pinned_feed_tabs_and_post_actions()
             avatar: None,
             service_did: "did:plc:service".into(),
             endpoint: "https://feed.example".into(),
+            unavailable: false,
         }],
         ..FakeOAuthFlow::default()
     };
@@ -2811,6 +2836,7 @@ async fn app_timeline_does_not_wait_for_slow_pinned_feed_resolution() {
                 avatar: None,
                 service_did: "did:plc:service".into(),
                 endpoint: "https://feed.example".into(),
+                unavailable: false,
             }
         })
         .collect();
@@ -7610,5 +7636,150 @@ async fn own_profile_links_to_the_block_list_settings_and_other_profiles_do_not(
     assert!(
         !other.contains("profile-block-lists-link"),
         "only on your own profile"
+    );
+}
+
+const GONE_FEED_URI: &str = "at://did:plc:dead/app.bsky.feed.generator/gone-feed";
+
+fn scope_without_preferences() -> String {
+    let scope = EXPECTED_OAUTH_SCOPE.replace(" rpc:app.bsky.actor.putPreferences?aud=*", "");
+    assert_ne!(scope, EXPECTED_OAUTH_SCOPE);
+    scope
+}
+
+async fn post_remove_feed(
+    app: &Router,
+    cookie: &str,
+    origin: &str,
+    uri: &str,
+) -> axum::response::Response {
+    let body = format!(
+        "uri={}",
+        url::form_urlencoded::byte_serialize(uri.as_bytes()).collect::<String>()
+    );
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/feeds/remove")
+                .header("origin", origin)
+                .header("cookie", cookie)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_dead_feed_page_offers_removal_and_an_older_sign_in_is_asked_to_renew() {
+    let encoded =
+        url::form_urlencoded::byte_serialize(GONE_FEED_URI.as_bytes()).collect::<String>();
+    let page = format!("/app/feed?uri={encoded}");
+
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), Arc::new(MemoryStorage::default()));
+    let cookie = finish_login(&app).await;
+    let html = get_html(&app, &page, &cookie).await;
+    assert!(html.contains("This feed no longer exists"), "{html}");
+    assert!(html.contains("action=\"/feeds/remove\""), "{html}");
+    assert!(
+        html.contains(&format!("name=\"uri\" value=\"{GONE_FEED_URI}\"")),
+        "{html}"
+    );
+
+    let scope = scope_without_preferences();
+    let old_app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(
+            FakeOAuthFlow::with_granted_scope(Some(&scope)),
+            Arc::new(MemoryStorage::default()),
+        );
+    let old_cookie = finish_login(&old_app).await;
+    let html = get_html(&old_app, &page, &old_cookie).await;
+    assert!(html.contains("This feed no longer exists"), "{html}");
+    assert!(html.contains("Sign in again to remove this feed"), "{html}");
+    assert!(!html.contains("/feeds/remove"), "{html}");
+}
+
+#[tokio::test]
+async fn removing_a_dead_feed_calls_the_flow_once_and_returns_to_the_app() {
+    let flow = FakeOAuthFlow::default();
+    let actions = flow.actions.clone();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, Arc::new(MemoryStorage::default()));
+    let cookie = finish_login(&app).await;
+
+    // Refused before any PDS call: another origin, and a uri that is not a feed generator.
+    let response = post_remove_feed(&app, &cookie, "https://evil.example", GONE_FEED_URI).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = post_remove_feed(
+        &app,
+        &cookie,
+        "https://appview.example",
+        "at://did:plc:dead/app.bsky.feed.post/abc",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        !actions
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|action| action.starts_with("remove-feed:")),
+        "{:?}",
+        actions.lock().unwrap()
+    );
+
+    let response = post_remove_feed(&app, &cookie, "https://appview.example", GONE_FEED_URI).await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers()["location"], "/app");
+    let removals = actions
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|action| action.starts_with("remove-feed:"))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(removals.len(), 1, "{removals:?}");
+    assert!(
+        removals[0].ends_with(&format!(":{GONE_FEED_URI}")),
+        "{removals:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_older_sign_in_cannot_remove_a_feed_until_it_signs_in_again() {
+    let scope = scope_without_preferences();
+    let flow = FakeOAuthFlow::with_granted_scope(Some(&scope));
+    let actions = flow.actions.clone();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, Arc::new(MemoryStorage::default()));
+    let cookie = finish_login(&app).await;
+    let response = post_remove_feed(&app, &cookie, "https://appview.example", GONE_FEED_URI).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("Sign in again to remove this feed"), "{html}");
+    assert!(
+        !actions
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|action| action.starts_with("remove-feed:")),
+        "{:?}",
+        actions.lock().unwrap()
     );
 }

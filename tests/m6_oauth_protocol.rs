@@ -45,7 +45,7 @@ use tracing::instrument::WithSubscriber;
 use tracing_subscriber::fmt::MakeWriter;
 
 const DID: &str = "did:plc:abcdefghijklmnopqrstuvwx";
-const EXPECTED_OAUTH_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.graph.getMutes?aud=*";
+const EXPECTED_OAUTH_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.graph.getMutes?aud=* rpc:app.bsky.actor.putPreferences?aud=*";
 
 #[derive(Clone)]
 struct FakeDidResolver {
@@ -123,6 +123,10 @@ struct FakeServerState {
     initial_expires_in: Option<u32>,
     // Successive access tokens handed out by refresh_token exchanges; "access-fresh" when empty.
     refresh_access_tokens: std::collections::VecDeque<String>,
+    // When set, app.bsky.actor.getPreferences answers 200 with this body (default: 403).
+    preferences: Option<Value>,
+    // Every app.bsky.actor.putPreferences body, in order.
+    put_preferences_bodies: Vec<Value>,
 }
 
 #[derive(Clone)]
@@ -1799,6 +1803,18 @@ async fn serve_one(mut stream: TcpStream, origin: &str, state: Arc<Mutex<FakeSer
                     _ => (200, vec![], json!({"feed":[]}).to_string()),
                 }
             }
+            path if path.starts_with("/xrpc/app.bsky.actor.getPreferences")
+                && state.preferences.is_some() =>
+            {
+                (200, vec![], state.preferences.clone().unwrap().to_string())
+            }
+            path if path.starts_with("/xrpc/app.bsky.actor.putPreferences") => {
+                let body = serde_json::from_slice(&request.body_bytes).unwrap_or(Value::Null);
+                state.put_preferences_bodies.push(body);
+                // A no-output procedure: the real PDS answers an empty, non-JSON 200 (atrium's own
+                // generated put_preferences/mute_actor accept only that shape).
+                (200, vec![("content-type", "text/plain")], String::new())
+            }
             path if path.starts_with("/xrpc/app.bsky.actor.getPreferences") => (
                 403,
                 vec![],
@@ -2621,5 +2637,91 @@ async fn a_dead_session_sends_the_browser_to_sign_in_again_and_says_why() {
         stored.is_none(),
         "the dead session must be deleted, not left to be retried"
     );
+    server.abort();
+}
+
+async fn post_remove_feed(app: &axum::Router, cookie: &str, uri: &str) -> axum::response::Response {
+    let body = format!(
+        "uri={}",
+        url::form_urlencoded::byte_serialize(uri.as_bytes()).collect::<String>()
+    );
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/feeds/remove")
+                .header("origin", "https://appview.example")
+                .header("cookie", cookie)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn removing_a_saved_feed_writes_back_every_other_preference_unchanged() {
+    let dead = "at://did:plc:dead/app.bsky.feed.generator/aaah6nedv6zzc";
+    let live = "at://did:plc:alive/app.bsky.feed.generator/good";
+    let adult = json!({"$type":"app.bsky.actor.defs#adultContentPref","enabled":false});
+    let muted = json!({"$type":"app.bsky.actor.defs#mutedWordsPref","items":[{"value":"spoiler","targets":["content"]}]});
+    let public = OAuthPublic::new("https://appview.example").unwrap();
+    let (flow, _store, shared, server) =
+        production_flow_with_public(public.clone(), None, Some(EXPECTED_OAUTH_SCOPE)).await;
+    let app = public.router_with_flow(flow, Arc::new(MemoryStorage::default()));
+    let cookie = finish_production_login(&app, &shared).await;
+    shared.lock().unwrap().preferences = Some(json!({"preferences":[
+        adult,
+        {"$type":"app.bsky.actor.defs#savedFeedsPrefV2","items":[
+            {"id":"t1","type":"timeline","value":"following","pinned":true},
+            {"id":"d1","type":"feed","value":dead,"pinned":true},
+            {"id":"l1","type":"feed","value":live,"pinned":true}
+        ]},
+        muted
+    ]}));
+
+    let response = post_remove_feed(&app, &cookie, dead).await;
+    let status = response.status();
+    let location = response.headers().get("location").cloned();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(location.unwrap(), "/app");
+    let puts = shared.lock().unwrap().put_preferences_bodies.clone();
+    assert_eq!(
+        puts,
+        vec![json!({"preferences":[
+            adult,
+            {"$type":"app.bsky.actor.defs#savedFeedsPrefV2","items":[
+                {"id":"t1","type":"timeline","value":"following","pinned":true},
+                {"id":"l1","type":"feed","value":live,"pinned":true}
+            ]},
+            muted
+        ]})]
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_failed_preferences_read_writes_nothing() {
+    let public = OAuthPublic::new("https://appview.example").unwrap();
+    let (flow, _store, shared, server) =
+        production_flow_with_public(public.clone(), None, Some(EXPECTED_OAUTH_SCOPE)).await;
+    let app = public.router_with_flow(flow, Arc::new(MemoryStorage::default()));
+    let cookie = finish_production_login(&app, &shared).await;
+    // shared.preferences stays None: getPreferences answers 403.
+    let response = post_remove_feed(
+        &app,
+        &cookie,
+        "at://did:plc:dead/app.bsky.feed.generator/aaah6nedv6zzc",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(shared.lock().unwrap().put_preferences_bodies.is_empty());
     server.abort();
 }

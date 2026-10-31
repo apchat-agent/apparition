@@ -22,6 +22,82 @@ pub struct ResolvedFeed {
     pub avatar: Option<String>,
     pub service_did: String,
     pub endpoint: String,
+    /// The creator's PDS said the feed record or its whole repo no longer exists (not a timeout or
+    /// server error): the tab shows "Unavailable feed" so the owner can remove it from their saved
+    /// feeds (owner, 2026-10-31). Absent in older cached entries, hence the default.
+    #[serde(default)]
+    pub unavailable: bool,
+}
+
+/// Errors from resolving a feed generator start with this when the creator's PDS answered that the
+/// record or the repo is gone; every other failure (timeouts, 5xx, bad JSON) may be transient and
+/// keeps the old fallback tab so a slow server never makes a live feed look dead.
+pub const FEED_GONE_PREFIX: &str = "feed generator no longer exists: ";
+
+pub fn feed_is_gone(error: &str) -> bool {
+    error.starts_with(FEED_GONE_PREFIX)
+}
+
+/// The reason a failed com.atproto.repo.getRecord answer means the record is definitely gone, or
+/// None when the failure may be transient. Only these two PDS answers count: RecordNotFound, and
+/// InvalidRequest "Could not find repo" (the account's repo was deleted, measured 2026-10-31 on
+/// enoki.us-east.host.bsky.network for at://did:plc:xfqcsi7wuwedeqaa5m7aih44/.../aaah6nedv6zzc).
+pub fn gone_reason(status: u16, body: &[u8]) -> Option<String> {
+    if status != 400 {
+        return None;
+    }
+    let body: Value = serde_json::from_slice(body).ok()?;
+    let error = body.get("error").and_then(Value::as_str)?;
+    let message = body
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match error {
+        "RecordNotFound" => Some(format!("{FEED_GONE_PREFIX}record not found")),
+        "InvalidRequest" if message.starts_with("Could not find repo") => Some(format!(
+            "{FEED_GONE_PREFIX}the creator's repo was not found"
+        )),
+        _ => None,
+    }
+}
+
+/// Removes every saved-feed entry for `feed_uri` from a full getPreferences `preferences` array and
+/// returns the array to send back with putPreferences, or None when the feed is not saved.
+/// putPreferences REPLACES the whole set, so everything else (muted words, content labels, other
+/// feeds, unknown future entries) must come back exactly as it was read.
+pub fn remove_saved_feed_from_preferences(
+    preferences: &[Value],
+    feed_uri: &str,
+) -> Option<Vec<Value>> {
+    let mut removed = false;
+    let updated = preferences
+        .iter()
+        .map(|preference| {
+            let kind = preference.get("$type").and_then(Value::as_str);
+            let mut preference = preference.clone();
+            if kind == Some("app.bsky.actor.defs#savedFeedsPrefV2")
+                && let Some(items) = preference.get_mut("items").and_then(Value::as_array_mut)
+            {
+                let before = items.len();
+                items.retain(|item| {
+                    !(item.get("type").and_then(Value::as_str) == Some("feed")
+                        && item.get("value").and_then(Value::as_str) == Some(feed_uri))
+                });
+                removed |= items.len() != before;
+            }
+            if kind == Some("app.bsky.actor.defs#savedFeedsPref") {
+                for key in ["pinned", "saved"] {
+                    if let Some(values) = preference.get_mut(key).and_then(Value::as_array_mut) {
+                        let before = values.len();
+                        values.retain(|value| value.as_str() != Some(feed_uri));
+                        removed |= values.len() != before;
+                    }
+                }
+            }
+            preference
+        })
+        .collect::<Vec<_>>();
+    removed.then_some(updated)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -308,6 +384,14 @@ fn unix_time_ms() -> i64 {
         .unwrap_or_default()
 }
 
+fn unavailable_feed(uri: &str) -> ResolvedFeed {
+    ResolvedFeed {
+        display_name: "Unavailable feed".to_owned(),
+        unavailable: true,
+        ..fallback_feed(uri)
+    }
+}
+
 fn fallback_feed(uri: &str) -> ResolvedFeed {
     let display_name = parse_feed_uri(uri)
         .ok()
@@ -333,6 +417,7 @@ fn fallback_feed(uri: &str) -> ResolvedFeed {
         avatar: None,
         service_did: String::new(),
         endpoint: String::new(),
+        unavailable: false,
     }
 }
 
@@ -404,8 +489,19 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
                     }
                     return feed;
                 }
-                CachedGeneratorResolution::Failure(_) if age_ms < 60 * 60 * 1000 => {
-                    return fallback_feed(uri);
+                CachedGeneratorResolution::Failure(error) if age_ms < 60 * 60 * 1000 => {
+                    return if feed_is_gone(&error) {
+                        unavailable_feed(uri)
+                    } else {
+                        fallback_feed(uri)
+                    };
+                }
+                CachedGeneratorResolution::Failure(error) if feed_is_gone(&error) => {
+                    // Re-checked in the background like any stale entry, but a feed that was gone
+                    // an hour ago keeps its "Unavailable" tab meanwhile instead of flipping back to
+                    // the rkey name.
+                    self.start_background_resolution(uri.to_owned()).await;
+                    return unavailable_feed(uri);
                 }
                 _ => {}
             }
@@ -504,6 +600,9 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
             .get(&record_url, HeaderMap::new(), 1024 * 1024)
             .await?;
         if !response.status().is_success() {
+            if let Some(reason) = gone_reason(response.status().as_u16(), response.body()) {
+                return Err(reason);
+            }
             return Err("feed generator record could not be fetched".to_owned());
         }
         let record: Value = serde_json::from_slice(response.body())
@@ -560,6 +659,7 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
                 .and_then(|avatar| feed_avatar_url(avatar, &creator_did)),
             service_did,
             endpoint: endpoint.trim_end_matches('/').to_owned(),
+            unavailable: false,
         };
         let mut cache = self.generator_cache.lock().await;
         cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
@@ -999,7 +1099,10 @@ pub fn parse_saved_feed_preferences(response: &Value) -> Vec<SavedFeedPreference
 
 #[cfg(test)]
 mod tests {
-    use super::{FeedClient, ResolvedFeed, parse_saved_feed_preferences, unix_time_ms};
+    use super::{
+        FeedClient, ResolvedFeed, feed_is_gone, gone_reason, parse_saved_feed_preferences,
+        remove_saved_feed_from_preferences, unix_time_ms,
+    };
     use crate::{
         identity::{DidDocument, DidService, IdentityBackend, IdentityResolver, ResolutionError},
         ingest::IndexedRecord,
@@ -1226,6 +1329,17 @@ mod tests {
             if uri.path() == "/xrpc/com.atproto.repo.getRecord" {
                 let query = uri.query().unwrap_or_default();
                 if query.contains("collection=app.bsky.feed.generator") {
+                    // The two answers a PDS gives for a deleted feed / deleted account (shapes
+                    // measured 2026-10-31), and one transient failure.
+                    if query.contains("rkey=gone") {
+                        return (axum::http::StatusCode::BAD_REQUEST, axum::Json(json!({"error":"RecordNotFound","message":"Could not locate record"}))).into_response();
+                    }
+                    if query.contains("rkey=norepo") {
+                        return (axum::http::StatusCode::BAD_REQUEST, axum::Json(json!({"error":"InvalidRequest","message":format!("Could not find repo: {CREATOR}")}))).into_response();
+                    }
+                    if query.contains("rkey=broken") {
+                        return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
                     if query.contains("rkey=slow-") {
                         tokio::time::sleep(generator_delay).await;
                     }
@@ -1602,6 +1716,7 @@ mod tests {
             avatar: None,
             service_did: "did:plc:service".into(),
             endpoint: format!("http://localhost:{}/fg", address.port()),
+            unavailable: false,
         };
         let client = client(resolver("".to_owned(), "".to_owned()));
         let logs = LogBuffer::default();
@@ -1715,5 +1830,112 @@ mod tests {
             super::feed_avatar_url(&avatar, "did:plc:creator"),
             Some("https://cdn.bsky.app/img/feed_thumbnail/plain/did:plc:creator/bafkreib7t6y5x4w3v2u1@jpeg".into())
         );
+    }
+
+    #[test]
+    fn gone_reason_only_accepts_the_two_definite_pds_answers() {
+        let body = |error: &str, message: &str| {
+            serde_json::to_vec(&json!({ "error": error, "message": message })).unwrap()
+        };
+        assert!(
+            gone_reason(400, &body("RecordNotFound", "Could not locate record"))
+                .is_some_and(|reason| feed_is_gone(&reason))
+        );
+        assert!(
+            gone_reason(
+                400,
+                &body("InvalidRequest", "Could not find repo: did:plc:x")
+            )
+            .is_some_and(|reason| feed_is_gone(&reason))
+        );
+        // Anything that may be transient or means something else must not hide a feed.
+        assert_eq!(gone_reason(500, &body("RecordNotFound", "")), None);
+        assert_eq!(
+            gone_reason(400, &body("InvalidRequest", "Invalid rkey")),
+            None
+        );
+        assert_eq!(
+            gone_reason(400, &body("RepoDeactivated", "Repo has been deactivated")),
+            None
+        );
+        assert_eq!(gone_reason(400, b"not json"), None);
+        assert!(!feed_is_gone("feed generator record could not be fetched"));
+    }
+
+    #[test]
+    fn removing_a_saved_feed_keeps_every_other_preference_exactly() {
+        let dead = "at://did:plc:dead/app.bsky.feed.generator/aaah6nedv6zzc";
+        let live = "at://did:plc:alive/app.bsky.feed.generator/good";
+        let preferences = vec![
+            json!({"$type":"app.bsky.actor.defs#adultContentPref","enabled":false}),
+            json!({"$type":"app.bsky.actor.defs#mutedWordsPref","items":[{"value":"spoiler","targets":["content"]}]}),
+            json!({"$type":"app.bsky.actor.defs#savedFeedsPrefV2","items":[
+                {"id":"t1","type":"timeline","value":"following","pinned":true},
+                {"id":"d1","type":"feed","value":dead,"pinned":true},
+                {"id":"l1","type":"feed","value":live,"pinned":false},
+                {"id":"x1","type":"list","value":dead,"pinned":false}
+            ]}),
+            json!({"$type":"app.bsky.actor.defs#savedFeedsPref","pinned":[dead,live],"saved":[live,dead]}),
+            json!({"$type":"app.example.future#pref","anything":[1,{"nested":true}]}),
+        ];
+        let updated = remove_saved_feed_from_preferences(&preferences, dead).unwrap();
+        assert_eq!(
+            updated,
+            vec![
+                preferences[0].clone(),
+                preferences[1].clone(),
+                json!({"$type":"app.bsky.actor.defs#savedFeedsPrefV2","items":[
+                    {"id":"t1","type":"timeline","value":"following","pinned":true},
+                    {"id":"l1","type":"feed","value":live,"pinned":false},
+                    {"id":"x1","type":"list","value":dead,"pinned":false}
+                ]}),
+                json!({"$type":"app.bsky.actor.defs#savedFeedsPref","pinned":[live],"saved":[live]}),
+                preferences[4].clone(),
+            ]
+        );
+        // A feed that is not saved is refused, so nothing is written.
+        assert_eq!(
+            remove_saved_feed_from_preferences(
+                &preferences,
+                "at://did:plc:other/app.bsky.feed.generator/x"
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_definitely_gone_feed_gets_an_unavailable_tab() {
+        let (pds, server) = fake_pds().await;
+        let port = pds.rsplit(':').next().unwrap().to_owned();
+        let identity = resolver(pds, format!("http://localhost:{port}/feed"));
+        let db = std::env::temp_dir().join(format!(
+            "appview-feed-gone-{}-{}.sqlite",
+            std::process::id(),
+            unix_time_ms()
+        ));
+        let store = crate::oauth::SqliteOAuthStore::open(&db).unwrap();
+        let client = Arc::new(FeedClient::new_with_store(
+            identity,
+            SafeHttpClient::with_resolver(TestResolver)
+                .with_http_test_hosts(["localhost".to_owned()]),
+            store,
+        ));
+        let uri = |rkey: &str| format!("at://{CREATOR}/app.bsky.feed.generator/{rkey}");
+        for rkey in ["gone", "norepo"] {
+            let error = client.resolve_feed(&uri(rkey)).await.unwrap_err();
+            assert!(feed_is_gone(&error), "{rkey}: {error}");
+            let tab = client.feed_for_tab(&uri(rkey)).await;
+            assert_eq!(tab.display_name, "Unavailable feed", "{rkey}");
+            assert!(tab.unavailable, "{rkey}");
+        }
+        let error = client.resolve_feed(&uri("broken")).await.unwrap_err();
+        assert!(!feed_is_gone(&error), "{error}");
+        let tab = client.feed_for_tab(&uri("broken")).await;
+        assert_eq!(tab.display_name, "Broken");
+        assert!(!tab.unavailable);
+        server.abort();
+        let _ = std::fs::remove_file(&db);
+        let _ = std::fs::remove_file(db.with_extension("sqlite-wal"));
+        let _ = std::fs::remove_file(db.with_extension("sqlite-shm"));
     }
 }
