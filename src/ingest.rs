@@ -2620,6 +2620,40 @@ impl SqliteStorage {
             .map_err(|_| StorageError::Poisoned)
     }
 
+    /// One page of a DID's followers plus the index/scan work the statement
+    /// performed, so a test can see whether it touched the whole follow
+    /// collection or only this DID's followers.
+    pub fn followers_for_did_counted(
+        &self,
+        did: &str,
+        limit: usize,
+    ) -> Result<(Vec<IndexedRecord>, StatementWork), StorageError> {
+        let mut work = StatementWork::default();
+        let records = self.followers_for_did_page(did, limit, Some(&mut work))?;
+        Ok((records, work))
+    }
+
+    fn followers_for_did_page(
+        &self,
+        did: &str,
+        limit: usize,
+        mut work: Option<&mut StatementWork>,
+    ) -> Result<Vec<IndexedRecord>, StorageError> {
+        let conn = self.read_conn()?;
+        let mut statement = conn.prepare(
+            "SELECT did, collection, rkey, uri, cid, time_us, record_json FROM records
+             WHERE collection='app.bsky.graph.follow' AND json_extract(record_json, '$.subject')=?1
+             ORDER BY time_us DESC, uri DESC LIMIT ?2",
+        )?;
+        let records = statement
+            .query_map(params![did, limit.clamp(1, 101) as i64], row_to_record)?
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(counted) = work.as_mut() {
+            counted.observe(&statement);
+        }
+        Ok(records)
+    }
+
     /// One page of the home timeline plus the index/scan work its statements
     /// performed, so a test (or a slow-query investigation) can see whether the
     /// query touched the whole post collection or only the viewer's authors.
@@ -3518,16 +3552,7 @@ impl Storage for SqliteStorage {
         did: &str,
         limit: usize,
     ) -> Result<Vec<IndexedRecord>, StorageError> {
-        let conn = self.read_conn()?;
-        let mut statement = conn.prepare(
-            "SELECT did, collection, rkey, uri, cid, time_us, record_json FROM records
-             WHERE collection='app.bsky.graph.follow' AND json_extract(record_json, '$.subject')=?1
-             ORDER BY time_us DESC, uri DESC LIMIT ?2",
-        )?;
-        statement
-            .query_map(params![did, limit.clamp(1, 101) as i64], row_to_record)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(Into::into)
+        self.followers_for_did_page(did, limit, None)
     }
 
     fn profile_counts(&self, did: &str) -> Result<(usize, usize, usize), StorageError> {
