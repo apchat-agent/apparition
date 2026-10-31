@@ -298,6 +298,36 @@ async fn search_redirects_signed_out_visitors_like_the_feeds_page() {
 }
 
 #[tokio::test]
+async fn search_ui_has_styles_and_the_sidebar_search_is_a_working_posts_form() {
+    let (base, _fake, server) = start_fake_search(search_posts_body(None)).await;
+    let router = router_with_search(AcceptingFlow, search_client(&base));
+    let cookie = login(&router).await;
+    let html = get_html(&router, "/search", &cookie).await;
+    let css = include_str!("../static/app.css");
+
+    for class in [
+        ".search-page-form",
+        ".search-type-tabs",
+        ".search-type-tab",
+        ".search-actor-list",
+        ".search-actor",
+        ".search-actor-link",
+        ".search-actor-avatar",
+        ".search-actor-description",
+    ] {
+        assert!(css.contains(class), "missing search style for {class}");
+    }
+    assert!(
+        html.contains("<form class=\"search-form\" action=\"/search\" method=\"get\" role=\"search\">")
+            && html.contains("name=\"q\" type=\"search\"")
+            && html.contains("name=\"type\" value=\"posts\"")
+            && !html.contains("id=\"site-search\" type=\"search\" placeholder=\"Search\" disabled"),
+        "the desktop sidebar search must submit a posts query: {html}"
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn empty_query_search_shows_the_form_and_makes_no_outbound_call() {
     let (base, fake, server) = start_fake_search(search_posts_body(None)).await;
     let router = router_with_search(AcceptingFlow, search_client(&base));
