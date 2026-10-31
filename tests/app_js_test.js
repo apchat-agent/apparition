@@ -8,6 +8,31 @@ function assertEquals(actual, expected) {
   assert(actual === expected, `expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
 }
 
+Deno.test("the active feed tab scrolls into the tab strip without moving the page", async () => {
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  const start = source.indexOf("function scrollActiveFeedTab");
+  assert(start >= 0, "app.js should define the active feed-tab scroll helper");
+  const end = source.indexOf("\n}", start) + 2;
+  assert(end > start, "the active feed-tab helper should be complete");
+  assert(source.includes("scrollActiveFeedTab();"), "app.js should run the helper on page load");
+  const scrollActiveFeedTab = new Function(`${source.slice(start, end)}; return scrollActiveFeedTab;`)();
+  let options;
+  let pageScrolls = 0;
+  const activeTab = { scrollIntoView(value) { options = value; } };
+  const pageDocument = {
+    querySelector(selector) {
+      assertEquals(selector, '.feed-tab[aria-current="page"]');
+      return activeTab;
+    },
+    defaultView: { scrollTo() { pageScrolls += 1; } },
+  };
+
+  scrollActiveFeedTab(pageDocument);
+  assertEquals(options.block, "nearest");
+  assertEquals(options.inline, "center");
+  assertEquals(pageScrolls, 0);
+});
+
 Deno.test("empty composer status messages do not render status bars", async () => {
   const css = await Deno.readTextFile(new URL("../static/app.css", import.meta.url));
   assert(
