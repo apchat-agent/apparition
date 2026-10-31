@@ -1818,6 +1818,25 @@ impl Storage for MemoryStorage {
 const SNAPSHOT_BATCH: usize = 500;
 const SQLITE_READ_CONNECTIONS: usize = 4;
 
+/// The index/scan work one read query's statements performed, read from
+/// rusqlite's per-statement counters (`Statement::get_status`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StatementWork {
+    pub fullscan_steps: u64,
+    pub vm_steps: u64,
+}
+
+impl StatementWork {
+    fn observe(&mut self, statement: &rusqlite::Statement<'_>) {
+        self.fullscan_steps += statement
+            .get_status(rusqlite::StatementStatus::FullscanStep)
+            .max(0) as u64;
+        self.vm_steps += statement
+            .get_status(rusqlite::StatementStatus::VmStep)
+            .max(0) as u64;
+    }
+}
+
 type FireCompletion = Box<dyn FnOnce() + Send>;
 type FireWrite =
     Box<dyn FnOnce(&Connection) -> Result<Option<FireCompletion>, StorageError> + Send>;
@@ -2596,6 +2615,55 @@ impl SqliteStorage {
         self.read_connections[index]
             .lock()
             .map_err(|_| StorageError::Poisoned)
+    }
+
+    /// One page of the home timeline plus the index/scan work its statements
+    /// performed, so a test (or a slow-query investigation) can see whether the
+    /// query touched the whole post collection or only the viewer's authors.
+    pub fn timeline_posts_counted(
+        &self,
+        actor: &str,
+        cursor: Option<&RecordCursor>,
+        limit: usize,
+    ) -> Result<(Vec<IndexedRecord>, StatementWork), StorageError> {
+        let mut work = StatementWork::default();
+        let records = self.timeline_posts_page(actor, cursor, limit, Some(&mut work))?;
+        Ok((records, work))
+    }
+
+    fn timeline_posts_page(
+        &self,
+        actor: &str,
+        cursor: Option<&RecordCursor>,
+        limit: usize,
+        mut work: Option<&mut StatementWork>,
+    ) -> Result<Vec<IndexedRecord>, StorageError> {
+        let conn = self.read_conn()?;
+        let mut statement = conn.prepare(
+            "SELECT did, collection, rkey, uri, cid, time_us, record_json FROM records
+             WHERE collection='app.bsky.feed.post'
+               AND (did=?1 OR did IN (
+                   SELECT json_extract(record_json, '$.subject') FROM records
+                   WHERE collection='app.bsky.graph.follow' AND did=?1
+               ))
+               AND (?2 IS NULL OR time_us < ?2 OR (time_us=?2 AND uri < ?3))
+             ORDER BY time_us DESC, uri DESC LIMIT ?4",
+        )?;
+        let records = statement
+            .query_map(
+                params![
+                    actor,
+                    cursor.map(|cursor| cursor.time_us.min(i64::MAX as u64) as i64),
+                    cursor.map(|cursor| cursor.uri.as_str()).unwrap_or(""),
+                    limit.clamp(1, 101) as i64,
+                ],
+                row_to_record,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(work) = work.as_mut() {
+            work.observe(&statement);
+        }
+        Ok(records)
     }
 
     fn pace_snapshot_writes(
@@ -3644,29 +3712,7 @@ impl Storage for SqliteStorage {
         cursor: Option<&RecordCursor>,
         limit: usize,
     ) -> Result<Vec<IndexedRecord>, StorageError> {
-        let conn = self.read_conn()?;
-        let mut statement = conn.prepare(
-            "SELECT did, collection, rkey, uri, cid, time_us, record_json FROM records
-             WHERE collection='app.bsky.feed.post'
-               AND (did=?1 OR did IN (
-                   SELECT json_extract(record_json, '$.subject') FROM records
-                   WHERE collection='app.bsky.graph.follow' AND did=?1
-               ))
-               AND (?2 IS NULL OR time_us < ?2 OR (time_us=?2 AND uri < ?3))
-             ORDER BY time_us DESC, uri DESC LIMIT ?4",
-        )?;
-        statement
-            .query_map(
-                params![
-                    actor,
-                    cursor.map(|cursor| cursor.time_us.min(i64::MAX as u64) as i64),
-                    cursor.map(|cursor| cursor.uri.as_str()).unwrap_or(""),
-                    limit.clamp(1, 101) as i64,
-                ],
-                row_to_record,
-            )?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(Into::into)
+        self.timeline_posts_page(actor, cursor, limit, None)
     }
 
     fn post_interaction_summary(
