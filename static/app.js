@@ -1251,6 +1251,37 @@ window.visualViewport?.addEventListener("resize", () => {
   resetDocumentScroll();
 });
 
+// Owner report 2026-10-31 (iPhone, Safari): "If I scroll down and hit '+' the reply box is not in view".
+// "+" and "New post" are plain links to /app#new-post. Once the URL already carries that hash (an earlier tap)
+// the same-hash click changes nothing, and on phones the page scrolls an INNER scroller (see
+// scrollableAncestorOf above), which the browser's hash jump never moves. So when the composer is on the
+// current page the click is taken over: no navigation, the scroller that holds the composer brings it to the
+// top, and focusing the textarea expands it. On other pages the link keeps navigating to /app#new-post, and
+// arriving with that hash reveals the composer the same way. Without JS the link still works as today.
+const bringNewPostComposerIntoView = () => {
+  const composer = document.getElementById?.("new-post");
+  if (!composer) return false;
+  const scroller = scrollableAncestorOf(composer);
+  if (scroller) {
+    const aboveViewport = composer.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+    scroller.scrollTop = Math.max(0, scroller.scrollTop + aboveViewport);
+  } else {
+    composer.scrollIntoView?.({ block: "start" });
+  }
+  composer.focus?.();
+  return true;
+};
+document.addEventListener("click", (event) => {
+  if (event.defaultPrevented || event.button || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  for (let element = event.target; element; element = element.parentElement) {
+    if (element.tagName !== "A") continue;
+    if (!String(element.hash || element.getAttribute?.("href") || "").endsWith("#new-post")) continue;
+    if (bringNewPostComposerIntoView()) event.preventDefault();
+    return;
+  }
+});
+if (window.location?.hash === "#new-post") bringNewPostComposerIntoView();
+
 // Keep the notification badge live while the page is open. SSE is the normal path;
 // the JSON count endpoint provides a low-frequency fallback for proxies that close streams.
 (() => {
