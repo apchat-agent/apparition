@@ -3010,3 +3010,134 @@ body {
   padding-top: env(safe-area-inset-top, 0px);
   padding-bottom: env(safe-area-inset-bottom, 0px);
 }
+
+/* The per-page timing console (app.js installTimingConsole): a small timer button fixed in the
+   top-right corner, away from the post actions and the mobile compose button, and a panel that
+   only exists after the button is tapped. Width is capped so it fits a 375 px phone; everything
+   sits at the top so it never covers post actions. */
+.timing-console-button {
+  position: fixed;
+  top: 0.5rem;
+  right: 0.5rem;
+  z-index: 12;
+  width: 2.1rem;
+  height: 2.1rem;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  color: var(--muted);
+  font: 0.72rem/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  cursor: pointer;
+}
+
+.timing-console-button:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.timing-console-panel {
+  position: fixed;
+  top: 3.1rem;
+  right: 0.5rem;
+  z-index: 30;
+  width: min(21rem, calc(100vw - 1rem));
+  max-height: min(70vh, 32rem);
+  overflow-y: auto;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  color: var(--text);
+  font: 0.7rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.timing-console-panel[hidden] {
+  display: none;
+}
+
+.timing-console-close {
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  padding: 0;
+  cursor: pointer;
+}
+
+.timing-console-heading {
+  margin-top: 0.45rem;
+  font-weight: 700;
+}
+
+.timing-console-phase,
+.timing-console-call {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.timing-console-notice,
+.timing-console-error {
+  color: var(--muted);
+}
+
+.timing-console-error {
+  color: var(--label-alert-ring);
+}
+
+.timing-console-row {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  padding: 0.1rem 0;
+  cursor: pointer;
+}
+
+.timing-console-detail[hidden] {
+  display: none;
+}
+
+.timing-console-scale {
+  display: flex;
+  width: 100%;
+  height: 4px;
+}
+
+.timing-console-bar {
+  height: 4px;
+  background: var(--accent);
+  border-radius: 2px;
+}
+
+.timing-console-w0 { width: 0; }
+.timing-console-w1 { width: 10%; }
+.timing-console-w2 { width: 20%; }
+.timing-console-w3 { width: 30%; }
+.timing-console-w4 { width: 40%; }
+.timing-console-w5 { width: 50%; }
+.timing-console-w6 { width: 60%; }
+.timing-console-w7 { width: 70%; }
+.timing-console-w8 { width: 80%; }
+.timing-console-w9 { width: 90%; }
+.timing-console-w10 { width: 100%; }
+
+@media (max-width: 440px) {
+  .timing-console-button {
+    top: 0.4rem;
+    right: 0.4rem;
+    width: 1.9rem;
+    height: 1.9rem;
+  }
+
+  .timing-console-panel {
+    top: 2.7rem;
+    right: 0.4rem;
+    max-height: min(60vh, 26rem);
+  }
+}

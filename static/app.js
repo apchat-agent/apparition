@@ -1,3 +1,20 @@
+// Round trips app.js measured for its own fragment fetches, keyed by the X-Timing-Id
+// response header, so the timing console can show the browser's view of each request.
+const appviewFetchTimings = new Map();
+
+function noteFetchTimingId(response, startedAt) {
+  try {
+    const timingId =
+      response?.headers && typeof response.headers.get === "function"
+        ? response.headers.get("x-timing-id")
+        : null;
+    if (timingId) appviewFetchTimings.set(timingId, Math.max(0, Date.now() - startedAt));
+  } catch {
+    // Without the header the panel simply has no browser round trip for this fetch.
+  }
+  return response;
+}
+
 document.addEventListener("change", (event) => {
   const select = event.target;
   if (!(select instanceof HTMLSelectElement) || !select.matches("[data-profile-list-select]")) return;
@@ -800,10 +817,11 @@ function fillProfileIdentities(root = document) {
   for (let index = 0; index < dids.length; index += batchLimit) {
     const chunk = dids.slice(index, index + batchLimit);
     const query = chunk.map((did) => `did=${encodeURIComponent(did)}`).join("&");
+    const fetchStartedAt = Date.now();
     fetch(`/profile-fragment?${query}`, {
       credentials: "same-origin",
       headers: { Accept: "application/json" },
-    }).then(async (response) => {
+    }).then((response) => (typeof noteFetchTimingId === "function" ? noteFetchTimingId(response, fetchStartedAt) : response)).then(async (response) => {
       if (!response.ok) throw new Error(`Profile fragment request failed (${response.status}).`);
       return response.json();
     }).then((result) => {
@@ -1165,7 +1183,7 @@ function applyListBlockLeak(root = document) {
 }
 
 function installBlockListLeakSettings() {
-  document.addEventListener("change", (event) => {
+document.addEventListener("change", (event) => {
     const input = event.target;
     if (!input?.matches?.("[data-list-block-uri]")) return;
     const listUri = input.getAttribute("data-list-block-uri");
@@ -1251,10 +1269,12 @@ window.visualViewport?.addEventListener("resize", () => {
 
   const refreshCount = async () => {
     try {
+      const fetchStartedAt = Date.now();
       const response = await fetch("/notifications/unread-count", {
         credentials: "same-origin",
         headers: { Accept: "application/json" },
       });
+      if (typeof noteFetchTimingId === "function") noteFetchTimingId(response, fetchStartedAt);
       if (!response.ok) return;
       const result = await response.json();
       updateBadges(result.count);
@@ -1297,10 +1317,11 @@ function fillDeferredQuotes(root = document) {
     const fragmentUrl = placeholder.getAttribute("data-quote-fragment");
     if (!fragmentUrl) continue;
     if (placeholder.dataset) placeholder.dataset.quoteLoading = "true";
+    const fetchStartedAt = Date.now();
     fetch(fragmentUrl, {
       credentials: "same-origin",
       headers: { Accept: "text/html" },
-    }).then(async (response) => {
+    }).then((response) => (typeof noteFetchTimingId === "function" ? noteFetchTimingId(response, fetchStartedAt) : response)).then(async (response) => {
       if (!response.ok) throw new Error(`Quote fragment request failed (${response.status}).`);
       const fragmentDocument = new DOMParser().parseFromString(await response.text(), "text/html");
       const card = fragmentDocument.querySelector(".quoted-post-card");
@@ -1391,3 +1412,174 @@ function installBarDebugOverlay(host = window, pageDocument = document) {
   return { box, probe, refresh };
 }
 installBarDebugOverlay();
+
+// The per-page timing console (owner, 2026-10-31): a small timer button in the top-right corner
+// (away from the post actions and the mobile bottom bar) that, ONLY when tapped, asks /timing/recent
+// for this viewer's own recent requests and shows this page's server phases and outbound-call
+// waterfall first, then the browser's view of the page load, then one tappable line per other
+// recent request. Nothing is fetched on a normal page view. Signed-out pages get no button at all.
+function installTimingConsole(pageDocument = document, pageWindow = window, fetchTimings = appviewFetchTimings) {
+  const pageBody = pageDocument.body;
+  const pageTimingId = pageBody?.getAttribute?.("data-timing-id") || "";
+  if (!pageDocument.querySelector?.('form[action="/logout"]') || !pageTimingId) return null;
+
+  const button = pageDocument.createElement("button");
+  button.type = "button";
+  button.className = "timing-console-button";
+  button.setAttribute("aria-label", "Request timing console");
+  button.textContent = "ms";
+
+  const panel = pageDocument.createElement("div");
+  panel.className = "timing-console-panel";
+  panel.hidden = true;
+  const close = pageDocument.createElement("button");
+  close.type = "button";
+  close.className = "timing-console-close";
+  close.textContent = "Close";
+  close.addEventListener("click", () => {
+    panel.hidden = true;
+  });
+  const bodyBox = pageDocument.createElement("div");
+  bodyBox.className = "timing-console-body";
+  panel.append(close, bodyBox);
+  pageBody.append(button, panel);
+
+  const line = (className, text) => {
+    const row = pageDocument.createElement("div");
+    row.className = className;
+    row.textContent = text;
+    return row;
+  };
+  const rounded = (value) => {
+    const number = Number(value);
+    return Number.isFinite(number) ? Math.round(number) : null;
+  };
+  // Bars use ten width classes so all styling stays in app.css: no inline styles under CSP.
+  const bucket = (fraction) => {
+    const number = Number(fraction);
+    if (!Number.isFinite(number) || number <= 0) return 0;
+    return Math.min(10, Math.max(1, Math.round(number * 10)));
+  };
+  const scale = (fraction, offsetFraction) => {
+    const wrapper = pageDocument.createElement("span");
+    wrapper.className = "timing-console-scale";
+    const offset = pageDocument.createElement("span");
+    offset.className = `timing-console-offset timing-console-w${bucket(offsetFraction)}`;
+    const bar = pageDocument.createElement("span");
+    bar.className = `timing-console-bar timing-console-w${bucket(fraction)}`;
+    wrapper.append(offset, bar);
+    return wrapper;
+  };
+
+  const detailRows = (record) => {
+    const rows = [];
+    const total = Math.max(1, Number(record.total_ms) || 1);
+    const phases = record.phases || {};
+    for (const name of Object.keys(phases)) {
+      const value = Number(phases[name]);
+      if (!Number.isFinite(value)) {
+        rows.push(line("timing-console-phase", `${name} ${phases[name]}`));
+        continue;
+      }
+      const row = line("timing-console-phase", `${name} ${Math.round(value)} ms`);
+      row.append(scale(value / total, 0));
+      rows.push(row);
+    }
+    for (const call of record.calls || []) {
+      const target = `${call.host || ""}${call.path || ""}`;
+      const status = call.status != null ? String(call.status) : String(call.error || "no status");
+      const start = rounded(call.start_ms) ?? 0;
+      const duration = rounded(call.duration_ms) ?? 0;
+      const row = line("timing-console-call", `${call.kind} ${target} +${start} ms ${duration} ms ${status}`);
+      row.append(scale(duration / total, start / total));
+      rows.push(row);
+    }
+    if (record.calls_overflow) {
+      rows.push(line("timing-console-overflow", `${record.calls_overflow} more calls not shown`));
+    }
+    return rows;
+  };
+
+  const appendBrowserView = (record) => {
+    const entries = pageWindow?.performance?.getEntriesByType?.("navigation");
+    const navigation = entries && entries[0];
+    if (!navigation) return;
+    const started = Number(navigation.startTime) || 0;
+    const serverTotal = Number(record.total_ms) || 0;
+    const responseStart = Number(navigation.responseStart);
+    const responseEnd = Number(navigation.responseEnd);
+    if (Number.isFinite(responseStart) && responseStart > 0) {
+      bodyBox.append(line("timing-console-browser", `network + proxy: ${Math.round((responseStart - started) - serverTotal)} ms`));
+    }
+    if (Number.isFinite(responseEnd) && Number.isFinite(responseStart) && responseStart > 0) {
+      bodyBox.append(line("timing-console-browser", `download: ${Math.round(responseEnd - responseStart)} ms`));
+    }
+    const domReady = Number(navigation.domContentLoadedEventEnd);
+    if (Number.isFinite(domReady) && domReady > 0) {
+      bodyBox.append(line("timing-console-browser", `DOM ready: ${Math.round(domReady - started)} ms`));
+    }
+    const load = Number(navigation.loadEventEnd);
+    if (Number.isFinite(load) && load > 0) {
+      bodyBox.append(line("timing-console-browser", `load: ${Math.round(load - started)} ms`));
+    }
+  };
+
+  const render = (records) => {
+    const list = Array.isArray(records) ? records : [];
+    const thisPage = list.find((record) => record && record.id === pageTimingId);
+    if (thisPage) {
+      bodyBox.append(line("timing-console-heading", `this page · ${Math.round(Number(thisPage.total_ms) || 0)} ms server total`));
+      for (const row of detailRows(thisPage)) bodyBox.append(row);
+      appendBrowserView(thisPage);
+    } else {
+      bodyBox.append(line("timing-console-notice", "This page is not in the recent server timings yet."));
+    }
+    bodyBox.append(line("timing-console-heading", "other recent requests"));
+    const others = list.filter((record) => record && record.id !== pageTimingId);
+    if (!others.length) bodyBox.append(line("timing-console-notice", "None yet."));
+    for (const record of others) {
+      const callCount = (record.calls || []).length + (record.calls_overflow || 0);
+      const roundTrip = fetchTimings?.get?.(record.id);
+      let label = `${record.method || ""} ${record.path || ""} ${Math.round(Number(record.total_ms) || 0)} ms ${callCount} calls`;
+      if (roundTrip != null) label += ` · browser round trip ${Math.round(Number(roundTrip))} ms`;
+      const rowButton = pageDocument.createElement("button");
+      rowButton.type = "button";
+      rowButton.className = "timing-console-row";
+      rowButton.textContent = label;
+      const detail = pageDocument.createElement("div");
+      detail.className = "timing-console-detail";
+      detail.hidden = true;
+      for (const row of detailRows(record)) detail.append(row);
+      rowButton.addEventListener("click", () => {
+        detail.hidden = !detail.hidden;
+      });
+      bodyBox.append(rowButton, detail);
+    }
+  };
+
+  const load = async () => {
+    bodyBox.replaceChildren(line("timing-console-notice", "Loading timing data…"));
+    try {
+      const response = await fetch("/timing/recent", {
+        credentials: "same-origin",
+        headers: { Accept: "application/json" },
+      });
+      if (!response.ok) {
+        bodyBox.replaceChildren(line("timing-console-error", `Could not load timing data (HTTP ${response.status}).`));
+        return;
+      }
+      const result = await response.json();
+      render(result && result.records);
+    } catch (error) {
+      const reason = error && error.message ? error.message : String(error);
+      bodyBox.replaceChildren(line("timing-console-error", `Could not load timing data: ${reason}.`));
+    }
+  };
+
+  button.addEventListener("click", () => {
+    panel.hidden = false;
+    load();
+  });
+  return { button, panel, bodyBox };
+}
+installTimingConsole();
