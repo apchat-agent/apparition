@@ -136,7 +136,7 @@ const OAUTH_METADATA_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const OAUTH_METADATA_RESOLVER_CACHE_TTL: Duration = Duration::from_secs(1);
 const VIDEO_SERVICE_DID: &str = "did:web:video.bsky.app";
 const VIDEO_SERVICE_URL: &str = "https://video.bsky.app";
-const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.graph.getMutes?aud=* rpc:app.bsky.actor.putPreferences?aud=did:web:api.bsky.app%23bsky_appview";
+const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.graph.getMutes?aud=* rpc:app.bsky.feed.searchPosts?aud=* rpc:app.bsky.actor.putPreferences?aud=did:web:api.bsky.app%23bsky_appview";
 const BLOB_SCOPE: &str = "blob:image/*";
 const VIDEO_BLOB_SCOPE: &str = "blob:video/*";
 const VIDEO_SCOPES: [&str; 3] = [
@@ -189,10 +189,13 @@ const FEED_SCOPES: [&str; 2] = [
 /// a read-only login by default" (owner, 2026-10-31). What a sign-in without the "Allow changes"
 /// checkbox requests: atproto plus the read rpc scopes the read pages need. The client metadata
 /// `scope` (REQUESTED_SCOPE) stays the FULL list: it is the maximum a request may ask for.
-const READ_ONLY_SCOPES: [&str; 3] = [
+/// Posts search runs through the viewer's own session (owner, msgd 2026-10-31), so its rpc scope
+/// belongs to every sign-in, not to a checkbox.
+const READ_ONLY_SCOPES: [&str; 4] = [
     "rpc:app.bsky.actor.getPreferences?aud=*",
     "rpc:app.bsky.feed.getFeedSkeleton?aud=*",
     "rpc:app.bsky.graph.getMutes?aud=*",
+    "rpc:app.bsky.feed.searchPosts?aud=*",
 ];
 /// The sign-in checkboxes (owner, msgd 2026-10-31: "multiple checkboxes describing activities
 /// that a user would like to do ... with 'like' being checked by default", then again
