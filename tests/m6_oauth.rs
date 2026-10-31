@@ -30,10 +30,10 @@ use tower::ServiceExt;
 use tracing::{Event, Subscriber, field::Visit};
 use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
-const EXPECTED_READ_ONLY_SCOPE: &str = "atproto rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* rpc:app.bsky.graph.getMutes?aud=*";
-const EXPECTED_LIKE_ONLY_SCOPE: &str = "atproto rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* rpc:app.bsky.graph.getMutes?aud=* repo:app.bsky.feed.like?action=create&action=delete";
-const EXPECTED_ALL_BOXES_SCOPE: &str = "atproto rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* rpc:app.bsky.graph.getMutes?aud=* repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete repo:app.bsky.feed.post?action=create blob:image/* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.actor.putPreferences?aud=did:web:api.bsky.app%23bsky_appview";
-const EXPECTED_OAUTH_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.graph.getMutes?aud=* rpc:app.bsky.actor.putPreferences?aud=did:web:api.bsky.app%23bsky_appview";
+const EXPECTED_READ_ONLY_SCOPE: &str = "atproto rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* rpc:app.bsky.graph.getMutes?aud=* rpc:app.bsky.feed.searchPosts?aud=*";
+const EXPECTED_LIKE_ONLY_SCOPE: &str = "atproto rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* rpc:app.bsky.graph.getMutes?aud=* rpc:app.bsky.feed.searchPosts?aud=* repo:app.bsky.feed.like?action=create&action=delete";
+const EXPECTED_ALL_BOXES_SCOPE: &str = "atproto rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* rpc:app.bsky.graph.getMutes?aud=* rpc:app.bsky.feed.searchPosts?aud=* repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete repo:app.bsky.feed.post?action=create blob:image/* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.actor.putPreferences?aud=did:web:api.bsky.app%23bsky_appview";
+const EXPECTED_OAUTH_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.graph.getMutes?aud=* rpc:app.bsky.feed.searchPosts?aud=* rpc:app.bsky.actor.putPreferences?aud=did:web:api.bsky.app%23bsky_appview";
 
 #[derive(Clone)]
 struct ProfileHydrationTiming(Arc<Mutex<Option<u64>>>);
@@ -1624,6 +1624,58 @@ async fn authorize_with_all_five_boxes_sends_the_full_scope_union() {
         captured.lock().unwrap().as_deref(),
         Some(EXPECTED_ALL_BOXES_SCOPE),
         "all five boxes must request atproto + read-only + every box's scopes, de-duplicated, in box order"
+    );
+}
+
+#[tokio::test]
+async fn every_sign_in_asks_for_the_signed_posts_search_scope() {
+    // Posts search now runs through the viewer's own session, so every sign-in must carry the
+    // searchPosts rpc scope whatever the ticked boxes say (owner, msgd 2026-10-31).
+    for body in [
+        "handle=alice.test",
+        "handle=alice.test&allow=like",
+        "handle=alice.test&allow=feeds",
+        "handle=alice.test&allow=like&allow=repost&allow=post&allow=social&allow=feeds",
+    ] {
+        let flow = FakeOAuthFlow::default();
+        let captured = flow.authorize_scopes.clone();
+        let app = OAuthPublic::new("https://appview.example")
+            .unwrap()
+            .router_with_flow(flow, Arc::new(MemoryStorage::default()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/oauth/authorize")
+                    .header("origin", "https://appview.example")
+                    .header("sec-fetch-site", "same-origin")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let scopes = captured.lock().unwrap().clone().unwrap_or_default();
+        assert!(
+            scopes
+                .split_whitespace()
+                .any(|scope| scope == "rpc:app.bsky.feed.searchPosts?aud=*"),
+            "the sign-in from {body} must ask for rpc:app.bsky.feed.searchPosts?aud=*: {scopes}"
+        );
+    }
+}
+
+#[test]
+fn client_metadata_scope_contains_the_signed_posts_search_scope() {
+    let public = OAuthPublic::new("https://appview.example").unwrap();
+    let metadata = public.metadata();
+    let scope = metadata["scope"].as_str().unwrap_or_default();
+    assert!(
+        scope
+            .split_whitespace()
+            .any(|scope| scope == "rpc:app.bsky.feed.searchPosts?aud=*"),
+        "the client metadata maximum must include the signed posts search scope: {scope}"
     );
 }
 
