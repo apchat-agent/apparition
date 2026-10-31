@@ -1514,6 +1514,49 @@ async fn login_page_accepts_an_atproto_handle_or_did() {
 }
 
 #[tokio::test]
+async fn login_page_offers_a_write_checkbox_unchecked_by_default() {
+    let response = router()
+        .oneshot(
+            Request::builder()
+                .uri("/login")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(html.contains("name=\"write\""), "{html}");
+    assert!(html.contains("value=\"1\""), "{html}");
+    assert!(
+        html.contains("Allow changes (post, like, follow, edit feeds)"),
+        "{html}"
+    );
+    assert!(!html.contains("checked"), "{html}");
+    assert!(html.contains("method=\"post\""), "{html}");
+}
+
+#[tokio::test]
+async fn login_page_pre_ticks_the_write_checkbox_for_write_one() {
+    let response = router()
+        .oneshot(
+            Request::builder()
+                .uri("/login?write=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(html.contains("name=\"write\""), "{html}");
+    assert!(html.contains("checked"), "{html}");
+    assert!(html.contains("method=\"post\""), "{html}");
+}
+
+#[tokio::test]
 async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code() {
     let storage = Arc::new(MemoryStorage::default());
     let thread_uri = "at://did:plc:alice/app.bsky.feed.post/root";
