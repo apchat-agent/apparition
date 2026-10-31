@@ -807,6 +807,20 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<HashSet<String>, String>> + Send + 'a>> {
         Box::pin(async { Ok(HashSet::new()) })
     }
+    /// Posts search answered through the viewer's own signed-in session, proxied to the Bluesky
+    /// AppView (owner, msgd 2026-10-31: anonymous searchPosts answers 403 to any request that
+    /// carries a cursor, so paging needs the session). `Ok(None)` means "no signed search
+    /// here": test flows, and sessions whose granted scope predates the searchPosts scope.
+    /// The `Ok(Some)` value is the raw searchPosts answer, parsed by
+    /// [`crate::search::parse_search_posts_body`] like the anonymous one.
+    fn signed_search_posts<'a>(
+        &'a self,
+        _did: &'a str,
+        _query: &'a str,
+        _cursor: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Value>, String>> + Send + 'a>> {
+        Box::pin(async { Ok(None) })
+    }
     /// The at-uris of the lists the viewer subscribed to as block lists
     /// (`app.bsky.graph.listblock` subjects). Uncached raw fetch.
     fn subscribed_block_list_uris<'a>(
@@ -7884,9 +7898,12 @@ where
         ))
         .into_response();
     }
-    let page = match state.search.search_posts(&term, cursor).await {
-        Ok(page) => page,
-        Err(failure) => return search_unavailable_response(&failure, heading, &form, options),
+    let page = match state.flow.signed_search_posts(&did, &term, cursor).await {
+        Ok(Some(body)) => crate::search::parse_search_posts_body(&body),
+        Ok(None) | Err(_) => match state.search.search_posts(&term, cursor).await {
+            Ok(page) => page,
+            Err(failure) => return search_unavailable_response(&failure, heading, &form, options),
+        },
     };
     if let Err(error) = persist_public_profiles(
         state.storage.as_ref(),

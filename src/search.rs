@@ -69,6 +69,52 @@ pub struct SearchClient {
     base: String,
 }
 
+/// Parse a searchPosts answer into the page's shape. Shared by the anonymous client and the
+/// viewer's signed search (lane av64q) so both answers go through the same reading code.
+pub fn parse_search_posts_body(body: &Value) -> SearchPostsPage {
+    let mut page = SearchPostsPage {
+        cursor: response_cursor(body),
+        ..Default::default()
+    };
+    let Some(posts) = body.get("posts").and_then(Value::as_array) else {
+        return page;
+    };
+    // searchPosts lists PostViews directly. There is no "post" wrapper as in getTimeline's
+    // FeedViewPost; reading one dropped every real hit (live, 2026-10-31).
+    for view in posts {
+        let Some(uri) = view.get("uri").and_then(Value::as_str) else {
+            continue;
+        };
+        let Ok((did, collection, rkey)) = parse_post_uri(uri) else {
+            continue;
+        };
+        let Some(record) = view
+            .get("record")
+            .filter(|record| record.is_object())
+            .cloned()
+        else {
+            continue;
+        };
+        let author = view
+            .get("author")
+            .and_then(parse_public_profile_view)
+            .filter(|author| author.did == did);
+        page.posts.push(FetchedPublicPost {
+            record: IndexedRecord {
+                did,
+                collection,
+                rkey,
+                uri: uri.to_owned(),
+                cid: view.get("cid").and_then(Value::as_str).map(str::to_owned),
+                time_us: unix_time_us(),
+                record,
+            },
+            author,
+        });
+    }
+    page
+}
+
 impl SearchClient {
     /// Production always uses [`LABELLED_APPVIEW_BASE`]: measured 2026-10-31, api.bsky.app
     /// answers `app.bsky.feed.searchPosts` and `app.bsky.actor.searchActors` WITHOUT auth
@@ -93,47 +139,7 @@ impl SearchClient {
         let body = self
             .fetch("app.bsky.feed.searchPosts", query, cursor)
             .await?;
-        let mut page = SearchPostsPage {
-            cursor: response_cursor(&body),
-            ..Default::default()
-        };
-        let Some(posts) = body.get("posts").and_then(Value::as_array) else {
-            return Ok(page);
-        };
-        // searchPosts lists PostViews directly. There is no "post" wrapper as in getTimeline's
-        // FeedViewPost; reading one dropped every real hit (live, 2026-10-31).
-        for view in posts {
-            let Some(uri) = view.get("uri").and_then(Value::as_str) else {
-                continue;
-            };
-            let Ok((did, collection, rkey)) = parse_post_uri(uri) else {
-                continue;
-            };
-            let Some(record) = view
-                .get("record")
-                .filter(|record| record.is_object())
-                .cloned()
-            else {
-                continue;
-            };
-            let author = view
-                .get("author")
-                .and_then(parse_public_profile_view)
-                .filter(|author| author.did == did);
-            page.posts.push(FetchedPublicPost {
-                record: IndexedRecord {
-                    did,
-                    collection,
-                    rkey,
-                    uri: uri.to_owned(),
-                    cid: view.get("cid").and_then(Value::as_str).map(str::to_owned),
-                    time_us: unix_time_us(),
-                    record,
-                },
-                author,
-            });
-        }
-        Ok(page)
+        Ok(parse_search_posts_body(&body))
     }
 
     pub async fn search_actors(

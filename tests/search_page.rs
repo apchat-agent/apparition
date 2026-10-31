@@ -651,10 +651,12 @@ async fn people_search_escapes_names_and_descriptions_from_upstream() {
 // cursor, so posts search must run through the viewer's own signed-in session (owner,
 // msgd 2026-10-31).
 
+type SignedSearchCall = (String, String, Option<String>);
+
 #[derive(Clone)]
 struct SignedSearchFlow {
     body: Arc<Mutex<Value>>,
-    calls: Arc<Mutex<Vec<(String, String, Option<String>)>>>,
+    calls: Arc<Mutex<Vec<SignedSearchCall>>>,
 }
 
 impl SignedSearchFlow {
