@@ -1324,6 +1324,7 @@ impl OAuthPublic {
             .route("/app", get(app_home::<F, S>))
             .route("/feeds", get(feeds_page::<F, S>))
             .route("/search", get(search_page::<F, S>))
+            .route("/search/recent/clear", post(clear_recent_profiles::<F, S>))
             .route("/app/block-lists", get(block_lists_page::<F, S>))
             .route("/app/feed", get(feed_timeline_page::<F, S>))
             .route("/app/thread", get(thread_page::<F, S>))
@@ -7934,9 +7935,20 @@ where
     let heading = "<header class=\"page-heading\"><p class=\"eyebrow\">Find posts and people</p><h1>Search</h1></header>";
     let form = render_search_form(term.as_deref(), people);
     let Some(term) = term else {
+        let recent = if people {
+            match render_recent_profiles(state.storage.as_ref(), &did) {
+                Ok(recent) => recent,
+                Err(error) => {
+                    tracing::error!(%error, viewer_did = %did, "could not load recent search profiles");
+                    return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+                }
+            }
+        } else {
+            String::new()
+        };
         return Html(page_shell_with_options(
             "Search",
-            &format!("{heading}{form}"),
+            &format!("{heading}{form}{recent}"),
             true,
             options,
         ))
@@ -7952,11 +7964,18 @@ where
                 Ok(hidden) => hidden,
                 Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
             };
-        let rows = page
+        let visible_actors = page
             .actors
             .iter()
             .filter(|actor| !hidden_actors.contains(&actor.did))
-            .map(render_search_actor_row)
+            .collect::<Vec<_>>();
+        if let Err(error) = persist_search_actor_profiles(state.storage.as_ref(), &visible_actors) {
+            tracing::error!(%error, viewer_did = %did, "could not persist searched public profiles");
+            return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+        }
+        let rows = visible_actors
+            .iter()
+            .map(|actor| render_search_actor_row(actor))
             .collect::<String>();
         let rows = if rows.is_empty() {
             "<li class=\"empty-state\">No people matched that search.</li>".to_owned()
@@ -8081,6 +8100,98 @@ where
     .into_response()
 }
 
+async fn clear_recent_profiles<F, S>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    headers: HeaderMap,
+) -> Response
+where
+    F: OAuthFlow,
+    S: Storage + 'static,
+{
+    if !same_origin_request(&headers, &state.public.public_url) {
+        return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
+    }
+    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+        return Redirect::to("/login").into_response();
+    };
+    if let Err(error) = state.storage.clear_recent_profiles_for_viewer(&did) {
+        tracing::error!(%error, viewer_did = %did, "could not clear recent search profiles");
+        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+    }
+    Redirect::to("/search?type=people").into_response()
+}
+
+fn render_recent_profiles<S: Storage>(
+    storage: &S,
+    viewer_did: &str,
+) -> Result<String, StorageError> {
+    let recent = storage.recent_profiles_for_viewer(viewer_did)?;
+    let rows = if recent.is_empty() {
+        "<li class=\"empty-state\">No recently viewed profiles.</li>".to_owned()
+    } else {
+        recent
+            .iter()
+            .map(|did| {
+                let profile = profile_view_from_storage(storage, did)?;
+                let actor = SearchActor {
+                    did: did.clone(),
+                    handle: profile
+                        .get("handle")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    display_name: profile
+                        .get("displayName")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    avatar: profile
+                        .get("avatar")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    description: profile
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                };
+                Ok(render_search_actor_row_with_marker(&actor, false))
+            })
+            .collect::<Result<String, StorageError>>()?
+    };
+    Ok(format!(
+        "<section class=\"search-recent\" aria-labelledby=\"search-recent-heading\"><header class=\"search-recent-heading\"><h2 id=\"search-recent-heading\">Recent</h2><form action=\"/search/recent/clear\" method=\"post\"><button type=\"submit\">Clear</button></form></header><ol class=\"search-actor-list\">{rows}</ol></section>"
+    ))
+}
+
+fn persist_search_actor_profiles(
+    storage: &dyn Storage,
+    actors: &[&SearchActor],
+) -> Result<(), StorageError> {
+    let profiles = actors
+        .iter()
+        .filter_map(|actor| {
+            crate::feeds::parse_public_profile_view(&json!({
+                "did": actor.did,
+                "handle": actor.handle,
+                "displayName": actor.display_name,
+                "avatar": actor.avatar,
+            }))
+        })
+        .collect::<Vec<_>>();
+    persist_public_profiles(storage, profiles)?;
+    for actor in actors {
+        if let Some(description) = actor.description.as_deref()
+            && let Some(mut profile) =
+                storage.get_record(&actor.did, "app.bsky.actor.profile", "self")?
+        {
+            if !profile.record.is_object() {
+                profile.record = Value::Object(serde_json::Map::new());
+            }
+            profile.record["description"] = Value::String(description.to_owned());
+            storage.put_record(&profile)?;
+        }
+    }
+    Ok(())
+}
+
 fn render_more_results(people: bool, term: &str, cursor: Option<&str>) -> String {
     let Some(cursor) = cursor else {
         return String::new();
@@ -8120,6 +8231,10 @@ fn render_search_form(term: Option<&str>, people: bool) -> String {
 }
 
 fn render_search_actor_row(actor: &SearchActor) -> String {
+    render_search_actor_row_with_marker(actor, true)
+}
+
+fn render_search_actor_row_with_marker(actor: &SearchActor, from_search: bool) -> String {
     let handle = actor.handle.clone().unwrap_or_else(|| actor.did.clone());
     let display_name = actor.display_name.clone().unwrap_or_else(|| handle.clone());
     let profile = json!({
@@ -8139,8 +8254,9 @@ fn render_search_actor_row(actor: &SearchActor) -> String {
             )
         })
         .unwrap_or_default();
+    let marker = if from_search { "&amp;from=search" } else { "" };
     format!(
-        "<li class=\"search-actor\"><a class=\"search-actor-link\" href=\"/profile?did={}&amp;from=search\">{}<span class=\"search-actor-name\">{}</span><span class=\"search-actor-handle\">@{}</span>{}</a></li>",
+        "<li class=\"search-actor\"><a class=\"search-actor-link\" href=\"/profile?did={}{marker}\">{}<span class=\"search-actor-name\">{}</span><span class=\"search-actor-handle\">@{}</span>{}</a></li>",
         form_encoded(&actor.did),
         avatar_markup(&profile, "search-actor-avatar"),
         html_escape(&display_name),
@@ -9664,6 +9780,13 @@ where
     page_timing.preferences_ms = tabs.preferences_ms;
     page_timing.tabs_ms = tabs.tabs_ms;
     let subject = query.get("did").map(String::as_str).unwrap_or(&did);
+    if query.get("from").map(String::as_str) == Some("search")
+        && query.contains_key("did")
+        && let Err(error) = state.storage.remember_recent_profile(&did, subject)
+    {
+        tracing::error!(%error, viewer_did = %did, profile_did = %subject, "could not remember a search profile visit");
+        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+    }
     let limit = query
         .get("limit")
         .and_then(|value| value.parse::<usize>().ok())

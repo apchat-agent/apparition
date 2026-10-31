@@ -487,6 +487,40 @@ textarea:focus-visible {
   color: var(--accent-hover);
 }
 
+.search-recent {
+  margin-top: 1.25rem;
+}
+
+.search-recent-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.65rem;
+}
+
+.search-recent-heading h2 {
+  margin: 0;
+  font-size: 1.15rem;
+}
+
+.search-recent-heading button {
+  min-height: 2.5rem;
+  padding: 0.35rem 0.85rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.search-recent-heading button:hover {
+  border-color: var(--accent);
+  background: var(--surface-raised);
+}
+
 .right-sidebar {
   position: sticky;
   top: 1rem;

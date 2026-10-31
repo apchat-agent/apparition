@@ -342,15 +342,34 @@ async fn recent_profiles_keep_the_latest_ten_search_result_clicks_in_order() {
         .unwrap()
         .router_with_flow_and_shutdown_and_profile_counts_and_relationships_and_search(
             AcceptingFlow,
-            storage,
+            storage.clone(),
             WebShutdown::new(),
             ProfileCountsClient::local_only(),
             RelationshipClient::local_only(),
             search_client(&base),
         );
     let cookie = login(&router).await;
+    let signed_out = response_for(&router, "/search?type=people", None).await;
+    assert_eq!(signed_out.status(), StatusCode::SEE_OTHER);
+    assert!(
+        storage
+            .recent_profiles_for_viewer(ALICE)
+            .unwrap()
+            .is_empty()
+    );
     let results = get_html(&router, "/search?q=recent&type=people", &cookie).await;
-    assert!(results.contains("&amp;from=search"), "search result links must carry the marker: {results}");
+    assert!(
+        results.contains("&amp;from=search"),
+        "search result links must carry the marker: {results}"
+    );
+    let unmarked = response_for(&router, "/profile?did=did%3Aplc%3Aunmarked", Some(&cookie)).await;
+    assert_eq!(unmarked.status(), StatusCode::OK);
+    assert!(
+        storage
+            .recent_profiles_for_viewer(ALICE)
+            .unwrap()
+            .is_empty()
+    );
 
     for index in 0..12 {
         let response = response_for(
@@ -377,11 +396,27 @@ async fn recent_profiles_keep_the_latest_ten_search_result_clicks_in_order() {
         .split("</ol>")
         .next()
         .unwrap_or_default();
-    assert!(html.contains("Recent"), "the blank People tab must show recent profiles: {html}");
-    assert!(rows.contains("Recent 5"), "reopened profile should be first: {rows}");
-    assert!(rows.contains("Bio 5"), "stored public profile bio should be reused: {rows}");
-    assert_eq!(rows.matches("search-actor\"").count(), 10, "keep only ten unique profiles: {rows}");
-    assert!(!rows.contains("Recent 0") && !rows.contains("Recent 1"), "oldest profiles should be evicted: {rows}");
+    assert!(
+        html.contains("Recent"),
+        "the blank People tab must show recent profiles: {html}"
+    );
+    assert!(
+        rows.contains("Recent 5"),
+        "reopened profile should be first: {rows}"
+    );
+    assert!(
+        rows.contains("Bio 5"),
+        "stored public profile bio should be reused: {rows}"
+    );
+    assert_eq!(
+        rows.matches("search-actor\"").count(),
+        10,
+        "keep only ten unique profiles: {rows}"
+    );
+    assert!(
+        !rows.contains("Recent 0</span>") && !rows.contains("Recent 1</span>"),
+        "oldest profiles should be evicted: {rows}"
+    );
     server.abort();
 }
 

@@ -426,6 +426,13 @@ pub trait Storage: Send + Sync {
         limit: usize,
     ) -> Result<Vec<IndexedRecord>, StorageError>;
     fn profile_counts(&self, did: &str) -> Result<(usize, usize, usize), StorageError>;
+    fn remember_recent_profile(
+        &self,
+        viewer_did: &str,
+        profile_did: &str,
+    ) -> Result<(), StorageError>;
+    fn recent_profiles_for_viewer(&self, viewer_did: &str) -> Result<Vec<String>, StorageError>;
+    fn clear_recent_profiles_for_viewer(&self, viewer_did: &str) -> Result<(), StorageError>;
     fn profile_index_snapshot(&self) -> Result<HashMap<String, ProfileIndexEntry>, StorageError>;
     fn set_profile_index_entry(
         &self,
@@ -656,6 +663,7 @@ struct MemoryState {
     handle_refresh_queue: HashSet<String>,
     handle_refresh_order: VecDeque<String>,
     profile_index: HashMap<String, ProfileIndexEntry>,
+    recent_profiles: HashMap<String, Vec<String>>,
     profile_fetch_queue: VecDeque<String>,
     notification_last_seen: HashMap<String, u64>,
 }
@@ -1112,6 +1120,42 @@ impl Storage for MemoryStorage {
             }
         }
         Ok((follows, followers, posts))
+    }
+
+    fn remember_recent_profile(
+        &self,
+        viewer_did: &str,
+        profile_did: &str,
+    ) -> Result<(), StorageError> {
+        let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        let recent = inner
+            .recent_profiles
+            .entry(viewer_did.to_owned())
+            .or_default();
+        recent.retain(|did| did != profile_did);
+        recent.insert(0, profile_did.to_owned());
+        recent.truncate(10);
+        Ok(())
+    }
+
+    fn recent_profiles_for_viewer(&self, viewer_did: &str) -> Result<Vec<String>, StorageError> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .recent_profiles
+            .get(viewer_did)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn clear_recent_profiles_for_viewer(&self, viewer_did: &str) -> Result<(), StorageError> {
+        self.inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .recent_profiles
+            .remove(viewer_did);
+        Ok(())
     }
 
     fn profile_index_snapshot(&self) -> Result<HashMap<String, ProfileIndexEntry>, StorageError> {
@@ -2482,7 +2526,17 @@ impl SqliteStorage {
              CREATE TABLE IF NOT EXISTS profile_fetch_queue (
                  seq INTEGER PRIMARY KEY AUTOINCREMENT,
                  did TEXT NOT NULL UNIQUE
+             );
+             CREATE TABLE IF NOT EXISTS recent_profile_clicks (
+                 seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                 viewer_did TEXT NOT NULL,
+                 profile_did TEXT NOT NULL,
+                 UNIQUE(viewer_did, profile_did)
              );",
+        )?;
+        connection.execute_batch(
+            "CREATE INDEX IF NOT EXISTS recent_profile_clicks_viewer_order
+             ON recent_profile_clicks(viewer_did, seq DESC);",
         )?;
         let handle_refresh_has_priority: bool = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('handle_refresh_queue') WHERE name='priority')",
@@ -4527,6 +4581,57 @@ impl Storage for SqliteStorage {
         })
     }
 
+    fn remember_recent_profile(
+        &self,
+        viewer_did: &str,
+        profile_did: &str,
+    ) -> Result<(), StorageError> {
+        let viewer_did = viewer_did.to_owned();
+        let profile_did = profile_did.to_owned();
+        self.writer.call(move |connection| {
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "DELETE FROM recent_profile_clicks WHERE viewer_did=?1 AND profile_did=?2",
+                params![viewer_did, profile_did],
+            )?;
+            transaction.execute(
+                "INSERT INTO recent_profile_clicks(viewer_did,profile_did) VALUES(?1,?2)",
+                params![viewer_did, profile_did],
+            )?;
+            transaction.execute(
+                "DELETE FROM recent_profile_clicks WHERE viewer_did=?1 AND seq NOT IN (
+                     SELECT seq FROM recent_profile_clicks WHERE viewer_did=?1
+                     ORDER BY seq DESC LIMIT 10
+                 )",
+                [&viewer_did],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })
+    }
+
+    fn recent_profiles_for_viewer(&self, viewer_did: &str) -> Result<Vec<String>, StorageError> {
+        let connection = self.read_conn()?;
+        let mut statement = connection.prepare(
+            "SELECT profile_did FROM recent_profile_clicks
+             WHERE viewer_did=?1 ORDER BY seq DESC LIMIT 10",
+        )?;
+        Ok(statement
+            .query_map([viewer_did], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn clear_recent_profiles_for_viewer(&self, viewer_did: &str) -> Result<(), StorageError> {
+        let viewer_did = viewer_did.to_owned();
+        self.writer.call(move |connection| {
+            connection.execute(
+                "DELETE FROM recent_profile_clicks WHERE viewer_did=?1",
+                [viewer_did],
+            )?;
+            Ok(())
+        })
+    }
+
     fn bytes_on_disk(&self) -> u64 {
         let bytes = fs::metadata(&self.path).map(|meta| meta.len()).unwrap_or(0);
         let wal_path = PathBuf::from(format!("{}-wal", self.path.display()));
@@ -5790,5 +5895,98 @@ mod sqlite_writer_tests {
             })
             .unwrap();
         assert_eq!(touched, 1, "one page DID should touch one queue row");
+    }
+}
+
+#[cfg(test)]
+mod recent_profile_storage_tests {
+    use super::*;
+
+    fn expected_recent_profiles() -> Vec<String> {
+        std::iter::once("did:plc:profile-5".to_owned())
+            .chain(
+                (2..=11)
+                    .rev()
+                    .filter(|index| *index != 5)
+                    .map(|index| format!("did:plc:profile-{index}")),
+            )
+            .collect()
+    }
+
+    #[test]
+    fn recent_profiles_are_unique_capped_ordered_and_viewer_scoped() {
+        for storage in [
+            Box::new(MemoryStorage::default()) as Box<dyn Storage>,
+            Box::new(SqliteStorage::open(":memory:").unwrap()) as Box<dyn Storage>,
+        ] {
+            for index in 0..12 {
+                storage
+                    .remember_recent_profile(
+                        "did:plc:viewer-one",
+                        &format!("did:plc:profile-{index}"),
+                    )
+                    .unwrap();
+            }
+            storage
+                .remember_recent_profile("did:plc:viewer-one", "did:plc:profile-5")
+                .unwrap();
+            storage
+                .remember_recent_profile("did:plc:viewer-two", "did:plc:other")
+                .unwrap();
+            assert_eq!(
+                storage
+                    .recent_profiles_for_viewer("did:plc:viewer-one")
+                    .unwrap(),
+                expected_recent_profiles()
+            );
+            assert_eq!(
+                storage
+                    .recent_profiles_for_viewer("did:plc:viewer-two")
+                    .unwrap(),
+                ["did:plc:other"]
+            );
+            storage
+                .clear_recent_profiles_for_viewer("did:plc:viewer-one")
+                .unwrap();
+            assert!(
+                storage
+                    .recent_profiles_for_viewer("did:plc:viewer-one")
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                storage
+                    .recent_profiles_for_viewer("did:plc:viewer-two")
+                    .unwrap(),
+                ["did:plc:other"]
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_recent_profiles_survive_reopening_the_database() {
+        let path = std::env::temp_dir().join(format!(
+            "appview-recent-profiles-{}-{}.sqlite3",
+            std::process::id(),
+            epoch_millis()
+        ));
+        {
+            let storage = SqliteStorage::open(&path).unwrap();
+            storage
+                .remember_recent_profile("did:plc:viewer", "did:plc:profile")
+                .unwrap();
+        }
+        {
+            let storage = SqliteStorage::open(&path).unwrap();
+            assert_eq!(
+                storage
+                    .recent_profiles_for_viewer("did:plc:viewer")
+                    .unwrap(),
+                ["did:plc:profile"]
+            );
+        }
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{}-wal", path.display()));
+        let _ = fs::remove_file(format!("{}-shm", path.display()));
     }
 }
