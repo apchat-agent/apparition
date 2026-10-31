@@ -7900,10 +7900,24 @@ where
     }
     let page = match state.flow.signed_search_posts(&did, &term, cursor).await {
         Ok(Some(body)) => crate::search::parse_search_posts_body(&body),
-        Ok(None) | Err(_) => match state.search.search_posts(&term, cursor).await {
+        Ok(None) => match state.search.search_posts(&term, cursor).await {
             Ok(page) => page,
             Err(failure) => return search_unavailable_response(&failure, heading, &form, options),
         },
+        Err(error) => {
+            // Owner's logging rule: the fallback names the real underlying error.
+            tracing::warn!(
+                %error,
+                did = %did,
+                "signed posts search failed; falling back to the anonymous search"
+            );
+            match state.search.search_posts(&term, cursor).await {
+                Ok(page) => page,
+                Err(failure) => {
+                    return search_unavailable_response(&failure, heading, &form, options);
+                }
+            }
+        }
     };
     if let Err(error) = persist_public_profiles(
         state.storage.as_ref(),
