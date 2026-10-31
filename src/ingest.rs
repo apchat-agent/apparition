@@ -2612,7 +2612,10 @@ impl SqliteStorage {
         )
     }
 
-    fn read_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StorageError> {
+    /// Picks a read connection. Public so a test (or an investigation) can hold
+    /// one connection's guard and watch what the next reader does; production
+    /// code should keep using the storage methods.
+    pub fn read_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StorageError> {
         if self.read_connections.is_empty() {
             return Err(StorageError::WriterStopped);
         }
