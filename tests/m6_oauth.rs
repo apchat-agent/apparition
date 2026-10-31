@@ -5148,6 +5148,108 @@ async fn authenticated_pages_render_the_mobile_navigation_before_the_layout() {
     }
 }
 
+fn phone_frame(html: &str) -> String {
+    let nav = html
+        .find("<nav class=\"mobile-nav\"")
+        .expect("the shell renders the mobile nav");
+    let layout = html
+        .find("<div class=\"app-layout")
+        .expect("the shell renders the app layout");
+    html[nav..layout].to_owned()
+}
+
+fn desktop_nav(html: &str) -> String {
+    let start = html
+        .find("<nav class=\"primary-nav\"")
+        .expect("the shell renders the desktop nav");
+    let end = start
+        + html[start..]
+            .find("</nav>")
+            .expect("the desktop nav closes")
+        + "</nav>".len();
+    html[start..end].to_owned()
+}
+
+#[tokio::test]
+async fn one_shared_phone_menu_shows_the_avatar_and_search_on_every_signed_in_page() {
+    let storage = Arc::new(MemoryStorage::default());
+    storage
+        .put_record(&IndexedRecord {
+            did: "did:plc:alice".into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "root".into(),
+            uri: "at://did:plc:alice/app.bsky.feed.post/root".into(),
+            cid: Some("root-cid".into()),
+            time_us: 1,
+            record: serde_json::json!({"text":"A local post"}),
+        })
+        .unwrap();
+    storage
+        .put_record(&IndexedRecord {
+            did: "did:plc:alice".into(),
+            collection: "app.bsky.actor.profile".into(),
+            rkey: "self".into(),
+            uri: "at://did:plc:alice/app.bsky.actor.profile/self".into(),
+            cid: None,
+            time_us: 2,
+            record: serde_json::json!({
+                "publicHandle": "alice.test",
+                "displayName": "Alice",
+                "publicAvatar": "https://cdn.bsky.app/img/avatar/plain/did:plc:alice/bafkreifakeavatar@jpeg",
+            }),
+        })
+        .unwrap();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage);
+    let cookie = finish_login(&app).await;
+    let mut menus: Vec<(&str, String)> = Vec::new();
+    for path in [
+        "/app",
+        "/feeds",
+        "/thread?uri=at%3A%2F%2Fdid%3Aplc%3Aalice%2Fapp.bsky.feed.post%2Froot",
+    ] {
+        let html = get_html(&app, path, &cookie).await;
+        let phone = phone_frame(&html);
+        assert!(
+            phone.contains("href=\"/search\""),
+            "{path}: the phone menu needs the Search link: {phone}"
+        );
+        assert!(
+            phone.contains("<img class=\"mobile-profile-avatar\""),
+            "{path}: the phone menu needs the viewer avatar: {phone}"
+        );
+        assert!(
+            phone.contains(">Notifications<"),
+            "{path}: both menus must carry the one chosen label: {phone}"
+        );
+        assert!(
+            !phone.contains(">Alerts<"),
+            "{path}: the shared phone menu must not keep the other label: {phone}"
+        );
+        assert!(
+            !phone.contains("disabled"),
+            "{path}: Search must be a link, never a disabled button: {phone}"
+        );
+        let desktop = desktop_nav(&html);
+        assert!(
+            desktop.contains("href=\"/search\"") && desktop.contains(">Search<"),
+            "{path}: the desktop menu needs the Search entry: {desktop}"
+        );
+        menus.push((path, phone));
+    }
+    assert_eq!(
+        menus[0].1, menus[1].1,
+        "the phone menu on {} and {} must be identical markup",
+        menus[0].0, menus[1].0
+    );
+    assert_eq!(
+        menus[0].1, menus[2].1,
+        "the phone menu on {} and {} must be identical markup",
+        menus[0].0, menus[2].0
+    );
+}
+
 #[test]
 fn sqlite_notification_last_seen_persists_and_filters_unread_events() {
     let path = std::path::PathBuf::from(format!(
