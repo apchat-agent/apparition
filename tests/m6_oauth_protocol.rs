@@ -1066,7 +1066,7 @@ async fn old_granted_scope_in_production_session_shows_feed_reauthorization_page
         html.to_ascii_lowercase()
             .contains("sign in again to load saved feeds")
     );
-    assert!(html.contains("href=\"/login?write=1\""));
+    assert!(html.contains("href=\"/login?allow=feeds\""));
     server.abort();
 }
 

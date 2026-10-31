@@ -3215,7 +3215,10 @@ async fn old_scope_session_gets_a_friendly_feed_reauthorization_page() {
         html.to_ascii_lowercase()
             .contains("sign in again to load saved feeds")
     );
-    assert!(html.contains("href=\"/login?write=1\""));
+    assert!(
+        html.contains("href=\"/login?allow=feeds\""),
+        "the saved-feeds link must pre-tick the feeds box: {html}"
+    );
     assert!(!html.contains("\"error\":\"OAuthError\""));
 }
 
@@ -6835,16 +6838,24 @@ async fn a_read_only_session_is_shown_a_sign_in_page_not_a_json_error_for_every_
             "/like",
             "uri=at%3A%2F%2Fdid%3Aplc%3Aauthor%2Fapp.bsky.feed.post%2Fone&cid=one-cid",
             "like posts",
+            "like",
         ),
         (
             "follow",
             "/profile/action",
             "subject=did%3Aplc%3Afriend&action=follow",
             "follow",
+            "social",
         ),
-        ("post", "/post", "text=must+not+write", "post"),
+        (
+            "post",
+            "/post",
+            "text=must+not+write",
+            "post",
+            "post",
+        ),
     ];
-    for (name, uri, body, wording) in writes {
+    for (name, uri, body, wording, box_name) in writes {
         let response = app
             .clone()
             .oneshot(
@@ -6879,8 +6890,8 @@ async fn a_read_only_session_is_shown_a_sign_in_page_not_a_json_error_for_every_
             "{name}: {content_type}"
         );
         assert!(
-            html.contains("href=\"/login?write=1\""),
-            "{name} must link to the write sign-in: {html}"
+            html.contains(&format!("href=\"/login?allow={box_name}\"")),
+            "{name} must link to the sign-in with its own {box_name} box: {html}"
         );
         assert!(
             html.contains(&format!("Sign in with changes allowed to {wording}")),
@@ -6895,6 +6906,109 @@ async fn a_read_only_session_is_shown_a_sign_in_page_not_a_json_error_for_every_
         actions.lock().unwrap().is_empty(),
         "a read-only session must never reach the PDS write: {:?}",
         actions.lock().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn a_like_only_session_likes_but_repost_and_post_point_at_their_own_boxes() {
+    let flow = FakeOAuthFlow::with_granted_scope(Some(EXPECTED_LIKE_ONLY_SCOPE));
+    let actions = flow.actions.clone();
+    let storage = Arc::new(MemoryStorage::default());
+    storage
+        .put_record(&fake_feed_post(
+            "did:plc:author",
+            "one",
+            10,
+            "a post to act on",
+        ))
+        .unwrap();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage);
+    let cookie = finish_login(&app).await;
+
+    let liked = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/like")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", &cookie)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "uri=at%3A%2F%2Fdid%3Aplc%3Aauthor%2Fapp.bsky.feed.post%2Fone&cid=one-cid",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(liked.status(), StatusCode::SEE_OTHER);
+    assert!(
+        actions
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|action| action.starts_with("like:")),
+        "a like-only session must be able to like: {:?}",
+        actions.lock().unwrap()
+    );
+
+    for (uri, body, box_name, wording) in [
+        (
+            "/repost",
+            "uri=at%3A%2F%2Fdid%3Aplc%3Aauthor%2Fapp.bsky.feed.post%2Fone&cid=one-cid",
+            "repost",
+            "repost",
+        ),
+        ("/post", "text=must+not+write", "post", "post"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("origin", "https://appview.example")
+                    .header("sec-fetch-site", "same-origin")
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
+        let html = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            html.contains(&format!("href=\"/login?allow={box_name}\"")),
+            "{uri} must link to the sign-in with its own {box_name} box: {html}"
+        );
+        assert!(
+            html.contains(&format!("Sign in with changes allowed to {wording}")),
+            "{uri}: {html}"
+        );
+    }
+    let non_like_actions = actions
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|action| !action.starts_with("like:"))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(
+        non_like_actions.is_empty(),
+        "a like-only session must make no other PDS call: {non_like_actions:?}"
     );
 }
 
@@ -7429,9 +7543,10 @@ async fn old_scope_profile_shows_per_action_reauthorization_messages() {
         html.contains("Sign in with changes allowed to follow"),
         "{html}"
     );
-    // The link must re-sign-in with the "Allow changes" box ticked (review mutant M5, 2026-10-31).
+    // The link must re-sign-in with the "Follow, block, mute and manage lists" box ticked
+    // (review mutant M5, 2026-10-31; per-activity boxes, lane av62q).
     assert!(
-        html.contains("href=\"/login?write=1\">Sign in with changes allowed to follow"),
+        html.contains("href=\"/login?allow=social\">Sign in with changes allowed to follow"),
         "{html}"
     );
     assert!(
@@ -7445,6 +7560,11 @@ async fn old_scope_profile_shows_per_action_reauthorization_messages() {
     assert!(
         html.contains("Sign in with changes allowed to add to lists"),
         "{html}"
+    );
+    assert_eq!(
+        html.matches("href=\"/login?allow=social\"").count(),
+        5,
+        "follow, block, mute and both list controls must all point at the social box: {html}"
     );
 }
 
@@ -8223,7 +8343,9 @@ async fn a_dead_feed_page_offers_removal_and_an_older_sign_in_is_asked_to_renew(
     let html = get_html(&old_app, &page, &old_cookie).await;
     assert!(html.contains("This feed no longer exists"), "{html}");
     assert!(
-        html.contains("Sign in with changes allowed to remove this feed"),
+        html.contains(
+            "href=\"/login?allow=feeds\">Sign in with changes allowed to remove this feed"
+        ),
         "{html}"
     );
     assert!(!html.contains("/feeds/remove"), "{html}");
@@ -8298,7 +8420,7 @@ async fn an_older_sign_in_cannot_remove_a_feed_until_it_signs_in_again() {
     )
     .unwrap();
     assert!(
-        html.contains("Sign in with changes allowed to remove this feed"),
+        html.contains("href=\"/login?allow=feeds\">Sign in with changes allowed to remove this feed"),
         "{html}"
     );
     assert!(
