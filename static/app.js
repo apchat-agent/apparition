@@ -15,6 +15,13 @@ function noteFetchTimingId(response, startedAt) {
   return response;
 }
 
+function scrollActiveFeedTab(pageDocument = document) {
+  const activeTab = pageDocument.querySelector?.('.feed-tab[aria-current="page"]');
+  activeTab?.scrollIntoView?.({ block: "nearest", inline: "center" });
+}
+
+scrollActiveFeedTab();
+
 async function signInIfSessionExpired(response) {
   if (response.status !== 401) return false;
   let body;
