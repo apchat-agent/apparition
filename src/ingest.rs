@@ -2954,6 +2954,12 @@ impl SqliteStorage {
         let read_metrics = Arc::new(ReadPoolMetrics::default());
         let wal_metrics = Arc::new(WalMetrics::default());
         let pressure = Arc::new(StoragePressure::default());
+        let writer = SqliteWriter::new(
+            connection,
+            Arc::clone(&read_metrics),
+            Arc::clone(&wal_metrics),
+            Arc::clone(&pressure),
+        )?;
         let stop = Arc::new(AtomicBool::new(false));
         let backlog = Arc::new(AtomicU64::new(0));
         let checkpointer_worker = if !is_memory {
@@ -2969,12 +2975,7 @@ impl SqliteStorage {
             None
         };
         Ok(Self {
-            writer: SqliteWriter::new(
-                connection,
-                Arc::clone(&read_metrics),
-                Arc::clone(&wal_metrics),
-                Arc::clone(&pressure),
-            )?,
+            writer,
             read_connections,
             next_read_connection: AtomicU64::new(0),
             read_metrics,
