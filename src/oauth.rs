@@ -170,6 +170,9 @@ const POST_SCOPES: [&str; 5] = [
     "rpc:app.bsky.video.getUploadLimits?aud=*",
     "rpc:com.atproto.repo.uploadBlob?aud=*",
 ];
+/// What the post right checks on an existing session: the post box always requests these, but
+/// sessions signed in before the video scopes existed keep it too (video has its own flag).
+const POST_RIGHT_SCOPES: [&str; 2] = ["repo:app.bsky.feed.post?action=create", BLOB_SCOPE];
 const SOCIAL_SCOPES: [&str; 5] = [
     "repo:app.bsky.graph.follow?action=create&action=delete",
     "repo:app.bsky.graph.block?action=create&action=delete",
@@ -273,6 +276,12 @@ struct SessionPermissions {
     /// Position 8 in the cookie: cookies issued before it existed read as false, so those users
     /// stay signed in and are asked to sign in again only when they try to remove a feed.
     preferences: bool,
+    /// Positions 9-11 (owner, msgd 2026-10-31: one sign-in checkbox per activity). Cookies issued
+    /// before the split only carry `write`, and verify maps write=true there to all three, so a
+    /// session that holds the full old scope set keeps every right.
+    like: bool,
+    repost: bool,
+    post: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1349,7 +1358,7 @@ impl OAuthPublic {
     ) -> String {
         let expires = unix_time().saturating_add(SESSION_TTL_SECONDS);
         let payload = format!(
-            "{did}\n{expires}\n{session_id}\n{generation}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            "{did}\n{expires}\n{session_id}\n{generation}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             permissions.write,
             permissions.feed,
             permissions.blob,
@@ -1358,7 +1367,10 @@ impl OAuthPublic {
             permissions.block,
             permissions.mute,
             permissions.list,
-            permissions.preferences
+            permissions.preferences,
+            permissions.like,
+            permissions.repost,
+            permissions.post
         );
         let encoded = URL_SAFE_NO_PAD.encode(payload.as_bytes());
         let mut mac = HmacSha256::new_from_slice(&self.cookie_key())
@@ -1429,12 +1441,23 @@ impl OAuthPublic {
         {
             return None;
         }
+        // A cookie predating the per-activity split carries only the single `write` flag; on the
+        // old format write=true was the full old scope set, so it stands for all three boxes.
+        let split_flags = permission_values.len() >= 12;
+        let write = permission(0);
+        let per_activity = |index: usize| {
+            if split_flags {
+                permission(index)
+            } else {
+                write
+            }
+        };
         Some((
             did.to_owned(),
             session_id.to_owned(),
             generation.parse().ok()?,
             SessionPermissions {
-                write: permission(0),
+                write,
                 feed: permission(1),
                 blob: permission(2),
                 video: permission(3),
@@ -1443,6 +1466,9 @@ impl OAuthPublic {
                 mute: permission(6),
                 list: permission(7),
                 preferences: permission(8),
+                like: per_activity(9),
+                repost: per_activity(10),
+                post: per_activity(11),
             },
         ))
     }
@@ -6976,6 +7002,9 @@ where
                 mute: has_all_mute_scopes(account.granted_scope.as_deref()),
                 list: has_all_list_scopes(account.granted_scope.as_deref()),
                 preferences: has_all_preferences_scopes(account.granted_scope.as_deref()),
+                like: has_all_like_scopes(account.granted_scope.as_deref()),
+                repost: has_all_repost_scopes(account.granted_scope.as_deref()),
+                post: has_all_post_scopes(account.granted_scope.as_deref()),
             },
         ),
         if state.public.secure_cookies() {
@@ -8949,7 +8978,7 @@ fn permission_reauthorization_link(action: &str) -> String {
         _ => "add to lists",
     };
     format!(
-        "<a class=\"permission-prompt\" href=\"/login?write=1\">Sign in with changes allowed to {description}</a>"
+        "<a class=\"permission-prompt\" href=\"/login?allow=social\">Sign in with changes allowed to {description}</a>"
     )
 }
 
@@ -9558,7 +9587,7 @@ where
         _ => return oauth_error(StatusCode::BAD_REQUEST, "unknown profile action"),
     };
     if !allowed {
-        return write_permission_page(permission_name);
+        return write_permission_page(permission_name, "social");
     }
     if matches!(action, "block" | "list_remove")
         && form.get("confirm").map(String::as_str) != Some("yes")
@@ -10675,7 +10704,7 @@ fn render_composer(spec: ComposerSpec<'_>) -> String {
 
 fn render_media_picker(image_access: bool, video_access: bool, id: &str) -> String {
     if !image_access && !video_access {
-        return "<p class=\"picture-permission-hint\" role=\"status\"><a href=\"/login?write=1\">Sign in with changes allowed to enable pictures</a></p><p class=\"video-permission-hint\" role=\"status\"><a href=\"/login?write=1\">Sign in with changes allowed to post videos</a></p>".to_owned();
+        return "<p class=\"picture-permission-hint\" role=\"status\"><a href=\"/login?allow=post\">Sign in with changes allowed to enable pictures</a></p><p class=\"video-permission-hint\" role=\"status\"><a href=\"/login?allow=post\">Sign in with changes allowed to post videos</a></p>".to_owned();
     }
     format!(
         "<fieldset class=\"media-picker\" data-media-picker><legend>Add media</legend><input class=\"media-file-input\" id=\"{id}\" type=\"file\" name=\"media\" accept=\"image/*,video/mp4,video/webm,video/quicktime\" multiple data-media-input data-image-access=\"{image_access}\" data-video-access=\"{video_access}\"><label class=\"media-add-button\" for=\"{id}\"><span aria-hidden=\"true\">＋</span> Add media</label><p class=\"media-picker-hint\">Up to 4 pictures, or one video up to 300 MB and 10 minutes.</p><div class=\"media-previews\" data-media-previews></div><p class=\"media-picker-status\" data-media-status role=\"status\" aria-live=\"polite\"></p><label class=\"video-alt-label\" for=\"{id}-alt\" data-video-alt-label hidden>Video alt text (optional)<textarea id=\"{id}-alt\" name=\"video_alt\" maxlength=\"2000\" rows=\"2\" data-video-alt></textarea></label><progress data-video-progress max=\"100\" value=\"0\" hidden></progress><p class=\"video-upload-status\" data-video-upload-status role=\"status\" aria-live=\"polite\"></p></fieldset>"
@@ -11586,8 +11615,8 @@ where
     let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return Redirect::to("/login").into_response();
     };
-    if !verified_cookie_write_access(&state.public, &headers, state.storage.as_ref()) {
-        return write_permission_page("post videos");
+    if !verified_cookie_post_access(&state.public, &headers, state.storage.as_ref()) {
+        return write_permission_page("post videos", "post");
     }
     if !verified_cookie_video_access(&state.public, &headers, state.storage.as_ref()) {
         return oauth_error(StatusCode::FORBIDDEN, "sign in again to post videos");
@@ -11758,7 +11787,7 @@ where
     if verified_cookie_did(&state.public, &headers, state.storage.as_ref()).is_none() {
         return Redirect::to("/login").into_response();
     }
-    if !verified_cookie_write_access(&state.public, &headers, state.storage.as_ref()) {
+    if !verified_cookie_post_access(&state.public, &headers, state.storage.as_ref()) {
         return oauth_error(StatusCode::FORBIDDEN, "write permissions were not granted");
     }
     match state.link_card_fetcher.fetch(&input.url).await {
@@ -11782,8 +11811,8 @@ where
     let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return Redirect::to("/login").into_response();
     };
-    if !verified_cookie_write_access(&state.public, &headers, state.storage.as_ref()) {
-        return write_permission_page("post");
+    if !verified_cookie_post_access(&state.public, &headers, state.storage.as_ref()) {
+        return write_permission_page("post", "post");
     }
     let submission = match parse_post_submission(request, &state).await {
         Ok(submission) => submission,
@@ -11919,8 +11948,8 @@ where
     let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return Redirect::to("/login").into_response();
     };
-    if !verified_cookie_write_access(&state.public, &headers, state.storage.as_ref()) {
-        return write_permission_page("quote a post");
+    if !verified_cookie_post_access(&state.public, &headers, state.storage.as_ref()) {
+        return write_permission_page("quote a post", "post");
     }
     let submission = match parse_post_submission(request, &state).await {
         Ok(submission) => submission,
@@ -12047,8 +12076,8 @@ where
     let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return Redirect::to("/login").into_response();
     };
-    if !verified_cookie_write_access(&state.public, &headers, state.storage.as_ref()) {
-        return write_permission_page("reply");
+    if !verified_cookie_post_access(&state.public, &headers, state.storage.as_ref()) {
+        return write_permission_page("reply", "post");
     }
     let submission = match parse_post_submission(request, &state).await {
         Ok(submission) => submission,
@@ -12256,8 +12285,8 @@ where
     let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return Redirect::to("/login").into_response();
     };
-    if !verified_cookie_write_access(&state.public, &headers, state.storage.as_ref()) {
-        return write_permission_page("like posts");
+    if !verified_cookie_like_access(&state.public, &headers, state.storage.as_ref()) {
+        return write_permission_page("like posts", "like");
     }
     let (Some(uri), Some(cid)) = (form.get("uri"), form.get("cid")) else {
         return oauth_error(StatusCode::BAD_REQUEST, "uri and cid are required");
@@ -12373,8 +12402,8 @@ where
     let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
         return Redirect::to("/login").into_response();
     };
-    if !verified_cookie_write_access(&state.public, &headers, state.storage.as_ref()) {
-        return write_permission_page("repost");
+    if !verified_cookie_repost_access(&state.public, &headers, state.storage.as_ref()) {
+        return write_permission_page("repost", "repost");
     }
     let (Some(uri), Some(cid)) = (form.get("uri"), form.get("cid")) else {
         return oauth_error(StatusCode::BAD_REQUEST, "uri and cid are required");
@@ -12429,6 +12458,33 @@ fn verified_cookie_write_access<S: Storage>(
 ) -> bool {
     verified_cookie_session(public, headers, storage)
         .is_some_and(|(_, _, _, permissions)| permissions.write)
+}
+
+fn verified_cookie_post_access<S: Storage>(
+    public: &OAuthPublic,
+    headers: &HeaderMap,
+    storage: &S,
+) -> bool {
+    verified_cookie_session(public, headers, storage)
+        .is_some_and(|(_, _, _, permissions)| permissions.post)
+}
+
+fn verified_cookie_like_access<S: Storage>(
+    public: &OAuthPublic,
+    headers: &HeaderMap,
+    storage: &S,
+) -> bool {
+    verified_cookie_session(public, headers, storage)
+        .is_some_and(|(_, _, _, permissions)| permissions.like)
+}
+
+fn verified_cookie_repost_access<S: Storage>(
+    public: &OAuthPublic,
+    headers: &HeaderMap,
+    storage: &S,
+) -> bool {
+    verified_cookie_session(public, headers, storage)
+        .is_some_and(|(_, _, _, permissions)| permissions.repost)
 }
 
 fn verified_cookie_blob_access<S: Storage>(
@@ -12656,15 +12712,16 @@ fn oauth_error(status: StatusCode, message: &str) -> Response {
         .into_response()
 }
 
-/// A read-only sign-in (owner, 2026-10-31) must never see a raw JSON 403 for a write: this page
-/// explains the missing permission and links to the write-allowed sign-in (`/login?write=1`).
-fn write_permission_page(action: &str) -> Response {
+/// A sign-in that lacks an activity's right must never see a raw JSON 403 for that write: this
+/// page explains the missing permission and links to a sign-in that pre-ticks exactly the box the
+/// activity lives in (`/login?allow=<box>`, owner msgd 2026-10-31).
+fn write_permission_page(action: &str, allow_box: &str) -> Response {
     (
         StatusCode::FORBIDDEN,
         Html(page_shell(
             "Read-only sign-in",
             &format!(
-                "<section class=\"error-card\"><p class=\"eyebrow\">Read-only sign-in</p><h1>This sign-in cannot make changes</h1><p>You signed in without allowing changes, so this appview cannot {action}. Sign in again and tick the box to allow changes.</p><a class=\"primary-link\" href=\"/login?write=1\">Sign in with changes allowed to {action}</a></section>",
+                "<section class=\"error-card\"><p class=\"eyebrow\">Read-only sign-in</p><h1>This sign-in cannot make changes</h1><p>You signed in without allowing that activity, so this appview cannot {action}. Sign in again and tick the box for it.</p><a class=\"primary-link\" href=\"/login?allow={allow_box}\">Sign in with changes allowed to {action}</a></section>",
             ),
             false,
         )),
@@ -12706,7 +12763,7 @@ fn unavailable_feed_page(feed_uri: &str, can_remove: bool) -> Response {
             html_escape(feed_uri)
         )
     } else {
-        "<a class=\"primary-link\" href=\"/login?write=1\">Sign in with changes allowed to remove this feed</a>".to_owned()
+        "<a class=\"primary-link\" href=\"/login?allow=feeds\">Sign in with changes allowed to remove this feed</a>".to_owned()
     };
     Html(page_shell(
         "Unavailable feed",
@@ -12767,7 +12824,7 @@ where
 fn feed_reauthorization_page() -> Response {
     Html(page_shell(
         "Allow feeds",
-        "<section class=\"error-card\"><p class=\"eyebrow\">Permission update</p><h1>Sign in again to load saved feeds</h1><p>Your existing sign-in does not include permission to load saved feeds. Sign in again and approve the updated access.</p><a class=\"primary-link\" href=\"/login?write=1\">Sign in with changes allowed to load saved feeds</a></section>",
+        "<section class=\"error-card\"><p class=\"eyebrow\">Permission update</p><h1>Sign in again to load saved feeds</h1><p>Your existing sign-in does not include permission to load saved feeds. Sign in again and approve the updated access.</p><a class=\"primary-link\" href=\"/login?allow=feeds\">Sign in with changes allowed to load saved feeds</a></section>",
         false,
     ))
     .into_response()
@@ -14235,6 +14292,18 @@ fn has_all_preferences_scopes(scope: Option<&str>) -> bool {
     has_all_scopes(scope, &PREFERENCES_SCOPES)
 }
 
+fn has_all_like_scopes(scope: Option<&str>) -> bool {
+    has_all_scopes(scope, &LIKE_SCOPES)
+}
+
+fn has_all_repost_scopes(scope: Option<&str>) -> bool {
+    has_all_scopes(scope, &REPOST_SCOPES)
+}
+
+fn has_all_post_scopes(scope: Option<&str>) -> bool {
+    has_all_scopes(scope, &POST_RIGHT_SCOPES)
+}
+
 /// The scopes one sign-in checkbox stands for, exactly as they appear in the constants above.
 fn box_scopes(name: &str) -> &'static [&'static str] {
     match name {
@@ -15087,6 +15156,9 @@ mod tests {
                 mute: true,
                 list: true,
                 preferences: true,
+                like: false,
+                repost: false,
+                post: false,
             },
         );
         let app = public.router_with_flow(SlowMutesTestFlow, storage);
@@ -15245,6 +15317,9 @@ mod tests {
             mute: true,
             list: true,
             preferences: true,
+            like: false,
+            repost: false,
+            post: false,
         }
     }
 
@@ -15804,6 +15879,9 @@ mod tests {
                 mute: false,
                 list: false,
                 preferences: false,
+                like: false,
+                repost: false,
+                post: false,
             },
         );
         let app = public.router_with_flow(flow, storage);
@@ -15977,6 +16055,9 @@ mod tests {
                 mute: false,
                 list: false,
                 preferences: false,
+                like: false,
+                repost: false,
+                post: false,
             },
         );
         let app = public.router_with_flow(flow, storage);
@@ -17355,6 +17436,9 @@ mod tests {
                 mute: false,
                 list: false,
                 preferences: false,
+                like: false,
+                repost: false,
+                post: false,
             },
         );
         let app = public.router_with_flow(flow, storage);

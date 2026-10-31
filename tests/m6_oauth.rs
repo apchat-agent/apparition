@@ -6847,13 +6847,7 @@ async fn a_read_only_session_is_shown_a_sign_in_page_not_a_json_error_for_every_
             "follow",
             "social",
         ),
-        (
-            "post",
-            "/post",
-            "text=must+not+write",
-            "post",
-            "post",
-        ),
+        ("post", "/post", "text=must+not+write", "post", "post"),
     ];
     for (name, uri, body, wording, box_name) in writes {
         let response = app
@@ -8420,7 +8414,9 @@ async fn an_older_sign_in_cannot_remove_a_feed_until_it_signs_in_again() {
     )
     .unwrap();
     assert!(
-        html.contains("href=\"/login?allow=feeds\">Sign in with changes allowed to remove this feed"),
+        html.contains(
+            "href=\"/login?allow=feeds\">Sign in with changes allowed to remove this feed"
+        ),
         "{html}"
     );
     assert!(
