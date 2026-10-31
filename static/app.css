@@ -2446,12 +2446,6 @@ input[type="checkbox"] {
   accent-color: var(--accent, currentColor);
 }
 
-.login-write-option {
-  display: flex;
-  align-items: center;
-  gap: 0.6rem;
-}
-
 .login-form button {
   min-height: 50px;
   margin-top: 0.15rem;
