@@ -2503,3 +2503,121 @@ async fn a_refresh_rejected_with_invalid_grant_is_logged_with_the_authorization_
     );
     server.abort();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_dead_session_sends_the_browser_to_sign_in_again_and_says_why() {
+    let public = OAuthPublic::new("https://appview.example").unwrap();
+    let (flow, store, shared, server) =
+        production_flow_with_public(public.clone(), None, Some(EXPECTED_OAUTH_SCOPE)).await;
+    let app = public.router_with_flow(flow, Arc::new(MemoryStorage::default()));
+    let cookie = finish_production_login(&app, &shared).await;
+    // Access token dead at the PDS and the authorization server refuses the refresh token:
+    // nothing can revive this session, so the user must be sent back to sign in.
+    shared.lock().unwrap().create_required_access_tokens = Some(vec![]);
+    shared.lock().unwrap().refresh_failure = Some((400, "invalid_grant".to_owned()));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/like")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", cookie.clone())
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "uri=at%3A%2F%2Fdid%3Aplc%3Aauthor%2Fapp.bsky.feed.post%2Fr1&cid=bafyreifake",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::SEE_OTHER,
+        "a dead session must redirect to sign in, not stay signed in"
+    );
+    assert_eq!(
+        response.headers()[axum::http::header::LOCATION],
+        "/login?session_expired=1"
+    );
+    let set_cookie = response
+        .headers()
+        .get_all(axum::http::header::SET_COOKIE)
+        .iter()
+        .map(|value| value.to_str().unwrap().to_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        set_cookie.contains("appview_session=;") && set_cookie.contains("Max-Age=0"),
+        "the dead session cookie must be cleared: {set_cookie}"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/like")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", cookie.clone())
+                .header("x-appview-fetch", "1")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "uri=at%3A%2F%2Fdid%3Aplc%3Aauthor%2Fapp.bsky.feed.post%2Fr2&cid=bafyreifake",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = BodyExt::collect(response.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"], "SessionExpired");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("sign in again"),
+        "{body}"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/login?session_expired=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = String::from_utf8(
+        BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        html.contains("Your Bluesky sign-in expired"),
+        "the login page must say why the user is back here"
+    );
+
+    let stored = store
+        .get(&DID.parse::<Did>().unwrap())
+        .await
+        .expect("session store readable");
+    assert!(
+        stored.is_none(),
+        "the dead session must be deleted, not left to be retried"
+    );
+    server.abort();
+}
