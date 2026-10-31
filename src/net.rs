@@ -614,9 +614,10 @@ impl SafeHttpClient {
             let headers = response.headers().clone();
             let mut body = Vec::new();
             let mut response = response;
-            while let Some(chunk) = response.chunk().await.map_err(|_| {
-                call_timer.error = Some("outbound response read failed".to_owned());
-                "outbound response read failed".to_owned()
+            while let Some(chunk) = response.chunk().await.map_err(|error| {
+                let message = format!("outbound response read failed: {}", error.without_url());
+                call_timer.error = Some(message.clone());
+                message
             })? {
                 if body
                     .len()
