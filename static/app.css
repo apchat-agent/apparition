@@ -2524,11 +2524,6 @@ input[type="checkbox"] {
     background: transparent;
   }
 
-  .mobile-nav .mobile-search:disabled {
-    color: var(--muted);
-    opacity: 1;
-  }
-
   .mobile-profile-avatar {
     width: 1.4rem;
     height: 1.4rem;

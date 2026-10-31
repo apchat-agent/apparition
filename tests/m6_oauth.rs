@@ -1838,7 +1838,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
             ),
             "{path}"
         );
-        assert!(html.contains("href=\"/static/app.css?v=m42\""), "{path}");
+        assert!(html.contains("href=\"/static/app.css?v=m43\""), "{path}");
         assert!(!html.contains("style="), "{path}");
         // Both playback and interaction scripts are local, deferred, and never inline.
         assert_eq!(html.matches("<script").count(), 2, "{path}");
@@ -1852,7 +1852,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
     let stylesheet = app
         .oneshot(
             Request::builder()
-                .uri("/static/app.css?v=m42")
+                .uri("/static/app.css?v=m43")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1899,7 +1899,7 @@ async fn no_js_stylesheet_is_served_same_origin_and_linked_from_every_page_head(
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/static/nojs.css?v=m42")
+                .uri("/static/nojs.css?v=m43")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1950,7 +1950,7 @@ async fn no_js_stylesheet_is_served_same_origin_and_linked_from_every_page_head(
         .unwrap();
         assert!(
             html.contains(
-                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m42\"></noscript>"
+                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m43\"></noscript>"
             ),
             "{path}"
         );
@@ -2265,7 +2265,7 @@ async fn sign_in_error_page_uses_the_shared_mobile_document_shell() {
     );
     assert!(html.contains("Login failed, try again"));
     assert!(html.contains("href=\"/login\""));
-    assert!(html.contains("href=\"/static/app.css?v=m42\""));
+    assert!(html.contains("href=\"/static/app.css?v=m43\""));
     assert!(!html.contains("style="));
     // The shared shell loads both local deferred scripts, never inline code.
     assert_eq!(html.matches("<script").count(), 2);
@@ -2413,8 +2413,9 @@ async fn post_avatars_use_thumbnail_dimensions_and_lazy_load_after_six() {
         "{html}"
     );
     assert_eq!(html.matches("loading=\"eager\"").count(), 6, "{html}");
-    assert_eq!(html.matches("loading=\"lazy\"").count(), 1, "{html}");
-    assert_eq!(html.matches("decoding=\"async\"").count(), 7, "{html}");
+    // One extra lazy image: the shared phone menu's own viewer avatar (mobile-profile-avatar).
+    assert_eq!(html.matches("loading=\"lazy\"").count(), 2, "{html}");
+    assert_eq!(html.matches("decoding=\"async\"").count(), 8, "{html}");
     assert!(
         html.contains("width=\"44\" height=\"44\" loading=\"eager\" decoding=\"async\""),
         "{html}"

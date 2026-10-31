@@ -117,9 +117,9 @@ const OAUTH_STORE_WRITER_BATCH_SIZE: usize = 64;
 const OAUTH_STORE_WRITER_BATCH_DELAY: Duration = Duration::from_millis(5);
 const OAUTH_STORE_WRITER_METRICS_INTERVAL: Duration = Duration::from_secs(60);
 static NEXT_OAUTH_MEMORY_DATABASE_ID: AtomicUsize = AtomicUsize::new(1);
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m42";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m43";
 const WEB_SCRIPT_URL: &str = "/static/app.js?v=js24";
-const WEB_NOJS_STYLESHEET_URL: &str = "/static/nojs.css?v=m42";
+const WEB_NOJS_STYLESHEET_URL: &str = "/static/nojs.css?v=m43";
 const HLS_SCRIPT_URL: &str = "/static/vendor/hls.min.js?v=1.7.3";
 const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
 const SAVED_FEED_CACHE_PREFIX: &str = "saved-feed-preferences:";
@@ -5282,49 +5282,23 @@ async fn nojs_stylesheet() -> Response {
     response
 }
 
-fn page_shell(title: &str, content: &str, authenticated: bool) -> String {
-    page_shell_with_feeds(title, content, authenticated, &[], None, false)
-}
-
-fn page_shell_with_feeds(
+fn page_shell(
     title: &str,
     content: &str,
     authenticated: bool,
-    feeds: &[ResolvedFeed],
-    active_feed: Option<&str>,
-    following_active: bool,
-) -> String {
-    page_shell_with_feeds_and_badge(
-        title,
-        content,
-        authenticated,
-        feeds,
-        active_feed,
-        following_active,
-        0,
-    )
-}
-
-fn page_shell_with_feeds_and_badge(
-    title: &str,
-    content: &str,
-    authenticated: bool,
-    feeds: &[ResolvedFeed],
-    active_feed: Option<&str>,
-    following_active: bool,
-    unread_count: usize,
+    viewer_profile: Option<&Value>,
 ) -> String {
     page_shell_with_options(
         title,
         content,
         authenticated,
         PageShellOptions {
-            feeds,
-            active_feed,
-            following_active,
+            feeds: &[],
+            active_feed: None,
+            following_active: false,
             show_feed_tabs: true,
-            mobile_navigation_override: None,
-            unread_count,
+            viewer_profile,
+            unread_count: 0,
             allow_more: None,
         },
     )
@@ -5335,9 +5309,15 @@ struct PageShellOptions<'a> {
     active_feed: Option<&'a str>,
     following_active: bool,
     show_feed_tabs: bool,
-    mobile_navigation_override: Option<&'a str>,
+    viewer_profile: Option<&'a Value>,
     unread_count: usize,
     allow_more: Option<&'a str>,
+}
+
+/// The viewer's profile for the shared shell, built the way the thread page always did it:
+/// `profile_view_from_storage` with a handle/did fallback so the menu never disappears.
+fn viewer_profile_view<S: Storage>(storage: &S, did: &str) -> Value {
+    profile_view_from_storage(storage, did).unwrap_or_else(|_| json!({"did":did,"handle":did}))
 }
 
 fn page_shell_with_options(
@@ -5351,7 +5331,7 @@ fn page_shell_with_options(
         active_feed,
         following_active,
         show_feed_tabs,
-        mobile_navigation_override,
+        viewer_profile,
         unread_count,
         allow_more,
     } = options;
@@ -5361,8 +5341,9 @@ fn page_shell_with_options(
     };
     let navigation = if authenticated {
         format!(
-            "<nav class=\"primary-nav\" aria-label=\"Main navigation\"><a href=\"/app\">{}<span>Home</span></a><a href=\"/feeds\">{}<span>Feeds</span></a><a class=\"notification-nav-link\" href=\"/notifications\">{}<span>Notifications</span>{}</a><a href=\"/profile\">{}<span>Profile</span></a><a href=\"/app/block-lists\">{}<span>Block lists</span></a><a class=\"compose-link\" href=\"/app#new-post\">{}<span>New post</span></a>{allow_more_link}<form action=\"/logout\" method=\"post\"><button type=\"submit\">Sign out</button></form></nav>",
+            "<nav class=\"primary-nav\" aria-label=\"Main navigation\"><a href=\"/app\">{}<span>Home</span></a><a href=\"/search\">{}<span>Search</span></a><a href=\"/feeds\">{}<span>Feeds</span></a><a class=\"notification-nav-link\" href=\"/notifications\">{}<span>Notifications</span>{}</a><a href=\"/profile\">{}<span>Profile</span></a><a href=\"/app/block-lists\">{}<span>Block lists</span></a><a class=\"compose-link\" href=\"/app#new-post\">{}<span>New post</span></a>{allow_more_link}<form action=\"/logout\" method=\"post\"><button type=\"submit\">Sign out</button></form></nav>",
             icon_svg("home"),
+            icon_svg("search"),
             icon_svg("feeds"),
             icon_svg("notifications"),
             notification_badge_markup(unread_count),
@@ -5384,19 +5365,25 @@ fn page_shell_with_options(
         String::new()
     };
     let mobile_navigation = if authenticated {
-        mobile_navigation_override
-            .map(str::to_owned)
-            .unwrap_or_else(|| {
-                format!(
-                    "<nav class=\"mobile-nav\" aria-label=\"Mobile navigation\"><a href=\"/app\">{}<span>Home</span></a><a href=\"/feeds\">{}<span>Feeds</span></a><a class=\"notification-nav-link\" href=\"/notifications\">{}<span>Alerts</span>{}</a><a href=\"/profile\">{}<span>Profile</span></a></nav><a class=\"mobile-compose\" href=\"/app#new-post\" aria-label=\"New post\">{}</a>",
-                    icon_svg("home"),
-                    icon_svg("feeds"),
-                    icon_svg("notifications"),
-                    notification_badge_markup(unread_count),
-                    icon_svg("profile"),
-                    icon_svg("compose")
-                )
-            })
+        let profile_link = match viewer_profile {
+            Some(profile) => format!(
+                "<a href=\"/profile\" aria-label=\"Profile\">{}</a>",
+                avatar_markup(profile, "mobile-profile-avatar")
+            ),
+            None => format!(
+                "<a href=\"/profile\">{}<span>Profile</span></a>",
+                icon_svg("profile")
+            ),
+        };
+        format!(
+            "<nav class=\"mobile-nav\" aria-label=\"Mobile navigation\"><a href=\"/app\">{}<span>Home</span></a><a class=\"mobile-search\" href=\"/search\" aria-label=\"Mobile search\">{}<span>Search</span></a><a href=\"/feeds\">{}<span>Feeds</span></a><a class=\"notification-nav-link\" href=\"/notifications\">{}<span>Notifications</span>{}</a>{profile_link}</nav><a class=\"mobile-compose\" href=\"/app#new-post\" aria-label=\"New post\">{}</a>",
+            icon_svg("home"),
+            icon_svg("search"),
+            icon_svg("feeds"),
+            icon_svg("notifications"),
+            notification_badge_markup(unread_count),
+            icon_svg("compose")
+        )
     } else {
         String::new()
     };
@@ -6786,6 +6773,7 @@ async fn login(headers: HeaderMap, RawQuery(raw_query): RawQuery) -> Html<String
             "<section class=\"login-card\"><p class=\"eyebrow\">Your network, your view</p><h1>Sign in to AppView</h1>{notice}<p class=\"intro\">Use your AT Protocol handle or DID to continue securely with your account provider.</p><form action=\"/oauth/authorize\" method=\"post\" class=\"login-form\"><label for=\"handle\">AT Protocol handle or DID</label><input id=\"handle\" name=\"handle\" autocomplete=\"username\" autocapitalize=\"none\" placeholder=\"you.bsky.social\"{value} required><fieldset class=\"login-allow-options\"><legend>What do you want to do here?</legend>{boxes}<p class=\"login-allow-note\">Reading always works. Tick only the activities you want this appview to do for you.</p></fieldset><button type=\"submit\">Continue</button></form></section>"
         ),
         false,
+        None,
     ))
 }
 
@@ -7699,6 +7687,7 @@ where
     } else {
         String::new()
     };
+    let viewer_profile = viewer_profile_view(state.storage.as_ref(), &did);
     let allow_more = verified_cookie_allow_more(&state.public, &headers, state.storage.as_ref());
     let response = Html(page_shell_with_options(
         "Timeline",
@@ -7711,7 +7700,7 @@ where
             active_feed: None,
             following_active: true,
             show_feed_tabs: true,
-            mobile_navigation_override: None,
+            viewer_profile: Some(&viewer_profile),
             unread_count: unread_badge_count(state.storage.as_ref(), &did),
             allow_more: allow_more.as_deref(),
         },
@@ -7750,16 +7739,22 @@ where
     } else {
         entries
     };
-    Html(page_shell_with_feeds_and_badge(
+    let viewer_profile = viewer_profile_view(state.storage.as_ref(), &did);
+    Html(page_shell_with_options(
         "Feeds",
         &format!(
             "<header class=\"page-heading\"><p class=\"eyebrow\">Your saved algorithms</p><h1>Feeds</h1><p class=\"page-subtitle\">Pinned custom feeds from your account.</p></header><ol class=\"feed-list\">{entries}</ol>"
         ),
         true,
-        &feeds,
-        None,
-        false,
-        unread_badge_count(state.storage.as_ref(), &did),
+        PageShellOptions {
+            feeds: &feeds,
+            active_feed: None,
+            following_active: false,
+            show_feed_tabs: true,
+            viewer_profile: Some(&viewer_profile),
+            unread_count: unread_badge_count(state.storage.as_ref(), &did),
+            allow_more: None,
+        },
     ))
     .into_response()
 }
@@ -7807,16 +7802,22 @@ where
     } else {
         entries
     };
-    Html(page_shell_with_feeds_and_badge(
+    let viewer_profile = viewer_profile_view(state.storage.as_ref(), &did);
+    Html(page_shell_with_options(
         "Block lists",
         &format!(
             "<header class=\"page-heading\"><p class=\"eyebrow\">Your moderation</p><h1>Block lists</h1><p class=\"page-subtitle\">Posts by members of these lists stay hidden. Let a share of their posts through anyway.</p></header><ol class=\"block-list-settings\">{entries}</ol>"
         ),
         true,
-        &tabs.feeds,
-        None,
-        false,
-        unread_badge_count(state.storage.as_ref(), &did),
+        PageShellOptions {
+            feeds: &tabs.feeds,
+            active_feed: None,
+            following_active: false,
+            show_feed_tabs: true,
+            viewer_profile: Some(&viewer_profile),
+            unread_count: unread_badge_count(state.storage.as_ref(), &did),
+            allow_more: None,
+        },
     ))
     .into_response()
 }
@@ -8035,6 +8036,7 @@ where
     page_timing.preferences_ms = tabs.preferences_ms;
     page_timing.tabs_ms = tabs.tabs_ms;
     let shell_render_started = std::time::Instant::now();
+    let viewer_profile = viewer_profile_view(state.storage.as_ref(), &did);
     let allow_more = verified_cookie_allow_more(&state.public, &headers, state.storage.as_ref());
     let response = Html(page_shell_with_options(
         &page.generator.display_name,
@@ -8049,7 +8051,7 @@ where
             active_feed: Some(&page.generator.uri),
             following_active: false,
             show_feed_tabs: true,
-            mobile_navigation_override: None,
+            viewer_profile: Some(&viewer_profile),
             unread_count: unread_badge_count(state.storage.as_ref(), &did),
             allow_more: allow_more.as_deref(),
         },
@@ -8478,6 +8480,7 @@ where
     } else {
         String::new()
     };
+    let viewer_profile = viewer_profile_view(state.storage.as_ref(), &did);
     let allow_more = verified_cookie_allow_more(&state.public, &headers, state.storage.as_ref());
     let response = Html(page_shell_with_options(
         "Notifications",
@@ -8490,7 +8493,7 @@ where
             active_feed: None,
             following_active: false,
             show_feed_tabs: true,
-            mobile_navigation_override: None,
+            viewer_profile: Some(&viewer_profile),
             unread_count: unread_badge_count(state.storage.as_ref(), &did),
             allow_more: allow_more.as_deref(),
         },
@@ -9400,6 +9403,7 @@ where
         posts: &posts,
         older: &older,
     });
+    let viewer_profile = viewer_profile_view(state.storage.as_ref(), &did);
     let allow_more = verified_cookie_allow_more(&state.public, &headers, state.storage.as_ref());
     let response = Html(page_shell_with_options(
         display_name,
@@ -9410,7 +9414,7 @@ where
             active_feed: None,
             following_active: false,
             show_feed_tabs: true,
-            mobile_navigation_override: None,
+            viewer_profile: Some(&viewer_profile),
             unread_count: unread_badge_count(state.storage.as_ref(), &did),
             allow_more: allow_more.as_deref(),
         },
@@ -9569,7 +9573,14 @@ where
             permission_reauthorization_link("block")
         )
     };
-    Html(page_shell("Confirm block", &content, true)).into_response()
+    let viewer_profile = viewer_profile_view(state.storage.as_ref(), &viewer_did);
+    Html(page_shell(
+        "Confirm block",
+        &content,
+        true,
+        Some(&viewer_profile),
+    ))
+    .into_response()
 }
 
 fn render_profile_block_confirm_content(handle: &str, subject_did: &str) -> String {
@@ -10202,8 +10213,7 @@ where
         String::new()
     };
     let badge_count = unread_badge_count(state.storage.as_ref(), &viewer_did);
-    let mobile_navigation =
-        render_thread_mobile_navigation(state.storage.as_ref(), &viewer_did, badge_count);
+    let viewer_profile = viewer_profile_view(state.storage.as_ref(), &viewer_did);
     let allow_more = verified_cookie_allow_more(&state.public, &headers, state.storage.as_ref());
     let response = Html(page_shell_with_options(
         "Thread",
@@ -10224,7 +10234,7 @@ where
             active_feed: None,
             following_active: false,
             show_feed_tabs: false,
-            mobile_navigation_override: Some(&mobile_navigation),
+            viewer_profile: Some(&viewer_profile),
             unread_count: badge_count,
             allow_more: allow_more.as_deref(),
         },
@@ -10322,14 +10332,20 @@ where
         verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()),
     )
     .await;
-    Html(page_shell_with_feeds_and_badge(
+    let viewer_profile = viewer_profile_view(state.storage.as_ref(), &viewer_did);
+    Html(page_shell_with_options(
         "Quote post",
         &format!("<header class=\"page-heading\"><h1>Quote post</h1></header>{composer}"),
         true,
-        &tabs.feeds,
-        None,
-        false,
-        unread_badge_count(state.storage.as_ref(), &viewer_did),
+        PageShellOptions {
+            feeds: &tabs.feeds,
+            active_feed: None,
+            following_active: false,
+            show_feed_tabs: true,
+            viewer_profile: Some(&viewer_profile),
+            unread_count: unread_badge_count(state.storage.as_ref(), &viewer_did),
+            allow_more: None,
+        },
     ))
     .into_response()
 }
@@ -10769,25 +10785,6 @@ fn render_thread_reply_bar<S: Storage>(storage: &S, viewer_did: &str) -> String 
     format!(
         "<aside class=\"thread-reply-bar\" aria-label=\"Mobile reply bar\">{}<a href=\"#reply-composer\">Write your reply</a></aside>",
         avatar_markup(&profile, "small-avatar")
-    )
-}
-
-fn render_thread_mobile_navigation<S: Storage>(
-    storage: &S,
-    viewer_did: &str,
-    unread_count: usize,
-) -> String {
-    let profile = profile_view_from_storage(storage, viewer_did)
-        .unwrap_or_else(|_| json!({"did":viewer_did,"handle":viewer_did}));
-    format!(
-        "<nav class=\"mobile-nav\" aria-label=\"Mobile navigation\"><a href=\"/app\">{}<span>Home</span></a><button class=\"mobile-search\" type=\"button\" aria-label=\"Mobile search\" disabled>{}<span>Search</span></button><a href=\"/feeds\">{}<span>Feeds</span></a><a class=\"notification-nav-link\" href=\"/notifications\">{}<span>Notifications</span>{}</a><a href=\"/profile\" aria-label=\"Profile\">{}</a></nav><a class=\"mobile-compose\" href=\"/app#new-post\" aria-label=\"New post\">{}</a>",
-        icon_svg("home"),
-        icon_svg("search"),
-        icon_svg("feeds"),
-        icon_svg("notifications"),
-        notification_badge_markup(unread_count),
-        avatar_markup(&profile, "mobile-profile-avatar"),
-        icon_svg("compose")
     )
 }
 
@@ -12813,6 +12810,7 @@ fn write_permission_page(action: &str, allow_box: &str) -> Response {
                 "<section class=\"error-card\"><p class=\"eyebrow\">Read-only sign-in</p><h1>This sign-in cannot make changes</h1><p>You signed in without allowing that activity, so this appview cannot {action}. Sign in again and tick the box for it.</p><a class=\"primary-link\" href=\"/login?allow={allow_box}\">Sign in with changes allowed to {action}</a></section>",
             ),
             false,
+            None,
         )),
     )
         .into_response()
@@ -12828,6 +12826,7 @@ fn oauth_error_page(status: StatusCode, message: &str) -> Response {
                 html_escape(message)
             ),
             false,
+            None,
         )),
     )
         .into_response()
@@ -12838,6 +12837,7 @@ fn login_retry_page() -> Response {
         "Login failed",
         "<section class=\"error-card\"><p class=\"eyebrow\">Sign-in error</p><h1>Login failed, try again</h1><p>Your sign-in could not be completed.</p><a class=\"primary-link\" href=\"/login\">Try again</a></section>",
         false,
+        None,
     ))
     .into_response()
 }
@@ -12861,6 +12861,7 @@ fn unavailable_feed_page(feed_uri: &str, can_remove: bool) -> Response {
             html_escape(feed_uri)
         ),
         false,
+        None,
     ))
     .into_response()
 }
@@ -12915,6 +12916,7 @@ fn feed_reauthorization_page() -> Response {
         "Allow feeds",
         "<section class=\"error-card\"><p class=\"eyebrow\">Permission update</p><h1>Sign in again to load saved feeds</h1><p>Your existing sign-in does not include permission to load saved feeds. Sign in again and approve the updated access.</p><a class=\"primary-link\" href=\"/login?allow=feeds\">Sign in with changes allowed to load saved feeds</a></section>",
         false,
+        None,
     ))
     .into_response()
 }
@@ -14728,15 +14730,14 @@ mod tests {
                 posts: "<li class=\"empty-state\">No indexed posts yet.</li>",
                 older: "",
             });
-            let html =
-                page_shell_with_feeds_and_badge(display_name, &content, true, &[], None, false, 0)
-                    // Keep all browser-fixture traffic local while exercising production markup.
-                    .replace(banner_url, "/fixture-banner.svg");
+            let html = page_shell(display_name, &content, true, None)
+                // Keep all browser-fixture traffic local while exercising production markup.
+                .replace(banner_url, "/fixture-banner.svg");
             fs::write(output_dir.join(format!("{name}.html")), html).unwrap();
         }
 
         let block_confirmation = render_profile_block_confirm_content("riley.example", subject_did);
-        let block_confirmation = page_shell("Confirm block", &block_confirmation, true);
+        let block_confirmation = page_shell("Confirm block", &block_confirmation, true, None);
         fs::write(output_dir.join("block-confirm.html"), block_confirmation).unwrap();
     }
 
@@ -16617,7 +16618,7 @@ mod tests {
         assert!(css.contains(".thread-focus-actions .is-liked .icon {\n  fill: var(--accent);"));
         assert!(css.contains(".infinite-scroll-status {"));
         assert!(css.contains(".infinite-scroll-retry[hidden] {\n  display: none;"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m42"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m43"));
         assert!(WEB_SCRIPT_URL.contains("v=js24"));
     }
 
@@ -16647,7 +16648,7 @@ mod tests {
         ));
         assert!(css.contains("bottom: var(--mobile-compose-clearance);"));
         assert!(css.contains("padding-bottom: max(4.25rem, var(--mobile-compose-clearance));"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m42"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m43"));
     }
 
     #[test]
@@ -16828,10 +16829,10 @@ mod tests {
                 .any(|block| css_declaration(block, "display").as_deref() == Some("grid"))
         );
 
-        let head = page_shell("Write a post", "", true);
+        let head = page_shell("Write a post", "", true, None);
         assert!(
             head.contains(
-                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m42\"></noscript>"
+                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m43\"></noscript>"
             ),
             "the head must restore the full form for no-JS visitors: {head}"
         );
@@ -19768,8 +19769,8 @@ mod tests {
             css_declaration(body, "color").as_deref(),
             Some("var(--muted)")
         );
-        assert!(WEB_STYLESHEET_URL.contains("v=m42"));
-        assert!(WEB_NOJS_STYLESHEET_URL.contains("v=m42"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m43"));
+        assert!(WEB_NOJS_STYLESHEET_URL.contains("v=m43"));
     }
 
     #[test]
@@ -19801,7 +19802,7 @@ mod tests {
             css.find(".post-text a.post-text-link {") > css.find(".post-text a {"),
             "the accent rule must come after `.post-text a {{` so it wins the cascade"
         );
-        assert!(WEB_STYLESHEET_URL.contains("v=m42"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m43"));
     }
 }
 
