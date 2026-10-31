@@ -107,6 +107,12 @@ struct FakeServerState {
     service_auth_valid_access_tokens: Option<Vec<String>>,
     // When set, app.bsky.feed.getFeedSkeleton only answers when it carries this bearer token.
     skeleton_required_jwt: Option<String>,
+    // When set, com.atproto.repo.createRecord answers this status with an
+    // {"error":"InternalFailure","message":..} body instead of creating anything.
+    create_failure: Option<(u16, String)>,
+    // When set, the refresh_token grant answers this status with
+    // {"error":<error>,"error_description":..} instead of a new token set.
+    refresh_failure: Option<(u16, String)>,
     // Access token issued by the first (authorization-code) token exchange; defaults to
     // "access-expired".
     initial_access_token: Option<String>,
@@ -1689,15 +1695,27 @@ async fn serve_one(mut stream: TcpStream, origin: &str, state: Arc<Mutex<FakeSer
                     .unwrap_or("atproto")
                     .to_owned();
                 if request.body.contains("grant_type=refresh_token") {
-                    let access = state
-                        .refresh_access_tokens
-                        .pop_front()
-                        .unwrap_or_else(|| "access-fresh".to_owned());
-                    (
-                        200,
-                        vec![],
-                        json!({"access_token":access,"refresh_token":"refresh-fresh","token_type":"DPoP","expires_in":3600,"scope":scope,"sub":sub}).to_string(),
-                    )
+                    if let Some((status, error)) = state.refresh_failure.clone() {
+                        (
+                            status,
+                            vec![],
+                            json!({
+                                "error":error,
+                                "error_description":"the refresh token was rejected by the fake authorization server"
+                            })
+                            .to_string(),
+                        )
+                    } else {
+                        let access = state
+                            .refresh_access_tokens
+                            .pop_front()
+                            .unwrap_or_else(|| "access-fresh".to_owned());
+                        (
+                            200,
+                            vec![],
+                            json!({"access_token":access,"refresh_token":"refresh-fresh","token_type":"DPoP","expires_in":3600,"scope":scope,"sub":sub}).to_string(),
+                        )
+                    }
                 } else {
                     let access = state
                         .initial_access_token
@@ -1818,7 +1836,15 @@ async fn serve_one(mut stream: TcpStream, origin: &str, state: Arc<Mutex<FakeSer
                     .headers
                     .get("dpop")
                     .and_then(|proof| jwt_claim(proof, "nonce"));
-                if state.create_nonce_required && nonce.as_deref() != Some("write-nonce") {
+                if let Some((status, message)) = state.create_failure.clone() {
+                    (
+                        status,
+                        vec![],
+                        json!({"error":"InternalFailure","message":message}).to_string(),
+                    )
+                } else if state.create_nonce_required
+                    && nonce.as_deref() != Some("write-nonce")
+                {
                     state.create_nonce_challenges += 1;
                     (
                         401,
@@ -2296,5 +2322,94 @@ async fn session_cache_never_hands_out_a_pre_refresh_access_token() {
         );
     }
     drop(state);
+    server.abort();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_failed_like_names_the_pds_error_in_the_response_and_the_logs() {
+    let public = OAuthPublic::new("https://appview.example").unwrap();
+    let (flow, _store, shared, server) =
+        production_flow_with_public(public.clone(), None, Some(EXPECTED_OAUTH_SCOPE)).await;
+    let app = public.router_with_flow(flow, Arc::new(MemoryStorage::default()));
+    let cookie = finish_production_login(&app, &shared).await;
+    shared.lock().unwrap().create_failure =
+        Some((500, "fake PDS refused the like".to_owned()));
+
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let capture = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(CapturedMakeWriter(output.clone()))
+        .finish();
+    let _capture_guard = tracing::subscriber::set_default(capture);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/like")
+                .header("origin", "https://appview.example")
+                .header("sec-fetch-site", "same-origin")
+                .header("cookie", cookie)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    "uri=at%3A%2F%2Fdid%3Aplc%3Aauthor%2Fapp.bsky.feed.post%2Fr1&cid=bafyreifake",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    drop(_capture_guard);
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["error"], "OAuthError");
+    let message = body["message"].as_str().unwrap_or_default();
+    assert!(
+        message.starts_with("Bluesky did not accept the like:"),
+        "the failed like must name what failed: {message}"
+    );
+    assert!(
+        message.contains("fake PDS refused the like"),
+        "the message must carry the real PDS reason: {message}"
+    );
+
+    let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    let warn_line = logs
+        .lines()
+        .find(|line| line.contains("web write failed"))
+        .unwrap_or_else(|| panic!("a warn line naming the failure is required: {logs}"));
+    assert!(warn_line.contains("WARN"), "{warn_line}");
+    assert!(warn_line.contains("route=\"like\""), "{warn_line}");
+    assert!(warn_line.contains(DID), "{warn_line}");
+    assert!(
+        warn_line.contains("fake PDS refused the like"),
+        "the warn line must carry the real error text: {warn_line}"
+    );
+
+    let write_line = logs
+        .lines()
+        .find(|line| line.contains("web write ") && !line.contains("web write failed"))
+        .unwrap_or_else(|| panic!("the web write timing line is required: {logs}"));
+    for field in [
+        "route=\"like\"",
+        "total_ms=",
+        "outbound_call_count=",
+        "outbound_call_ms=",
+        "dpop_nonce_retries=",
+        "dpop_nonce_retry=",
+        "outbound_calls=",
+    ] {
+        assert!(
+            write_line.contains(field),
+            "{field} must stay on the web write line: {write_line}"
+        );
+    }
+    assert!(
+        write_line.contains("fake PDS refused the like"),
+        "the web write line must count the failure with its real text: {write_line}"
+    );
     server.abort();
 }
