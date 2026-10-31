@@ -1468,6 +1468,7 @@ struct OAuthMetadataHttpClient {
     cache: Arc<tokio::sync::Mutex<HashMap<String, CachedOAuthMetadataResponse>>>,
     refreshes: Arc<tokio::sync::Mutex<HashSet<String>>>,
     cold_refreshes: OAuthMetadataColdRefreshes,
+    writer_metrics: Arc<OAuthWriterMetrics>,
 }
 
 impl OAuthMetadataHttpClient {
@@ -1477,7 +1478,13 @@ impl OAuthMetadataHttpClient {
             cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             refreshes: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             cold_refreshes: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            writer_metrics: Arc::new(OAuthWriterMetrics::default()),
         }
+    }
+
+    fn with_writer_metrics(mut self, metrics: Arc<OAuthWriterMetrics>) -> Self {
+        self.writer_metrics = metrics;
+        self
     }
 
     fn metadata_key(request: &http::Request<Vec<u8>>) -> Option<String> {
@@ -1539,6 +1546,57 @@ impl HttpClient for OAuthMetadataHttpClient {
         &self,
         request: http::Request<Vec<u8>>,
     ) -> Result<http::Response<Vec<u8>>, Box<dyn std::error::Error + Send + Sync + 'static>> {
+        let token_issuer = (request.method() == http::Method::POST
+            && request
+                .body()
+                .windows(b"grant_type=".len())
+                .any(|w| w == b"grant_type="))
+        .then(|| {
+            let refresh = request
+                .body()
+                .windows(b"grant_type=refresh_token".len())
+                .any(|w| w == b"grant_type=refresh_token");
+            let issuer = match (request.uri().scheme_str(), request.uri().authority()) {
+                (Some(scheme), Some(authority)) => format!("{scheme}://{authority}"),
+                _ => request.uri().to_string(),
+            };
+            (issuer, refresh)
+        });
+        if let Some((issuer, refresh)) = token_issuer {
+            let response = self.inner.send_http(request).await?;
+            if !response.status().is_success() {
+                // Atrium swallows a failed token response inside refresh_token(), so this is
+                // the only place the authorization server's own reason can be logged.
+                let body = String::from_utf8_lossy(response.body()).to_string();
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+                let error = parsed
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unparsable response");
+                let description = parsed
+                    .get("error_description")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let did = OAUTH_TOKEN_REQUEST_DID
+                    .try_with(Clone::clone)
+                    .unwrap_or_else(|_| "-".to_owned());
+                tracing::warn!(
+                    did = %did,
+                    issuer = %issuer,
+                    refresh,
+                    status = response.status().as_u16(),
+                    error = %error,
+                    error_description = %description,
+                    body = %body.chars().take(512).collect::<String>(),
+                    "OAuth token endpoint rejected the request"
+                );
+                if refresh {
+                    self.writer_metrics.record_refresh_failure();
+                }
+            }
+            return Ok(response);
+        }
         let Some(key) = Self::metadata_key(&request) else {
             return self.inner.send_http(request).await;
         };
@@ -1593,6 +1651,10 @@ impl HttpClient for OAuthMetadataHttpClient {
     }
 }
 
+tokio::task_local! {
+    static OAUTH_TOKEN_REQUEST_DID: String;
+}
+
 #[derive(Clone)]
 struct SharedOAuthSession {
     inner: Arc<RestoredOAuthSession>,
@@ -1626,7 +1688,9 @@ impl XrpcClient for SharedOAuthSession {
         O: serde::de::DeserializeOwned + Send + Sync,
         E: serde::de::DeserializeOwned + Send + Sync + std::fmt::Debug,
     {
-        let result = self.inner.send_xrpc(request).await;
+        let result = OAUTH_TOKEN_REQUEST_DID
+            .scope(self.did.clone(), self.inner.send_xrpc(request))
+            .await;
         if let Err(error) = &result
             && format!("{error:?}")
                 .to_ascii_lowercase()
@@ -1639,7 +1703,9 @@ impl XrpcClient for SharedOAuthSession {
             self.cache.lock().await.remove(&self.did);
             self.restores.lock().await.remove(&self.did);
             if self.expire_stored_session().await {
-                let retry = self.inner.send_xrpc(request).await;
+                let retry = OAUTH_TOKEN_REQUEST_DID
+                    .scope(self.did.clone(), self.inner.send_xrpc(request))
+                    .await;
                 if retry.is_ok() {
                     // The retried call refreshed this session in place; the cache must only
                     // ever hand out this post-refresh session, never the pre-refresh one.
@@ -1841,6 +1907,7 @@ struct OAuthWriterMetrics {
     transaction_count: AtomicU64,
     transaction_total_ns: AtomicU64,
     transaction_max_ns: AtomicU64,
+    refresh_failures: AtomicU64,
 }
 
 impl OAuthWriterMetrics {
@@ -1863,6 +1930,10 @@ impl OAuthWriterMetrics {
             .fetch_max(elapsed_ns, Ordering::Relaxed);
     }
 
+    fn record_refresh_failure(&self) {
+        self.refresh_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn report(&self) {
         let count = self.transaction_count.swap(0, Ordering::Relaxed);
         let total_ns = self.transaction_total_ns.swap(0, Ordering::Relaxed);
@@ -1879,6 +1950,7 @@ impl OAuthWriterMetrics {
             },
             oauth_writer_transaction_max_ms = max_ns as f64 / 1_000_000.0,
             oauth_writer_dropped_count = self.dropped.swap(0, Ordering::Relaxed),
+            oauth_refresh_failure_count = self.refresh_failures.swap(0, Ordering::Relaxed),
             "OAuth SQLite writer minute metrics"
         );
     }
@@ -2075,6 +2147,11 @@ pub struct SqliteOAuthStore {
 }
 
 impl SqliteOAuthStore {
+    /// Refreshes the authorization server rejected since the last metrics report.
+    pub fn oauth_refresh_failure_count(&self) -> u64 {
+        self.writer.metrics.refresh_failures.load(Ordering::Relaxed)
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self, OAuthStoreError> {
         let path = path.as_ref();
         let is_memory = path == Path::new(":memory:");
@@ -2328,7 +2405,8 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         ));
         let retained_http_client = guarded_client.clone();
         let http_client = Arc::new(guarded_client);
-        let oauth_http_client = OAuthMetadataHttpClient::new((*http_client).clone());
+        let oauth_http_client = OAuthMetadataHttpClient::new((*http_client).clone())
+            .with_writer_metrics(store.writer.metrics.clone());
         let redirect_uri = public.metadata["redirect_uris"][0]
             .as_str()
             .ok_or_else(|| "OAuth client metadata has no redirect URI".to_owned())?
@@ -16962,6 +17040,32 @@ mod tests {
         fn make_writer(&'a self) -> Self::Writer {
             FeedTestLogWriter(self.clone())
         }
+    }
+
+    #[test]
+    fn writer_metrics_report_carries_the_refresh_failure_count() {
+        let logs = FeedTestLogs::default();
+        let metrics = OAuthWriterMetrics::default();
+        metrics.record_refresh_failure();
+        metrics.record_refresh_failure();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(logs.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        metrics.report();
+        drop(_guard);
+        let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            text.contains("oauth_refresh_failure_count=2"),
+            "the minute metrics must report rejected refreshes: {text}"
+        );
+        assert!(
+            text.contains("OAuth SQLite writer minute metrics"),
+            "{text}"
+        );
     }
 
     async fn feed_test_flow(

@@ -2437,7 +2437,7 @@ async fn a_failed_like_names_the_pds_error_in_the_response_and_the_logs() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_refresh_rejected_with_invalid_grant_is_logged_with_the_authorization_servers_reason() {
     let public = OAuthPublic::new("https://appview.example").unwrap();
-    let (flow, _store, shared, server) =
+    let (flow, store, shared, server) =
         production_flow_with_public(public.clone(), None, Some(EXPECTED_OAUTH_SCOPE)).await;
     let app = public.router_with_flow(flow, Arc::new(MemoryStorage::default()));
     let cookie = finish_production_login(&app, &shared).await;
@@ -2496,6 +2496,10 @@ async fn a_refresh_rejected_with_invalid_grant_is_logged_with_the_authorization_
             .any(|request| request.path == "/token"
                 && request.body.contains("grant_type=refresh_token")),
         "the refresh must actually have been attempted"
+    );
+    assert!(
+        store.oauth_refresh_failure_count() >= 1,
+        "every rejected refresh must raise the minute-metric counter"
     );
     server.abort();
 }
