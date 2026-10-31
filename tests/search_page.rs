@@ -28,19 +28,13 @@ use tower::ServiceExt;
 
 const ALICE: &str = "did:plc:alice";
 const HIT_URI: &str = "at://did:plc:searched/app.bsky.feed.post/hit1";
-
-#[derive(Clone, Copy, PartialEq)]
-enum FakeReply {
-    Posts,
-    ServerError,
-}
+const WRITE_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete";
 
 #[derive(Clone)]
 struct FakeSearch {
     calls: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<(String, String)>>>,
     posts_body: Arc<Mutex<Value>>,
-    reply: Arc<Mutex<FakeReply>>,
 }
 
 impl FakeSearch {
@@ -54,14 +48,7 @@ async fn fake_search_posts(
     RawQuery(query): RawQuery,
 ) -> Response<Body> {
     fake.record_call("/xrpc/app.bsky.feed.searchPosts", query);
-    match *fake.reply.lock().unwrap() {
-        FakeReply::Posts => axum::Json(fake.posts_body()).into_response(),
-        FakeReply::ServerError => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            r#"{"error":"InternalServerError","message":"the upstream exploded"}"#,
-        )
-            .into_response(),
-    }
+    axum::Json(fake.posts_body()).into_response()
 }
 
 async fn fake_search_actors(
@@ -69,10 +56,7 @@ async fn fake_search_actors(
     RawQuery(query): RawQuery,
 ) -> Response<Body> {
     fake.record_call("/xrpc/app.bsky.actor.searchActors", query);
-    match *fake.reply.lock().unwrap() {
-        FakeReply::Posts => axum::Json(json!({"actors": []})).into_response(),
-        FakeReply::ServerError => (StatusCode::INTERNAL_SERVER_ERROR, "boom").into_response(),
-    }
+    axum::Json(json!({"actors": []})).into_response()
 }
 
 impl FakeSearch {
@@ -116,7 +100,6 @@ async fn start_fake_search(body: Value) -> (String, FakeSearch, tokio::task::Joi
         calls: Arc::new(AtomicUsize::new(0)),
         requests: Arc::new(Mutex::new(Vec::new())),
         posts_body: Arc::new(Mutex::new(body)),
-        reply: Arc::new(Mutex::new(FakeReply::Posts)),
     };
     let app = Router::new()
         .route("/xrpc/app.bsky.feed.searchPosts", get(fake_search_posts))
@@ -153,7 +136,7 @@ impl OAuthFlow for AcceptingFlow {
             Ok(OAuthAccount {
                 did: ALICE.to_owned(),
                 verified_handle: Some("alice.test".to_owned()),
-                granted_scope: Some("atproto".to_owned()),
+                granted_scope: Some(WRITE_SCOPE.to_owned()),
             })
         })
     }
@@ -217,7 +200,11 @@ async fn response_for(router: &Router, uri: &str, cookie: Option<&str>) -> Respo
     if let Some(cookie) = cookie {
         builder = builder.header("cookie", cookie);
     }
-    router.clone().oneshot(builder.body(Body::empty()).unwrap()).await.unwrap()
+    router
+        .clone()
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
 }
 
 async fn get_html(router: &Router, uri: &str, cookie: &str) -> String {
@@ -290,16 +277,22 @@ async fn posts_search_calls_the_labelled_base_once_and_renders_through_the_feed_
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
         .collect::<Vec<_>>();
     assert!(
-        query.iter().any(|(key, value)| key == "q" && value == "minc"),
+        query
+            .iter()
+            .any(|(key, value)| key == "q" && value == "minc"),
         "q=minc missing from {query:?}"
     );
     assert!(
-        query.iter().any(|(key, value)| key == "limit" && value == "25"),
+        query
+            .iter()
+            .any(|(key, value)| key == "limit" && value == "25"),
         "limit=25 missing from {query:?}"
     );
     assert!(html.contains("mincy post"), "post text missing: {html}");
     assert!(
-        html.contains("/app/thread?uri=at%3A%2F%2Fdid%3Aplc%3Asearched%2Fapp.bsky.feed.post%2Fhit1"),
+        html.contains(
+            "/app/thread?uri=at%3A%2F%2Fdid%3Aplc%3Asearched%2Fapp.bsky.feed.post%2Fhit1"
+        ),
         "the shared post renderer's thread link must appear: {html}"
     );
     assert!(

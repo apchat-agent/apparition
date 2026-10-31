@@ -10,6 +10,7 @@ pub mod link_card;
 pub mod net;
 pub mod oauth;
 pub mod profile_counts;
+pub mod search;
 pub mod timing_console;
 
 use axum::{Json, Router, routing::get};

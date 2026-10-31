@@ -3,7 +3,7 @@ use crate::{
     api::profile_view_from_storage,
     feeds::{
         FeedClient, FeedSkeletonPage, FeedTimeline, FeedTimelineTiming, ResolvedFeed,
-        SavedFeedPreference, parse_saved_feed_preferences,
+        SavedFeedPreference, parse_saved_feed_preferences, persist_public_profiles,
     },
     ingest::{
         IndexedNotification, IndexedRecord, MemoryStorage, NotificationCursor, ProfileIndexEntry,
@@ -19,6 +19,7 @@ use crate::{
         RELATIONSHIP_CONFIRMATION_TTL, RelationshipClient, apply_profile_counts, now_millis,
         relationship_cache_key,
     },
+    search::{SearchCallError, SearchClient},
     timing_console::{
         TIMING_PAGE_LIMIT, TIMING_RECENT_PATH, TimingConsole, TimingRecord, new_timing_id,
         now_unix_ms,
@@ -933,12 +934,21 @@ impl OAuthFlow for DisabledOAuthFlow {
     }
 }
 
+/// The outbound service clients a web router ships with, grouped so router builders stay
+/// under clippy's argument limit as more services join the state.
+struct WebClients {
+    profile_counts: ProfileCountsClient,
+    relationships: RelationshipClient,
+    search: SearchClient,
+}
+
 pub struct OAuthWebState<F, S> {
     pub public: OAuthPublic,
     pub flow: F,
     pub storage: Arc<S>,
     profile_counts: ProfileCountsClient,
     relationships: RelationshipClient,
+    search: SearchClient,
     link_card_fetcher: LinkCardFetcher,
     feed_page_cache: FeedPageCache,
     block_lists: Arc<BlockListCache>,
@@ -1191,12 +1201,38 @@ impl OAuthPublic {
         F: OAuthFlow,
         S: Storage + 'static,
     {
-        self.router_with_timing_console(
+        self.router_with_flow_and_shutdown_and_profile_counts_and_relationships_and_search(
             flow,
             storage,
             shutdown,
             profile_counts,
             relationships,
+            SearchClient::production(),
+        )
+    }
+
+    pub fn router_with_flow_and_shutdown_and_profile_counts_and_relationships_and_search<F, S>(
+        &self,
+        flow: F,
+        storage: Arc<S>,
+        shutdown: WebShutdown,
+        profile_counts: ProfileCountsClient,
+        relationships: RelationshipClient,
+        search: SearchClient,
+    ) -> Router
+    where
+        F: OAuthFlow,
+        S: Storage + 'static,
+    {
+        self.router_with_timing_console(
+            flow,
+            storage,
+            shutdown,
+            WebClients {
+                profile_counts,
+                relationships,
+                search,
+            },
             Arc::new(TimingConsole::default()),
         )
     }
@@ -1218,8 +1254,11 @@ impl OAuthPublic {
             flow,
             storage,
             WebShutdown::new(),
-            ProfileCountsClient::local_only(),
-            RelationshipClient::local_only(),
+            WebClients {
+                profile_counts: ProfileCountsClient::local_only(),
+                relationships: RelationshipClient::local_only(),
+                search: SearchClient::production(),
+            },
             timing_console,
         )
     }
@@ -1229,8 +1268,7 @@ impl OAuthPublic {
         flow: F,
         storage: Arc<S>,
         shutdown: WebShutdown,
-        profile_counts: ProfileCountsClient,
-        relationships: RelationshipClient,
+        clients: WebClients,
         timing_console: Arc<TimingConsole>,
     ) -> Router
     where
@@ -1241,8 +1279,9 @@ impl OAuthPublic {
             public: self.clone(),
             flow,
             storage,
-            profile_counts,
-            relationships,
+            profile_counts: clients.profile_counts,
+            relationships: clients.relationships,
+            search: clients.search,
             link_card_fetcher: LinkCardFetcher::new(),
             shutdown,
             feed_page_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -1263,6 +1302,7 @@ impl OAuthPublic {
             .route("/logout", post(logout::<F, S>))
             .route("/app", get(app_home::<F, S>))
             .route("/feeds", get(feeds_page::<F, S>))
+            .route("/search", get(search_page::<F, S>))
             .route("/app/block-lists", get(block_lists_page::<F, S>))
             .route("/app/feed", get(feed_timeline_page::<F, S>))
             .route("/app/thread", get(thread_page::<F, S>))
@@ -7755,6 +7795,190 @@ where
             unread_count: unread_badge_count(state.storage.as_ref(), &did),
             allow_more: None,
         },
+    ))
+    .into_response()
+}
+
+async fn search_page<F, S>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response
+where
+    F: OAuthFlow,
+    S: Storage + 'static,
+{
+    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+        return Redirect::to("/login").into_response();
+    };
+    let term = query
+        .get("q")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let people = query.get("type").map(String::as_str) == Some("people");
+    let viewer_profile = viewer_profile_view(state.storage.as_ref(), &did);
+    let tabs = pinned_feeds_for_layout(
+        &state.flow,
+        &did,
+        verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()),
+    )
+    .await;
+    let options = PageShellOptions {
+        feeds: &tabs.feeds,
+        active_feed: None,
+        following_active: false,
+        show_feed_tabs: false,
+        viewer_profile: Some(&viewer_profile),
+        unread_count: unread_badge_count(state.storage.as_ref(), &did),
+        allow_more: None,
+    };
+    let heading = "<header class=\"page-heading\"><p class=\"eyebrow\">Find posts and people</p><h1>Search</h1></header>";
+    let form = render_search_form(term.as_deref(), people);
+    let Some(term) = term else {
+        return Html(page_shell_with_options(
+            "Search",
+            &format!("{heading}{form}"),
+            true,
+            options,
+        ))
+        .into_response();
+    };
+    if people {
+        return Html(page_shell_with_options(
+            "Search",
+            &format!(
+                "{heading}{form}<ol class=\"search-actor-list\"><li class=\"empty-state\">No people found.</li></ol>"
+            ),
+            true,
+            options,
+        ))
+        .into_response();
+    }
+    let page = match state.search.search_posts(&term, None).await {
+        Ok(page) => page,
+        Err(failure) => return search_unavailable_response(&failure, heading, &form, options),
+    };
+    if let Err(error) = persist_public_profiles(
+        state.storage.as_ref(),
+        page.posts.iter().filter_map(|post| post.author.clone()),
+    ) {
+        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+    }
+    let records = page
+        .posts
+        .iter()
+        .map(|post| &post.record)
+        .collect::<Vec<_>>();
+    let hidden_actors =
+        match timeline_hidden_actor_dids(&state.flow, state.storage.as_ref(), &did).await {
+            Ok(hidden) => hidden,
+            Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
+        };
+    let visible = records
+        .into_iter()
+        .filter(|record| !hidden_actors.contains(&record.did))
+        .collect::<Vec<_>>();
+    let content_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
+    let parents = match hydrate_page_parents(
+        &state.flow,
+        state.storage.as_ref(),
+        &visible,
+        content_deadline,
+    )
+    .await
+    {
+        Ok(parents) => parents,
+        Err(error) => {
+            return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+        }
+    };
+    let quote_records = page_records_with_parents(&visible, &parents);
+    let hydration = match hydrate_page_content(
+        &state.flow,
+        &did,
+        state.storage.clone(),
+        &visible,
+        &quote_records,
+        std::iter::empty(),
+        content_deadline,
+    )
+    .await
+    {
+        Ok(hydration) => hydration,
+        Err(error) => {
+            return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+        }
+    };
+    if let Err(error) = queue_missing_parent_authors(state.storage.as_ref(), &parents) {
+        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+    }
+    let rights = verified_cookie_form_rights(&state.public, &headers, state.storage.as_ref());
+    let posts = render_timeline_post_items(
+        state.storage.as_ref(),
+        &visible,
+        &[],
+        &parents,
+        &TimelineRenderContext {
+            viewer_did: &did,
+            rights,
+            quote_index: &hydration.quote_index,
+            list_blocks: &HashMap::new(),
+        },
+    );
+    let posts = if posts.is_empty() {
+        "<li class=\"empty-state\">No posts matched that search.</li>".to_owned()
+    } else {
+        posts
+    };
+    Html(page_shell_with_options(
+        "Search",
+        &format!("{heading}{form}<ol class=\"post-list\">{posts}</ol>"),
+        true,
+        options,
+    ))
+    .into_response()
+}
+
+fn render_search_form(term: Option<&str>, people: bool) -> String {
+    let active_type = if people { "people" } else { "posts" };
+    let value = term.map(html_escape).unwrap_or_default();
+    let kept_query = term
+        .map(|term| format!("&amp;q={}", form_encoded(term)))
+        .unwrap_or_default();
+    let posts_state = if people {
+        ("", "")
+    } else {
+        (" is-active", " aria-current=\"page\"")
+    };
+    let people_state = if people {
+        (" is-active", " aria-current=\"page\"")
+    } else {
+        ("", "")
+    };
+    format!(
+        "<form class=\"search-page-form\" action=\"/search\" method=\"get\" role=\"search\"><label class=\"sr-only\" for=\"search-input\">Search</label><input id=\"search-input\" type=\"search\" name=\"q\" value=\"{value}\" placeholder=\"Search posts and people\"><input type=\"hidden\" name=\"type\" value=\"{active_type}\"><button type=\"submit\">Search</button></form><nav class=\"search-type-tabs\" aria-label=\"Search type\"><a class=\"search-type-tab{}\" href=\"/search?type=posts{kept_query}\"{}>Posts</a><a class=\"search-type-tab{}\" href=\"/search?type=people{kept_query}\"{}>People</a></nav>",
+        posts_state.0, posts_state.1, people_state.0, people_state.1
+    )
+}
+
+fn search_unavailable_response(
+    failure: &SearchCallError,
+    heading: &str,
+    form: &str,
+    options: PageShellOptions<'_>,
+) -> Response {
+    let message = match failure.status {
+        Some(status) => format!("Search is unavailable right now (status {status})."),
+        None => "Search is unavailable right now.".to_owned(),
+    };
+    Html(page_shell_with_options(
+        "Search",
+        &format!(
+            "{heading}{form}<section class=\"error-card\"><p class=\"eyebrow\">Search</p><h1>{message}</h1><p>The search service did not answer. Please try again shortly.</p></section>"
+        ),
+        true,
+        options,
     ))
     .into_response()
 }

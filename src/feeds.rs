@@ -983,7 +983,7 @@ fn parse_feed_uri(uri: &str) -> Result<(String, String, String), String> {
     Ok((did.to_owned(), collection.to_owned(), rkey.to_owned()))
 }
 
-fn parse_post_uri(uri: &str) -> Result<(String, String, String), String> {
+pub(crate) fn parse_post_uri(uri: &str) -> Result<(String, String, String), String> {
     let Some(path) = uri.strip_prefix("at://") else {
         return Err("post URI must use the at:// scheme".to_owned());
     };
