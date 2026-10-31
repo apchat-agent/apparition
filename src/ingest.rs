@@ -2354,6 +2354,9 @@ impl SqliteStorage {
                  ON records(collection, did, json_extract(record_json, '$.subject'));
              CREATE INDEX IF NOT EXISTS records_follow_subject_actor
                  ON records(collection, json_extract(record_json, '$.subject'), did, time_us DESC);
+             CREATE INDEX IF NOT EXISTS records_follow_subject_time
+                 ON records(collection, json_extract(record_json, '$.subject'), time_us DESC, uri DESC)
+                 WHERE collection='app.bsky.graph.follow';
              CREATE INDEX IF NOT EXISTS records_collection_subject_uri
                  ON records(collection, json_extract(record_json, '$.subject.uri'), time_us DESC);
              CREATE INDEX IF NOT EXISTS records_collection_parent_uri
@@ -2640,8 +2643,14 @@ impl SqliteStorage {
         mut work: Option<&mut StatementWork>,
     ) -> Result<Vec<IndexedRecord>, StorageError> {
         let conn = self.read_conn()?;
+        // INDEXED BY pins the per-subject time order: without sqlite_stat rows the planner
+        // otherwise picks records_collection_time and walks the WHOLE follow collection
+        // newest-first, testing json_extract(subject) on every row, so a sparsely-followed
+        // DID never fills the LIMIT. The forced index yields the rows for this subject in
+        // (time_us DESC, uri DESC) order, so the LIMIT stops the walk at one page.
         let mut statement = conn.prepare(
             "SELECT did, collection, rkey, uri, cid, time_us, record_json FROM records
+             INDEXED BY records_follow_subject_time
              WHERE collection='app.bsky.graph.follow' AND json_extract(record_json, '$.subject')=?1
              ORDER BY time_us DESC, uri DESC LIMIT ?2",
         )?;
