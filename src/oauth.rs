@@ -19,6 +19,10 @@ use crate::{
         RELATIONSHIP_CONFIRMATION_TTL, RelationshipClient, apply_profile_counts, now_millis,
         relationship_cache_key,
     },
+    timing_console::{
+        TIMING_PAGE_LIMIT, TIMING_RECENT_PATH, TimingConsole, TimingRecord, new_timing_id,
+        now_unix_ms,
+    },
 };
 use atrium_api::{
     agent::{Agent, CloneWithProxy, Configure, SessionManager},
@@ -49,8 +53,8 @@ use axum::{
         DefaultBodyLimit, Form, FromRequest, Multipart, OriginalUri, Path as AxumPath, Query,
         Request, State,
     },
-    http::{HeaderMap, HeaderValue, StatusCode, header},
-    middleware::{Next, from_fn},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
+    middleware::{Next, from_fn, from_fn_with_state},
     response::{
         Html, IntoResponse, Redirect, Response,
         sse::{Event, Sse},
@@ -855,6 +859,7 @@ pub struct OAuthWebState<F, S> {
     feed_page_cache: FeedPageCache,
     block_lists: Arc<BlockListCache>,
     notification_streams: Arc<Mutex<HashMap<String, usize>>>,
+    timing_console: Arc<TimingConsole>,
     shutdown: WebShutdown,
 }
 
@@ -1102,6 +1107,52 @@ impl OAuthPublic {
         F: OAuthFlow,
         S: Storage + 'static,
     {
+        self.router_with_timing_console(
+            flow,
+            storage,
+            shutdown,
+            profile_counts,
+            relationships,
+            Arc::new(TimingConsole::default()),
+        )
+    }
+
+    /// Builds the web router with a caller-supplied timing history, so tests can inspect
+    /// the ring and drive its once-a-minute metrics line.
+    #[cfg(test)]
+    pub(crate) fn router_with_flow_and_timing_console<F, S>(
+        &self,
+        flow: F,
+        storage: Arc<S>,
+        timing_console: Arc<TimingConsole>,
+    ) -> Router
+    where
+        F: OAuthFlow,
+        S: Storage + 'static,
+    {
+        self.router_with_timing_console(
+            flow,
+            storage,
+            WebShutdown::new(),
+            ProfileCountsClient::local_only(),
+            RelationshipClient::local_only(),
+            timing_console,
+        )
+    }
+
+    fn router_with_timing_console<F, S>(
+        &self,
+        flow: F,
+        storage: Arc<S>,
+        shutdown: WebShutdown,
+        profile_counts: ProfileCountsClient,
+        relationships: RelationshipClient,
+        timing_console: Arc<TimingConsole>,
+    ) -> Router
+    where
+        F: OAuthFlow,
+        S: Storage + 'static,
+    {
         let state = Arc::new(OAuthWebState {
             public: self.clone(),
             flow,
@@ -1113,6 +1164,7 @@ impl OAuthPublic {
             feed_page_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             block_lists: Arc::new(BlockListCache::default()),
             notification_streams: Arc::new(Mutex::new(HashMap::new())),
+            timing_console,
         });
         let regular_routes = Router::new()
             .route(METADATA_PATH, get(metadata::<F, S>))
@@ -1133,6 +1185,7 @@ impl OAuthPublic {
             .route("/quote-fragment", get(quote_fragment::<F, S>))
             .route("/profile-fragment", get(profile_fragment::<F, S>))
             .route("/notifications", get(notifications_page::<F, S>))
+            .route("/timing/recent", get(timing_recent::<F, S>))
             .route(
                 "/notifications/unread-count",
                 get(notification_unread_count::<F, S>),
@@ -1151,7 +1204,10 @@ impl OAuthPublic {
             .route("/repost", post(write_repost::<F, S>))
             .layer(DefaultBodyLimit::max(MAX_POST_BODY_BYTES))
             .layer(from_fn(log_web_post_client_errors))
-            .layer(from_fn(account_web_outbound_calls))
+            .layer(from_fn_with_state(
+                state.clone(),
+                account_web_outbound_calls::<F, S>,
+            ))
             .with_state(state.clone());
         let video_routes = Router::new()
             .route("/video", post(upload_video::<F, S>))
@@ -5003,13 +5059,18 @@ fn page_shell_with_options(
     } else {
         "app-layout guest-layout"
     };
+    let body_open = match current_request_timing_id() {
+        Some(timing_id) => format!("<body data-timing-id=\"{timing_id}\">"),
+        None => "<body>".to_owned(),
+    };
     format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\"><title>{}</title><link rel=\"stylesheet\" href=\"{}\"><noscript><link rel=\"stylesheet\" href=\"{}\"></noscript><script src=\"{}\" defer></script><script src=\"{}\" defer></script></head><body>{}<a class=\"skip-link\" href=\"#main-content\">Skip to content</a>{mobile_navigation}<div class=\"{layout}\"><aside class=\"left-sidebar\"><a class=\"brand\" href=\"/app\">AppView</a>{navigation}</aside><div class=\"center-column\"><header class=\"center-sticky\">{tabs}</header><main id=\"main-content\" class=\"page-content\">{content}</main></div>{right_sidebar}</div></body></html>",
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\"><title>{}</title><link rel=\"stylesheet\" href=\"{}\"><noscript><link rel=\"stylesheet\" href=\"{}\"></noscript><script src=\"{}\" defer></script><script src=\"{}\" defer></script></head>{}{}<a class=\"skip-link\" href=\"#main-content\">Skip to content</a>{mobile_navigation}<div class=\"{layout}\"><aside class=\"left-sidebar\"><a class=\"brand\" href=\"/app\">AppView</a>{navigation}</aside><div class=\"center-column\"><header class=\"center-sticky\">{tabs}</header><main id=\"main-content\" class=\"page-content\">{content}</main></div>{right_sidebar}</div></body></html>",
         html_escape(title),
         WEB_STYLESHEET_URL,
         WEB_NOJS_STYLESHEET_URL,
         HLS_SCRIPT_URL,
         WEB_SCRIPT_URL,
+        body_open,
         icon_sprite()
     )
 }
@@ -5171,7 +5232,53 @@ enum AncestorSource {
     Live,
 }
 
-async fn account_web_outbound_calls(request: Request, next: Next) -> Response {
+/// Response header carrying the request's timing console id.
+const TIMING_ID_HEADER: HeaderName = HeaderName::from_static("x-timing-id");
+
+tokio::task_local! {
+    static REQUEST_TIMING_ID: String;
+    static WEB_PAGE_PHASE_DETAIL: WebPagePhaseDetail;
+}
+
+async fn with_request_timing_id<F: Future>(timing_id: String, future: F) -> F::Output {
+    REQUEST_TIMING_ID.scope(timing_id, future).await
+}
+
+async fn with_web_page_phase_detail<F: Future>(detail: WebPagePhaseDetail, future: F) -> F::Output {
+    WEB_PAGE_PHASE_DETAIL.scope(detail, future).await
+}
+
+fn current_request_timing_id() -> Option<String> {
+    REQUEST_TIMING_ID.try_with(Clone::clone).ok()
+}
+
+/// Where the page handler's `WebPageTiming` drop leaves its phase detail so the timing
+/// middleware can store it in the history after the response is built.
+#[derive(Clone, Default)]
+struct WebPagePhaseDetail(Arc<Mutex<Option<(String, Value)>>>);
+
+impl WebPagePhaseDetail {
+    fn set(&self, page: &str, fields: Value) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some((page.to_owned(), fields));
+        }
+    }
+
+    fn take(&self) -> (Option<String>, Option<Value>) {
+        self.0
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+            .map(|(page, fields)| (Some(page), Some(fields)))
+            .unwrap_or_default()
+    }
+}
+
+async fn account_web_outbound_calls<F: OAuthFlow, S: Storage + 'static>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    request: Request,
+    next: Next,
+) -> Response {
     let write_route = if request.method() == axum::http::Method::POST {
         match request.uri().path() {
             "/like" => Some("like"),
@@ -5183,9 +5290,52 @@ async fn account_web_outbound_calls(request: Request, next: Next) -> Response {
     } else {
         None
     };
+    let timing_id = new_timing_id();
+    let timing_self_request = request.uri().path() == TIMING_RECENT_PATH;
+    let timing_method = request.method().to_string();
+    let timing_path = request.uri().path().to_owned();
+    let timing_viewer =
+        verified_cookie_did(&state.public, request.headers(), state.storage.as_ref());
     let started = std::time::Instant::now();
+    let started_at_ms = now_unix_ms();
     let accounting = RequestOutboundAccounting::default();
-    let response = with_request_outbound_accounting(accounting.clone(), next.run(request)).await;
+    let page_phases = WebPagePhaseDetail::default();
+    let response = with_request_outbound_accounting(
+        accounting.clone(),
+        with_web_page_phase_detail(
+            page_phases.clone(),
+            with_request_timing_id(timing_id.clone(), next.run(request)),
+        ),
+    )
+    .await;
+    let mut response = response;
+    match HeaderValue::from_str(&timing_id) {
+        Ok(value) => {
+            response.headers_mut().insert(TIMING_ID_HEADER, value);
+        }
+        Err(error) => tracing::warn!(
+            error = %error,
+            timing_id = %timing_id,
+            "could not send the X-Timing-Id response header"
+        ),
+    }
+    if !timing_self_request {
+        let calls = accounting.snapshot();
+        let (page, phases) = page_phases.take();
+        state.timing_console.record(TimingRecord {
+            id: timing_id.clone(),
+            viewer: timing_viewer,
+            method: timing_method,
+            path: timing_path,
+            status: response.status().as_u16(),
+            started_at_ms,
+            total_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            page,
+            phases,
+            calls: calls.calls,
+            calls_overflow: calls.calls_overflow,
+        });
+    }
     if let Some(route) = write_route {
         let calls = accounting.snapshot();
         tracing::info!(
@@ -5200,6 +5350,26 @@ async fn account_web_outbound_calls(request: Request, next: Next) -> Response {
         );
     }
     response
+}
+
+/// The timing console endpoint: the logged-in viewer's own newest records, newest first.
+/// Records of other viewers and records without a viewer are never returned, and this
+/// endpoint's own requests are never recorded (it must not fill the history with itself).
+async fn timing_recent<F: OAuthFlow, S: Storage + 'static>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let records = state
+        .timing_console
+        .recent_for_viewer(&did, TIMING_PAGE_LIMIT);
+    (
+        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        Json(json!({"records": records})),
+    )
+        .into_response()
 }
 
 async fn log_web_post_client_errors(request: Request, next: Next) -> Response {
@@ -5372,6 +5542,55 @@ impl Drop for WebPageTiming {
             total_ms,
             "web page phases"
         );
+        if let Ok(detail) = WEB_PAGE_PHASE_DETAIL.try_with(Clone::clone) {
+            let named: &[(&str, u64)] = &[
+                ("session_token_refresh_ms", self.session_token_refresh_ms),
+                ("saved_feeds_ms", self.saved_feeds_ms),
+                ("preferences_ms", self.preferences_ms),
+                ("tabs_ms", self.tabs_ms),
+                ("timeline_fetch_index_ms", self.timeline_fetch_index_ms),
+                ("timeline_fetch_live_ms", self.timeline_fetch_live_ms),
+                ("feed_timeline_ms", self.feed_timeline_ms),
+                ("mutes_ms", self.mutes_ms),
+                ("list_blocks_ms", self.list_blocks_ms),
+                ("list_blocked_posts", self.list_blocked_posts),
+                ("parent_hydration_ms", self.parent_hydration_ms),
+                ("content_hydration_ms", self.content_hydration_ms),
+                ("profile_hydration_ms", self.profile_hydration_ms),
+                ("quote_hydration_ms", self.quote_hydration_ms),
+                ("account_labels_ms", self.account_labels_ms),
+                ("profile_counts_ms", self.profile_counts_ms),
+                ("relationship_ms", self.relationship_ms),
+                (
+                    "relationship_requests",
+                    u64::from(self.relationship_requests),
+                ),
+                (
+                    "relationship_rows_written",
+                    u64::from(self.relationship_rows_written),
+                ),
+                ("profile_action_panel_ms", self.profile_action_panel_ms),
+                ("profile_action_mutes_ms", self.profile_action_mutes_ms),
+                ("profile_list_choices_ms", self.profile_list_choices_ms),
+                ("render_ms", self.render_ms),
+                ("ancestors_from_index", self.ancestors_from_index as u64),
+                ("ancestors_live", self.ancestors_live as u64),
+                ("ancestors_timed_out", self.ancestors_timed_out as u64),
+            ];
+            let mut fields = serde_json::Map::new();
+            for (name, value) in named {
+                if *value != 0 {
+                    fields.insert((*name).to_owned(), json!(*value));
+                }
+            }
+            if self.relationship_answer != "none" {
+                fields.insert(
+                    "relationship_answer".to_owned(),
+                    json!(self.relationship_answer),
+                );
+            }
+            detail.set(self.page, Value::Object(fields));
+        }
     }
 }
 
@@ -14108,7 +14327,8 @@ mod tests {
                     .await?;
                 client
                     .get(
-                        &url::Url::parse(&format!("{base}/xrpc/app.bsky.actor.getProfile")).unwrap(),
+                        &url::Url::parse(&format!("{base}/xrpc/app.bsky.actor.getProfile"))
+                            .unwrap(),
                         HeaderMap::new(),
                         4096,
                     )
@@ -14246,7 +14466,10 @@ mod tests {
             "phase_gap_ms=",
             "total_ms=",
         ] {
-            assert!(phase_line.contains(field), "{field} must stay in {phase_line}");
+            assert!(
+                phase_line.contains(field),
+                "{field} must stay in {phase_line}"
+            );
         }
 
         let response = app
@@ -14262,7 +14485,10 @@ mod tests {
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
         let body = collect_body(response).await;
         let body_text = String::from_utf8(body.clone()).unwrap();
-        assert!(!body_text.contains("SECRET"), "query strings never leak: {body_text}");
+        assert!(
+            !body_text.contains("SECRET"),
+            "query strings never leak: {body_text}"
+        );
         let payload: Value = serde_json::from_slice(&body).unwrap();
         let records = payload["records"].as_array().expect("a records array");
         assert_eq!(records.len(), 1, "one record: {body_text}");
@@ -14273,8 +14499,13 @@ mod tests {
         assert_eq!(record["path"], json!("/app"));
         assert_eq!(record["status"], json!(200));
         assert_eq!(record["page"], json!("app"));
-        let mutes_ms = record["phases"]["mutes_ms"].as_u64().expect("mutes_ms phase");
-        assert!(mutes_ms >= 20, "the two fake calls ran inside mutes_ms: {record}");
+        let mutes_ms = record["phases"]["mutes_ms"]
+            .as_u64()
+            .expect("mutes_ms phase");
+        assert!(
+            mutes_ms >= 20,
+            "the two fake calls ran inside mutes_ms: {record}"
+        );
         let calls = record["calls"].as_array().expect("call details");
         assert_eq!(calls.len(), 2, "{record}");
         assert_eq!(calls[0]["kind"], json!("pds_get_record"));
@@ -14283,13 +14514,22 @@ mod tests {
         assert_eq!(calls[0]["path"], json!("/xrpc/com.atproto.repo.getRecord"));
         assert_eq!(calls[0]["status"], json!(200));
         assert!(calls[0]["error"].is_null());
-        assert!(calls[0]["duration_ms"].as_u64().unwrap_or_default() >= 15, "{record}");
-        assert!(calls[0]["start_ms"].as_u64().unwrap_or_default() < mutes_ms, "{record}");
+        assert!(
+            calls[0]["duration_ms"].as_u64().unwrap_or_default() >= 15,
+            "{record}"
+        );
+        assert!(
+            calls[0]["start_ms"].as_u64().unwrap_or_default() < mutes_ms,
+            "{record}"
+        );
         assert_eq!(calls[1]["kind"], json!("public_appview"));
         assert_eq!(calls[1]["path"], json!("/xrpc/app.bsky.actor.getProfile"));
         assert!(
             calls[1]["start_ms"].as_u64().unwrap_or_default()
-                >= calls[0]["duration_ms"].as_u64().unwrap_or_default().saturating_sub(10),
+                >= calls[0]["duration_ms"]
+                    .as_u64()
+                    .unwrap_or_default()
+                    .saturating_sub(10),
             "the second call started after the first had run: {record}"
         );
         assert_eq!(record["calls_overflow"], json!(0));
@@ -14305,17 +14545,22 @@ mod tests {
         let token_a = public.issue_session_cookie(
             viewer_a,
             "timing-console-a-session",
-            storage.rotate_web_session(viewer_a, "timing-console-a-session").unwrap(),
+            storage
+                .rotate_web_session(viewer_a, "timing-console-a-session")
+                .unwrap(),
             read_only_session_permissions(),
         );
         let token_b = public.issue_session_cookie(
             viewer_b,
             "timing-console-b-session",
-            storage.rotate_web_session(viewer_b, "timing-console-b-session").unwrap(),
+            storage
+                .rotate_web_session(viewer_b, "timing-console-b-session")
+                .unwrap(),
             read_only_session_permissions(),
         );
         let console = Arc::new(TimingConsole::with_report_interval(Duration::ZERO));
-        let app = public.router_with_flow_and_timing_console(DisabledOAuthFlow, storage, console);
+        let app =
+            public.router_with_flow_and_timing_console(DisabledOAuthFlow, storage, console.clone());
         let get = |uri: &'static str, cookie: Option<String>| {
             let app = app.clone();
             async move {
@@ -14323,7 +14568,9 @@ mod tests {
                 if let Some(cookie) = cookie {
                     builder = builder.header("cookie", cookie);
                 }
-                app.oneshot(builder.body(Body::empty()).unwrap()).await.unwrap()
+                app.oneshot(builder.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
             }
         };
 
@@ -14347,54 +14594,102 @@ mod tests {
             let response = get("/login", Some(format!("{SESSION_COOKIE}={token_a}")))
                 .with_subscriber(metrics_subscriber())
                 .await;
-            ids_a.push(response.headers()["x-timing-id"].to_str().unwrap().to_owned());
+            ids_a.push(
+                response.headers()["x-timing-id"]
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+            );
         }
         let response = get("/login", Some(format!("{SESSION_COOKIE}={token_b}"))).await;
-        let id_b = response.headers()["x-timing-id"].to_str().unwrap().to_owned();
+        let id_b = response.headers()["x-timing-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
         assert!(get("/login", None).await.status().is_success());
 
-        let response = get("/timing/recent", Some(format!("{SESSION_COOKIE}={token_a}"))).await;
+        let response = get(
+            "/timing/recent",
+            Some(format!("{SESSION_COOKIE}={token_a}")),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
-        let payload: Value =
-            serde_json::from_slice(&collect_body(response).await).unwrap();
+        let payload: Value = serde_json::from_slice(&collect_body(response).await).unwrap();
         let records = payload["records"].as_array().unwrap();
         assert_eq!(records.len(), 2, "viewer A sees exactly their own records");
-        assert!(records.iter().all(|record| record["viewer"] == json!(viewer_a)));
+        assert!(
+            records
+                .iter()
+                .all(|record| record["viewer"] == json!(viewer_a))
+        );
         assert_eq!(records[0]["id"], json!(ids_a[1]), "newest first");
         assert_eq!(records[1]["id"], json!(ids_a[0]));
-        assert!(!records.iter().any(|record| record["id"] == json!(id_b)), "B stays hidden");
+        assert!(
+            !records.iter().any(|record| record["id"] == json!(id_b)),
+            "B stays hidden"
+        );
 
-        let response = get("/timing/recent", Some(format!("{SESSION_COOKIE}={token_b}"))).await;
-        let payload: Value =
-            serde_json::from_slice(&collect_body(response).await).unwrap();
+        let response = get(
+            "/timing/recent",
+            Some(format!("{SESSION_COOKIE}={token_b}")),
+        )
+        .await;
+        let payload: Value = serde_json::from_slice(&collect_body(response).await).unwrap();
         let records = payload["records"].as_array().unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0]["id"], json!(id_b), "B sees only their own record");
+        assert_eq!(
+            records[0]["id"],
+            json!(id_b),
+            "B sees only their own record"
+        );
 
         for _ in 0..35 {
             let response = get("/login", Some(format!("{SESSION_COOKIE}={token_a}"))).await;
-            ids_a.push(response.headers()["x-timing-id"].to_str().unwrap().to_owned());
+            ids_a.push(
+                response.headers()["x-timing-id"]
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+            );
         }
-        let response = get("/timing/recent", Some(format!("{SESSION_COOKIE}={token_a}"))).await;
-        let payload: Value =
-            serde_json::from_slice(&collect_body(response).await).unwrap();
+        let response = get(
+            "/timing/recent",
+            Some(format!("{SESSION_COOKIE}={token_a}")),
+        )
+        .await;
+        let payload: Value = serde_json::from_slice(&collect_body(response).await).unwrap();
         let records = payload["records"].as_array().unwrap();
         assert_eq!(records.len(), 30, "at most 30 records are returned");
         assert_eq!(records[0]["id"], json!(ids_a[36]));
-        assert_eq!(records[29]["id"], json!(ids_a[7]), "the 30 newest, oldest last");
+        assert_eq!(
+            records[29]["id"],
+            json!(ids_a[7]),
+            "the 30 newest, oldest last"
+        );
 
         for _ in 0..200 {
             get("/login", None).await;
         }
-        let response = get("/timing/recent", Some(format!("{SESSION_COOKIE}={token_a}"))).await;
-        let payload: Value =
-            serde_json::from_slice(&collect_body(response).await).unwrap();
+        let response = get(
+            "/timing/recent",
+            Some(format!("{SESSION_COOKIE}={token_a}")),
+        )
+        .await;
+        let payload: Value = serde_json::from_slice(&collect_body(response).await).unwrap();
         assert!(
             payload["records"].as_array().unwrap().is_empty(),
             "A's records are evicted once 200 newer ones exist, and anonymous records are never returned"
         );
-        assert_eq!(console.held_count(), 200, "the ring keeps the newest 200 records");
-        assert_eq!(console.evicted_count(), 39, "2+1+1+2+35+200 stored minus 200 held");
+        assert_eq!(
+            console.held_count(),
+            200,
+            "the ring keeps the newest 200 records"
+        );
+        assert_eq!(
+            console.evicted_count(),
+            39,
+            "2+1+1+2+35+200 stored minus 200 held"
+        );
 
         let metrics = String::from_utf8(logs.0.lock().unwrap().clone())
             .unwrap()
