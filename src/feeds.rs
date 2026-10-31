@@ -1196,7 +1196,14 @@ mod tests {
                 "value":post.get("record").cloned().unwrap_or_default()
             }))
             .into_response(),
-            None => StatusCode::NOT_FOUND.into_response(),
+            None => (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({
+                    "error":"RecordNotFound",
+                    "message":"Could not locate record"
+                })),
+            )
+                .into_response(),
         }
     }
 
@@ -1677,6 +1684,37 @@ mod tests {
         assert_eq!(page.feed.len(), 1);
         assert_eq!(page.feed[0].record.uri, uri);
         assert_eq!(*state.appview_calls.lock().unwrap(), [1]);
+        assert_eq!(*state.pds_calls.lock().unwrap(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_definitely_missing_post_uses_one_pds_lookup_across_feed_page_loads() {
+        use crate::ingest::MemoryStorage;
+
+        let uri = "at://did:plc:deleted/app.bsky.feed.post/gone";
+        let (pds, state, server) =
+            batch_server(HashMap::new(), HashMap::new(), StatusCode::OK).await;
+        let pds_endpoint = pds.trim_end_matches("/xrpc/").to_owned();
+        let identity = fake_batch_identity(["did:plc:deleted".to_owned()], &pds_endpoint);
+        let client = test_client_with_appview(identity, pds);
+        for _ in 0..2 {
+            let page = client
+                .hydrate_skeleton(
+                    super::FeedSkeletonPage {
+                        feed: vec![super::FeedSkeletonEntry {
+                            post_uri: uri.to_owned(),
+                            reason: None,
+                        }],
+                        cursor: None,
+                    },
+                    &MemoryStorage::default(),
+                )
+                .await
+                .unwrap();
+            assert!(page.feed.is_empty());
+            assert_eq!(page.dropped_count, 1);
+        }
         assert_eq!(*state.pds_calls.lock().unwrap(), 1);
         server.abort();
     }
