@@ -3959,16 +3959,26 @@ impl Storage for SqliteStorage {
             ..PostInteractionSummary::default()
         };
         if let Some(viewer_did) = viewer_did {
-            summary.viewer_like = conn.query_row(
-                "SELECT uri FROM records WHERE collection='app.bsky.feed.like' AND did=?1 AND json_extract(record_json, '$.subject.uri')=?2 ORDER BY time_us DESC LIMIT 1",
-                params![viewer_did, uri],
-                |row| row.get(0),
-            ).optional()?;
-            summary.viewer_repost = conn.query_row(
-                "SELECT uri FROM records WHERE collection='app.bsky.feed.repost' AND did=?1 AND json_extract(record_json, '$.subject.uri')=?2 ORDER BY time_us DESC LIMIT 1",
-                params![viewer_did, uri],
-                |row| row.get(0),
-            ).optional()?;
+            summary.viewer_like = conn
+                .query_row(
+                    "SELECT uri FROM records INDEXED BY records_author_subject_uri
+                 WHERE collection='app.bsky.feed.like' AND did=?1
+                   AND json_extract(record_json, '$.subject.uri')=?2
+                 ORDER BY time_us DESC LIMIT 1",
+                    params![viewer_did, uri],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            summary.viewer_repost = conn
+                .query_row(
+                    "SELECT uri FROM records INDEXED BY records_author_subject_uri
+                 WHERE collection='app.bsky.feed.repost' AND did=?1
+                   AND json_extract(record_json, '$.subject.uri')=?2
+                 ORDER BY time_us DESC LIMIT 1",
+                    params![viewer_did, uri],
+                    |row| row.get(0),
+                )
+                .optional()?;
         }
         Ok(summary)
     }

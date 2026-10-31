@@ -256,7 +256,7 @@ fn viewer_interaction_lookup_uses_the_per_author_index_and_keeps_newest_uri() {
     let connection = Connection::open(&path).unwrap();
     for collection in ["app.bsky.feed.like", "app.bsky.feed.repost"] {
         let query = format!(
-            "EXPLAIN QUERY PLAN SELECT uri FROM records
+            "EXPLAIN QUERY PLAN SELECT uri FROM records INDEXED BY records_author_subject_uri
              WHERE collection='{collection}' AND did=?1
                AND json_extract(record_json, '$.subject.uri')=?2
              ORDER BY time_us DESC LIMIT 1"
