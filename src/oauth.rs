@@ -8880,7 +8880,9 @@ fn permission_reauthorization_link(action: &str) -> String {
         "unmute" => "unmute",
         _ => "add to lists",
     };
-    format!("<a class=\"permission-prompt\" href=\"/login\">Sign in again to {description}</a>")
+    format!(
+        "<a class=\"permission-prompt\" href=\"/login?write=1\">Sign in with changes allowed to {description}</a>"
+    )
 }
 
 fn profile_action_form(
@@ -9488,10 +9490,7 @@ where
         _ => return oauth_error(StatusCode::BAD_REQUEST, "unknown profile action"),
     };
     if !allowed {
-        return oauth_error(
-            StatusCode::FORBIDDEN,
-            &format!("Sign in again to {permission_name}"),
-        );
+        return write_permission_page(permission_name);
     }
     if matches!(action, "block" | "list_remove")
         && form.get("confirm").map(String::as_str) != Some("yes")
@@ -10608,7 +10607,7 @@ fn render_composer(spec: ComposerSpec<'_>) -> String {
 
 fn render_media_picker(image_access: bool, video_access: bool, id: &str) -> String {
     if !image_access && !video_access {
-        return "<p class=\"picture-permission-hint\" role=\"status\"><a href=\"/login\">Log in again to enable pictures</a></p><p class=\"video-permission-hint\" role=\"status\"><a href=\"/login\">sign in again to post videos</a></p>".to_owned();
+        return "<p class=\"picture-permission-hint\" role=\"status\"><a href=\"/login?write=1\">Sign in with changes allowed to enable pictures</a></p><p class=\"video-permission-hint\" role=\"status\"><a href=\"/login?write=1\">Sign in with changes allowed to post videos</a></p>".to_owned();
     }
     format!(
         "<fieldset class=\"media-picker\" data-media-picker><legend>Add media</legend><input class=\"media-file-input\" id=\"{id}\" type=\"file\" name=\"media\" accept=\"image/*,video/mp4,video/webm,video/quicktime\" multiple data-media-input data-image-access=\"{image_access}\" data-video-access=\"{video_access}\"><label class=\"media-add-button\" for=\"{id}\"><span aria-hidden=\"true\">＋</span> Add media</label><p class=\"media-picker-hint\">Up to 4 pictures, or one video up to 300 MB and 10 minutes.</p><div class=\"media-previews\" data-media-previews></div><p class=\"media-picker-status\" data-media-status role=\"status\" aria-live=\"polite\"></p><label class=\"video-alt-label\" for=\"{id}-alt\" data-video-alt-label hidden>Video alt text (optional)<textarea id=\"{id}-alt\" name=\"video_alt\" maxlength=\"2000\" rows=\"2\" data-video-alt></textarea></label><progress data-video-progress max=\"100\" value=\"0\" hidden></progress><p class=\"video-upload-status\" data-video-upload-status role=\"status\" aria-live=\"polite\"></p></fieldset>"
@@ -11520,7 +11519,7 @@ where
         return Redirect::to("/login").into_response();
     };
     if !verified_cookie_write_access(&state.public, &headers, state.storage.as_ref()) {
-        return oauth_error(StatusCode::FORBIDDEN, "write permissions were not granted");
+        return write_permission_page("post videos");
     }
     if !verified_cookie_video_access(&state.public, &headers, state.storage.as_ref()) {
         return oauth_error(StatusCode::FORBIDDEN, "sign in again to post videos");
@@ -11716,7 +11715,7 @@ where
         return Redirect::to("/login").into_response();
     };
     if !verified_cookie_write_access(&state.public, &headers, state.storage.as_ref()) {
-        return oauth_error(StatusCode::FORBIDDEN, "write permissions were not granted");
+        return write_permission_page("post");
     }
     let submission = match parse_post_submission(request, &state).await {
         Ok(submission) => submission,
@@ -11853,7 +11852,7 @@ where
         return Redirect::to("/login").into_response();
     };
     if !verified_cookie_write_access(&state.public, &headers, state.storage.as_ref()) {
-        return oauth_error(StatusCode::FORBIDDEN, "write permissions were not granted");
+        return write_permission_page("quote a post");
     }
     let submission = match parse_post_submission(request, &state).await {
         Ok(submission) => submission,
@@ -11981,7 +11980,7 @@ where
         return Redirect::to("/login").into_response();
     };
     if !verified_cookie_write_access(&state.public, &headers, state.storage.as_ref()) {
-        return oauth_error(StatusCode::FORBIDDEN, "write permissions were not granted");
+        return write_permission_page("reply");
     }
     let submission = match parse_post_submission(request, &state).await {
         Ok(submission) => submission,
@@ -12190,7 +12189,7 @@ where
         return Redirect::to("/login").into_response();
     };
     if !verified_cookie_write_access(&state.public, &headers, state.storage.as_ref()) {
-        return oauth_error(StatusCode::FORBIDDEN, "write permissions were not granted");
+        return write_permission_page("like posts");
     }
     let (Some(uri), Some(cid)) = (form.get("uri"), form.get("cid")) else {
         return oauth_error(StatusCode::BAD_REQUEST, "uri and cid are required");
@@ -12307,7 +12306,7 @@ where
         return Redirect::to("/login").into_response();
     };
     if !verified_cookie_write_access(&state.public, &headers, state.storage.as_ref()) {
-        return oauth_error(StatusCode::FORBIDDEN, "write permissions were not granted");
+        return write_permission_page("repost");
     }
     let (Some(uri), Some(cid)) = (form.get("uri"), form.get("cid")) else {
         return oauth_error(StatusCode::BAD_REQUEST, "uri and cid are required");
@@ -12589,6 +12588,22 @@ fn oauth_error(status: StatusCode, message: &str) -> Response {
         .into_response()
 }
 
+/// A read-only sign-in (owner, 2026-10-31) must never see a raw JSON 403 for a write: this page
+/// explains the missing permission and links to the write-allowed sign-in (`/login?write=1`).
+fn write_permission_page(action: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Html(page_shell(
+            "Read-only sign-in",
+            &format!(
+                "<section class=\"error-card\"><p class=\"eyebrow\">Read-only sign-in</p><h1>This sign-in cannot make changes</h1><p>You signed in without allowing changes, so this appview cannot {action}. Sign in again and tick the box to allow changes.</p><a class=\"primary-link\" href=\"/login?write=1\">Sign in with changes allowed to {action}</a></section>",
+            ),
+            false,
+        )),
+    )
+        .into_response()
+}
+
 fn oauth_error_page(status: StatusCode, message: &str) -> Response {
     (
         status,
@@ -12623,7 +12638,7 @@ fn unavailable_feed_page(feed_uri: &str, can_remove: bool) -> Response {
             html_escape(feed_uri)
         )
     } else {
-        "<a class=\"primary-link\" href=\"/login\">Sign in again to remove this feed</a>".to_owned()
+        "<a class=\"primary-link\" href=\"/login?write=1\">Sign in with changes allowed to remove this feed</a>".to_owned()
     };
     Html(page_shell(
         "Unavailable feed",
@@ -12684,7 +12699,7 @@ where
 fn feed_reauthorization_page() -> Response {
     Html(page_shell(
         "Allow feeds",
-        "<section class=\"error-card\"><p class=\"eyebrow\">Permission update</p><h1>Sign in again to allow feeds</h1><p>Your existing sign-in does not include permission to load saved feeds. Sign in again and approve the updated access.</p><a class=\"primary-link\" href=\"/login\">Sign in again</a></section>",
+        "<section class=\"error-card\"><p class=\"eyebrow\">Permission update</p><h1>Sign in with changes allowed to load saved feeds</h1><p>Your existing sign-in does not include permission to load saved feeds. Sign in again and approve the updated access.</p><a class=\"primary-link\" href=\"/login?write=1\">Sign in with changes allowed to load saved feeds</a></section>",
         false,
     ))
     .into_response()

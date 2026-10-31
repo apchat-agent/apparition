@@ -3052,9 +3052,9 @@ async fn old_scope_session_gets_a_friendly_feed_reauthorization_page() {
     .unwrap();
     assert!(
         html.to_ascii_lowercase()
-            .contains("sign in again to allow feeds")
+            .contains("sign in with changes allowed to load saved feeds")
     );
-    assert!(html.contains("href=\"/login\""));
+    assert!(html.contains("href=\"/login?write=1\""));
     assert!(!html.contains("\"error\":\"OAuthError\""));
 }
 
@@ -6656,7 +6656,12 @@ async fn a_read_only_session_is_shown_a_sign_in_page_not_a_json_error_for_every_
     let actions = flow.actions.clone();
     let storage = Arc::new(MemoryStorage::default());
     storage
-        .put_record(&fake_feed_post("did:plc:author", "one", 10, "a post to act on"))
+        .put_record(&fake_feed_post(
+            "did:plc:author",
+            "one",
+            10,
+            "a post to act on",
+        ))
         .unwrap();
     let app = OAuthPublic::new("https://appview.example")
         .unwrap()
@@ -6708,7 +6713,10 @@ async fn a_read_only_session_is_shown_a_sign_in_page_not_a_json_error_for_every_
                 .to_vec(),
         )
         .unwrap();
-        assert!(content_type.starts_with("text/html"), "{name}: {content_type}");
+        assert!(
+            content_type.starts_with("text/html"),
+            "{name}: {content_type}"
+        );
         assert!(
             html.contains("href=\"/login?write=1\""),
             "{name} must link to the write sign-in: {html}"
@@ -7109,10 +7117,22 @@ async fn old_scope_profile_shows_per_action_reauthorization_messages() {
     let cookie = finish_login(&app).await;
     let html = get_html(&app, "/profile?did=did%3Aplc%3Afriend", &cookie).await;
 
-    assert!(html.contains("Sign in again to follow"), "{html}");
-    assert!(html.contains("Sign in again to block"), "{html}");
-    assert!(html.contains("Sign in again to mute"), "{html}");
-    assert!(html.contains("Sign in again to add to lists"), "{html}");
+    assert!(
+        html.contains("Sign in with changes allowed to follow"),
+        "{html}"
+    );
+    assert!(
+        html.contains("Sign in with changes allowed to block"),
+        "{html}"
+    );
+    assert!(
+        html.contains("Sign in with changes allowed to mute"),
+        "{html}"
+    );
+    assert!(
+        html.contains("Sign in with changes allowed to add to lists"),
+        "{html}"
+    );
 }
 
 #[tokio::test]
@@ -7889,7 +7909,10 @@ async fn a_dead_feed_page_offers_removal_and_an_older_sign_in_is_asked_to_renew(
     let old_cookie = finish_login(&old_app).await;
     let html = get_html(&old_app, &page, &old_cookie).await;
     assert!(html.contains("This feed no longer exists"), "{html}");
-    assert!(html.contains("Sign in again to remove this feed"), "{html}");
+    assert!(
+        html.contains("Sign in with changes allowed to remove this feed"),
+        "{html}"
+    );
     assert!(!html.contains("/feeds/remove"), "{html}");
 }
 
@@ -7961,7 +7984,10 @@ async fn an_older_sign_in_cannot_remove_a_feed_until_it_signs_in_again() {
             .to_vec(),
     )
     .unwrap();
-    assert!(html.contains("Sign in again to remove this feed"), "{html}");
+    assert!(
+        html.contains("Sign in with changes allowed to remove this feed"),
+        "{html}"
+    );
     assert!(
         !actions
             .lock()
