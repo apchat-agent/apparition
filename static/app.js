@@ -572,7 +572,12 @@ function enhanceCompactComposer(form) {
     const lineHeight = Number.parseFloat(computed?.lineHeight) || 24;
     const verticalPadding = (Number.parseFloat(computed?.paddingTop) || 0) +
       (Number.parseFloat(computed?.paddingBottom) || 0);
-    textarea.rows = Math.min(10, Math.max(expanded ? 2 : 1, Math.ceil((textarea.scrollHeight - verticalPadding) / lineHeight)));
+    // scrollHeight never falls below the box's own height, so measuring at the CURRENT rows turned the rounding
+    // of a fractional (or "normal") line height into one extra row per keystroke. Collapse to the smallest box
+    // first: then scrollHeight reflects the text itself and the row count only follows the number of lines.
+    textarea.rows = 1;
+    const contentHeight = Math.max(0, textarea.scrollHeight - verticalPadding);
+    textarea.rows = Math.min(10, Math.max(expanded ? 2 : 1, Math.ceil(contentHeight / lineHeight)));
   };
   const expand = () => {
     form.classList.add("is-expanded");
