@@ -36,6 +36,8 @@ const MAX_PROFILE_FETCH_QUEUE: usize = 10_000;
 const SQLITE_WRITER_QUEUE: usize = 256;
 const SQLITE_WRITER_BATCH_SIZE: usize = 64;
 const SQLITE_WRITER_BATCH_DELAY: Duration = Duration::from_millis(5);
+const WAL_JOURNAL_SIZE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+const CHECKPOINT_BUSY_TIMEOUT: Duration = Duration::from_millis(50);
 const SQLITE_WRITER_METRICS_INTERVAL: Duration = Duration::from_secs(60);
 static NEXT_MEMORY_DATABASE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -1928,6 +1930,24 @@ struct SqliteWriterMetrics {
     transaction_max_ns: AtomicU64,
 }
 
+#[derive(Default)]
+struct WalMetrics {
+    file_bytes: AtomicU64,
+    frames: AtomicU64,
+    checkpointed: AtomicU64,
+    reset: AtomicBool,
+    backfill_wait_ns: AtomicU64,
+}
+
+impl WalMetrics {
+    fn record_checkpoint(&self, file_bytes: u64, frames: u64, checkpointed: u64, reset: bool) {
+        self.file_bytes.store(file_bytes, Ordering::Relaxed);
+        self.frames.store(frames, Ordering::Relaxed);
+        self.checkpointed.store(checkpointed, Ordering::Relaxed);
+        self.reset.store(reset, Ordering::Relaxed);
+    }
+}
+
 impl SqliteWriterMetrics {
     fn queued(&self) {
         let depth = self.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1963,7 +1983,7 @@ impl SqliteWriterMetrics {
         self.failed_writes.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn report(&self, read_metrics: &ReadPoolMetrics) {
+    fn report(&self, read_metrics: &ReadPoolMetrics, wal_metrics: &WalMetrics) {
         let count = self.transaction_count.swap(0, Ordering::Relaxed);
         let total_ns = self.transaction_total_ns.swap(0, Ordering::Relaxed);
         let max_ns = self.transaction_max_ns.swap(0, Ordering::Relaxed);
@@ -1983,6 +2003,12 @@ impl SqliteWriterMetrics {
             read_wait_count = read_metrics.waits.swap(0, Ordering::Relaxed),
             read_wait_max_ms =
                 read_metrics.wait_max_ns.swap(0, Ordering::Relaxed) as f64 / 1_000_000.0,
+            wal_bytes = wal_metrics.file_bytes.load(Ordering::Relaxed),
+            wal_frames = wal_metrics.frames.load(Ordering::Relaxed),
+            ckpt_frames = wal_metrics.checkpointed.load(Ordering::Relaxed),
+            wal_reset = wal_metrics.reset.load(Ordering::Relaxed),
+            backfill_wait_ms =
+                wal_metrics.backfill_wait_ns.swap(0, Ordering::Relaxed) as f64 / 1_000_000.0,
             "SQLite writer minute metrics"
         );
     }
@@ -2028,14 +2054,22 @@ impl SqliteWriter {
     fn new(
         connection: Connection,
         read_metrics: Arc<ReadPoolMetrics>,
+        wal_metrics: Arc<WalMetrics>,
     ) -> Result<Self, StorageError> {
         let (sender, receiver) = mpsc::sync_channel(SQLITE_WRITER_QUEUE);
         let metrics = Arc::new(SqliteWriterMetrics::default());
         let thread_metrics = Arc::clone(&metrics);
+        let thread_wal_metrics = Arc::clone(&wal_metrics);
         let worker = std::thread::Builder::new()
             .name("sqlite-writer".to_owned())
             .spawn(move || {
-                sqlite_writer_loop(connection, receiver, thread_metrics, read_metrics)
+                sqlite_writer_loop(
+                    connection,
+                    receiver,
+                    thread_metrics,
+                    read_metrics,
+                    thread_wal_metrics,
+                )
             })?;
         Ok(Self {
             sender: Some(sender),
@@ -2115,6 +2149,7 @@ fn sqlite_writer_loop(
     receiver: Receiver<SqliteWriterMessage>,
     metrics: Arc<SqliteWriterMetrics>,
     read_metrics: Arc<ReadPoolMetrics>,
+    wal_metrics: Arc<WalMetrics>,
 ) {
     let mut next_metrics = Instant::now() + SQLITE_WRITER_METRICS_INTERVAL;
     let mut pending = None;
@@ -2125,7 +2160,7 @@ fn sqlite_writer_loop(
             match receiver.recv_timeout(next_metrics.saturating_duration_since(Instant::now())) {
                 Ok(message) => Some(message),
                 Err(RecvTimeoutError::Timeout) => {
-                    metrics.report(&read_metrics);
+                    metrics.report(&read_metrics, &wal_metrics);
                     next_metrics = Instant::now() + SQLITE_WRITER_METRICS_INTERVAL;
                     continue;
                 }
@@ -2222,7 +2257,7 @@ fn sqlite_writer_loop(
             }
         }
         if Instant::now() >= next_metrics {
-            metrics.report(&read_metrics);
+            metrics.report(&read_metrics, &wal_metrics);
             next_metrics = Instant::now() + SQLITE_WRITER_METRICS_INTERVAL;
         }
     }
@@ -2235,7 +2270,9 @@ pub struct SqliteStorage {
     read_metrics: Arc<ReadPoolMetrics>,
     path: PathBuf,
     checkpointer_stop: Arc<AtomicBool>,
+    checkpointer_worker: Option<std::thread::JoinHandle<()>>,
     checkpoint_backlog: Arc<AtomicU64>,
+    wal_metrics: Arc<WalMetrics>,
     tracked: Arc<RwLock<TrackedSet>>,
     profile_index: Arc<RwLock<HashMap<String, ProfileIndexEntry>>>,
     notification_hub: NotificationHub,
@@ -2245,6 +2282,30 @@ pub struct SqliteStorage {
 impl Drop for SqliteStorage {
     fn drop(&mut self) {
         self.checkpointer_stop.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.checkpointer_worker.take() {
+            worker.thread().unpark();
+            if worker.join().is_err() {
+                tracing::error!("SQLite checkpointer thread panicked during shutdown");
+            }
+        }
+        if self.path != Path::new(":memory:") {
+            let database_path = self.path.clone();
+            let wal_metrics = Arc::clone(&self.wal_metrics);
+            let shutdown_checkpoint = self.writer.call(move |connection| {
+                connection.busy_timeout(CHECKPOINT_BUSY_TIMEOUT)?;
+                let result = checkpoint_wal(connection)?;
+                wal_metrics.record_checkpoint(
+                    wal_file_bytes(&database_path),
+                    result.frames.max(0) as u64,
+                    result.checkpointed.max(0) as u64,
+                    result.reset,
+                );
+                Ok(result)
+            });
+            if let Err(error) = shutdown_checkpoint {
+                tracing::warn!(%error, "WAL checkpoint failed during shutdown");
+            }
+        }
         self.writer.shutdown();
     }
 }
@@ -2387,33 +2448,100 @@ fn build_profile_index(
 
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
 
+#[derive(Clone, Copy, Debug)]
+struct CheckpointResult {
+    busy: i64,
+    frames: i64,
+    checkpointed: i64,
+    reset: bool,
+}
+
+fn checkpoint_wal(connection: &Connection) -> rusqlite::Result<CheckpointResult> {
+    let (busy, frames, checkpointed) =
+        connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+    let mut result = CheckpointResult {
+        busy,
+        frames,
+        checkpointed,
+        reset: false,
+    };
+    if busy == 0 && frames >= 0 && frames == checkpointed {
+        // TRUNCATE is the only round that frees the file immediately. It may
+        // wait for old readers, so this connection has a short busy timeout.
+        let (truncate_busy, truncate_frames, truncate_checkpointed) =
+            connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+        result.reset = truncate_busy == 0 && truncate_frames == 0 && truncate_checkpointed == 0;
+    }
+    Ok(result)
+}
+
+fn wal_file_bytes(path: &Path) -> u64 {
+    fs::metadata(format!("{}-wal", path.display()))
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
 fn spawn_checkpointer(
     path: PathBuf,
     stop: Arc<AtomicBool>,
     backlog: Arc<AtomicU64>,
-) -> Result<(), StorageError> {
+    wal_metrics: Arc<WalMetrics>,
+) -> Result<std::thread::JoinHandle<()>, StorageError> {
     let connection = Connection::open(&path)?;
-    connection.execute_batch("PRAGMA busy_timeout = 5000;")?;
-    std::thread::Builder::new()
+    connection.busy_timeout(CHECKPOINT_BUSY_TIMEOUT)?;
+    connection.execute_batch(&format!(
+        "PRAGMA journal_size_limit = {WAL_JOURNAL_SIZE_LIMIT_BYTES};"
+    ))?;
+    let worker = std::thread::Builder::new()
         .name("sqlite-checkpoint".to_owned())
         .spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
-                std::thread::sleep(CHECKPOINT_INTERVAL);
+            loop {
+                std::thread::park_timeout(CHECKPOINT_INTERVAL);
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
                 // Unknown counts as behind: a checkpoint of a big WAL runs for minutes,
                 // and the last small number would let the backfill pile on meanwhile.
                 backlog.store(u64::MAX, Ordering::Relaxed);
-                // Row: (busy, frames in the WAL, frames checkpointed).
-                match connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
-                    Ok((row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
-                }) {
-                    Ok((log, done)) => {
-                        backlog.store(log.saturating_sub(done).max(0) as u64, Ordering::Relaxed)
+                match checkpoint_wal(&connection) {
+                    Ok(result) => {
+                        let file_bytes = wal_file_bytes(&path);
+                        wal_metrics.record_checkpoint(
+                            file_bytes,
+                            result.frames.max(0) as u64,
+                            result.checkpointed.max(0) as u64,
+                            result.reset,
+                        );
+                        backlog.store(
+                            result.frames.saturating_sub(result.checkpointed).max(0) as u64,
+                            Ordering::Relaxed,
+                        );
+                        if result.busy != 0 {
+                            tracing::debug!(
+                                busy = result.busy,
+                                wal_frames = result.frames,
+                                ckpt_frames = result.checkpointed,
+                                "WAL checkpoint could not reset while readers were active"
+                            );
+                        }
                     }
                     Err(error) => tracing::warn!(%error, "WAL checkpoint failed"),
                 }
             }
         })?;
-    Ok(())
+    Ok(worker)
 }
 
 impl SqliteStorage {
@@ -2733,24 +2861,34 @@ impl SqliteStorage {
             read_connections.push(Mutex::new(reader));
         }
         let read_metrics = Arc::new(ReadPoolMetrics::default());
+        let wal_metrics = Arc::new(WalMetrics::default());
         let stop = Arc::new(AtomicBool::new(false));
         let backlog = Arc::new(AtomicU64::new(0));
-        if !is_memory {
+        let checkpointer_worker = if !is_memory {
             backlog.store(u64::MAX, Ordering::Relaxed);
-            spawn_checkpointer(
+            Some(spawn_checkpointer(
                 database_path.clone(),
                 Arc::clone(&stop),
                 Arc::clone(&backlog),
-            )?;
-        }
+                Arc::clone(&wal_metrics),
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
-            writer: SqliteWriter::new(connection, Arc::clone(&read_metrics))?,
+            writer: SqliteWriter::new(
+                connection,
+                Arc::clone(&read_metrics),
+                Arc::clone(&wal_metrics),
+            )?,
             read_connections,
             next_read_connection: AtomicU64::new(0),
             read_metrics,
             path,
             checkpointer_stop: stop,
+            checkpointer_worker,
             checkpoint_backlog: backlog,
+            wal_metrics,
             tracked: Arc::new(RwLock::new(tracked_set)),
             profile_index: Arc::new(RwLock::new(profile_index)),
             notification_hub: NotificationHub::default(),
@@ -5916,7 +6054,7 @@ mod sqlite_writer_tests {
         let read_metrics = ReadPoolMetrics::default();
         read_metrics.record_wait(Duration::from_millis(7));
         read_metrics.record_wait(Duration::from_millis(3));
-        SqliteWriterMetrics::default().report(&read_metrics);
+        SqliteWriterMetrics::default().report(&read_metrics, &WalMetrics::default());
 
         let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
         assert!(text.contains("SQLite writer minute metrics"), "{text}");
@@ -6058,7 +6196,12 @@ mod sqlite_writer_tests {
         connection
             .execute_batch("CREATE TABLE shutdown_write(value TEXT NOT NULL);")
             .unwrap();
-        let writer = SqliteWriter::new(connection, Arc::new(ReadPoolMetrics::default())).unwrap();
+        let writer = SqliteWriter::new(
+            connection,
+            Arc::new(ReadPoolMetrics::default()),
+            Arc::new(WalMetrics::default()),
+        )
+        .unwrap();
         writer.fire(|connection| {
             std::thread::sleep(Duration::from_millis(200));
             connection.execute("INSERT INTO shutdown_write(value) VALUES('flushed')", [])?;
@@ -6083,7 +6226,12 @@ mod sqlite_writer_tests {
         connection
             .execute_batch("CREATE TABLE batch_write(value TEXT PRIMARY KEY);")
             .unwrap();
-        let writer = SqliteWriter::new(connection, Arc::new(ReadPoolMetrics::default())).unwrap();
+        let writer = SqliteWriter::new(
+            connection,
+            Arc::new(ReadPoolMetrics::default()),
+            Arc::new(WalMetrics::default()),
+        )
+        .unwrap();
         writer.fire(|connection| {
             connection.execute("INSERT INTO batch_write(value) VALUES('good-before')", [])?;
             Ok(None)

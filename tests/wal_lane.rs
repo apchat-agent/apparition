@@ -101,7 +101,7 @@ fn passive_probe() {
 }
 
 #[test]
-fn passive_checkpoint_keeps_wal_within_four_journal_limits() {
+fn passive_checkpoint_can_leave_wal_above_four_journal_limits() {
     let path = temp_db("bound");
     let connection = Connection::open(&path).unwrap();
     connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA journal_size_limit=65536; CREATE TABLE t(k INTEGER PRIMARY KEY, v BLOB);").unwrap();
@@ -118,15 +118,85 @@ fn passive_checkpoint_keeps_wal_within_four_journal_limits() {
     let wal_path = PathBuf::from(format!("{}-wal", path.display()));
     let wal_bytes = std::fs::metadata(&wal_path).unwrap().len();
     eprintln!(
-        "RED bound measurement: checkpoint={checkpoint:?} wal_bytes={wal_bytes} bound_bytes={}",
+        "PASSIVE-only measurement: checkpoint={checkpoint:?} wal_bytes={wal_bytes} bound_bytes={}",
         4 * 65_536_u64
     );
     drop(connection);
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(wal_path);
+    assert_eq!(checkpoint.1, checkpoint.2);
     assert!(
-        wal_bytes <= 4 * 65_536,
-        "WAL file {wal_bytes} exceeds four journal limits after a full PASSIVE checkpoint"
+        wal_bytes > 4 * 65_536,
+        "fixture did not grow beyond four journal limits: {wal_bytes}"
+    );
+}
+
+#[test]
+fn storage_checkpointer_truncates_a_fully_checkpointed_wal() {
+    let path = temp_db("automatic-reset");
+    let storage = SqliteStorage::open(&path).unwrap();
+    let writer = Connection::open(&path).unwrap();
+    writer.execute_batch("PRAGMA wal_autocheckpoint=0; CREATE TABLE test_payload(k INTEGER PRIMARY KEY, v BLOB);").unwrap();
+    for index in 0..128 {
+        writer
+            .execute(
+                "INSERT INTO test_payload VALUES (?1, zeroblob(32768))",
+                [index],
+            )
+            .unwrap();
+    }
+    let wal_path = PathBuf::from(format!("{}-wal", path.display()));
+    assert!(std::fs::metadata(&wal_path).unwrap().len() > 4 * 65_536);
+    drop(writer);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while storage.write_backlog() == u64::MAX {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "checkpointer did not report its first round"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    let wal_bytes = std::fs::metadata(&wal_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    eprintln!("GREEN automatic reset measurement: wal_bytes={wal_bytes}");
+    drop(storage);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(wal_path);
+    assert!(
+        wal_bytes <= 65_536,
+        "fully checkpointed WAL remains {wal_bytes} bytes"
+    );
+}
+
+#[test]
+fn clean_shutdown_truncates_the_wal() {
+    let path = temp_db("shutdown-reset");
+    let storage = SqliteStorage::open(&path).unwrap();
+    let writer = Connection::open(&path).unwrap();
+    writer.execute_batch("PRAGMA wal_autocheckpoint=0; CREATE TABLE test_payload(k INTEGER PRIMARY KEY, v BLOB);").unwrap();
+    for index in 0..128 {
+        writer
+            .execute(
+                "INSERT INTO test_payload VALUES (?1, zeroblob(32768))",
+                [index],
+            )
+            .unwrap();
+    }
+    let wal_path = PathBuf::from(format!("{}-wal", path.display()));
+    assert!(std::fs::metadata(&wal_path).unwrap().len() > 4 * 65_536);
+    drop(storage);
+    let wal_bytes = std::fs::metadata(&wal_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    eprintln!("clean shutdown measurement: wal_bytes={wal_bytes}");
+    drop(writer);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(wal_path);
+    assert!(
+        wal_bytes <= 65_536,
+        "clean shutdown left a {wal_bytes} byte WAL"
     );
 }
 

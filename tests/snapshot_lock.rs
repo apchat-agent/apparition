@@ -138,6 +138,75 @@ fn page_reads_do_not_wait_for_a_writer_holding_the_database() {
     drop(storage);
 }
 
+#[test]
+fn page_reads_do_not_wait_for_a_checkpoint_waiting_on_an_open_reader() {
+    let dir = std::env::temp_dir().join(format!(
+        "appview-checkpoint-read-isolation-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let _guard = TempDirGuard::new(&dir);
+    let path = dir.join("appview.db");
+    let storage = SqliteStorage::open(&path).unwrap();
+    let writer = Connection::open(&path).unwrap();
+    writer
+        .execute_batch(
+            "PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE checkpoint_payload(k INTEGER PRIMARY KEY, v BLOB);",
+        )
+        .unwrap();
+    for index in 0..128 {
+        writer
+            .execute(
+                "INSERT INTO checkpoint_payload VALUES (?1, zeroblob(32768))",
+                [index],
+            )
+            .unwrap();
+    }
+    drop(writer);
+
+    let reader = Connection::open(&path).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT count(*) FROM checkpoint_payload", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+
+    // Keep page reads active across the checkpointer's two-second interval.
+    // Its TRUNCATE attempt is held by the read transaction and times out after
+    // 50 ms; WAL-mode page reads use their own connections and should continue.
+    let deadline = Instant::now() + Duration::from_millis(2_500);
+    let mut worst = Duration::ZERO;
+    let mut reads = 0_u64;
+    while Instant::now() < deadline {
+        let started = Instant::now();
+        assert!(
+            storage
+                .get_record("did:plc:read", "app.bsky.feed.post", "missing")
+                .unwrap()
+                .is_none()
+        );
+        worst = worst.max(started.elapsed());
+        reads += 1;
+    }
+    reader.execute_batch("ROLLBACK").unwrap();
+    drop(reader);
+    drop(storage);
+    assert!(
+        reads > 10,
+        "only {reads} page reads ran during the checkpoint interval"
+    );
+    assert!(
+        worst < Duration::from_millis(100),
+        "page reads waited {worst:?} behind a checkpoint waiting for a reader"
+    );
+}
+
 #[tokio::test]
 async fn large_repo_backfill_is_spread_across_batches_by_a_record_rate_budget() {
     struct EmptyFetcher;
