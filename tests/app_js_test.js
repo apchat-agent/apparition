@@ -1838,7 +1838,8 @@ Deno.test("the timing console button opens the page waterfall only after being t
     assert(button, "the button is added to the page");
     button.listeners.get("click")();
     await new Promise((resolve) => setTimeout(resolve, 0));
-    assertEquals(harness.requests, ["/timing/recent"]);
+    assertEquals(harness.requests.length, 1);
+    assertEquals(harness.requests[0], "/timing/recent");
     const panel = findByClass(harness.body, "timing-console-panel");
     assert(panel && !panel.hidden, "tapping the button opens the panel");
     const text = collectText(panel);
