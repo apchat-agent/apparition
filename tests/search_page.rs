@@ -318,8 +318,9 @@ async fn search_ui_has_styles_and_the_sidebar_search_is_a_working_posts_form() {
         assert!(css.contains(class), "missing search style for {class}");
     }
     assert!(
-        html.contains("<form class=\"search-form\" action=\"/search\" method=\"get\" role=\"search\">")
-            && html.contains("name=\"q\" type=\"search\"")
+        html.contains(
+            "<form class=\"search-form\" action=\"/search\" method=\"get\" role=\"search\">"
+        ) && html.contains("name=\"q\" type=\"search\"")
             && html.contains("name=\"type\" value=\"posts\"")
             && !html.contains("id=\"site-search\" type=\"search\" placeholder=\"Search\" disabled"),
         "the desktop sidebar search must submit a posts query: {html}"

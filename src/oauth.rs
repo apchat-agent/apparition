@@ -118,9 +118,9 @@ const OAUTH_STORE_WRITER_BATCH_SIZE: usize = 64;
 const OAUTH_STORE_WRITER_BATCH_DELAY: Duration = Duration::from_millis(5);
 const OAUTH_STORE_WRITER_METRICS_INTERVAL: Duration = Duration::from_secs(60);
 static NEXT_OAUTH_MEMORY_DATABASE_ID: AtomicUsize = AtomicUsize::new(1);
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m43";
-const WEB_SCRIPT_URL: &str = "/static/app.js?v=js24";
-const WEB_NOJS_STYLESHEET_URL: &str = "/static/nojs.css?v=m43";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m44";
+const WEB_SCRIPT_URL: &str = "/static/app.js?v=js25";
+const WEB_NOJS_STYLESHEET_URL: &str = "/static/nojs.css?v=m44";
 const HLS_SCRIPT_URL: &str = "/static/vendor/hls.min.js?v=1.7.3";
 const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
 const SAVED_FEED_CACHE_PREFIX: &str = "saved-feed-preferences:";
@@ -5605,7 +5605,7 @@ fn render_right_sidebar(feeds: &[ResolvedFeed]) -> String {
             .collect::<String>()
     };
     format!(
-        "<aside class=\"right-sidebar\"><form class=\"search-form\" role=\"search\"><label class=\"sr-only\" for=\"site-search\">Search</label><span aria-hidden=\"true\">{}</span><input id=\"site-search\" type=\"search\" placeholder=\"Search\" disabled></form><section class=\"sidebar-section\"><h2>Feeds</h2><ul>{feed_links}</ul><a class=\"sidebar-more\" href=\"/feeds\">All feeds</a></section></aside>",
+        "<aside class=\"right-sidebar\"><form class=\"search-form\" action=\"/search\" method=\"get\" role=\"search\"><label class=\"sr-only\" for=\"site-search\">Search</label><span aria-hidden=\"true\">{}</span><input id=\"site-search\" name=\"q\" type=\"search\" placeholder=\"Search\"><input type=\"hidden\" name=\"type\" value=\"posts\"><button type=\"submit\">Search</button></form><section class=\"sidebar-section\"><h2>Feeds</h2><ul>{feed_links}</ul><a class=\"sidebar-more\" href=\"/feeds\">All feeds</a></section></aside>",
         icon_svg("search")
     )
 }
@@ -8110,8 +8110,12 @@ fn render_search_form(term: Option<&str>, people: bool) -> String {
         ("", "")
     };
     format!(
-        "<form class=\"search-page-form\" action=\"/search\" method=\"get\" role=\"search\"><label class=\"sr-only\" for=\"search-input\">Search</label><input id=\"search-input\" type=\"search\" name=\"q\" value=\"{value}\" placeholder=\"Search posts and people\"><input type=\"hidden\" name=\"type\" value=\"{active_type}\"><button type=\"submit\">Search</button></form><nav class=\"search-type-tabs\" aria-label=\"Search type\"><a class=\"search-type-tab{}\" href=\"/search?type=posts{kept_query}\"{}>Posts</a><a class=\"search-type-tab{}\" href=\"/search?type=people{kept_query}\"{}>People</a></nav>",
-        posts_state.0, posts_state.1, people_state.0, people_state.1
+        "<form class=\"search-page-form\" action=\"/search\" method=\"get\" role=\"search\"><label class=\"sr-only\" for=\"search-input\">Search</label><span class=\"search-page-icon\" aria-hidden=\"true\">{}</span><input id=\"search-input\" type=\"search\" name=\"q\" value=\"{value}\" placeholder=\"Search posts and people\"><input type=\"hidden\" name=\"type\" value=\"{active_type}\"><button type=\"submit\">Search</button></form><nav class=\"search-type-tabs\" aria-label=\"Search type\"><a class=\"search-type-tab{}\" href=\"/search?type=posts{kept_query}\"{}>Posts</a><a class=\"search-type-tab{}\" href=\"/search?type=people{kept_query}\"{}>People</a></nav>",
+        icon_svg("search"),
+        posts_state.0,
+        posts_state.1,
+        people_state.0,
+        people_state.1
     )
 }
 
@@ -8136,9 +8140,9 @@ fn render_search_actor_row(actor: &SearchActor) -> String {
         })
         .unwrap_or_default();
     format!(
-        "<li class=\"search-actor\"><a class=\"search-actor-link\" href=\"/profile?did={}\">{}<span class=\"search-actor-name\">{}</span><span class=\"search-actor-handle\">@{}</span>{}</a></li>",
+        "<li class=\"search-actor\"><a class=\"search-actor-link\" href=\"/profile?did={}&amp;from=search\">{}<span class=\"search-actor-name\">{}</span><span class=\"search-actor-handle\">@{}</span>{}</a></li>",
         form_encoded(&actor.did),
-        avatar_markup(&profile, "small-avatar"),
+        avatar_markup(&profile, "search-actor-avatar"),
         html_escape(&display_name),
         html_escape(&handle),
         description,
@@ -13555,6 +13559,7 @@ fn avatar_thumbnail_url(avatar: &str) -> Option<String> {
 fn avatar_dimensions(class_name: &str) -> (u16, u16) {
     match class_name {
         "small-avatar" => (32, 32),
+        "search-actor-avatar" => (44, 44),
         "profile-avatar" => (80, 80),
         "focus-avatar" => (56, 56),
         "mobile-profile-avatar" => (25, 25),
@@ -17062,8 +17067,8 @@ mod tests {
         assert!(css.contains(".thread-focus-actions .is-liked .icon {\n  fill: var(--accent);"));
         assert!(css.contains(".infinite-scroll-status {"));
         assert!(css.contains(".infinite-scroll-retry[hidden] {\n  display: none;"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m43"));
-        assert!(WEB_SCRIPT_URL.contains("v=js24"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m44"));
+        assert!(WEB_SCRIPT_URL.contains("v=js25"));
     }
 
     #[test]
@@ -17092,7 +17097,7 @@ mod tests {
         ));
         assert!(css.contains("bottom: var(--mobile-compose-clearance);"));
         assert!(css.contains("padding-bottom: max(4.25rem, var(--mobile-compose-clearance));"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m43"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m44"));
     }
 
     #[test]
@@ -17276,7 +17281,7 @@ mod tests {
         let head = page_shell("Write a post", "", true, None);
         assert!(
             head.contains(
-                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m43\"></noscript>"
+                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m44\"></noscript>"
             ),
             "the head must restore the full form for no-JS visitors: {head}"
         );
@@ -20318,8 +20323,8 @@ mod tests {
             css_declaration(body, "color").as_deref(),
             Some("var(--muted)")
         );
-        assert!(WEB_STYLESHEET_URL.contains("v=m43"));
-        assert!(WEB_NOJS_STYLESHEET_URL.contains("v=m43"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m44"));
+        assert!(WEB_NOJS_STYLESHEET_URL.contains("v=m44"));
     }
 
     #[test]
@@ -20351,7 +20356,7 @@ mod tests {
             css.find(".post-text a.post-text-link {") > css.find(".post-text a {"),
             "the accent rule must come after `.post-text a {{` so it wins the cascade"
         );
-        assert!(WEB_STYLESHEET_URL.contains("v=m43"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m44"));
     }
 }
 
