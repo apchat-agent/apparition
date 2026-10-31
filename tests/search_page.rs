@@ -253,6 +253,10 @@ async fn get_html(router: &Router, uri: &str, cookie: &str) -> String {
 }
 
 fn router_with_search(flow: AcceptingFlow, search: SearchClient) -> Router {
+    router_with_any_search(flow, search)
+}
+
+fn router_with_any_search<F: OAuthFlow>(flow: F, search: SearchClient) -> Router {
     OAuthPublic::new("https://appview.example")
         .unwrap()
         .router_with_flow_and_shutdown_and_profile_counts_and_relationships_and_search(
@@ -639,6 +643,158 @@ async fn people_search_escapes_names_and_descriptions_from_upstream() {
     assert!(
         html.contains("&lt;img src=x onerror=alert(1)&gt; hi"),
         "the description must be shown escaped: {html}"
+    );
+    server.abort();
+}
+
+// Added by lane av64q: anonymous searchPosts answers 403 to any request that carries a
+// cursor, so posts search must run through the viewer's own signed-in session (owner,
+// msgd 2026-10-31).
+
+#[derive(Clone)]
+struct SignedSearchFlow {
+    body: Arc<Mutex<Value>>,
+    calls: Arc<Mutex<Vec<(String, String, Option<String>)>>>,
+}
+
+impl SignedSearchFlow {
+    fn new(body: Value) -> Self {
+        Self {
+            body: Arc::new(Mutex::new(body)),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl OAuthFlow for SignedSearchFlow {
+    fn authorize<'a>(
+        &'a self,
+        _: &'a str,
+        _: &'a str,
+        _: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(async { Ok("https://auth.example/authorize".to_owned()) })
+    }
+    fn callback<'a>(
+        &'a self,
+        _: OAuthCallback,
+    ) -> Pin<Box<dyn Future<Output = Result<OAuthAccount, String>> + Send + 'a>> {
+        Box::pin(async {
+            Ok(OAuthAccount {
+                did: ALICE.to_owned(),
+                verified_handle: Some("alice.test".to_owned()),
+                granted_scope: Some(WRITE_SCOPE.to_owned()),
+            })
+        })
+    }
+    fn logout<'a>(
+        &'a self,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn signed_search_posts<'a>(
+        &'a self,
+        did: &'a str,
+        query: &'a str,
+        cursor: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Value>, String>> + Send + 'a>> {
+        let calls = self.calls.clone();
+        let body = self.body.lock().unwrap().clone();
+        let did = did.to_owned();
+        let query = query.to_owned();
+        let cursor = cursor.map(str::to_owned);
+        Box::pin(async move {
+            calls.lock().unwrap().push((did, query, cursor));
+            Ok(Some(body))
+        })
+    }
+}
+
+fn signed_search_flow(body: Value) -> SignedSearchFlow {
+    SignedSearchFlow::new(body)
+}
+
+#[tokio::test]
+async fn posts_search_uses_the_signed_search_and_never_calls_the_anonymous_api() {
+    let signed_body = json!({
+        "posts": [{
+            "uri": HIT_URI,
+            "cid": "hit1-cid",
+            "author": {
+                "did": "did:plc:searched",
+                "handle": "searched.test",
+                "displayName": "Searched"
+            },
+            "record": {
+                "$type": "app.bsky.feed.post",
+                "text": "signed mincy post",
+                "createdAt": "2026-10-31T12:00:00.000Z"
+            },
+            "indexedAt": "2026-10-31T12:00:01.000Z"
+        }],
+        "cursor": "signed-cursor-2"
+    });
+    let (base, fake, server) = start_fake_search(search_posts_body(None)).await;
+    let flow = signed_search_flow(signed_body);
+    let router = router_with_any_search(flow.clone(), search_client(&base));
+    let cookie = login(&router).await;
+    let html = get_html(&router, "/search?q=minc", &cookie).await;
+    assert_eq!(
+        fake.calls.load(Ordering::SeqCst),
+        0,
+        "a signed answer must not spend the anonymous call"
+    );
+    let calls = flow.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls,
+        vec![(ALICE.to_owned(), "minc".to_owned(), None)],
+        "the flow must get the viewer DID and the query"
+    );
+    assert!(
+        html.contains("signed mincy post"),
+        "the signed search's posts must render: {html}"
+    );
+    assert!(
+        html.contains(
+            "<a class=\"pagination-link\" rel=\"next\" href=\"/search?q=minc&amp;type=posts&amp;cursor=signed-cursor-2\">More results</a>"
+        ),
+        "the signed response's cursor must drive the More results link: {html}"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn the_page_cursor_is_forwarded_to_the_signed_search() {
+    let signed_body = json!({"posts": [], "cursor": null});
+    let (base, fake, server) = start_fake_search(search_posts_body(None)).await;
+    let flow = signed_search_flow(signed_body);
+    let router = router_with_any_search(flow.clone(), search_client(&base));
+    let cookie = login(&router).await;
+    let html = get_html(
+        &router,
+        "/search?q=minc&type=posts&cursor=cursor-page-2",
+        &cookie,
+    )
+    .await;
+    assert_eq!(
+        fake.calls.load(Ordering::SeqCst),
+        0,
+        "the anonymous endpoint must stay untouched once the flow can answer"
+    );
+    let calls = flow.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls,
+        vec![(
+            ALICE.to_owned(),
+            "minc".to_owned(),
+            Some("cursor-page-2".to_owned())
+        )],
+        "the cursor from /search?q=..&cursor=X must reach the flow: {calls:?}"
+    );
+    assert!(
+        html.contains("empty-state"),
+        "the empty signed answer still renders the page: {html}"
     );
     server.abort();
 }
