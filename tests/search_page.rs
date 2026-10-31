@@ -329,6 +329,100 @@ async fn search_ui_has_styles_and_the_sidebar_search_is_a_working_posts_form() {
 }
 
 #[tokio::test]
+async fn recent_profiles_keep_the_latest_ten_search_result_clicks_in_order() {
+    let actors = json!({"actors": (0..12).map(|index| json!({
+        "did": format!("did:plc:recent{index}"),
+        "handle": format!("recent{index}.test"),
+        "displayName": format!("Recent {index}"),
+        "description": format!("Bio {index}"),
+    })).collect::<Vec<_>>()});
+    let (base, _fake, server) = start_fake_search_with(search_posts_body(None), actors).await;
+    let storage = Arc::new(MemoryStorage::default());
+    let router = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow_and_shutdown_and_profile_counts_and_relationships_and_search(
+            AcceptingFlow,
+            storage,
+            WebShutdown::new(),
+            ProfileCountsClient::local_only(),
+            RelationshipClient::local_only(),
+            search_client(&base),
+        );
+    let cookie = login(&router).await;
+    let results = get_html(&router, "/search?q=recent&type=people", &cookie).await;
+    assert!(results.contains("&amp;from=search"), "search result links must carry the marker: {results}");
+
+    for index in 0..12 {
+        let response = response_for(
+            &router,
+            &format!("/profile?did=did%3Aplc%3Arecent{index}&from=search"),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let reopened = response_for(
+        &router,
+        "/profile?did=did%3Aplc%3Arecent5&from=search",
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(reopened.status(), StatusCode::OK);
+
+    let html = get_html(&router, "/search?type=people", &cookie).await;
+    let rows = html
+        .split("<ol class=\"search-actor-list\">")
+        .nth(1)
+        .unwrap_or_default()
+        .split("</ol>")
+        .next()
+        .unwrap_or_default();
+    assert!(html.contains("Recent"), "the blank People tab must show recent profiles: {html}");
+    assert!(rows.contains("Recent 5"), "reopened profile should be first: {rows}");
+    assert!(rows.contains("Bio 5"), "stored public profile bio should be reused: {rows}");
+    assert_eq!(rows.matches("search-actor\"").count(), 10, "keep only ten unique profiles: {rows}");
+    assert!(!rows.contains("Recent 0") && !rows.contains("Recent 1"), "oldest profiles should be evicted: {rows}");
+    server.abort();
+}
+
+#[tokio::test]
+async fn recent_profile_clear_requires_same_origin_and_redirects_back_to_people_search() {
+    let (base, _fake, server) = start_fake_search(search_posts_body(None)).await;
+    let router = router_with_search(AcceptingFlow, search_client(&base));
+    let cookie = login(&router).await;
+    let cross_origin = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/search/recent/clear")
+                .header("origin", "https://evil.example")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cross_origin.status(), StatusCode::FORBIDDEN);
+
+    let cleared = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/search/recent/clear")
+                .header("origin", "https://appview.example")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cleared.status(), StatusCode::SEE_OTHER);
+    assert_eq!(cleared.headers()["location"], "/search?type=people");
+    server.abort();
+}
+
+#[tokio::test]
 async fn empty_query_search_shows_the_form_and_makes_no_outbound_call() {
     let (base, fake, server) = start_fake_search(search_posts_body(None)).await;
     let router = router_with_search(AcceptingFlow, search_client(&base));
