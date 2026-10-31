@@ -7113,8 +7113,7 @@ async fn a_like_only_session_shows_the_like_button_but_hides_repost_and_compose(
 }
 
 #[tokio::test]
-async fn a_like_only_session_can_like_from_the_thread_page_but_sees_no_repost_or_reply_composer()
-{
+async fn a_like_only_session_can_like_from_the_thread_page_but_sees_no_repost_or_reply_composer() {
     let flow = FakeOAuthFlow::with_granted_scope(Some(EXPECTED_LIKE_ONLY_SCOPE));
     let storage = Arc::new(MemoryStorage::default());
     storage
@@ -7135,9 +7134,7 @@ async fn a_like_only_session_can_like_from_the_thread_page_but_sees_no_repost_or
     let response = app
         .oneshot(
             Request::builder()
-                .uri(
-                    "/app/thread?uri=at%3A%2F%2Fdid%3Aplc%3Aauthor%2Fapp.bsky.feed.post%2Fone",
-                )
+                .uri("/app/thread?uri=at%3A%2F%2Fdid%3Aplc%3Aauthor%2Fapp.bsky.feed.post%2Fone")
                 .header("cookie", cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -7167,6 +7164,85 @@ async fn a_like_only_session_can_like_from_the_thread_page_but_sees_no_repost_or
     assert!(
         !html.contains("reply-composer"),
         "no post box was ticked, so no reply composer: {html}"
+    );
+}
+
+#[tokio::test]
+async fn a_partial_session_gets_an_allow_more_link_pre_ticked_with_its_current_boxes() {
+    let flow = FakeOAuthFlow::with_granted_scope(Some(EXPECTED_LIKE_ONLY_SCOPE));
+    let storage = Arc::new(MemoryStorage::default());
+    storage
+        .set_follow("did:plc:alice", "did:plc:author", true)
+        .unwrap();
+    storage
+        .put_record(&fake_feed_post("did:plc:author", "one", 10, "a post"))
+        .unwrap();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage);
+    let cookie = finish_login(&app).await;
+    let html = String::from_utf8(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/app")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        html.contains("class=\"allow-more\" href=\"/login?allow=like\""),
+        "a like-only session gets an Allow more link that keeps its like box ticked: {html}"
+    );
+    assert!(html.contains("Allow more"), "{html}");
+}
+
+#[tokio::test]
+async fn a_full_session_sees_no_allow_more_link() {
+    let flow = FakeOAuthFlow::with_granted_scope(Some(EXPECTED_ALL_BOXES_SCOPE));
+    let storage = Arc::new(MemoryStorage::default());
+    storage
+        .set_follow("did:plc:alice", "did:plc:author", true)
+        .unwrap();
+    storage
+        .put_record(&fake_feed_post("did:plc:author", "one", 10, "a post"))
+        .unwrap();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage);
+    let cookie = finish_login(&app).await;
+    let html = String::from_utf8(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/app")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        !html.contains("Allow more"),
+        "a session holding all five boxes must not be offered more: {html}"
     );
 }
 
