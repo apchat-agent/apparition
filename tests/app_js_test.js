@@ -423,6 +423,93 @@ Deno.test("like handler fills the heart and clears it when unliked", async () =>
   assert(!form.submitted, "successful requests should keep using the in-place handler");
 });
 
+Deno.test("a SessionExpired 401 sends the browser to sign in again instead of resubmitting", async () => {
+  const listeners = new Map();
+  const documentMock = {
+    addEventListener(name, listener) {
+      listeners.set(name, listener);
+    },
+    querySelector() {
+      return null;
+    },
+    querySelectorAll() {
+      return [];
+    },
+    createElement() {
+      return {};
+    },
+  };
+  const button = {
+    disabled: false,
+    attributes: new Map(),
+    childNodes: [],
+    classList: { toggle() {}, contains() { return false; } },
+    getAttribute() { return null; },
+    setAttribute() {},
+    querySelector() { return null; },
+    append() {},
+  };
+  class FakeFormElement {
+    constructor() {
+      this.submitted = false;
+    }
+    getAttribute(name) {
+      return name === "action" ? "/like" : null;
+    }
+    querySelector(selector) {
+      return selector === "button" ? button : null;
+    }
+    append() {}
+    submit() {
+      this.submitted = true;
+    }
+  }
+  const form = new FakeFormElement();
+
+  globalThis.document = documentMock;
+  globalThis.HTMLFormElement = FakeFormElement;
+  globalThis.Node = { TEXT_NODE: 3 };
+  const assignments = [];
+  globalThis.window = {
+    scrollY: 0,
+    scrollX: 0,
+    visualViewport: { addEventListener() {} },
+    location: {
+      assign(url) {
+        assignments.push(url);
+      },
+    },
+  };
+  globalThis.FormData = class {
+    [Symbol.iterator]() {
+      return [][Symbol.iterator]();
+    }
+  };
+  globalThis.fetch = async () => ({
+    ok: false,
+    status: 401,
+    json: async () => ({ error: "SessionExpired", message: "Your Bluesky sign-in expired; please sign in again." }),
+  });
+
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  new Function(source)();
+  const submit = listeners.get("submit");
+  assert(submit);
+
+  await submit({ target: form, preventDefault() {} });
+  assert(
+    assignments.length === 1 && assignments[0] === "/login?session_expired=1",
+    `the dead session must send the browser to sign in again, got ${JSON.stringify(assignments)}`,
+  );
+  assert(!form.submitted, "a dead session must not resubmit the form");
+
+  globalThis.window = {
+    scrollY: 0,
+    scrollX: 0,
+    visualViewport: { addEventListener() {} },
+  };
+});
+
 Deno.test("notification badges update from SSE and fall back to 30-second polling", async () => {
   const listeners = new Map();
   const visibilityListeners = new Map();

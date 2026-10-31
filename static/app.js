@@ -15,6 +15,21 @@ function noteFetchTimingId(response, startedAt) {
   return response;
 }
 
+async function signInIfSessionExpired(response) {
+  if (response.status !== 401) return false;
+  let body;
+  try {
+    body = await response.json();
+  } catch {
+    return false;
+  }
+  if (body && body.error === "SessionExpired") {
+    window.location.assign("/login?session_expired=1");
+    return true;
+  }
+  return false;
+}
+
 document.addEventListener("change", (event) => {
   const select = event.target;
   if (!(select instanceof HTMLSelectElement) || !select.matches("[data-profile-list-select]")) return;
@@ -82,7 +97,10 @@ document.addEventListener("submit", async (event) => {
         headers: { "x-appview-fetch": "1" },
         credentials: "same-origin",
       });
-      if (!response.ok) throw new Error(String(response.status));
+      if (!response.ok) {
+        if (await signInIfSessionExpired(response)) return;
+        throw new Error(String(response.status));
+      }
       const result = await response.json();
       const current = document.querySelector(".profile-actions");
       if (!current || typeof result.actions_html !== "string") throw new Error("profile actions are unavailable");
@@ -114,7 +132,10 @@ document.addEventListener("submit", async (event) => {
       headers: { "x-appview-fetch": "1" },
       credentials: "same-origin",
     });
-    if (!response.ok) throw new Error(String(response.status));
+    if (!response.ok) {
+      if (await signInIfSessionExpired(response)) return;
+      throw new Error(String(response.status));
+    }
     const state = await response.json();
     button.classList.toggle("is-liked", state.liked);
     button.setAttribute("aria-pressed", state.liked ? "true" : "false");
@@ -1198,7 +1219,7 @@ function applyListBlockLeak(root = document) {
 }
 
 function installBlockListLeakSettings() {
-document.addEventListener("change", (event) => {
+  document.addEventListener("change", (event) => {
     const input = event.target;
     if (!input?.matches?.("[data-list-block-uri]")) return;
     const listUri = input.getAttribute("data-list-block-uri");

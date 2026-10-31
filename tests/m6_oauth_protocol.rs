@@ -2473,7 +2473,9 @@ async fn a_refresh_rejected_with_invalid_grant_is_logged_with_the_authorization_
         .await
         .unwrap();
     drop(_capture_guard);
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    // A rejected refresh kills the session, so the user is sent to sign in again; the warn
+    // line below is the point of this test.
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
 
     let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
     let refresh_line = logs

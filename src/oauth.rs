@@ -84,7 +84,7 @@ use std::{
     sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread::JoinHandle,
 };
@@ -117,9 +117,9 @@ const OAUTH_STORE_WRITER_BATCH_SIZE: usize = 64;
 const OAUTH_STORE_WRITER_BATCH_DELAY: Duration = Duration::from_millis(5);
 const OAUTH_STORE_WRITER_METRICS_INTERVAL: Duration = Duration::from_secs(60);
 static NEXT_OAUTH_MEMORY_DATABASE_ID: AtomicUsize = AtomicUsize::new(1);
-const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m39";
+const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m40";
 const WEB_SCRIPT_URL: &str = "/static/app.js?v=js24";
-const WEB_NOJS_STYLESHEET_URL: &str = "/static/nojs.css?v=m39";
+const WEB_NOJS_STYLESHEET_URL: &str = "/static/nojs.css?v=m40";
 const HLS_SCRIPT_URL: &str = "/static/vendor/hls.min.js?v=1.7.3";
 const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
 const SAVED_FEED_CACHE_PREFIX: &str = "saved-feed-preferences:";
@@ -1578,9 +1578,18 @@ impl HttpClient for OAuthMetadataHttpClient {
                     .get("error_description")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("");
-                let did = OAUTH_TOKEN_REQUEST_DID
-                    .try_with(Clone::clone)
-                    .unwrap_or_else(|_| "-".to_owned());
+                let attempt = OAUTH_TOKEN_REQUEST
+                    .try_with(Arc::clone)
+                    .unwrap_or_else(|_| {
+                        Arc::new(OAuthTokenAttempt {
+                            did: "-".to_owned(),
+                            grant_rejected: AtomicBool::new(false),
+                        })
+                    });
+                if error == "invalid_grant" {
+                    attempt.grant_rejected.store(true, Ordering::Relaxed);
+                }
+                let did = attempt.did.clone();
                 tracing::warn!(
                     did = %did,
                     issuer = %issuer,
@@ -1651,8 +1660,53 @@ impl HttpClient for OAuthMetadataHttpClient {
     }
 }
 
+/// Whose token request this is, and whether the authorization server said `invalid_grant`
+/// (the refresh token itself is dead, so no retry can revive the session).
+struct OAuthTokenAttempt {
+    did: String,
+    grant_rejected: AtomicBool,
+}
+
 tokio::task_local! {
-    static OAUTH_TOKEN_REQUEST_DID: String;
+    static OAUTH_TOKEN_REQUEST: Arc<OAuthTokenAttempt>;
+}
+
+tokio::task_local! {
+    static OAUTH_SESSION_DEAD_DID: Arc<Mutex<Option<String>>>;
+}
+
+fn mark_oauth_session_dead(did: &str) {
+    let _ = OAUTH_SESSION_DEAD_DID.try_with(|slot| {
+        if let Ok(mut slot) = slot.lock() {
+            *slot = Some(did.to_owned());
+        }
+    });
+}
+
+fn take_dead_oauth_session() -> Option<String> {
+    OAUTH_SESSION_DEAD_DID
+        .try_with(|slot| slot.lock().ok().and_then(|mut slot| slot.take()))
+        .unwrap_or(None)
+}
+
+/// The user's Bluesky sign-in is dead: clear this app's cookie, send them to sign in again,
+/// and tell fetch callers with 401 SessionExpired instead of a redirect they cannot read.
+fn session_expired_response(public: &OAuthPublic, headers: &HeaderMap) -> Response {
+    const MESSAGE: &str = "Your Bluesky sign-in expired; please sign in again.";
+    if headers
+        .get("x-appview-fetch")
+        .is_some_and(|value| value.as_bytes() == b"1")
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"SessionExpired","message":MESSAGE})),
+        )
+            .into_response();
+    }
+    clear_session_cookie(
+        Redirect::to("/login?session_expired=1").into_response(),
+        public.secure_cookies(),
+    )
 }
 
 #[derive(Clone)]
@@ -1688,8 +1742,12 @@ impl XrpcClient for SharedOAuthSession {
         O: serde::de::DeserializeOwned + Send + Sync,
         E: serde::de::DeserializeOwned + Send + Sync + std::fmt::Debug,
     {
-        let result = OAUTH_TOKEN_REQUEST_DID
-            .scope(self.did.clone(), self.inner.send_xrpc(request))
+        let attempt = Arc::new(OAuthTokenAttempt {
+            did: self.did.clone(),
+            grant_rejected: AtomicBool::new(false),
+        });
+        let result = OAUTH_TOKEN_REQUEST
+            .scope(attempt.clone(), self.inner.send_xrpc(request))
             .await;
         if let Err(error) = &result
             && format!("{error:?}")
@@ -1703,8 +1761,8 @@ impl XrpcClient for SharedOAuthSession {
             self.cache.lock().await.remove(&self.did);
             self.restores.lock().await.remove(&self.did);
             if self.expire_stored_session().await {
-                let retry = OAUTH_TOKEN_REQUEST_DID
-                    .scope(self.did.clone(), self.inner.send_xrpc(request))
+                let retry = OAUTH_TOKEN_REQUEST
+                    .scope(attempt.clone(), self.inner.send_xrpc(request))
                     .await;
                 if retry.is_ok() {
                     // The retried call refreshed this session in place; the cache must only
@@ -1716,6 +1774,21 @@ impl XrpcClient for SharedOAuthSession {
                             self.inner.clone(),
                         ),
                     );
+                } else if attempt.grant_rejected.load(Ordering::Relaxed) {
+                    // The authorization server rejected the refresh token itself: this
+                    // session cannot be revived, so delete it and tell the request handler
+                    // to send the user to sign in again instead of failing the write.
+                    tracing::warn!(
+                        did = %self.did,
+                        error = %format!("{error:?}"),
+                        "OAuth session is dead: the authorization server rejected the refresh token"
+                    );
+                    if let Ok(did) = self.did.parse::<Did>() {
+                        let _ = self.store.del(&did).await;
+                    }
+                    self.cache.lock().await.remove(&self.did);
+                    self.restores.lock().await.remove(&self.did);
+                    mark_oauth_session_dead(&self.did);
                 }
                 return retry;
             }
@@ -2541,6 +2614,20 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             .await
             .clone();
 
+        if let Err(error) = &result
+            && error
+                .to_ascii_lowercase()
+                .contains("session does not exist")
+        {
+            // The stored session is gone (e.g. deleted as dead by an earlier request): there
+            // is nothing to restore, so the user must sign in again rather than see a failure.
+            tracing::warn!(
+                did = %key,
+                error = %error,
+                "OAuth session cannot be restored: sending the user to sign in again"
+            );
+            mark_oauth_session_dead(&key);
+        }
         if let Ok(session) = &result {
             let now = tokio::time::Instant::now();
             let mut cache = self.session_cache.lock().await;
@@ -5388,14 +5475,17 @@ fn oauth_named_error(status: StatusCode, message: &str) -> Response {
 /// warned with route + DID, recorded for the `web write` line, and the user gets an error whose
 /// message names what failed instead of "the request could not be completed".
 fn web_write_response(
-    _public: &OAuthPublic,
-    _headers: &HeaderMap,
+    public: &OAuthPublic,
+    headers: &HeaderMap,
     route: &str,
     verb: &str,
     did: &str,
     status: StatusCode,
     error: &str,
 ) -> Response {
+    if take_dead_oauth_session().is_some() {
+        return session_expired_response(public, headers);
+    }
     tracing::warn!(route, did = %did, error = %error, "web write failed");
     record_web_write_failure(error);
     let message = if status == StatusCode::BAD_GATEWAY {
@@ -5465,13 +5555,17 @@ async fn account_web_outbound_calls<F: OAuthFlow, S: Storage + 'static>(
     let accounting = RequestOutboundAccounting::default();
     let page_phases = WebPagePhaseDetail::default();
     let write_failure = Arc::new(Mutex::new(None::<String>));
+    let dead_session = Arc::new(Mutex::new(None::<String>));
     let response = with_request_outbound_accounting(
         accounting.clone(),
         with_web_page_phase_detail(
             page_phases.clone(),
             with_request_timing_id(
                 timing_id.clone(),
-                with_web_write_failure(write_failure.clone(), next.run(request)),
+                with_web_write_failure(
+                    write_failure.clone(),
+                    OAUTH_SESSION_DEAD_DID.scope(dead_session, next.run(request)),
+                ),
             ),
         ),
     )
@@ -6467,15 +6561,23 @@ fn remember_handle_cookie(handle: &str, secure: bool) -> Option<String> {
     })
 }
 
-async fn login(headers: HeaderMap) -> Html<String> {
+async fn login(headers: HeaderMap, Query(query): Query<HashMap<String, String>>) -> Html<String> {
     let value = cookie_value_named(&headers, HANDLE_COOKIE)
         .filter(|handle| handle_shaped(handle))
         .map(|handle| format!(" value=\"{}\"", html_escape(handle)))
         .unwrap_or_default();
+    let notice = if query
+        .get("session_expired")
+        .is_some_and(|value| value == "1")
+    {
+        "<p class=\"intro notice\" role=\"alert\">Your Bluesky sign-in expired; please sign in again.</p>"
+    } else {
+        ""
+    };
     Html(page_shell(
         "Sign in",
         &format!(
-            "<section class=\"login-card\"><p class=\"eyebrow\">Your network, your view</p><h1>Sign in to AppView</h1><p class=\"intro\">Use your AT Protocol handle or DID to continue securely with your account provider.</p><form action=\"/oauth/authorize\" method=\"post\" class=\"login-form\"><label for=\"handle\">AT Protocol handle or DID</label><input id=\"handle\" name=\"handle\" autocomplete=\"username\" autocapitalize=\"none\" placeholder=\"you.bsky.social\"{value} required><button type=\"submit\">Continue</button></form></section>"
+            "<section class=\"login-card\"><p class=\"eyebrow\">Your network, your view</p><h1>Sign in to AppView</h1>{notice}<p class=\"intro\">Use your AT Protocol handle or DID to continue securely with your account provider.</p><form action=\"/oauth/authorize\" method=\"post\" class=\"login-form\"><label for=\"handle\">AT Protocol handle or DID</label><input id=\"handle\" name=\"handle\" autocomplete=\"username\" autocapitalize=\"none\" placeholder=\"you.bsky.social\"{value} required><button type=\"submit\">Continue</button></form></section>"
         ),
         false,
     ))
@@ -7386,7 +7488,12 @@ where
     }
     let feeds = match state.flow.pinned_feed_tabs(&did).await {
         Ok(tabs) => tabs.feeds,
-        Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
+        Err(error) => {
+            if take_dead_oauth_session().is_some() {
+                return session_expired_response(&state.public, &headers);
+            }
+            return oauth_error(StatusCode::BAD_GATEWAY, &error);
+        }
     };
     let entries = feeds.iter().map(render_feed_card).collect::<String>();
     let entries = if entries.is_empty() {
@@ -7514,7 +7621,12 @@ where
             .await
         {
             Ok(page) => page,
-            Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
+            Err(error) => {
+                if take_dead_oauth_session().is_some() {
+                    return session_expired_response(&state.public, &headers);
+                }
+                return oauth_error(StatusCode::BAD_GATEWAY, &error);
+            }
         }
     };
     if !page.timing.cache_hit {
@@ -15843,7 +15955,7 @@ mod tests {
         assert!(css.contains(".thread-focus-actions .is-liked .icon {\n  fill: var(--accent);"));
         assert!(css.contains(".infinite-scroll-status {"));
         assert!(css.contains(".infinite-scroll-retry[hidden] {\n  display: none;"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m39"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m40"));
         assert!(WEB_SCRIPT_URL.contains("v=js24"));
     }
 
@@ -15873,7 +15985,7 @@ mod tests {
         ));
         assert!(css.contains("bottom: var(--mobile-compose-clearance);"));
         assert!(css.contains("padding-bottom: max(4.25rem, var(--mobile-compose-clearance));"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m39"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m40"));
     }
 
     #[test]
@@ -16057,7 +16169,7 @@ mod tests {
         let head = page_shell("Write a post", "", true);
         assert!(
             head.contains(
-                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m39\"></noscript>"
+                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m40\"></noscript>"
             ),
             "the head must restore the full form for no-JS visitors: {head}"
         );
@@ -18687,7 +18799,7 @@ mod tests {
             header::COOKIE,
             "appview_handle=owner.example.test".parse().unwrap(),
         );
-        let Html(body) = login(headers).await;
+        let Html(body) = login(headers, Query(HashMap::new())).await;
         assert!(body.contains("value=\"owner.example.test\""), "{body}");
 
         let mut headers = HeaderMap::new();
@@ -18695,7 +18807,7 @@ mod tests {
             header::COOKIE,
             "appview_handle=x\"onfocus=alert(1)".parse().unwrap(),
         );
-        let Html(body) = login(headers).await;
+        let Html(body) = login(headers, Query(HashMap::new())).await;
         assert!(!body.contains("onfocus"), "{body}");
     }
 
@@ -18982,8 +19094,8 @@ mod tests {
             css_declaration(body, "color").as_deref(),
             Some("var(--muted)")
         );
-        assert!(WEB_STYLESHEET_URL.contains("v=m39"));
-        assert!(WEB_NOJS_STYLESHEET_URL.contains("v=m39"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m40"));
+        assert!(WEB_NOJS_STYLESHEET_URL.contains("v=m40"));
     }
 
     #[test]
@@ -19015,7 +19127,7 @@ mod tests {
             css.find(".post-text a.post-text-link {") > css.find(".post-text a {"),
             "the accent rule must come after `.post-text a {{` so it wins the cascade"
         );
-        assert!(WEB_STYLESHEET_URL.contains("v=m39"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m40"));
     }
 }
 
