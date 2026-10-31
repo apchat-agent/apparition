@@ -363,3 +363,50 @@ fn moving_an_interaction_into_a_warm_post_updates_both_cached_rows() {
     drop(storage);
     remove_database(&path);
 }
+
+#[test]
+fn a_viewer_lookup_on_a_popular_post_walks_only_the_viewers_own_rows() {
+    let path = database_path("viewer-popular");
+    remove_database(&path);
+    let storage = SqliteStorage::open(&path).unwrap();
+    let popular = post_uri(300);
+    // Production SQL, not a copy: without INDEXED BY the planner may walk every
+    // like on the post (records_collection_subject_uri) and filter by did.
+    let updates = (0..2_000)
+        .map(|index| JetstreamStorageUpdate {
+            upsert: Some(record(
+                &format!("did:plc:fan-{index}"),
+                "app.bsky.feed.like",
+                "like",
+                &popular,
+            )),
+            ..JetstreamStorageUpdate::default()
+        })
+        .collect::<Vec<_>>();
+    storage.apply_jetstream_batch(&updates).unwrap();
+    storage
+        .put_record(&record(
+            "did:plc:viewer",
+            "app.bsky.feed.like",
+            "mine",
+            &popular,
+        ))
+        .unwrap();
+    storage.post_interaction_summary(&popular, None).unwrap(); // warm the count row
+
+    let (summary, work) = storage
+        .post_interaction_summary_counted(&popular, Some("did:plc:viewer"))
+        .unwrap();
+    assert_eq!(summary.like_count, 2_001);
+    assert_eq!(
+        summary.viewer_like.as_deref(),
+        Some("at://did:plc:viewer/app.bsky.feed.like/mine")
+    );
+    assert!(
+        work.vm_steps < 2_000,
+        "viewer lookup did {} VM steps on a post with 2,001 likes",
+        work.vm_steps
+    );
+    drop(storage);
+    remove_database(&path);
+}
