@@ -284,6 +284,24 @@ struct SessionPermissions {
     post: bool,
 }
 
+/// Which per-activity write forms a session may see (owner, msgd 2026-10-31). Each feed/thread
+/// control is gated on its own box, so a like-only reader gets a like button but no repost menu or
+/// compose box instead of the all-or-nothing old `write` behaviour.
+#[derive(Clone, Copy, Default)]
+struct FormRights {
+    post: bool,
+    repost: bool,
+    like: bool,
+}
+
+impl FormRights {
+    /// True when the session can make at least one kind of change, so the page need not show the
+    /// blanket "read-only" notice.
+    fn any(self) -> bool {
+        self.post || self.repost || self.like
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OAuthCallback {
     pub code: String,
@@ -7576,8 +7594,7 @@ where
     if let Err(error) = queue_missing_parent_authors(state.storage.as_ref(), &parents) {
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
-    let write_forms_enabled =
-        verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
+    let rights = verified_cookie_form_rights(&state.public, &headers, state.storage.as_ref());
     let render_started = std::time::Instant::now();
     let posts = render_timeline_post_items(
         state.storage.as_ref(),
@@ -7586,7 +7603,7 @@ where
         &parents,
         &TimelineRenderContext {
             viewer_did: &did,
-            write_forms_enabled,
+            rights,
             quote_index: &quote_index,
             list_blocks: &list_blocks,
         },
@@ -7625,12 +7642,12 @@ where
         String::new()
     };
     let rest_render_started = std::time::Instant::now();
-    let read_only_message = if write_forms_enabled {
+    let read_only_message = if rights.any() {
         String::new()
     } else {
         "<p role=\"status\">Read-only: write permissions were not granted, so posting, liking, and reposting are disabled.</p>".to_owned()
     };
-    let post_form = if write_forms_enabled {
+    let post_form = if rights.post {
         let blob_access =
             verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref());
         let video_access =
@@ -7945,8 +7962,7 @@ where
     if let Err(error) = queue_missing_parent_authors(state.storage.as_ref(), &parents) {
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
-    let write_forms_enabled =
-        verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
+    let rights = verified_cookie_form_rights(&state.public, &headers, state.storage.as_ref());
     let render_started = std::time::Instant::now();
     let feed_preludes = feed_items
         .iter()
@@ -7969,7 +7985,7 @@ where
         &parents,
         &TimelineRenderContext {
             viewer_did: &did,
-            write_forms_enabled,
+            rights,
             quote_index: &quote_index,
             list_blocks: &list_blocks,
         },
@@ -9306,8 +9322,7 @@ where
     .into_iter()
     .flatten()
     .collect::<String>();
-    let write_forms_enabled =
-        verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
+    let rights = verified_cookie_form_rights(&state.public, &headers, state.storage.as_ref());
     let render_started = std::time::Instant::now();
     let no_list_blocks = HashMap::new();
     let posts = render_timeline_post_items(
@@ -9317,7 +9332,7 @@ where
         &parents,
         &TimelineRenderContext {
             viewer_did: &did,
-            write_forms_enabled,
+            rights,
             quote_index: &quote_index,
             list_blocks: &no_list_blocks,
         },
@@ -10020,8 +10035,7 @@ where
     } else {
         page_timing.timeline_fetch_index_ms += record_elapsed_ms;
     }
-    let write_forms_enabled =
-        verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
+    let rights = verified_cookie_form_rights(&state.public, &headers, state.storage.as_ref());
     let parent_height = query
         .get("parentHeight")
         .and_then(|value| value.parse::<usize>().ok())
@@ -10105,7 +10119,7 @@ where
                     state.storage.as_ref(),
                     ancestor,
                     &viewer_did,
-                    write_forms_enabled,
+                    rights,
                     false,
                     index < 6,
                     &quote_index,
@@ -10121,7 +10135,7 @@ where
         .collect::<HashSet<_>>();
     let reply_options = ThreadReplyRenderOptions {
         viewer_did: &viewer_did,
-        write_forms_enabled,
+        rights,
         thread_continuations: &thread_continuations,
         quote_index: &quote_index,
     };
@@ -10135,12 +10149,12 @@ where
         Ok(replies) => replies,
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
-    let read_only_message = if write_forms_enabled {
+    let read_only_message = if rights.any() {
         String::new()
     } else {
         "<p role=\"status\">Read-only: write permissions were not granted.</p>".to_owned()
     };
-    let reply_composer = if write_forms_enabled {
+    let reply_composer = if rights.post {
         render_reply_composer(
             state.storage.as_ref(),
             &viewer_did,
@@ -10151,7 +10165,7 @@ where
     } else {
         String::new()
     };
-    let reply_bar = if write_forms_enabled {
+    let reply_bar = if rights.post {
         render_thread_reply_bar(state.storage.as_ref(), &viewer_did)
     } else {
         String::new()
@@ -10167,7 +10181,7 @@ where
                 state.storage.as_ref(),
                 &record,
                 &viewer_did,
-                write_forms_enabled,
+                rights,
                 true,
                 &quote_index,
             )
@@ -10236,9 +10250,8 @@ where
     ) {
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
-    let write_forms_enabled =
-        verified_cookie_write_access(&state.public, &headers, state.storage.as_ref());
-    let composer = if write_forms_enabled {
+    let rights = verified_cookie_form_rights(&state.public, &headers, state.storage.as_ref());
+    let composer = if rights.post {
         let blob_access =
             verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref());
         let video_access =
@@ -10749,7 +10762,7 @@ fn render_thread_focus<S: Storage>(
     storage: &S,
     record: &IndexedRecord,
     viewer_did: &str,
-    write_forms_enabled: bool,
+    rights: FormRights,
     eager_avatar: bool,
     quote_index: &QuoteRenderIndex,
 ) -> String {
@@ -10817,7 +10830,7 @@ fn render_thread_focus<S: Storage>(
         icon_svg("reply"),
         action_count_markup(interactions.reply_count)
     );
-    let repost_action = if write_forms_enabled {
+    let repost_action = if rights.repost {
         format!(
             "<details class=\"repost-menu\"><summary class=\"post-action\" aria-label=\"Repost menu\">{}<span class=\"sr-only\">Repost</span>{}</summary><div class=\"repost-menu-options\"><form class=\"post-action-form\" action=\"/repost\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\"><button class=\"post-action\" type=\"submit\" aria-label=\"Repost by @{}\">Repost</button></form><a href=\"/compose?quote_uri={}\">Quote post</a></div></details>",
             icon_svg("repost"),
@@ -10832,7 +10845,7 @@ fn render_thread_focus<S: Storage>(
             action_count_markup(interactions.repost_count)
         )
     };
-    let like_action = if write_forms_enabled {
+    let like_action = if rights.like {
         let liked = interactions.viewer_like.is_some();
         let intent = interactions
             .viewer_like
@@ -10943,7 +10956,7 @@ fn collect_thread_reply_records<S: Storage>(
 
 struct ThreadReplyRenderOptions<'a> {
     viewer_did: &'a str,
-    write_forms_enabled: bool,
+    rights: FormRights,
     thread_continuations: &'a HashSet<String>,
     quote_index: &'a QuoteRenderIndex,
 }
@@ -10977,7 +10990,7 @@ fn render_thread_replies<S: Storage>(
                 storage,
                 reply,
                 options.viewer_did,
-                options.write_forms_enabled,
+                options.rights,
                 false,
                 false,
                 options.quote_index
@@ -12451,13 +12464,20 @@ fn verified_cookie_did<S: Storage>(
     verified_cookie_session(public, headers, storage).map(|(did, _, _, _)| did)
 }
 
-fn verified_cookie_write_access<S: Storage>(
+/// The per-activity form rights a signed-in viewer holds, read once so every feed/thread control
+/// can be gated on its own box.
+fn verified_cookie_form_rights<S: Storage>(
     public: &OAuthPublic,
     headers: &HeaderMap,
     storage: &S,
-) -> bool {
+) -> FormRights {
     verified_cookie_session(public, headers, storage)
-        .is_some_and(|(_, _, _, permissions)| permissions.write)
+        .map(|(_, _, _, permissions)| FormRights {
+            post: permissions.post,
+            repost: permissions.repost,
+            like: permissions.like,
+        })
+        .unwrap_or_default()
 }
 
 fn verified_cookie_post_access<S: Storage>(
@@ -13304,7 +13324,7 @@ fn render_web_post<S: Storage>(
     storage: &S,
     record: &IndexedRecord,
     viewer_did: &str,
-    write_forms_enabled: bool,
+    rights: FormRights,
     link_text_to_thread: bool,
     eager_avatar: bool,
     quote_index: &QuoteRenderIndex,
@@ -13381,7 +13401,28 @@ fn render_web_post<S: Storage>(
     );
     let uri = html_escape(&record.uri);
     let cid = html_escape(record.cid.as_deref().unwrap_or(""));
-    let (repost_action, like_action) = if write_forms_enabled {
+    let repost_action = if rights.repost {
+        let repost_label = if interactions.viewer_repost.is_some() {
+            "Reposted"
+        } else {
+            "Repost"
+        };
+        let quote_href = format!("/compose?quote_uri={}", form_encoded(&record.uri));
+        format!(
+            "<details class=\"repost-menu\"><summary class=\"post-action\" aria-label=\"Repost menu\">{}<span class=\"sr-only\">{repost_label}</span>{}</summary><div class=\"repost-menu-options\"><form class=\"post-action-form\" action=\"/repost\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\"><button class=\"post-action\" type=\"submit\" aria-label=\"Repost by @{}\">Repost</button></form><a href=\"{}\">Quote post</a></div></details>",
+            icon_svg("repost"),
+            action_count_markup(interactions.repost_count),
+            html_escape(&handle),
+            html_escape(&quote_href)
+        )
+    } else {
+        format!(
+            "<span class=\"post-action action-readonly\" aria-label=\"Repost count\">{}{}</span>",
+            icon_svg("repost"),
+            action_count_markup(interactions.repost_count)
+        )
+    };
+    let like_action = if rights.like {
         let (like_intent, like_label) = if interactions.viewer_like.is_some() {
             (
                 "<input type=\"hidden\" name=\"intent\" value=\"delete\">",
@@ -13390,49 +13431,28 @@ fn render_web_post<S: Storage>(
         } else {
             ("", "Like")
         };
-        let repost_label = if interactions.viewer_repost.is_some() {
-            "Reposted"
-        } else {
-            "Repost"
-        };
         let like_aria = if interactions.viewer_like.is_some() {
             format!("Unlike post by @{}", html_escape(&handle))
         } else {
             format!("Like post by @{}", html_escape(&handle))
         };
-        let quote_href = format!("/compose?quote_uri={}", form_encoded(&record.uri));
-        let repost = format!(
-            "<details class=\"repost-menu\"><summary class=\"post-action\" aria-label=\"Repost menu\">{}<span class=\"sr-only\">{repost_label}</span>{}</summary><div class=\"repost-menu-options\"><form class=\"post-action-form\" action=\"/repost\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\"><button class=\"post-action\" type=\"submit\" aria-label=\"Repost by @{}\">Repost</button></form><a href=\"{}\">Quote post</a></div></details>",
-            icon_svg("repost"),
-            action_count_markup(interactions.repost_count),
-            html_escape(&handle),
-            html_escape(&quote_href)
-        );
         let liked = interactions.viewer_like.is_some();
-        let like = format!(
+        format!(
             "<form class=\"post-action-form\" action=\"/like\" method=\"post\"><input type=\"hidden\" name=\"uri\" value=\"{uri}\"><input type=\"hidden\" name=\"cid\" value=\"{cid}\">{like_intent}<button class=\"post-action{}\" type=\"submit\" aria-label=\"{like_aria}\" aria-pressed=\"{liked}\">{}<span class=\"sr-only\">{like_label}</span>{}</button></form>",
             if liked { " is-liked" } else { "" },
             icon_svg("like"),
             action_count_markup(interactions.like_count)
-        );
-        (repost, like)
+        )
     } else {
-        (
-            format!(
-                "<span class=\"post-action action-readonly\" aria-label=\"Repost count\">{}{}</span>",
-                icon_svg("repost"),
-                action_count_markup(interactions.repost_count)
-            ),
-            format!(
-                "<span class=\"post-action action-readonly{}\" aria-label=\"Like count\">{}{}</span>",
-                if interactions.viewer_like.is_some() {
-                    " is-liked"
-                } else {
-                    ""
-                },
-                icon_svg("like"),
-                action_count_markup(interactions.like_count)
-            ),
+        format!(
+            "<span class=\"post-action action-readonly{}\" aria-label=\"Like count\">{}{}</span>",
+            if interactions.viewer_like.is_some() {
+                " is-liked"
+            } else {
+                ""
+            },
+            icon_svg("like"),
+            action_count_markup(interactions.like_count)
         )
     };
     let share_action = format!(
@@ -13535,7 +13555,7 @@ struct TimelinePostItemOptions<'a> {
     previous_uri: Option<&'a str>,
     parents: &'a PageParentIndex,
     viewer_did: &'a str,
-    write_forms_enabled: bool,
+    rights: FormRights,
     eager_avatar: bool,
     quote_index: &'a QuoteRenderIndex,
     list_block_attrs: String,
@@ -13664,7 +13684,7 @@ fn timeline_post_grouping(
 
 struct TimelineRenderContext<'a> {
     viewer_did: &'a str,
-    write_forms_enabled: bool,
+    rights: FormRights,
     quote_index: &'a QuoteRenderIndex,
     list_blocks: &'a HashMap<String, ListBlockMark>,
 }
@@ -13728,7 +13748,7 @@ fn render_timeline_post_items<S: Storage>(
                     storage,
                     member,
                     context.viewer_did,
-                    context.write_forms_enabled,
+                    context.rights,
                     true,
                     page_index.is_none_or(|page_index| page_index < 6),
                     context.quote_index,
@@ -13762,7 +13782,7 @@ fn render_timeline_post_items<S: Storage>(
                         .map(|previous| records[previous].uri.as_str()),
                     parents,
                     viewer_did: context.viewer_did,
-                    write_forms_enabled: context.write_forms_enabled,
+                    rights: context.rights,
                     eager_avatar: index < 6,
                     quote_index: context.quote_index,
                     list_block_attrs: timeline_list_block_attrs(
@@ -13785,7 +13805,7 @@ fn render_timeline_post_item<S: Storage>(
         storage,
         record,
         options.viewer_did,
-        options.write_forms_enabled,
+        options.rights,
         true,
         options.eager_avatar,
         options.quote_index,
@@ -16316,7 +16336,10 @@ mod tests {
         let token = signed_legacy_token(&public, &payload);
         let permissions = public.verify_session_cookie(&token).unwrap().3;
         assert!(permissions.write);
-        assert!(!permissions.like, "the like flag is read verbatim, not from write");
+        assert!(
+            !permissions.like,
+            "the like flag is read verbatim, not from write"
+        );
         assert!(permissions.repost);
         assert!(!permissions.post);
     }
@@ -18894,7 +18917,7 @@ mod tests {
             &storage,
             &post,
             "did:plc:viewer",
-            false,
+            FormRights::default(),
             false,
             false,
             &index,
@@ -19443,7 +19466,7 @@ mod tests {
             &storage,
             &record,
             "did:plc:viewer",
-            false,
+            FormRights::default(),
             true,
             false,
             &index,
@@ -19474,8 +19497,14 @@ mod tests {
         storage.put_record(&record).unwrap();
         let index = QuoteRenderIndex::default();
 
-        let rendered =
-            render_thread_focus(&storage, &record, "did:plc:viewer", false, false, &index);
+        let rendered = render_thread_focus(
+            &storage,
+            &record,
+            "did:plc:viewer",
+            FormRights::default(),
+            false,
+            &index,
+        );
 
         assert!(
             rendered.contains(&format!(
