@@ -420,7 +420,10 @@ async fn posts_by_a_muted_author_are_hidden_from_search_results() {
         !html.contains("mincy post"),
         "a muted author's post must not be shown: {html}"
     );
-    assert!(html.contains("empty-state"), "the page needs its empty message: {html}");
+    assert!(
+        html.contains("empty-state"),
+        "the page needs its empty message: {html}"
+    );
     server.abort();
 }
 
@@ -455,6 +458,9 @@ async fn posts_by_a_blocked_author_are_hidden_from_search_results() {
         !html.contains("mincy post"),
         "a blocked author's post must not be shown: {html}"
     );
-    assert!(html.contains("empty-state"), "the page needs its empty message: {html}");
+    assert!(
+        html.contains("empty-state"),
+        "the page needs its empty message: {html}"
+    );
     server.abort();
 }
