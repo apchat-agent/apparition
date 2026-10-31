@@ -3238,7 +3238,12 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             api.app.bsky.feed.search_posts(parameters),
         )
         .await
-        .map_err(|_| format!("Bluesky searchPosts request timed out after {query:?}"))?
+        .map_err(|_| {
+            format!(
+                "Bluesky searchPosts request timed out after {} s",
+                SEARCH_REQUEST_TIMEOUT.as_secs()
+            )
+        })?
         .map_err(|error| format!("Bluesky searchPosts request failed: {error:?}"))?;
         serde_json::to_value(&output)
             .map(Some)
