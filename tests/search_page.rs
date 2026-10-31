@@ -40,6 +40,7 @@ struct FakeSearch {
     posts_body: Arc<Mutex<Value>>,
     actors_body: Arc<Mutex<Value>>,
     fail: Arc<AtomicBool>,
+    cursor_forbidden: Arc<AtomicBool>,
 }
 
 impl FakeSearch {
@@ -62,9 +63,20 @@ async fn fake_search_posts(
     State(fake): State<FakeSearch>,
     RawQuery(query): RawQuery,
 ) -> Response<Body> {
-    fake.record_call("/xrpc/app.bsky.feed.searchPosts", query);
+    fake.record_call("/xrpc/app.bsky.feed.searchPosts", query.clone());
     if let Some(failure) = fake.failure() {
         return failure;
+    }
+    // Measured 2026-10-31: api.bsky.app answers page 1 but refuses every anonymous request
+    // that carries a cursor with 403 "Request forbidden by administrative rules".
+    if fake.cursor_forbidden.load(Ordering::SeqCst)
+        && query.as_deref().is_some_and(|query| query.contains("cursor="))
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            r#"{"error":"AuthenticationRequired","message":"Request forbidden by administrative rules"}"#,
+        )
+            .into_response();
     }
     axum::Json(fake.posts_body()).into_response()
 }
@@ -130,6 +142,7 @@ async fn start_fake_search_with(
         posts_body: Arc::new(Mutex::new(posts_body)),
         actors_body: Arc::new(Mutex::new(actors_body)),
         fail: Arc::new(AtomicBool::new(false)),
+        cursor_forbidden: Arc::new(AtomicBool::new(false)),
     };
     let app = Router::new()
         .route("/xrpc/app.bsky.feed.searchPosts", get(fake_search_posts))
@@ -871,6 +884,51 @@ async fn a_signed_search_failure_warns_with_the_real_error_and_falls_back_to_ano
             .iter()
             .any(|warning| warning.contains("Request forbidden by administrative rules")),
         "the warning must name the real underlying error: {warnings:?}"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_403_on_an_anonymous_cursor_page_asks_for_a_fresh_sign_in_instead_of_the_error_page() {
+    let (base, fake, server) = start_fake_search(search_posts_body(Some("cursor-page-2"))).await;
+    fake.cursor_forbidden.store(true, Ordering::SeqCst);
+    let router = router_with_search(AcceptingFlow, search_client(&base));
+    let cookie = login(&router).await;
+    let first = get_html(&router, "/search?q=minc", &cookie).await;
+    assert!(
+        first.contains("More results"),
+        "page 1 still offers the next page: {first}"
+    );
+    let warnings = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(WarningCapture(warnings.clone()));
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let html = get_html(
+        &router,
+        "/search?q=minc&type=posts&cursor=cursor-page-2",
+        &cookie,
+    )
+    .await;
+    drop(_guard);
+    assert!(
+        html.contains("More results need a fresh sign-in"),
+        "the cursor page must ask for a fresh sign-in: {html}"
+    );
+    assert!(
+        !html.contains("Search is unavailable"),
+        "this is not the unavailable page: {html}"
+    );
+    assert!(
+        html.contains("href=\"/login?allow=like&amp;allow=repost&amp;allow=post\""),
+        "the sign-in link must keep the boxes the session already holds: {html}"
+    );
+    let warnings = warnings.lock().unwrap();
+    assert!(
+        warnings.iter().any(|warning| {
+            warning.contains("status=403")
+                && warning.contains("/xrpc/app.bsky.feed.searchPosts")
+                && warning.contains("cursor=cursor-page-2")
+        }),
+        "the warning must carry the status and the cursor URL: {warnings:?}"
     );
     server.abort();
 }
