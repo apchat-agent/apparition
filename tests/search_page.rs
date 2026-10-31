@@ -91,24 +91,24 @@ impl FakeSearch {
 }
 
 fn search_posts_body(cursor: Option<&str>) -> Value {
+    // The real searchPosts answer lists PostViews directly, with no "post" wrapper (unlike
+    // getTimeline's FeedViewPost). Checked against api.bsky.app on 2026-10-31.
     json!({
         "posts": [{
-            "post": {
-                "uri": HIT_URI,
-                "cid": "hit1-cid",
-                "author": {
-                    "did": "did:plc:searched",
-                    "handle": "searched.test",
-                    "displayName": "Searched",
-                    "avatar": "https://cdn.bsky.app/img/avatar/plain/did:plc:searched/bafkhit@jpeg"
-                },
-                "record": {
-                    "$type": "app.bsky.feed.post",
-                    "text": "mincy post",
-                    "createdAt": "2026-10-30T10:00:00.000Z"
-                },
-                "indexedAt": "2026-10-30T10:00:01.000Z"
-            }
+            "uri": HIT_URI,
+            "cid": "hit1-cid",
+            "author": {
+                "did": "did:plc:searched",
+                "handle": "searched.test",
+                "displayName": "Searched",
+                "avatar": "https://cdn.bsky.app/img/avatar/plain/did:plc:searched/bafkhit@jpeg"
+            },
+            "record": {
+                "$type": "app.bsky.feed.post",
+                "text": "mincy post",
+                "createdAt": "2026-10-30T10:00:00.000Z"
+            },
+            "indexedAt": "2026-10-30T10:00:01.000Z"
         }],
         "cursor": cursor
     })
