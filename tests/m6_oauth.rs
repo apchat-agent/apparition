@@ -8967,3 +8967,75 @@ async fn an_older_sign_in_cannot_remove_a_feed_until_it_signs_in_again() {
         actions.lock().unwrap()
     );
 }
+
+#[tokio::test]
+async fn bare_app_ignores_a_remembered_feed_that_is_no_longer_pinned() {
+    // The remembered tab outlives the pin list: a feed unpinned elsewhere must not
+    // send bare /app to some other pinned feed.
+    let storage = Arc::new(MemoryStorage::default());
+    let flow = FakeOAuthFlow {
+        pinned_feeds: vec![ResolvedFeed {
+            uri: "at://did:plc:creator/app.bsky.feed.generator/still-pinned".to_owned(),
+            display_name: "Still pinned".to_owned(),
+            description: None,
+            avatar: None,
+            service_did: "did:plc:service".to_owned(),
+            endpoint: "https://feed.example".to_owned(),
+            unavailable: false,
+        }],
+        ..FakeOAuthFlow::default()
+    };
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage.clone());
+    let cookie = finish_login(&app).await;
+    storage
+        .set_last_active_feed_tab(
+            "did:plc:alice",
+            "at://did:plc:creator/app.bsky.feed.generator/unpinned",
+        )
+        .unwrap();
+    let home = app
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(home.status(), StatusCode::OK);
+}
+
+#[test]
+fn sqlite_recent_profiles_prune_the_table_to_ten_rows() {
+    // The read query also says LIMIT 10, so only the table itself shows a missed prune.
+    let dir = std::env::temp_dir().join(format!(
+        "appview-recent-prune-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("appview.db");
+    let storage = SqliteStorage::open(&path).unwrap();
+    for index in 0..12 {
+        storage
+            .remember_recent_profile("did:plc:alice", &format!("did:plc:recent{index}"))
+            .unwrap();
+    }
+    drop(storage);
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let rows: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM recent_profile_clicks WHERE viewer_did='did:plc:alice'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 10);
+    let _ = std::fs::remove_dir_all(&dir);
+}

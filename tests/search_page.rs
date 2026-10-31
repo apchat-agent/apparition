@@ -327,7 +327,7 @@ async fn search_ui_has_styles_and_the_sidebar_search_is_a_working_posts_form() {
             "<form class=\"search-form\" action=\"/search\" method=\"get\" role=\"search\">"
         ) && html.contains("name=\"q\" type=\"search\"")
             && html.contains("name=\"type\" value=\"posts\"")
-            && !html.contains("id=\"site-search\" type=\"search\" placeholder=\"Search\" disabled"),
+            && !sidebar_search_input(&html).contains("disabled"),
         "the desktop sidebar search must submit a posts query: {html}"
     );
     server.abort();
@@ -408,6 +408,15 @@ async fn recent_profiles_keep_the_latest_ten_search_result_clicks_in_order() {
     assert!(
         rows.contains("Recent 5"),
         "reopened profile should be first: {rows}"
+    );
+    assert!(
+        !rows.contains("from=search"),
+        "a Recent row is not a search result, so clicking it must not record a new click: {rows}"
+    );
+    let posts = get_html(&router, "/search", &cookie).await;
+    assert!(
+        !posts.contains("search-recent"),
+        "recent profiles belong on the People tab only: {posts}"
     );
     assert!(
         rows.contains("Bio 5"),
@@ -1134,4 +1143,12 @@ async fn a_blank_query_shows_the_form_and_makes_no_outbound_call() {
     }
     assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
     server.abort();
+}
+
+fn sidebar_search_input(html: &str) -> &str {
+    let start = html
+        .find("<input id=\"site-search\"")
+        .expect("sidebar search input is present");
+    let end = start + html[start..].find('>').unwrap();
+    &html[start..=end]
 }
