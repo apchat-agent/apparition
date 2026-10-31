@@ -6153,6 +6153,54 @@ mod sqlite_writer_tests {
         let _ = fs::remove_file(format!("{}-shm", path.display()));
     }
 
+    static CHECKPOINT_BUSY_CALLS: AtomicU64 = AtomicU64::new(0);
+
+    fn count_busy_call(_attempt: i32) -> bool {
+        CHECKPOINT_BUSY_CALLS.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+
+    #[test]
+    fn a_checkpoint_that_is_behind_never_waits_for_readers() {
+        let path = test_path("behind-no-truncate");
+        remove_database(&path);
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;
+                 CREATE TABLE t(x INTEGER); INSERT INTO t VALUES (1);",
+            )
+            .unwrap();
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        for value in 0..50 {
+            writer
+                .execute("INSERT INTO t VALUES (?1)", [value])
+                .unwrap();
+        }
+        let checkpointer = Connection::open(&path).unwrap();
+        checkpointer.busy_handler(Some(count_busy_call)).unwrap();
+        CHECKPOINT_BUSY_CALLS.store(0, Ordering::Relaxed);
+
+        // The open reader pins an old snapshot, so PASSIVE cannot catch up. A
+        // TRUNCATE here would copy the whole backlog while holding writers out
+        // and then wait for the reader: the stall this checkpointer prevents.
+        let behind = checkpoint_wal(&checkpointer).unwrap();
+        assert!(behind.frames > behind.checkpointed, "{behind:?}");
+        assert!(!behind.reset);
+        assert_eq!(CHECKPOINT_BUSY_CALLS.load(Ordering::Relaxed), 0);
+
+        reader.execute_batch("COMMIT").unwrap();
+        let caught_up = checkpoint_wal(&checkpointer).unwrap();
+        assert!(caught_up.reset, "{caught_up:?}");
+
+        drop((reader, checkpointer, writer));
+        remove_database(&path);
+    }
+
     #[test]
     fn the_writer_minute_metrics_line_carries_the_read_pool_wait_counters() {
         struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
