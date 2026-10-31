@@ -161,6 +161,22 @@ const WRITE_SCOPES: [&str; 3] = [
     "repo:app.bsky.feed.like?action=create&action=delete",
     "repo:app.bsky.feed.repost?action=create&action=delete",
 ];
+const LIKE_SCOPES: [&str; 1] = ["repo:app.bsky.feed.like?action=create&action=delete"];
+const REPOST_SCOPES: [&str; 1] = ["repo:app.bsky.feed.repost?action=create&action=delete"];
+const POST_SCOPES: [&str; 5] = [
+    "repo:app.bsky.feed.post?action=create",
+    BLOB_SCOPE,
+    VIDEO_BLOB_SCOPE,
+    "rpc:app.bsky.video.getUploadLimits?aud=*",
+    "rpc:com.atproto.repo.uploadBlob?aud=*",
+];
+const SOCIAL_SCOPES: [&str; 5] = [
+    "repo:app.bsky.graph.follow?action=create&action=delete",
+    "repo:app.bsky.graph.block?action=create&action=delete",
+    "repo:app.bsky.graph.listitem?action=create&action=delete",
+    "rpc:app.bsky.graph.muteActor?aud=*",
+    "rpc:app.bsky.graph.unmuteActor?aud=*",
+];
 const FEED_SCOPES: [&str; 2] = [
     "rpc:app.bsky.actor.getPreferences?aud=*",
     "rpc:app.bsky.feed.getFeedSkeleton?aud=*",
@@ -549,8 +565,8 @@ pub struct BlockListDetail {
 }
 
 pub trait OAuthFlow: Clone + Send + Sync + 'static {
-    /// `scopes` is the scope list chosen for this sign-in: the full `REQUESTED_SCOPE` list when
-    /// the login form ticked "Allow changes", or the read-only list when it did not.
+    /// `scopes` is the scope list chosen for this sign-in: atproto + the read-only list + the
+    /// scopes of the activity boxes the login form ticked (`allow` checkboxes, owner 2026-10-31).
     fn authorize<'a>(
         &'a self,
         login: &'a str,
@@ -6725,7 +6741,7 @@ async fn login(headers: HeaderMap, RawQuery(raw_query): RawQuery) -> Html<String
 async fn authorize<F, S>(
     State(state): State<Arc<OAuthWebState<F, S>>>,
     headers: HeaderMap,
-    Form(form): Form<HashMap<String, String>>,
+    body: Bytes,
 ) -> Response
 where
     F: OAuthFlow,
@@ -6737,8 +6753,16 @@ where
             "authorization must start from this origin",
         );
     }
-    if form
-        .get("handle")
+    // The `allow` checkbox parameter repeats, and serde_urlencoded collapses repeated keys into
+    // one value, so the form body is parsed directly to see every ticked box.
+    let pairs = url::form_urlencoded::parse(&body).collect::<Vec<_>>();
+    let handle = pairs
+        .iter()
+        .rev()
+        .find(|(key, _)| &**key == "handle")
+        .map(|(_, value)| value.as_ref().to_owned());
+    if handle
+        .as_deref()
         .is_none_or(|handle| handle.trim().is_empty())
     {
         return (
@@ -6747,32 +6771,37 @@ where
         )
             .into_response();
     }
+    let handle = normalize_login(handle.as_deref().expect("validated above"));
     let mut binding_bytes = [0u8; 32];
     thread_rng().fill_bytes(&mut binding_bytes);
     let browser_binding = URL_SAFE_NO_PAD.encode(binding_bytes);
-    // The client metadata still advertises the full list; per request we ask for either the full
-    // list (checkbox ticked) or the read-only list (owner: read-only login by default).
-    let write_requested = form.get("write").is_some_and(|value| value == "1");
-    let scopes = if write_requested {
-        requested_scopes()
-    } else {
-        read_only_scopes()
+    // The client metadata still advertises the full list; per request we ask for atproto plus the
+    // read-only list plus exactly the scopes of the boxes the user ticked (owner, msgd 2026-10-31).
+    let asked_boxes = pairs
+        .iter()
+        .filter(|(key, _)| &**key == "allow")
+        .map(|(_, value)| value.as_ref().to_owned())
+        .collect::<Vec<_>>();
+    let boxes = ALLOW_BOXES
+        .iter()
+        .filter(|(value, _)| asked_boxes.iter().any(|asked| asked == value))
+        .map(|(value, _)| *value)
+        .collect::<Vec<_>>();
+    for asked in &asked_boxes {
+        if !ALLOW_BOXES.iter().any(|(value, _)| value == asked) {
+            tracing::warn!(allow = %asked, "ignoring unknown allow value in the sign-in form");
+        }
     }
-    .into_iter()
-    .map(|scope| scope.as_ref().to_owned())
-    .collect::<Vec<_>>();
+    let scopes = requested_scopes_for_boxes(&boxes);
     tracing::info!(
-        write = write_requested,
+        boxes = %boxes.join(","),
         scopes = %scopes.join(" "),
         "oauth sign-in started"
     );
-    let authorize_result = std::panic::AssertUnwindSafe(state.flow.authorize(
-        &normalize_login(form.get("handle").expect("validated above")),
-        &browser_binding,
-        scopes,
-    ))
-    .catch_unwind()
-    .await;
+    let authorize_result =
+        std::panic::AssertUnwindSafe(state.flow.authorize(&handle, &browser_binding, scopes))
+            .catch_unwind()
+            .await;
     match authorize_result {
         Ok(Ok(url)) if valid_redirect_url(&url) => {
             let mut response = Redirect::to(&url).into_response();
@@ -6789,10 +6818,7 @@ where
                 header::SET_COOKIE,
                 HeaderValue::from_str(&cookie).expect("login cookie token is header safe"),
             );
-            if let Some(remember) = remember_handle_cookie(
-                &normalize_login(form.get("handle").expect("validated above")),
-                state.public.secure_cookies(),
-            ) {
+            if let Some(remember) = remember_handle_cookie(&handle, state.public.secure_cookies()) {
                 response.headers_mut().append(
                     header::SET_COOKIE,
                     HeaderValue::from_str(&remember).expect("handle-shaped values are header safe"),
@@ -14209,14 +14235,33 @@ fn has_all_preferences_scopes(scope: Option<&str>) -> bool {
     has_all_scopes(scope, &PREFERENCES_SCOPES)
 }
 
-fn read_only_scopes() -> Vec<Scope> {
-    std::iter::once(Scope::Known(KnownScope::Atproto))
-        .chain(
-            READ_ONLY_SCOPES
-                .iter()
-                .map(|scope| Scope::Unknown((*scope).to_owned())),
-        )
-        .collect()
+/// The scopes one sign-in checkbox stands for, exactly as they appear in the constants above.
+fn box_scopes(name: &str) -> &'static [&'static str] {
+    match name {
+        "like" => &LIKE_SCOPES,
+        "repost" => &REPOST_SCOPES,
+        "post" => &POST_SCOPES,
+        "social" => &SOCIAL_SCOPES,
+        "feeds" => &PREFERENCES_SCOPES,
+        _ => &[],
+    }
+}
+
+/// What a sign-in with these boxes ticked asks for: atproto + the read-only list + the union of
+/// the boxes' scopes, de-duplicated, in a stable (checkbox) order.
+fn requested_scopes_for_boxes(boxes: &[&'static str]) -> Vec<String> {
+    let mut scopes = Vec::new();
+    let mut seen = HashSet::new();
+    for scope in std::iter::once("atproto").chain(READ_ONLY_SCOPES).chain(
+        boxes
+            .iter()
+            .flat_map(|name| box_scopes(name).iter().copied()),
+    ) {
+        if seen.insert(scope) {
+            scopes.push(scope.to_owned());
+        }
+    }
+    scopes
 }
 
 fn scopes_from_strings(values: Vec<String>) -> Vec<Scope> {
