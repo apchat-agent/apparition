@@ -180,3 +180,44 @@ fn home_timeline_query_does_not_walk_the_post_collection() {
     drop(storage);
     remove_database(&path);
 }
+
+#[test]
+fn a_viewer_who_follows_themselves_sees_each_own_post_once() {
+    // The per-author walk already reads the viewer's own posts; a self-follow must
+    // not walk them a second time.
+    let path = database_path("self-follow");
+    seed(&path);
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO records(did,collection,rkey,uri,cid,time_us,record_json)
+             VALUES(?1,'app.bsky.graph.follow','f-self',?2,'cid-f-self',?3,?4)",
+            params![
+                VIEWER,
+                format!("at://{VIEWER}/app.bsky.graph.follow/f-self"),
+                BASE + 12,
+                format!(r#"{{"subject":"{VIEWER}"}}"#)
+            ],
+        )
+        .unwrap();
+    drop(connection);
+    let storage = SqliteStorage::open(&path).unwrap();
+
+    let page = storage.timeline_posts(VIEWER, None, 50).unwrap();
+    assert_eq!(
+        page.iter()
+            .map(|record| record.uri.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            expected_uri(VIEWER, "v-hi"),
+            expected_uri(VIEWER, "z9-vtie"),
+            expected_uri(FOLLOWED_A, "bbb"),
+            expected_uri(FOLLOWED_A, "aaa"),
+            expected_uri(FOLLOWED_A, "a-old"),
+            expected_uri(FOLLOWED_B, "b-old"),
+        ]
+    );
+
+    drop(storage);
+    remove_database(&path);
+}
