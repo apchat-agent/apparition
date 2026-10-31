@@ -10,7 +10,7 @@ use std::time::Duration;
 use url::Url;
 
 const MAX_SEARCH_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
-const SEARCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+pub(crate) const SEARCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const SEARCH_RESULT_LIMIT: usize = 25;
 const MAX_LOG_BODY_EXCERPT_CHARS: usize = 200;
 

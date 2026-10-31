@@ -19,7 +19,7 @@ use crate::{
         RELATIONSHIP_CONFIRMATION_TTL, RelationshipClient, apply_profile_counts, now_millis,
         relationship_cache_key,
     },
-    search::{SearchActor, SearchCallError, SearchClient},
+    search::{SEARCH_REQUEST_TIMEOUT, SearchActor, SearchCallError, SearchClient},
     timing_console::{
         TIMING_PAGE_LIMIT, TIMING_RECENT_PATH, TimingConsole, TimingRecord, new_timing_id,
         now_unix_ms,
@@ -152,6 +152,9 @@ const MUTE_SCOPES: [&str; 3] = [
     "rpc:app.bsky.graph.unmuteActor?aud=*",
     "rpc:app.bsky.graph.getMutes?aud=*",
 ];
+/// Granted on every sign-in (it is in READ_ONLY_SCOPES); checked before spending a signed
+/// searchPosts call so a session signed in before this scope existed just returns None.
+const SEARCH_POSTS_SCOPES: [&str; 1] = ["rpc:app.bsky.feed.searchPosts?aud=*"];
 /// Removing a dead saved feed rewrites the viewer's preferences (owner, 2026-10-31).
 /// The audience must be named exactly: bsky.social grants `aud=*` for putPreferences but its PDS
 /// then rejects the call with ScopeMissingError naming this audience (measured 2026-10-31).
@@ -3185,6 +3188,63 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         result
     }
 
+    /// Posts search through the viewer's own session, proxied to the Bluesky AppView exactly
+    /// like [`Self::refresh_muted_actor_dids`]. Reads the locally stored grant first: a session
+    /// signed in before the searchPosts scope existed returns `Ok(None)` without spending a
+    /// call that the PDS would reject. Times out on the search page's 3 s budget, the same
+    /// outer-timeout style as the mute refresh on its page budget.
+    async fn signed_search_posts_body(
+        &self,
+        did: &str,
+        query: &str,
+        cursor: Option<&str>,
+    ) -> Result<Option<Value>, String> {
+        let parsed_did = did
+            .parse::<Did>()
+            .map_err(|_| "viewer DID is invalid".to_owned())?;
+        let Some(stored) = self
+            .store
+            .get(&parsed_did)
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return Err("the viewer has no stored sign-in to search with".to_owned());
+        };
+        if !has_all_scopes(stored.token_set.scope.as_deref(), &SEARCH_POSTS_SCOPES) {
+            return Ok(None);
+        }
+        let session = self.restored_session(&parsed_did).await?;
+        let proxy_did = BSKY_APPVIEW_DID
+            .parse::<Did>()
+            .map_err(|_| "Bluesky AppView service DID is invalid".to_owned())?;
+        let api = Self::session_agent(&session).api_with_proxy(proxy_did, BSKY_APPVIEW_SERVICE);
+        let parameters = atrium_api::app::bsky::feed::search_posts::ParametersData {
+            q: query.to_owned(),
+            cursor: cursor.map(str::to_owned),
+            limit: 25u8.try_into().ok(),
+            author: None,
+            domain: None,
+            lang: None,
+            mentions: None,
+            since: None,
+            sort: None,
+            tag: None,
+            until: None,
+            url: None,
+        }
+        .into();
+        let output = tokio::time::timeout(
+            SEARCH_REQUEST_TIMEOUT,
+            api.app.bsky.feed.search_posts(parameters),
+        )
+        .await
+        .map_err(|_| format!("Bluesky searchPosts request timed out after {query:?}"))?
+        .map_err(|error| format!("Bluesky searchPosts request failed: {error:?}"))?;
+        serde_json::to_value(&output)
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
     async fn schedule_muted_actor_refresh(&self, did: &str) {
         let mut pending = self.muted_actor_refreshes.lock().await;
         if !pending.insert(did.to_owned()) {
@@ -4910,6 +4970,15 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
         did: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<HashSet<String>, String>> + Send + 'a>> {
         Box::pin(async move { self.fetch_muted_actor_dids(did).await })
+    }
+
+    fn signed_search_posts<'a>(
+        &'a self,
+        did: &'a str,
+        query: &'a str,
+        cursor: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Value>, String>> + Send + 'a>> {
+        Box::pin(async move { self.signed_search_posts_body(did, query, cursor).await })
     }
 
     fn subscribed_block_list_uris<'a>(
@@ -18637,11 +18706,7 @@ mod tests {
         let parameters = url::form_urlencoded::parse(query.as_bytes())
             .into_owned()
             .collect::<Vec<_>>();
-        for (key, value) in [
-            ("q", "minc"),
-            ("limit", "25"),
-            ("cursor", "cursor-page-2"),
-        ] {
+        for (key, value) in [("q", "minc"), ("limit", "25"), ("cursor", "cursor-page-2")] {
             assert!(
                 parameters
                     .iter()
