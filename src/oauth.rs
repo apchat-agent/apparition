@@ -7817,6 +7817,10 @@ where
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
     let people = query.get("type").map(String::as_str) == Some("people");
+    let cursor = query
+        .get("cursor")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty());
     let viewer_profile = viewer_profile_view(state.storage.as_ref(), &did);
     let tabs = pinned_feeds_for_layout(
         &state.flow,
@@ -7845,7 +7849,7 @@ where
         .into_response();
     };
     if people {
-        let page = match state.search.search_actors(&term, None).await {
+        let page = match state.search.search_actors(&term, cursor).await {
             Ok(page) => page,
             Err(failure) => return search_unavailable_response(&failure, heading, &form, options),
         };
@@ -7865,15 +7869,16 @@ where
         } else {
             rows
         };
+        let more = render_more_results(people, &term, page.cursor.as_deref());
         return Html(page_shell_with_options(
             "Search",
-            &format!("{heading}{form}<ol class=\"search-actor-list\">{rows}</ol>"),
+            &format!("{heading}{form}<ol class=\"search-actor-list\">{rows}</ol>{more}"),
             true,
             options,
         ))
         .into_response();
     }
-    let page = match state.search.search_posts(&term, None).await {
+    let page = match state.search.search_posts(&term, cursor).await {
         Ok(page) => page,
         Err(failure) => return search_unavailable_response(&failure, heading, &form, options),
     };
@@ -7949,13 +7954,26 @@ where
     } else {
         posts
     };
+    let more = render_more_results(people, &term, page.cursor.as_deref());
     Html(page_shell_with_options(
         "Search",
-        &format!("{heading}{form}<ol class=\"post-list\">{posts}</ol>"),
+        &format!("{heading}{form}<ol class=\"post-list\">{posts}</ol>{more}"),
         true,
         options,
     ))
     .into_response()
+}
+
+fn render_more_results(people: bool, term: &str, cursor: Option<&str>) -> String {
+    let Some(cursor) = cursor else {
+        return String::new();
+    };
+    let active_type = if people { "people" } else { "posts" };
+    format!(
+        "<a class=\"pagination-link\" rel=\"next\" href=\"/search?q={}&amp;type={active_type}&amp;cursor={}\">More results</a>",
+        form_encoded(term),
+        form_encoded(cursor)
+    )
 }
 
 fn render_search_form(term: Option<&str>, people: bool) -> String {

@@ -25,6 +25,7 @@ pub struct SearchCallError {
 #[derive(Debug, Default)]
 pub struct SearchPostsPage {
     pub posts: Vec<FetchedPublicPost>,
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug)]
@@ -39,6 +40,7 @@ pub struct SearchActor {
 #[derive(Debug, Default)]
 pub struct SearchActorsPage {
     pub actors: Vec<SearchActor>,
+    pub cursor: Option<String>,
 }
 
 fn optional_str(value: &Value, key: &str) -> Option<String> {
@@ -47,6 +49,10 @@ fn optional_str(value: &Value, key: &str) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty())
         .map(str::to_owned)
+}
+
+fn response_cursor(body: &Value) -> Option<String> {
+    optional_str(body, "cursor")
 }
 
 fn unix_time_us() -> u64 {
@@ -87,7 +93,10 @@ impl SearchClient {
         let body = self
             .fetch("app.bsky.feed.searchPosts", query, cursor)
             .await?;
-        let mut page = SearchPostsPage::default();
+        let mut page = SearchPostsPage {
+            cursor: response_cursor(&body),
+            ..Default::default()
+        };
         let Some(posts) = body.get("posts").and_then(Value::as_array) else {
             return Ok(page);
         };
@@ -136,7 +145,10 @@ impl SearchClient {
         let body = self
             .fetch("app.bsky.actor.searchActors", query, cursor)
             .await?;
-        let mut page = SearchActorsPage::default();
+        let mut page = SearchActorsPage {
+            cursor: response_cursor(&body),
+            ..Default::default()
+        };
         let Some(actors) = body.get("actors").and_then(Value::as_array) else {
             return Ok(page);
         };

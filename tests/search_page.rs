@@ -571,6 +571,9 @@ async fn a_response_cursor_becomes_a_more_results_link_and_is_sent_back_on_the_n
         "the next page must forward the cursor upstream: {}",
         requests[1].1
     );
-    assert!(html.contains("mincy post"), "the second page renders too: {html}");
+    assert!(
+        html.contains("mincy post"),
+        "the second page renders too: {html}"
+    );
     server.abort();
 }
