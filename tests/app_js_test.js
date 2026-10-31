@@ -123,6 +123,83 @@ Deno.test("composer expands, opens link entry, grows its text area, and warns ne
   }
 });
 
+Deno.test("the composer textarea keeps one row count per text line instead of growing one row per keystroke", async () => {
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  const start = source.indexOf("function enhanceCompactComposer");
+  const end = source.indexOf("function attachMediaComposer", start);
+  const enhance = new Function(`${source.slice(start, end)}; return enhanceCompactComposer;`)();
+  const makeClassList = () => {
+    const names = new Set();
+    return {
+      add(name) { names.add(name); },
+      remove(name) { names.delete(name); },
+      contains(name) { return names.has(name); },
+      toggle(name, force) {
+        const enabled = force === undefined ? !names.has(name) : force;
+        if (enabled) names.add(name);
+        else names.delete(name);
+        return enabled;
+      },
+    };
+  };
+  let lineHeightCss = "21.6px";
+  const makeHarness = (lineHeight) => {
+    lineHeightCss = lineHeight;
+    const events = new Map();
+    const textarea = {
+      value: "",
+      rows: 1,
+      get scrollHeight() {
+        const lines = Math.max(1, this.value.split("\n").length);
+        const padding = 16;
+        // A browser never reports scrollHeight below the box's own current height, so with a fractional
+        // 21.6 px line (CSS line-height 1.35, or a "normal" line-height) the old measurement had to grow.
+        return Math.ceil(Math.max(lines * 21.6 + padding, this.rows * 21.6 + padding));
+      },
+      addEventListener(name, listener) { events.set(`textarea:${name}`, listener); },
+    };
+    const form = {
+      classList: makeClassList(),
+      querySelector(selector) {
+        return selector === "[data-compose-input]" ? textarea : null;
+      },
+    };
+    return { events, form, textarea };
+  };
+  const originalWindow = globalThis.window;
+  globalThis.window = {
+    getComputedStyle() { return { lineHeight: lineHeightCss, paddingTop: "8px", paddingBottom: "8px" }; },
+  };
+  try {
+    const harness = makeHarness("21.6px");
+    enhance(harness.form);
+    harness.events.get("textarea:focus")();
+    assertEquals(harness.textarea.rows, 2, "an empty focused composer sits at the expanded minimum");
+    for (let typed = 1; typed <= 20; typed += 1) {
+      harness.textarea.value = "x".repeat(typed);
+      harness.events.get("textarea:input")();
+      assertEquals(harness.textarea.rows, 2, `typing ${typed} characters on ONE line must keep rows at the expanded minimum`);
+    }
+    harness.textarea.value = `${"x".repeat(20)}\nsecond line`;
+    harness.events.get("textarea:input")();
+    assertEquals(harness.textarea.rows, 3, "a second text line must add exactly one more row");
+    harness.textarea.value = "x".repeat(20);
+    harness.events.get("textarea:input")();
+    assertEquals(harness.textarea.rows, 2, "deleting the second line must shrink back down");
+
+    const normal = makeHarness("normal");
+    enhance(normal.form);
+    normal.events.get("textarea:focus")();
+    for (let typed = 1; typed <= 20; typed += 1) {
+      normal.textarea.value = "x".repeat(typed);
+      normal.events.get("textarea:input")();
+      assertEquals(normal.textarea.rows, 2, `a "normal" computed line-height must not grow the box per keystroke (keystroke ${typed})`);
+    }
+  } finally {
+    globalThis.window = originalWindow;
+  }
+});
+
 Deno.test("phone navigation and post actions keep 44-pixel tap targets", async () => {
   const css = await Deno.readTextFile(new URL("../static/app.css", import.meta.url));
   const declarations = (selector) => {
