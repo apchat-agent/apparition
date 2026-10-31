@@ -1043,4 +1043,127 @@ mod tests {
 
         assert_eq!(client.clients.lock().unwrap().clients.len(), 2);
     }
+
+    #[tokio::test]
+    async fn outbound_call_details_keep_method_host_path_offsets_and_status_but_never_the_query() {
+        use super::{RequestOutboundAccounting, with_request_outbound_accounting};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/{*path}",
+            get(|| async {
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                "ok"
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = SafeHttpClient::new().with_http_test_hosts(["127.0.0.1".to_owned()]);
+        let accounting = RequestOutboundAccounting::default();
+        with_request_outbound_accounting(accounting.clone(), async {
+            client
+                .get(
+                    &Url::parse(&format!(
+                        "http://{address}/xrpc/com.atproto.repo.getRecord?token=SECRET"
+                    ))
+                    .unwrap(),
+                    http::HeaderMap::new(),
+                    16,
+                )
+                .await
+                .unwrap();
+            client
+                .get(
+                    &Url::parse(&format!(
+                        "http://{address}/xrpc/app.bsky.actor.getProfile"
+                    ))
+                    .unwrap(),
+                    http::HeaderMap::new(),
+                    16,
+                )
+                .await
+                .unwrap();
+            let refused = Url::parse("http://127.0.0.1:1/refused").unwrap();
+            assert!(
+                client
+                    .get(&refused, http::HeaderMap::new(), 16)
+                    .await
+                    .is_err(),
+                "a closed port must refuse the call"
+            );
+        })
+        .await;
+
+        let snapshot = accounting.snapshot();
+        assert_eq!(snapshot.total_calls, 3);
+        assert_eq!(snapshot.calls.len(), 3, "one detail per call: {snapshot:?}");
+        let [first, second, refused] = snapshot.calls.as_slice() else {
+            panic!("three call details: {snapshot:?}");
+        };
+        assert_eq!(first.kind, "pds_get_record");
+        assert_eq!(first.method, "GET");
+        assert_eq!(first.host, "127.0.0.1");
+        assert_eq!(first.path, "/xrpc/com.atproto.repo.getRecord");
+        assert_eq!(first.status, Some(200));
+        assert!(first.error.is_none(), "{first:?}");
+        assert!(first.duration_ms >= 25, "the server slept 30 ms: {first:?}");
+        assert_eq!(second.kind, "public_appview");
+        assert_eq!(second.path, "/xrpc/app.bsky.actor.getProfile");
+        assert_eq!(second.status, Some(200));
+        assert!(
+            second.start_ms >= first.duration_ms.saturating_sub(10),
+            "one call after another: {first:?} {second:?}"
+        );
+        assert_eq!(refused.status, None);
+        assert!(
+            refused
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("outbound HTTP request failed")),
+            "the refused call carries the real error: {refused:?}"
+        );
+        let debug = format!("{snapshot:?}");
+        assert!(
+            !debug.contains("SECRET"),
+            "the query string never reaches the details: {debug}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn outbound_call_details_keep_64_calls_and_count_the_overflow() {
+        use super::{RequestOutboundAccounting, with_request_outbound_accounting};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route("/{*path}", get(|| async { "ok" }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = SafeHttpClient::new().with_http_test_hosts(["127.0.0.1".to_owned()]);
+        let accounting = RequestOutboundAccounting::default();
+        with_request_outbound_accounting(accounting.clone(), async {
+            for _ in 0..70 {
+                client
+                    .get(
+                        &Url::parse(&format!("http://{address}/xrpc/other")).unwrap(),
+                        http::HeaderMap::new(),
+                        16,
+                    )
+                    .await
+                    .unwrap();
+            }
+        })
+        .await;
+
+        let snapshot = accounting.snapshot();
+        assert_eq!(snapshot.total_calls, 70, "totals keep counting past the cap");
+        assert_eq!(snapshot.calls.len(), 64, "the detail list is capped at 64");
+        assert_eq!(snapshot.calls_overflow, 6);
+        assert_eq!(snapshot.calls[0].path, "/xrpc/other", "the earliest calls are kept");
+        assert_eq!(snapshot.calls[63].path, "/xrpc/other");
+        server.abort();
+    }
 }
