@@ -3267,6 +3267,76 @@ async fn pinned_feed_list_and_feed_timeline_routes_are_available_to_signed_in_us
 }
 
 #[tokio::test]
+async fn bare_app_resumes_the_pinned_feed_until_following_is_selected() {
+    let feed_uri = "at://did:plc:creator/app.bsky.feed.generator/remembered";
+    let feed = ResolvedFeed {
+        uri: feed_uri.to_owned(),
+        display_name: "Remembered feed".to_owned(),
+        description: None,
+        avatar: None,
+        service_did: "did:plc:service".to_owned(),
+        endpoint: "https://feed.example".to_owned(),
+        unavailable: false,
+    };
+    let storage = Arc::new(MemoryStorage::default());
+    let flow = FakeOAuthFlow {
+        pinned_feeds: vec![feed],
+        ..FakeOAuthFlow::default()
+    };
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage);
+    let cookie = finish_login(&app).await;
+    let encoded_uri = url::form_urlencoded::byte_serialize(feed_uri.as_bytes()).collect::<String>();
+    let feed_path = format!("/app/feed?uri={encoded_uri}");
+    let feed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&feed_path)
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(feed.status(), StatusCode::OK);
+
+    let resumed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resumed.status(), StatusCode::SEE_OTHER);
+    assert_eq!(resumed.headers()["location"], feed_path);
+
+    let following = get_html(&app, "/app?tab=following", &cookie).await;
+    assert!(
+        following.contains(
+            "<a class=\"feed-tab is-active\" href=\"/app?tab=following\" aria-current=\"page\">Following</a>"
+        ),
+        "Following needs an explicit tab URL and current state: {following}"
+    );
+    let following_home = app
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(following_home.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn old_scope_session_gets_a_friendly_feed_reauthorization_page() {
     let old_scope = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete";
     let app = OAuthPublic::new("https://appview.example")
