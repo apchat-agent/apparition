@@ -3267,6 +3267,74 @@ async fn pinned_feed_list_and_feed_timeline_routes_are_available_to_signed_in_us
 }
 
 #[tokio::test]
+async fn a_failed_remembered_tab_write_still_shows_the_page() {
+    // Remembering the tab is a convenience: when the database refuses the write, the
+    // viewer still gets the Following page and the feed page, and the warning names the error.
+    let dir = std::env::temp_dir().join(format!(
+        "appview-tab-write-fails-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("appview.db");
+    let storage = Arc::new(SqliteStorage::open(&path).unwrap());
+    let feed_uri = "at://did:plc:creator/app.bsky.feed.generator/remembered";
+    let flow = FakeOAuthFlow {
+        pinned_feeds: vec![ResolvedFeed {
+            uri: feed_uri.to_owned(),
+            display_name: "Remembered feed".to_owned(),
+            description: None,
+            avatar: None,
+            service_did: "did:plc:service".to_owned(),
+            endpoint: "https://feed.example".to_owned(),
+            unavailable: false,
+        }],
+        ..FakeOAuthFlow::default()
+    };
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage);
+    let cookie = finish_login(&app).await;
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER refuse_tab_write BEFORE INSERT ON appview_state
+             WHEN NEW.key LIKE 'last-active-feed-tab:%'
+             BEGIN SELECT RAISE(ABORT, 'injected tab write failure'); END;",
+        )
+        .unwrap();
+    for path in [
+        "/app?tab=following".to_owned(),
+        "/app".to_owned(),
+        format!(
+            "/app/feed?uri={}",
+            url::form_urlencoded::byte_serialize(feed_uri.as_bytes()).collect::<String>()
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&path)
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{path}: a failed tab write must not fail the page"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
 async fn bare_app_resumes_the_pinned_feed_until_following_is_selected() {
     let feed_uri = "at://did:plc:creator/app.bsky.feed.generator/remembered";
     let feed = ResolvedFeed {
