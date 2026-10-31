@@ -307,13 +307,18 @@ async fn search_ui_has_styles_and_the_sidebar_search_is_a_working_posts_form() {
 
     for class in [
         ".search-page-form",
+        ".search-page-icon",
         ".search-type-tabs",
         ".search-type-tab",
         ".search-actor-list",
         ".search-actor",
         ".search-actor-link",
         ".search-actor-avatar",
+        ".search-actor-name",
+        ".search-actor-handle",
         ".search-actor-description",
+        ".search-recent",
+        ".search-recent-heading",
     ] {
         assert!(css.contains(class), "missing search style for {class}");
     }
