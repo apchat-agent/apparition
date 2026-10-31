@@ -35,6 +35,7 @@ struct FakeSearch {
     calls: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<(String, String)>>>,
     posts_body: Arc<Mutex<Value>>,
+    actors_body: Arc<Mutex<Value>>,
 }
 
 impl FakeSearch {
@@ -56,7 +57,7 @@ async fn fake_search_actors(
     RawQuery(query): RawQuery,
 ) -> Response<Body> {
     fake.record_call("/xrpc/app.bsky.actor.searchActors", query);
-    axum::Json(json!({"actors": []})).into_response()
+    axum::Json(fake.actors_body.lock().unwrap().clone()).into_response()
 }
 
 impl FakeSearch {
@@ -94,12 +95,20 @@ fn search_posts_body(cursor: Option<&str>) -> Value {
 }
 
 async fn start_fake_search(body: Value) -> (String, FakeSearch, tokio::task::JoinHandle<()>) {
+    start_fake_search_with(body, json!({"actors": []})).await
+}
+
+async fn start_fake_search_with(
+    posts_body: Value,
+    actors_body: Value,
+) -> (String, FakeSearch, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let fake = FakeSearch {
         calls: Arc::new(AtomicUsize::new(0)),
         requests: Arc::new(Mutex::new(Vec::new())),
-        posts_body: Arc::new(Mutex::new(body)),
+        posts_body: Arc::new(Mutex::new(posts_body)),
+        actors_body: Arc::new(Mutex::new(actors_body)),
     };
     let app = Router::new()
         .route("/xrpc/app.bsky.feed.searchPosts", get(fake_search_posts))
@@ -298,6 +307,43 @@ async fn posts_search_calls_the_labelled_base_once_and_renders_through_the_feed_
     assert!(
         html.contains(&format!("value=\"{HIT_URI}\"")),
         "the shared post renderer's like form must reference the hit: {html}"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn people_search_renders_actor_rows_linking_to_the_profile_page() {
+    let actors = json!({"actors": [{
+        "did": "did:plc:finder",
+        "handle": "finder.test",
+        "displayName": "Finder",
+        "description": "First line.\nSecond line hides.",
+        "avatar": "https://cdn.bsky.app/img/avatar/plain/did:plc:finder/bafkfinder@jpeg"
+    }]});
+    let (base, fake, server) =
+        start_fake_search_with(search_posts_body(None), actors).await;
+    let router = router_with_search(AcceptingFlow, search_client(&base));
+    let cookie = login(&router).await;
+    let html = get_html(&router, "/search?q=fin&type=people", &cookie).await;
+    let requests = fake.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1, "people search must hit the people endpoint once");
+    assert_eq!(requests[0].0, "/xrpc/app.bsky.actor.searchActors");
+    assert!(requests[0].1.contains("q=fin"), "{}", requests[0].1);
+    assert!(requests[0].1.contains("limit=25"), "{}", requests[0].1);
+    assert!(html.contains("Finder"), "display name missing: {html}");
+    assert!(html.contains("@finder.test"), "handle missing: {html}");
+    assert!(html.contains("First line."), "description first line missing: {html}");
+    assert!(
+        !html.contains("Second line"),
+        "only the description's first line may show: {html}"
+    );
+    assert!(
+        html.contains("/profile?did=did%3Aplc%3Afinder"),
+        "the row must link to the app's profile page: {html}"
+    );
+    assert!(
+        html.contains("https://cdn.bsky.app/img/avatar_thumbnail/plain/did:plc:finder/bafkfinder@jpeg"),
+        "the row must show the avatar: {html}"
     );
     server.abort();
 }
