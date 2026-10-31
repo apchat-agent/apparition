@@ -7255,6 +7255,11 @@ async fn old_scope_profile_shows_per_action_reauthorization_messages() {
         html.contains("Sign in with changes allowed to follow"),
         "{html}"
     );
+    // The link must re-sign-in with the "Allow changes" box ticked (review mutant M5, 2026-10-31).
+    assert!(
+        html.contains("href=\"/login?write=1\">Sign in with changes allowed to follow"),
+        "{html}"
+    );
     assert!(
         html.contains("Sign in with changes allowed to block"),
         "{html}"
