@@ -87,6 +87,19 @@ impl<S: Subscriber> Layer<S> for WarningCapture {
 }
 
 #[derive(Clone)]
+struct InfoCapture(Arc<Mutex<Vec<String>>>);
+
+impl<S: Subscriber> Layer<S> for InfoCapture {
+    fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+        if *event.metadata().level() == tracing::Level::INFO {
+            let mut line = String::new();
+            event.record(&mut WarningVisitor(&mut line));
+            self.0.lock().unwrap().push(line);
+        }
+    }
+}
+
+#[derive(Clone)]
 struct WebPagePhases(Arc<Mutex<Vec<(String, u64, bool)>>>);
 
 struct WebPagePhaseVisitor {
@@ -6734,6 +6747,127 @@ async fn a_read_only_session_is_shown_a_sign_in_page_not_a_json_error_for_every_
         actions.lock().unwrap().is_empty(),
         "a read-only session must never reach the PDS write: {:?}",
         actions.lock().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn a_read_only_session_loads_the_home_feed_page() {
+    let flow = FakeOAuthFlow::with_granted_scope(Some(EXPECTED_READ_ONLY_SCOPE));
+    let storage = Arc::new(MemoryStorage::default());
+    storage
+        .set_follow("did:plc:alice", "did:plc:author", true)
+        .unwrap();
+    storage
+        .put_record(&fake_feed_post(
+            "did:plc:author",
+            "one",
+            10,
+            "read-only still reads this",
+        ))
+        .unwrap();
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(flow, storage);
+    let cookie = finish_login(&app).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/app")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let html = String::from_utf8(
+        response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("read-only still reads this"), "{html}");
+}
+
+#[tokio::test]
+async fn sign_in_logs_its_kind_and_the_granted_scopes_at_info() {
+    let infos = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(InfoCapture(infos.clone()));
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), Arc::new(MemoryStorage::default()));
+
+    let read_only_login_cookie = prelogin_cookie(&app).await;
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .uri("/oauth/callback?code=valid-code&state=valid-state&scope=atproto")
+                .header("cookie", read_only_login_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let write_login_cookie = {
+        let authorize = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/oauth/authorize")
+                    .header("origin", "https://appview.example")
+                    .header("sec-fetch-site", "same-origin")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("handle=alice.test&write=1"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorize.status(), StatusCode::SEE_OTHER);
+        authorize.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    app.oneshot(
+        Request::builder()
+            .uri("/oauth/callback?code=valid-code&state=valid-state&scope=atproto")
+            .header("cookie", write_login_cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    let lines = infos.lock().unwrap();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("oauth sign-in started") && line.contains("write=false")),
+        "no read-only sign-in kind logged: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("oauth sign-in started") && line.contains("write=true")),
+        "no with-changes sign-in kind logged: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.contains("granted scopes") && line.contains(EXPECTED_OAUTH_SCOPE)
+        }),
+        "the granted scope strings were not logged: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("access_token")),
+        "never log tokens: {lines:?}"
     );
 }
 
