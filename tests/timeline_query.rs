@@ -182,6 +182,106 @@ fn home_timeline_query_does_not_walk_the_post_collection() {
 }
 
 #[test]
+fn viewer_interaction_lookup_uses_the_per_author_index_and_keeps_newest_uri() {
+    let path = database_path("viewer-interactions");
+    seed(&path);
+    let mut connection = Connection::open(&path).unwrap();
+    let transaction = connection.transaction().unwrap();
+    {
+        let mut insert = transaction
+            .prepare_cached(
+                "INSERT INTO records(did,collection,rkey,uri,cid,time_us,record_json)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            )
+            .unwrap();
+        for index in 0..2_000 {
+            let did = format!("did:plc:like-{index:04}");
+            let rkey = format!("l-{index}");
+            insert
+                .execute(params![
+                    did,
+                    "app.bsky.feed.like",
+                    rkey,
+                    format!("at://{did}/app.bsky.feed.like/{rkey}"),
+                    format!("cid-like-{index}"),
+                    BASE + index,
+                    format!(
+                        r#"{{"subject":{{"uri":"{}"}}}}"#,
+                        expected_uri(VIEWER, "v-hi")
+                    ),
+                ])
+                .unwrap();
+        }
+        for (collection, prefix) in [
+            ("app.bsky.feed.like", "like"),
+            ("app.bsky.feed.repost", "repost"),
+        ] {
+            for (rkey, time_us) in [
+                (format!("{prefix}-old"), BASE + 10),
+                (format!("{prefix}-new"), BASE + 20),
+            ] {
+                insert
+                    .execute(params![
+                        VIEWER,
+                        collection,
+                        rkey,
+                        format!("at://{VIEWER}/{collection}/{rkey}"),
+                        format!("cid-{collection}-{time_us}"),
+                        time_us,
+                        format!(
+                            r#"{{"subject":{{"uri":"{}"}}}}"#,
+                            expected_uri(VIEWER, "v-hi")
+                        ),
+                    ])
+                    .unwrap();
+            }
+        }
+    }
+    transaction.commit().unwrap();
+    drop(connection);
+
+    let storage = SqliteStorage::open(&path).unwrap();
+    let summary = storage
+        .post_interaction_summary(&expected_uri(VIEWER, "v-hi"), Some(VIEWER))
+        .unwrap();
+    assert_eq!(
+        summary.viewer_like,
+        Some(format!("at://{VIEWER}/app.bsky.feed.like/like-new"))
+    );
+    assert_eq!(
+        summary.viewer_repost,
+        Some(format!("at://{VIEWER}/app.bsky.feed.repost/repost-new"))
+    );
+
+    let connection = Connection::open(&path).unwrap();
+    for collection in ["app.bsky.feed.like", "app.bsky.feed.repost"] {
+        let query = format!(
+            "EXPLAIN QUERY PLAN SELECT uri FROM records
+             WHERE collection='{collection}' AND did=?1
+               AND json_extract(record_json, '$.subject.uri')=?2
+             ORDER BY time_us DESC LIMIT 1"
+        );
+        let details = connection
+            .prepare(&query)
+            .unwrap()
+            .query_map(params![VIEWER, expected_uri(VIEWER, "v-hi")], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("; ");
+        assert!(
+            details.contains("records_author_subject_uri"),
+            "viewer {collection} query plan must use the per-author index: {details}"
+        );
+    }
+
+    drop(storage);
+    remove_database(&path);
+}
+
+#[test]
 fn a_viewer_who_follows_themselves_sees_each_own_post_once() {
     // The per-author walk already reads the viewer's own posts; a self-follow must
     // not walk them a second time.
