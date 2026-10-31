@@ -3337,6 +3337,21 @@ async fn bare_app_resumes_the_pinned_feed_until_following_is_selected() {
 }
 
 #[tokio::test]
+async fn following_tab_link_uses_an_explicit_selection_query() {
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), Arc::new(MemoryStorage::default()));
+    let cookie = finish_login(&app).await;
+    let html = get_html(&app, "/app?tab=following", &cookie).await;
+    assert!(
+        html.contains(
+            "<a class=\"feed-tab is-active\" href=\"/app?tab=following\" aria-current=\"page\">Following</a>"
+        ),
+        "the selected Following tab must explicitly record the selection: {html}"
+    );
+}
+
+#[tokio::test]
 async fn old_scope_session_gets_a_friendly_feed_reauthorization_page() {
     let old_scope = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete";
     let app = OAuthPublic::new("https://appview.example")
