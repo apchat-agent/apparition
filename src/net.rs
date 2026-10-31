@@ -1,3 +1,4 @@
+use serde::Serialize;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     future::Future,
@@ -9,6 +10,8 @@ use std::{
 use tokio::{net::lookup_host, sync::Semaphore, time::timeout};
 use url::Url;
 
+/// How many individual outbound calls one web request keeps details for (timing console).
+const MAX_OUTBOUND_CALL_DETAILS: usize = 64;
 const MAX_REDIRECTS: usize = 5;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_OAUTH_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
@@ -29,12 +32,28 @@ pub(crate) async fn with_background_request_pool<F: Future>(future: F) -> F::Out
     USE_BACKGROUND_REQUEST_POOL.scope(true, future).await
 }
 
+/// One individual outbound call made while a web request was being served.
+/// The URL path is recorded without the query string; headers and tokens never are.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct OutboundCallRecord {
+    pub kind: String,
+    pub method: String,
+    pub host: String,
+    pub path: String,
+    pub start_ms: u64,
+    pub duration_ms: u64,
+    pub status: Option<u16>,
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct OutboundCallSnapshot {
     pub total_calls: usize,
     pub total_ms: u64,
     pub dpop_nonce_retries: usize,
     pub by_kind: BTreeMap<String, (usize, u64)>,
+    pub calls: Vec<OutboundCallRecord>,
+    pub calls_overflow: usize,
 }
 
 #[derive(Default)]
@@ -43,9 +62,19 @@ struct RequestOutboundCallState {
     pending_nonce_retries: HashSet<String>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct RequestOutboundAccounting {
+    start: Instant,
     state: Arc<Mutex<RequestOutboundCallState>>,
+}
+
+impl Default for RequestOutboundAccounting {
+    fn default() -> Self {
+        Self {
+            start: Instant::now(),
+            state: Arc::new(Mutex::new(RequestOutboundCallState::default())),
+        }
+    }
 }
 
 impl RequestOutboundAccounting {
@@ -54,6 +83,13 @@ impl RequestOutboundAccounting {
             .lock()
             .map(|state| state.snapshot.clone())
             .unwrap_or_default()
+    }
+
+    fn start_offset_ms(&self, at: Instant) -> u64 {
+        at.checked_duration_since(self.start)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64
     }
 
     fn next_call_kind(&self, key: &str, normal_kind: &str) -> String {
@@ -69,18 +105,34 @@ impl RequestOutboundAccounting {
             .unwrap_or_else(|_| normal_kind.to_owned())
     }
 
-    fn record_call(&self, kind: &str, elapsed: Duration, nonce_challenge: bool, key: &str) {
+    fn record_call(&self, call: OutboundCallRecord, nonce_challenge: bool, key: &str) {
+        if call.status.is_none()
+            && let Some(error) = &call.error
+        {
+            tracing::warn!(
+                kind = %call.kind,
+                host = %call.host,
+                path = %call.path,
+                error = %error,
+                "an outbound call made during a web request failed"
+            );
+        }
         if let Ok(mut state) = self.state.lock() {
-            let elapsed_ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
+            let elapsed_ms = call.duration_ms;
             state.snapshot.total_calls = state.snapshot.total_calls.saturating_add(1);
             state.snapshot.total_ms = state.snapshot.total_ms.saturating_add(elapsed_ms);
-            if kind == "dpop_nonce_retry" {
+            if call.kind == "dpop_nonce_retry" {
                 state.snapshot.dpop_nonce_retries =
                     state.snapshot.dpop_nonce_retries.saturating_add(1);
             }
-            let (count, total_ms) = state.snapshot.by_kind.entry(kind.to_owned()).or_default();
+            let (count, total_ms) = state.snapshot.by_kind.entry(call.kind.clone()).or_default();
             *count = count.saturating_add(1);
             *total_ms = total_ms.saturating_add(elapsed_ms);
+            if state.snapshot.calls.len() >= MAX_OUTBOUND_CALL_DETAILS {
+                state.snapshot.calls_overflow = state.snapshot.calls_overflow.saturating_add(1);
+            } else {
+                state.snapshot.calls.push(call);
+            }
             if nonce_challenge {
                 state.pending_nonce_retries.insert(key.to_owned());
             }
@@ -115,6 +167,11 @@ pub(crate) struct OutboundCallTimer {
     key: String,
     started: Instant,
     nonce_challenge: bool,
+    method: String,
+    host: String,
+    path: String,
+    status: Option<u16>,
+    error: Option<String>,
 }
 
 impl OutboundCallTimer {
@@ -132,6 +189,12 @@ impl OutboundCallTimer {
             key,
             started,
             nonce_challenge: false,
+            method: method.as_str().to_owned(),
+            // Only the host and the URL path are kept: never the query string, headers or tokens.
+            host: url.host_str().unwrap_or_default().to_owned(),
+            path: url.path().to_owned(),
+            status: None,
+            error: None,
         }
     }
 }
@@ -139,9 +202,24 @@ impl OutboundCallTimer {
 impl Drop for OutboundCallTimer {
     fn drop(&mut self) {
         if let Some(accounting) = &self.accounting {
+            let elapsed = self.started.elapsed();
+            let status = self.status;
+            let error = self.error.clone().or_else(|| {
+                status
+                    .is_none()
+                    .then(|| "the call ended without an HTTP response".to_owned())
+            });
             accounting.record_call(
-                &self.kind,
-                self.started.elapsed(),
+                OutboundCallRecord {
+                    kind: self.kind.clone(),
+                    method: self.method.clone(),
+                    host: self.host.clone(),
+                    path: self.path.clone(),
+                    start_ms: accounting.start_offset_ms(self.started),
+                    duration_ms: elapsed.as_millis().min(u64::MAX as u128) as u64,
+                    status,
+                    error,
+                },
                 self.nonce_challenge,
                 &self.key,
             );
@@ -478,8 +556,11 @@ impl SafeHttpClient {
                 .send()
                 .await
                 .map_err(|error| {
-                    format!("outbound HTTP request failed: {}", error.without_url())
+                    let message = format!("outbound HTTP request failed: {}", error.without_url());
+                    call_timer.error = Some(message.clone());
+                    message
                 })?;
+            call_timer.status = Some(response.status().as_u16());
 
             if is_redirect(response.status())
                 && let Some(location) = response.headers().get(http::header::LOCATION)
@@ -525,6 +606,7 @@ impl SafeHttpClient {
                 .content_length()
                 .is_some_and(|length| length > max_bytes as u64)
             {
+                call_timer.error = Some("outbound response exceeds size limit".to_owned());
                 return Err("outbound response exceeds size limit".to_owned());
             }
             let status = response.status();
@@ -532,16 +614,16 @@ impl SafeHttpClient {
             let headers = response.headers().clone();
             let mut body = Vec::new();
             let mut response = response;
-            while let Some(chunk) = response
-                .chunk()
-                .await
-                .map_err(|_| "outbound response read failed".to_owned())?
-            {
+            while let Some(chunk) = response.chunk().await.map_err(|_| {
+                call_timer.error = Some("outbound response read failed".to_owned());
+                "outbound response read failed".to_owned()
+            })? {
                 if body
                     .len()
                     .checked_add(chunk.len())
                     .is_none_or(|length| length > max_bytes)
                 {
+                    call_timer.error = Some("outbound response exceeds size limit".to_owned());
                     return Err("outbound response exceeds size limit".to_owned());
                 }
                 body.extend_from_slice(&chunk);
@@ -1076,10 +1158,8 @@ mod tests {
                 .unwrap();
             client
                 .get(
-                    &Url::parse(&format!(
-                        "http://{address}/xrpc/app.bsky.actor.getProfile"
-                    ))
-                    .unwrap(),
+                    &Url::parse(&format!("http://{address}/xrpc/app.bsky.actor.getProfile"))
+                        .unwrap(),
                     http::HeaderMap::new(),
                     16,
                 )
@@ -1159,10 +1239,16 @@ mod tests {
         .await;
 
         let snapshot = accounting.snapshot();
-        assert_eq!(snapshot.total_calls, 70, "totals keep counting past the cap");
+        assert_eq!(
+            snapshot.total_calls, 70,
+            "totals keep counting past the cap"
+        );
         assert_eq!(snapshot.calls.len(), 64, "the detail list is capped at 64");
         assert_eq!(snapshot.calls_overflow, 6);
-        assert_eq!(snapshot.calls[0].path, "/xrpc/other", "the earliest calls are kept");
+        assert_eq!(
+            snapshot.calls[0].path, "/xrpc/other",
+            "the earliest calls are kept"
+        );
         assert_eq!(snapshot.calls[63].path, "/xrpc/other");
         server.abort();
     }
