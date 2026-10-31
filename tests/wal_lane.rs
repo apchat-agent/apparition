@@ -101,6 +101,36 @@ fn passive_probe() {
 }
 
 #[test]
+fn passive_checkpoint_keeps_wal_within_four_journal_limits() {
+    let path = temp_db("bound");
+    let connection = Connection::open(&path).unwrap();
+    connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA journal_size_limit=65536; CREATE TABLE t(k INTEGER PRIMARY KEY, v BLOB);").unwrap();
+    for index in 0..128 {
+        connection
+            .execute("INSERT INTO t VALUES (?1, zeroblob(32768))", [index])
+            .unwrap();
+    }
+    let checkpoint: (i64, i64, i64) = connection
+        .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap();
+    let wal_path = PathBuf::from(format!("{}-wal", path.display()));
+    let wal_bytes = std::fs::metadata(&wal_path).unwrap().len();
+    eprintln!(
+        "RED bound measurement: checkpoint={checkpoint:?} wal_bytes={wal_bytes} bound_bytes={}",
+        4 * 65_536_u64
+    );
+    drop(connection);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(wal_path);
+    assert!(
+        wal_bytes <= 4 * 65_536,
+        "WAL file {wal_bytes} exceeds four journal limits after a full PASSIVE checkpoint"
+    );
+}
+
+#[test]
 fn crash_child() {
     let Ok(path) = std::env::var("AV68C_CRASH_DB") else {
         return;
