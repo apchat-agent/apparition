@@ -1739,3 +1739,160 @@ Deno.test("at pct 30 applyListBlockLeak shows exactly the posts whose sample is 
     restoreStorage();
   }
 });
+
+Deno.test("the timing console button opens the page waterfall only after being tapped", async () => {
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  const css = await Deno.readTextFile(new URL("../static/app.css", import.meta.url));
+  const start = source.indexOf("function installTimingConsole");
+  assert(start >= 0, "app.js must define installTimingConsole");
+  const call = source.indexOf("installTimingConsole();", start);
+  assert(call > start, "app.js must install the timing console on load");
+  const installTimingConsole = new Function(`${source.slice(start, call)}; return installTimingConsole;`)();
+
+  assert(/\.timing-console-button\s*\{[^}]*position:\s*fixed/.test(css), "the button must be fixed in a corner");
+  assert(/\.timing-console-button\s*\{[^}]*z-index:\s*\d+/.test(css), "the button needs its own z-index");
+  assert(/\.timing-console-panel\s*\{[^}]*position:\s*fixed/.test(css), "the panel must be fixed to the viewport");
+  assert(/\.timing-console-panel\s*\{[^}]*width:\s*min\([^)]*calc\(100vw/.test(css),
+    "the panel must shrink to fit a 375 px phone");
+  assert(!/\.timing-console-(button|panel)\s*\{[^}]*bottom:/.test(css),
+    "the console sits at the top and never covers the post actions at the bottom");
+
+  class Element {
+    constructor(tag) {
+      this.tagName = tag;
+      this.className = "";
+      this.textContent = "";
+      this.hidden = false;
+      this.attributes = new Map();
+      this.children = [];
+      this.listeners = new Map();
+    }
+    setAttribute(name, value) { this.attributes.set(name, String(value)); }
+    getAttribute(name) { return this.attributes.get(name) ?? null; }
+    append(...nodes) { this.children.push(...nodes); }
+    replaceChildren(...nodes) { this.children = [...nodes]; }
+    addEventListener(name, listener) { this.listeners.set(name, listener); }
+  }
+  const collectText = (node) =>
+    node.textContent + node.children.map((child) => collectText(child)).join("\n");
+  const findByClass = (node, className) => {
+    if (node.className === className) return node;
+    for (const child of node.children) {
+      const found = findByClass(child, className);
+      if (found) return found;
+    }
+    return null;
+  };
+
+  const pageRecord = {
+    id: "abc123", viewer: "did:plc:owner", method: "GET", path: "/app", status: 200,
+    started_at_ms: 1780000000000, total_ms: 120, page: "app",
+    phases: { mutes_ms: 60, render_ms: 20 },
+    calls: [
+      { kind: "public_appview", method: "GET", host: "public.api.bsky.app", path: "/xrpc/app.bsky.feed.getTimeline", start_ms: 5, duration_ms: 220, status: 200, error: null },
+      { kind: "pds_get_record", method: "GET", host: "pds.example", path: "/xrpc/com.atproto.repo.getRecord", start_ms: 230, duration_ms: 180, status: null, error: "outbound HTTP request failed: connect" },
+    ],
+    calls_overflow: 0,
+  };
+  const fragmentRecord = {
+    id: "frag1", viewer: "did:plc:owner", method: "GET", path: "/profile-fragment", status: 200,
+    started_at_ms: 1780000000500, total_ms: 40, page: null, phases: null,
+    calls: [], calls_overflow: 0,
+  };
+
+  const makeHarness = ({ loggedIn = true, failing = false } = {}) => {
+    const body = new Element("body");
+    body.setAttribute("data-timing-id", "abc123");
+    const documentMock = {
+      body,
+      createElement: (tag) => new Element(tag),
+      querySelector: (selector) =>
+        loggedIn && selector === 'form[action="/logout"]' ? new Element("form") : null,
+    };
+    const navigation = {
+      startTime: 0,
+      responseStart: 150,
+      responseEnd: 210,
+      domContentLoadedEventEnd: 350,
+      loadEventEnd: 420,
+    };
+    const windowMock = {
+      performance: { getEntriesByType: (kind) => (kind === "navigation" ? [navigation] : []) },
+    };
+    const requests = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      requests.push(url);
+      if (failing) return { ok: false, status: 503 };
+      return { ok: true, json: async () => ({ records: [fragmentRecord, pageRecord] }) };
+    };
+    return { body, documentMock, requests, windowMock, restore: () => { globalThis.fetch = originalFetch; } };
+  };
+
+  const harness = makeHarness();
+  try {
+    const widget = installTimingConsole(harness.documentMock, harness.windowMock, new Map([["frag1", 44]]));
+    assert(widget, "a logged-in page gets the timing console");
+    assertEquals(harness.requests.length, 0, "nothing is fetched until the button is tapped");
+    const button = findByClass(harness.body, "timing-console-button");
+    assert(button, "the button is added to the page");
+    button.listeners.get("click")();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEquals(harness.requests, ["/timing/recent"]);
+    const panel = findByClass(harness.body, "timing-console-panel");
+    assert(panel && !panel.hidden, "tapping the button opens the panel");
+    const text = collectText(panel);
+    assert(text.includes("120"), `this page's server total shows: ${text}`);
+    assert(text.includes("mutes_ms"), `each non-zero phase shows: ${text}`);
+    assert(
+      text.includes("public_appview public.api.bsky.app/xrpc/app.bsky.feed.getTimeline +5 ms 220 ms 200"),
+      `a call row with its start and duration: ${text}`,
+    );
+    assert(
+      text.includes("pds_get_record pds.example/xrpc/com.atproto.repo.getRecord +230 ms 180 ms outbound HTTP request failed: connect"),
+      `a failed call row carries the error: ${text}`,
+    );
+    assert(text.includes("network + proxy: 30 ms"), `the network + proxy figure shows: ${text}`);
+    assert(text.includes("download: 60 ms"), `the download time shows: ${text}`);
+    assert(text.includes("DOM ready: 350 ms") && text.includes("load: 420 ms"),
+      `DOM ready and load show: ${text}`);
+    assert(
+      text.includes("GET /profile-fragment 40 ms 0 calls") && text.includes("browser round trip 44 ms"),
+      `a fragment row with its browser round trip: ${text}`,
+    );
+    const row = findByClass(panel, "timing-console-row");
+    assert(row, "other recent requests are one line each");
+    const detailNode = findByClass(panel, "timing-console-detail");
+    assert(detailNode && detailNode.hidden, "the detail starts collapsed");
+    row.listeners.get("click")();
+    assert(!detailNode.hidden, "tapping the row expands the same detail");
+    const close = findByClass(panel, "timing-console-close");
+    assert(close, "the panel has a close button");
+    close.listeners.get("click")();
+    assert(panel.hidden, "the close button closes the panel");
+  } finally {
+    harness.restore();
+  }
+
+  const anonymous = makeHarness({ loggedIn: false });
+  try {
+    const widget = installTimingConsole(anonymous.documentMock, anonymous.windowMock, new Map());
+    assertEquals(widget, null, "a signed-out page gets no timing button");
+    assertEquals(anonymous.body.children.length, 0);
+    assertEquals(anonymous.requests.length, 0);
+  } finally {
+    anonymous.restore();
+  }
+
+  const failing = makeHarness({ failing: true });
+  try {
+    installTimingConsole(failing.documentMock, failing.windowMock, new Map());
+    const button = findByClass(failing.body, "timing-console-button");
+    button.listeners.get("click")();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const panel = findByClass(failing.body, "timing-console-panel");
+    assert(collectText(panel).includes("503"), "a failing fetch shows the HTTP status");
+  } finally {
+    failing.restore();
+  }
+});

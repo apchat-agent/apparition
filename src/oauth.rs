@@ -15429,8 +15429,8 @@ mod tests {
         assert!(css.contains(".thread-focus-actions .is-liked .icon {\n  fill: var(--accent);"));
         assert!(css.contains(".infinite-scroll-status {"));
         assert!(css.contains(".infinite-scroll-retry[hidden] {\n  display: none;"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m38"));
-        assert!(WEB_SCRIPT_URL.contains("v=js22"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m39"));
+        assert!(WEB_SCRIPT_URL.contains("v=js23"));
     }
 
     #[test]
@@ -15459,7 +15459,7 @@ mod tests {
         ));
         assert!(css.contains("bottom: var(--mobile-compose-clearance);"));
         assert!(css.contains("padding-bottom: max(4.25rem, var(--mobile-compose-clearance));"));
-        assert!(WEB_STYLESHEET_URL.contains("v=m38"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m39"));
     }
 
     #[test]
@@ -15643,7 +15643,7 @@ mod tests {
         let head = page_shell("Write a post", "", true);
         assert!(
             head.contains(
-                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m38\"></noscript>"
+                "<noscript><link rel=\"stylesheet\" href=\"/static/nojs.css?v=m39\"></noscript>"
             ),
             "the head must restore the full form for no-JS visitors: {head}"
         );
@@ -18542,8 +18542,8 @@ mod tests {
             css_declaration(body, "color").as_deref(),
             Some("var(--muted)")
         );
-        assert!(WEB_STYLESHEET_URL.contains("v=m38"));
-        assert!(WEB_NOJS_STYLESHEET_URL.contains("v=m38"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m39"));
+        assert!(WEB_NOJS_STYLESHEET_URL.contains("v=m39"));
     }
 
     #[test]
@@ -18575,7 +18575,7 @@ mod tests {
             css.find(".post-text a.post-text-link {") > css.find(".post-text a {"),
             "the accent rule must come after `.post-text a {{` so it wins the cascade"
         );
-        assert!(WEB_STYLESHEET_URL.contains("v=m38"));
+        assert!(WEB_STYLESHEET_URL.contains("v=m39"));
     }
 }
 
