@@ -1590,8 +1590,13 @@ async fn authorize_with_write_requested_sends_the_full_scope_list() {
     );
 }
 
+// Replaced by the per-activity box tests below (lane av62q, owner msgd 2026-10-31):
+// `login_page_offers_a_write_checkbox_unchecked_by_default` and
+// `login_page_pre_ticks_the_write_checkbox_for_write_one` tested the single name=write
+// "Allow changes" box that the per-activity fieldset replaces.
+
 #[tokio::test]
-async fn login_page_offers_a_write_checkbox_unchecked_by_default() {
+async fn login_page_offers_five_activity_boxes_with_only_like_checked_by_default() {
     let response = router()
         .oneshot(
             Request::builder()
@@ -1604,22 +1609,53 @@ async fn login_page_offers_a_write_checkbox_unchecked_by_default() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let html = String::from_utf8(body.to_vec()).unwrap();
-    assert!(html.contains("name=\"write\""), "{html}");
-    assert!(html.contains("value=\"1\""), "{html}");
     assert!(
-        html.contains("Allow changes (post, like, follow, edit feeds)"),
-        "{html}"
+        html.contains("What do you want to do here?"),
+        "the fieldset must ask what the user wants to do: {html}"
     );
-    assert!(!html.contains("checked"), "{html}");
+    assert_eq!(
+        html.matches("name=\"allow\"").count(),
+        5,
+        "five checkboxes, each name=allow: {html}"
+    );
+    let positions = ["like", "repost", "post", "social", "feeds"]
+        .iter()
+        .map(|value| {
+            html.find(&format!("name=\"allow\" value=\"{value}\""))
+                .unwrap_or_else(|| panic!("missing a checkbox for {value}: {html}"))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "the boxes must be offered in the order like, repost, post, social, feeds: {html}"
+    );
+    for label in [
+        "Like posts",
+        "Repost",
+        "Write posts and replies (with pictures and video)",
+        "Follow, block, mute and manage lists",
+        "Edit your saved feeds",
+    ] {
+        assert!(html.contains(label), "missing the label {label}: {html}");
+    }
+    assert!(
+        html.contains("value=\"like\" checked"),
+        "like must be ticked by default: {html}"
+    );
+    assert_eq!(
+        html.matches(" checked").count(),
+        1,
+        "only like is checked by default: {html}"
+    );
     assert!(html.contains("method=\"post\""), "{html}");
 }
 
 #[tokio::test]
-async fn login_page_pre_ticks_the_write_checkbox_for_write_one() {
+async fn login_page_allow_parameters_pre_tick_exactly_those_boxes() {
     let response = router()
         .oneshot(
             Request::builder()
-                .uri("/login?write=1")
+                .uri("/login?allow=post&allow=social")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1628,9 +1664,48 @@ async fn login_page_pre_ticks_the_write_checkbox_for_write_one() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let html = String::from_utf8(body.to_vec()).unwrap();
-    assert!(html.contains("name=\"write\""), "{html}");
-    assert!(html.contains("checked"), "{html}");
-    assert!(html.contains("method=\"post\""), "{html}");
+    assert!(
+        html.contains("value=\"post\" checked"),
+        "post must be ticked: {html}"
+    );
+    assert!(
+        html.contains("value=\"social\" checked"),
+        "social must be ticked: {html}"
+    );
+    assert_eq!(
+        html.matches(" checked").count(),
+        2,
+        "exactly post and social are ticked: {html}"
+    );
+    assert!(
+        !html.contains("value=\"like\" checked"),
+        "a re-sign-in link for other boxes must not silently keep like ticked: {html}"
+    );
+}
+
+#[tokio::test]
+async fn login_page_keeps_the_session_expired_notice_beside_the_activity_boxes() {
+    let response = router()
+        .oneshot(
+            Request::builder()
+                .uri("/login?session_expired=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(
+        html.contains("Your Bluesky sign-in expired; please sign in again."),
+        "{html}"
+    );
+    assert_eq!(
+        html.matches(" checked").count(),
+        1,
+        "the expired notice keeps the default (like only): {html}"
+    );
 }
 
 #[tokio::test]
