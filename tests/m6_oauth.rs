@@ -1669,7 +1669,7 @@ async fn authorize_ignores_an_unknown_allow_value_and_logs_a_warning() {
 // "Allow changes" box that the per-activity fieldset replaces.
 
 #[tokio::test]
-async fn login_page_offers_five_activity_boxes_with_only_like_checked_by_default() {
+async fn login_page_offers_five_activity_boxes_with_the_expected_defaults_checked() {
     let response = router()
         .oneshot(
             Request::builder()
@@ -1711,16 +1711,49 @@ async fn login_page_offers_five_activity_boxes_with_only_like_checked_by_default
     ] {
         assert!(html.contains(label), "missing the label {label}: {html}");
     }
+    // Owner, msgd 2026-10-31: "check the ones that people would expect normally" — Like,
+    // Repost, Write posts and replies, and Follow/block/mute; saved-feed editing stays unticked.
+    for value in ["like", "repost", "post", "social"] {
+        assert!(
+            html.contains(&format!("value=\"{value}\" checked")),
+            "{value} must be ticked by default: {html}"
+        );
+    }
+    assert!(
+        !html.contains("value=\"feeds\" checked"),
+        "Edit your saved feeds must stay unticked by default: {html}"
+    );
+    assert_eq!(
+        html.matches(" checked").count(),
+        4,
+        "exactly like, repost, post and social are checked by default: {html}"
+    );
+    assert!(html.contains("method=\"post\""), "{html}");
+}
+
+#[tokio::test]
+async fn login_page_allow_like_still_ticks_only_the_like_box() {
+    let response = router()
+        .oneshot(
+            Request::builder()
+                .uri("/login?allow=like")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8(body.to_vec()).unwrap();
     assert!(
         html.contains("value=\"like\" checked"),
-        "like must be ticked by default: {html}"
+        "like must be ticked: {html}"
     );
     assert_eq!(
         html.matches(" checked").count(),
         1,
-        "only like is checked by default: {html}"
+        "repeated ?allow= parameters keep pre-ticking exactly those boxes: {html}"
     );
-    assert!(html.contains("method=\"post\""), "{html}");
 }
 
 #[tokio::test]
@@ -1776,8 +1809,8 @@ async fn login_page_keeps_the_session_expired_notice_beside_the_activity_boxes()
     );
     assert_eq!(
         html.matches(" checked").count(),
-        1,
-        "the expired notice keeps the default (like only): {html}"
+        4,
+        "the expired notice keeps the defaults (like, repost, post, social): {html}"
     );
 }
 
