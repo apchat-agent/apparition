@@ -12712,7 +12712,7 @@ where
 fn feed_reauthorization_page() -> Response {
     Html(page_shell(
         "Allow feeds",
-        "<section class=\"error-card\"><p class=\"eyebrow\">Permission update</p><h1>Sign in with changes allowed to load saved feeds</h1><p>Your existing sign-in does not include permission to load saved feeds. Sign in again and approve the updated access.</p><a class=\"primary-link\" href=\"/login?write=1\">Sign in with changes allowed to load saved feeds</a></section>",
+        "<section class=\"error-card\"><p class=\"eyebrow\">Permission update</p><h1>Sign in again to load saved feeds</h1><p>Your existing sign-in does not include permission to load saved feeds. Sign in again and approve the updated access.</p><a class=\"primary-link\" href=\"/login?write=1\">Sign in with changes allowed to load saved feeds</a></section>",
         false,
     ))
     .into_response()

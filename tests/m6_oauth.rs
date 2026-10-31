@@ -3065,7 +3065,7 @@ async fn old_scope_session_gets_a_friendly_feed_reauthorization_page() {
     .unwrap();
     assert!(
         html.to_ascii_lowercase()
-            .contains("sign in with changes allowed to load saved feeds")
+            .contains("sign in again to load saved feeds")
     );
     assert!(html.contains("href=\"/login?write=1\""));
     assert!(!html.contains("\"error\":\"OAuthError\""));
