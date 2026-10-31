@@ -209,13 +209,6 @@ impl SearchClient {
                 .chars()
                 .take(MAX_LOG_BODY_EXCERPT_CHARS)
                 .collect();
-            tracing::warn!(
-                method,
-                status,
-                url = %url,
-                body = %excerpt,
-                "search request failed"
-            );
             return Err(SearchCallError {
                 status: Some(status),
                 detail: excerpt,

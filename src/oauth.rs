@@ -8016,10 +8016,7 @@ fn search_unavailable_response(
     form: &str,
     options: PageShellOptions<'_>,
 ) -> Response {
-    let message = match failure.status {
-        Some(status) => format!("Search is unavailable right now (status {status})."),
-        None => "Search is unavailable right now.".to_owned(),
-    };
+    let message = "Search is unavailable right now.".to_owned();
     Html(page_shell_with_options(
         "Search",
         &format!(

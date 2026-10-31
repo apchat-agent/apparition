@@ -20,11 +20,13 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 use tokio::net::TcpListener;
 use tower::ServiceExt;
+use tracing::{Event, Subscriber, field::Visit};
+use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
 const ALICE: &str = "did:plc:alice";
 const HIT_AUTHOR: &str = "did:plc:searched";
@@ -37,11 +39,22 @@ struct FakeSearch {
     requests: Arc<Mutex<Vec<(String, String)>>>,
     posts_body: Arc<Mutex<Value>>,
     actors_body: Arc<Mutex<Value>>,
+    fail: Arc<AtomicBool>,
 }
 
 impl FakeSearch {
     fn posts_body(&self) -> Value {
         self.posts_body.lock().unwrap().clone()
+    }
+
+    fn failure(&self) -> Option<Response<Body>> {
+        self.fail.load(Ordering::SeqCst).then(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":"InternalServerError","message":"the upstream exploded"}"#,
+            )
+                .into_response()
+        })
     }
 }
 
@@ -50,6 +63,9 @@ async fn fake_search_posts(
     RawQuery(query): RawQuery,
 ) -> Response<Body> {
     fake.record_call("/xrpc/app.bsky.feed.searchPosts", query);
+    if let Some(failure) = fake.failure() {
+        return failure;
+    }
     axum::Json(fake.posts_body()).into_response()
 }
 
@@ -58,6 +74,9 @@ async fn fake_search_actors(
     RawQuery(query): RawQuery,
 ) -> Response<Body> {
     fake.record_call("/xrpc/app.bsky.actor.searchActors", query);
+    if let Some(failure) = fake.failure() {
+        return failure;
+    }
     axum::Json(fake.actors_body.lock().unwrap().clone()).into_response()
 }
 
@@ -110,6 +129,7 @@ async fn start_fake_search_with(
         requests: Arc::new(Mutex::new(Vec::new())),
         posts_body: Arc::new(Mutex::new(posts_body)),
         actors_body: Arc::new(Mutex::new(actors_body)),
+        fail: Arc::new(AtomicBool::new(false)),
     };
     let app = Router::new()
         .route("/xrpc/app.bsky.feed.searchPosts", get(fake_search_posts))
@@ -461,6 +481,67 @@ async fn posts_by_a_blocked_author_are_hidden_from_search_results() {
     assert!(
         html.contains("empty-state"),
         "the page needs its empty message: {html}"
+    );
+    server.abort();
+}
+
+#[derive(Clone)]
+struct WarningCapture(Arc<Mutex<Vec<String>>>);
+
+struct WarningVisitor<'a>(&'a mut String);
+
+impl Visit for WarningVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write as _;
+        let _ = write!(self.0, "{}={value:?} ", field.name());
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        use std::fmt::Write as _;
+        let _ = write!(self.0, "{}={value} ", field.name());
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        use std::fmt::Write as _;
+        let _ = write!(self.0, "{}={value} ", field.name());
+    }
+}
+
+impl<S: Subscriber> Layer<S> for WarningCapture {
+    fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+        if *event.metadata().level() == tracing::Level::WARN {
+            let mut line = String::new();
+            event.record(&mut WarningVisitor(&mut line));
+            self.0.lock().unwrap().push(line);
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_search_api_failure_shows_a_readable_page_and_logs_status_and_body_excerpt() {
+    let (base, fake, server) = start_fake_search(search_posts_body(None)).await;
+    fake.fail.store(true, Ordering::SeqCst);
+    let router = router_with_search(AcceptingFlow, search_client(&base));
+    let cookie = login(&router).await;
+    let warnings = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(WarningCapture(warnings.clone()));
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let html = get_html(&router, "/search?q=minc", &cookie).await;
+    drop(_guard);
+    assert!(
+        html.contains("Search is unavailable right now (status 500)"),
+        "the readable error line must name the status: {html}"
+    );
+    assert!(
+        !html.contains("upstream exploded"),
+        "the upstream JSON must never be echoed into the page: {html}"
+    );
+    let warnings = warnings.lock().unwrap();
+    assert!(
+        warnings.iter().any(|warning| {
+            warning.contains("status=500") && warning.contains("upstream exploded")
+        }),
+        "the warning must carry the status and the body excerpt: {warnings:?}"
     );
     server.abort();
 }
