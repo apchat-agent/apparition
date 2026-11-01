@@ -556,6 +556,7 @@ async fn write_timing_line_counts_a_fake_pds_dpop_nonce_retry() {
     };
     let subscriber = make_subscriber();
     let _thread_capture = tracing::subscriber::set_default(make_subscriber());
+    tracing::callsite::rebuild_interest_cache(); // set_default is thread-local; see tests/search_page.rs
     let before = shared.lock().unwrap().requests.len();
     let boundary = "nonce-write";
     let body = picture_multipart(boundary, "nonce accounting", None, None, &[]);
@@ -597,6 +598,7 @@ async fn write_timing_line_counts_a_fake_pds_dpop_nonce_retry() {
             .with_writer(CapturedMakeWriter(second_output.clone()))
             .finish(),
     );
+    tracing::callsite::rebuild_interest_cache(); // set_default is thread-local; see tests/search_page.rs
     let second_before = first_write_end;
     let second_boundary = "nonce-write-second";
     let second_body =
@@ -952,6 +954,7 @@ async fn pds_4xx_logs_safe_error_details_without_credentials() {
         .finish();
     let dispatch = tracing::Dispatch::new(subscriber);
     let _guard = tracing::dispatcher::set_default(&dispatch);
+    tracing::callsite::rebuild_interest_cache(); // set_default is thread-local; see tests/search_page.rs
     let result = flow.pinned_feeds(DID).await;
     assert!(result.is_err());
     drop(_guard);
@@ -2401,6 +2404,7 @@ async fn a_failed_like_names_the_pds_error_in_the_response_and_the_logs() {
             .finish()
     };
     let _capture_guard = tracing::subscriber::set_default(make_capture());
+    tracing::callsite::rebuild_interest_cache(); // set_default is thread-local; see tests/search_page.rs
     let response = app
         .clone()
         .oneshot(
@@ -2494,6 +2498,7 @@ async fn a_refresh_rejected_with_invalid_grant_is_logged_with_the_authorization_
         .with_writer(CapturedMakeWriter(output.clone()))
         .finish();
     let _capture_guard = tracing::subscriber::set_default(capture);
+    tracing::callsite::rebuild_interest_cache(); // set_default is thread-local; see tests/search_page.rs
     let response = app
         .clone()
         .oneshot(

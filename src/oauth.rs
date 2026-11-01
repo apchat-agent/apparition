@@ -21633,6 +21633,7 @@ mod tests {
             .with_writer(logs.clone())
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache(); // set_default is thread-local; see tests/search_page.rs
         metrics.report();
         drop(_guard);
         let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
@@ -22287,6 +22288,7 @@ mod tests {
             .with_writer(logs.clone())
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache(); // set_default is thread-local; see tests/search_page.rs
         let storage = Arc::new(MemoryStorage::default());
 
         let page = flow
@@ -26572,6 +26574,7 @@ mod tests {
             .with_writer(logs.clone())
             .finish();
         let capture = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache(); // set_default is thread-local; see tests/search_page.rs
         let failed_before = FAILED_INDEX_WRITES.load(Ordering::Relaxed);
         let response = post_like(&app, &cookie, like_form_body(&post.uri), true).await;
         assert_eq!(
@@ -26936,6 +26939,7 @@ mod tests {
             .with_writer(logs.clone())
             .finish();
         let capture = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache(); // set_default is thread-local; see tests/search_page.rs
         let response = post_like(&app, &cookie, like_form_body(&post.uri), true).await;
         assert_eq!(response.status(), StatusCode::OK);
         drop(json_response(response).await);
@@ -27037,6 +27041,7 @@ mod tests {
             .with_writer(logs.clone())
             .finish();
         let capture = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache(); // set_default is thread-local; see tests/search_page.rs
         let response = post_like(&app, &cookie, like_form_body(&post.uri), true).await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = json_response(response).await;

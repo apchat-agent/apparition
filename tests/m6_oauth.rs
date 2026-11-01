@@ -1715,6 +1715,7 @@ async fn authorize_ignores_an_unknown_allow_value_and_logs_a_warning() {
     let warnings = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::registry().with(WarningCapture(warnings.clone()));
     let _guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache(); // set_default is thread-local; see tests/search_page.rs
     let flow = FakeOAuthFlow::default();
     let captured = flow.authorize_scopes.clone();
     let app = OAuthPublic::new("https://appview.example")
@@ -4186,6 +4187,7 @@ async fn link_preview_and_post_client_errors_emit_one_sanitized_warning_each() {
     let warnings = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::registry().with(WarningCapture(warnings.clone()));
     let _guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache(); // set_default is thread-local; see tests/search_page.rs
 
     for (path, body) in [
         (
@@ -5799,6 +5801,7 @@ async fn app_timeline_waits_for_new_author_profiles_before_rendering() {
     let timing = Arc::new(Mutex::new(None));
     let subscriber = tracing_subscriber::registry().with(ProfileHydrationTiming(timing.clone()));
     let _guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache(); // set_default is thread-local; see tests/search_page.rs
     let started = Instant::now();
     let html = get_html(&app, "/app", &cookie).await;
     let elapsed = started.elapsed();
@@ -5860,6 +5863,7 @@ async fn app_timeline_skips_fresh_indexed_profiles_without_fetching() {
     let timing = Arc::new(Mutex::new(None));
     let subscriber = tracing_subscriber::registry().with(ProfileHydrationTiming(timing.clone()));
     let _guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache(); // set_default is thread-local; see tests/search_page.rs
     let started = Instant::now();
     let html = get_html(&app, "/app", &cookie).await;
 
@@ -7652,6 +7656,7 @@ async fn sign_in_logs_its_ticked_boxes_and_the_granted_scopes_at_info() {
     let infos = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::registry().with(InfoCapture(infos.clone()));
     let _guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache(); // set_default is thread-local; see tests/search_page.rs
     let app = OAuthPublic::new("https://appview.example")
         .unwrap()
         .router_with_flow(FakeOAuthFlow::default(), Arc::new(MemoryStorage::default()));
@@ -8621,6 +8626,7 @@ async fn a_failing_block_list_member_fetch_keeps_the_page_available_and_warns_wi
     let warnings = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::registry().with(WarningCapture(warnings.clone()));
     let _guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache(); // set_default is thread-local; see tests/search_page.rs
     let (status, html) = get_body(&app, "/app", &cookie).await;
     drop(_guard);
     assert_eq!(status, StatusCode::OK);
@@ -8729,6 +8735,7 @@ async fn the_following_timing_line_counts_list_blocked_posts() {
     let phases = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::registry().with(WebPagePhases(phases.clone()));
     let _guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache(); // set_default is thread-local; see tests/search_page.rs
     let (status, _html) = get_body(&app, "/app", &cookie).await;
     drop(_guard);
     assert_eq!(status, StatusCode::OK);

@@ -185,6 +185,7 @@ fn jetstream_large_database_batch_ingest_benchmark() {
         .finish();
     let dispatch = tracing::Dispatch::new(subscriber);
     let _guard = tracing::dispatcher::set_default(&dispatch);
+    tracing::callsite::rebuild_interest_cache(); // set_default is thread-local; see tests/search_page.rs
     let startup_started = std::time::Instant::now();
     let storage = Arc::new(SqliteStorage::open(&path).unwrap());
     println!(
@@ -1164,6 +1165,7 @@ async fn event_processing_timeout_releases_connection_and_logs_event_identity() 
         .finish();
     let dispatch = tracing::Dispatch::new(subscriber);
     let _guard = tracing::dispatcher::set_default(&dispatch);
+    tracing::callsite::rebuild_interest_cache(); // set_default is thread-local; see tests/search_page.rs
 
     let consumer = JetstreamConsumer::new(ingestor, Duration::from_millis(1))
         .with_event_timeout(Duration::from_millis(25));
@@ -1217,6 +1219,7 @@ async fn metrics_are_emitted_during_idle_periods_with_zero_events_and_cursor_lag
         .finish();
     let dispatch = tracing::Dispatch::new(subscriber);
     let _guard = tracing::dispatcher::set_default(&dispatch);
+    tracing::callsite::rebuild_interest_cache(); // set_default is thread-local; see tests/search_page.rs
 
     let consumer = JetstreamConsumer::new(ingestor, Duration::from_millis(1))
         .with_idle_timeout(Duration::from_millis(200))
@@ -1267,6 +1270,7 @@ async fn websocket_connection_lifecycle_is_logged_at_info() {
         .finish();
     let dispatch = tracing::Dispatch::new(subscriber);
     let _guard = tracing::dispatcher::set_default(&dispatch);
+    tracing::callsite::rebuild_interest_cache(); // set_default is thread-local; see tests/search_page.rs
 
     let consumer = JetstreamConsumer::new(
         Ingestor::new(Arc::new(MemoryStorage::default()), ScopeMode::Full),

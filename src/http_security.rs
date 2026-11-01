@@ -302,6 +302,7 @@ mod tests {
             .finish();
         let dispatch = tracing::Dispatch::new(subscriber);
         let _guard = tracing::dispatcher::set_default(&dispatch);
+        tracing::callsite::rebuild_interest_cache(); // set_default is thread-local; see tests/search_page.rs
 
         let app = protect(
             axum::Router::new().route("/slow", get(|| async { "done" })),
@@ -396,6 +397,7 @@ mod tests {
             .finish();
         let dispatch = tracing::Dispatch::new(subscriber);
         let _guard = tracing::dispatcher::set_default(&dispatch);
+        tracing::callsite::rebuild_interest_cache(); // set_default is thread-local; see tests/search_page.rs
 
         super::log_request(
             "GET",

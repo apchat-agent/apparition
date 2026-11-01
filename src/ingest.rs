@@ -7820,6 +7820,7 @@ mod sqlite_writer_tests {
                 .with_writer(CaptureMakeWriter(output.clone()))
                 .finish(),
         );
+        tracing::callsite::rebuild_interest_cache(); // set_default is thread-local; see tests/search_page.rs
         let read_metrics = ReadPoolMetrics::default();
         read_metrics.record_wait(Duration::from_millis(7));
         read_metrics.record_wait(Duration::from_millis(3));
@@ -8671,6 +8672,7 @@ mod recent_posts_storage_tests {
                 .with_writer(Capture(Arc::clone(&output)))
                 .finish(),
         );
+        tracing::callsite::rebuild_interest_cache(); // set_default is thread-local; see tests/search_page.rs
         metrics.report(&ReadPoolMetrics::default(), &WalMetrics::default());
         drop(_guard);
         let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();

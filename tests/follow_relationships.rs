@@ -445,6 +445,7 @@ async fn a_failed_relationship_lookup_keeps_the_page_and_rows_and_warns() {
         .finish();
     let dispatch = tracing::Dispatch::new(subscriber);
     let _guard = tracing::dispatcher::set_default(&dispatch);
+    tracing::callsite::rebuild_interest_cache(); // set_default is thread-local; see tests/search_page.rs
     let first = request_html(&app, &cookie).await;
     let second = request_html(&app, &cookie).await;
     let third = request_html(&app, &cookie).await;
