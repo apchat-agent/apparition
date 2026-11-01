@@ -4940,8 +4940,9 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
                     "author PDS recent posts request returned HTTP {status}"
                 ));
             }
-            let value: Value = serde_json::from_slice(response.body())
-                .map_err(|error| format!("author PDS returned invalid recent-posts JSON: {error}"))?;
+            let value: Value = serde_json::from_slice(response.body()).map_err(|error| {
+                format!("author PDS returned invalid recent-posts JSON: {error}")
+            })?;
             let records = value
                 .get("records")
                 .and_then(Value::as_array)
@@ -10426,9 +10427,7 @@ where
     // few/no posts, say so; the next load shows the fetched posts. No new
     // client-side code: the note rides the same page the fetch lands behind.
     let posts = if recent_posts_visit.show_loading_note {
-        format!(
-            "<li class=\"recent-posts-loading\">Loading recent posts…</li>{posts}"
-        )
+        format!("<li class=\"recent-posts-loading\">Loading recent posts…</li>{posts}")
     } else {
         posts
     };
@@ -10512,9 +10511,7 @@ fn profile_recent_posts_footer(state: &str) -> String {
         "fresh" => "recent posts: fetched a moment ago",
         _ => "recent posts: from the local index",
     };
-    format!(
-        "<p class=\"profile-recent-posts\" data-profile-recent-posts=\"{state}\">{text}</p>"
-    )
+    format!("<p class=\"profile-recent-posts\" data-profile-recent-posts=\"{state}\">{text}</p>")
 }
 
 fn render_profile_page_content(page: ProfilePageContent<'_>) -> String {
@@ -21748,8 +21745,7 @@ mod tests {
         fn fetch_recent_posts<'a>(
             &'a self,
             did: &'a str,
-        ) -> Pin<Box<dyn Future<Output = Result<Vec<IndexedRecord>, String>> + Send + 'a>>
-        {
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<IndexedRecord>, String>> + Send + 'a>> {
             let calls = Arc::clone(&self.calls);
             let posts = Arc::clone(&self.posts);
             let hold = self.hold;
@@ -21820,9 +21816,27 @@ mod tests {
         let viewer = "did:plc:recent-posts-viewer";
         let subject = "did:plc:recent-posts-untracked";
         let fetched = vec![
-            test_web_post(subject, "newest", 1_800_000_000_000_000, "the newest fetched post", None),
-            test_web_post(subject, "middle", 1_700_000_000_000_000, "the middle fetched post", None),
-            test_web_post(subject, "oldest", 1_600_000_000_000_000, "the oldest fetched post", None),
+            test_web_post(
+                subject,
+                "newest",
+                1_800_000_000_000_000,
+                "the newest fetched post",
+                None,
+            ),
+            test_web_post(
+                subject,
+                "middle",
+                1_700_000_000_000_000,
+                "the middle fetched post",
+                None,
+            ),
+            test_web_post(
+                subject,
+                "oldest",
+                1_600_000_000_000_000,
+                "the oldest fetched post",
+                None,
+            ),
         ];
         let flow = RecentPostsTestFlow::new([(subject.to_owned(), fetched)])
             .with_fetch_hold(Duration::from_secs(2));
@@ -21949,12 +21963,20 @@ mod tests {
             1,
             "a visit within the TTL must queue no refetch"
         );
-        assert_eq!(storage.pending_recent_posts_fetches(20).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            storage.pending_recent_posts_fetches(20).unwrap(),
+            Vec::<String>::new()
+        );
         let (queued, _done, _failed, _dropped) = storage.recent_posts_counters();
-        assert_eq!(queued, 1, "the TTL visit queued nothing, so the count stays at one");
+        assert_eq!(
+            queued, 1,
+            "the TTL visit queued nothing, so the count stays at one"
+        );
         let expired = crate::recent_posts::now_wall_ms()
             - crate::recent_posts::RECENT_POSTS_TTL.as_millis() as i64 * 2;
-        storage.record_recent_posts_fetched(subject, expired).unwrap();
+        storage
+            .record_recent_posts_fetched(subject, expired)
+            .unwrap();
         recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
         assert_eq!(
             storage.pending_recent_posts_fetches(20).unwrap(),
@@ -21977,9 +21999,13 @@ mod tests {
         let app = public.router_with_flow(flow.clone(), storage.clone());
         let cookie = format!("{SESSION_COOKIE}={token}");
         let worker = RecentPostsWorker::new(flow.clone(), storage.clone(), Duration::from_secs(30));
-        let (status, html) = recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
+        let (status, html) =
+            recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
         assert_eq!(status, StatusCode::OK, "the page renders regardless");
-        assert!(html.contains("No indexed posts yet"), "the page shows what is local");
+        assert!(
+            html.contains("No indexed posts yet"),
+            "the page shows what is local"
+        );
         let logs = FeedTestLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .without_time()
@@ -22003,14 +22029,21 @@ mod tests {
             .recent_posts_status(subject)
             .unwrap()
             .expect("the failed fetch is recorded");
-        assert_eq!(status_entry.fetched_at_ms, 0, "a failed fetch is not a cache hit");
+        assert_eq!(
+            status_entry.fetched_at_ms, 0,
+            "a failed fetch is not a cache hit"
+        );
         assert!(
             status_entry.next_retry_at_ms > crate::recent_posts::now_wall_ms(),
             "the failure sets a retry backoff"
         );
         let (status, _html) =
             recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
-        assert_eq!(status, StatusCode::OK, "the page still renders during the backoff");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the page still renders during the backoff"
+        );
         worker.run_once().await.unwrap();
         assert_eq!(
             flow.call_count(),
@@ -22039,14 +22072,16 @@ mod tests {
         let app = public.router_with_flow(flow.clone(), storage.clone());
         let cookie = format!("{SESSION_COOKIE}={token}");
         let worker = RecentPostsWorker::new(flow.clone(), storage.clone(), Duration::from_secs(30));
-        let (status, html) = recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
+        let (status, html) =
+            recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
         assert_eq!(status, StatusCode::OK);
         assert!(
             html.contains("recent-posts-loading") && html.contains("Loading recent posts"),
             "a page with no posts while its job is queued shows the short loading note"
         );
         worker.run_once().await.unwrap();
-        let (status, html) = recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
+        let (status, html) =
+            recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
         assert_eq!(status, StatusCode::OK);
         assert!(
             !html.contains("recent-posts-loading"),
@@ -22076,7 +22111,8 @@ mod tests {
         let token = recent_posts_session(&storage, &public, viewer);
         let app = public.router_with_flow(flow.clone(), storage.clone());
         let cookie = format!("{SESSION_COOKIE}={token}");
-        let (status, html) = recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
+        let (status, html) =
+            recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
         assert_eq!(status, StatusCode::OK);
         assert!(html.contains("indexed post 9"), "the indexed posts render");
         assert!(
@@ -22108,14 +22144,16 @@ mod tests {
         let app = public.router_with_flow(flow.clone(), storage.clone());
         let cookie = format!("{SESSION_COOKIE}={token}");
         let worker = RecentPostsWorker::new(flow.clone(), storage.clone(), Duration::from_secs(30));
-        let (status, html) = recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
+        let (status, html) =
+            recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
         assert_eq!(status, StatusCode::OK);
         assert!(
             html.contains("data-profile-recent-posts=\"queued\""),
             "the footer reports the queued state on the first visit"
         );
         worker.run_once().await.unwrap();
-        let (status, html) = recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
+        let (status, html) =
+            recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
         assert_eq!(status, StatusCode::OK);
         assert!(
             html.contains("data-profile-recent-posts=\"fresh\""),
@@ -22138,8 +22176,13 @@ mod tests {
         let token = recent_posts_session(&storage, &public, viewer);
         let app = public.router_with_flow(flow, storage.clone());
         let cookie = format!("{SESSION_COOKIE}={token}");
-        let (status, html) = recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
-        assert_eq!(status, StatusCode::OK, "the page renders even when the job is dropped");
+        let (status, html) =
+            recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the page renders even when the job is dropped"
+        );
         assert!(
             html.contains("data-profile-recent-posts=\"cached\""),
             "a visit whose job was dropped at the queue bound reports cached, not queued"
@@ -22149,7 +22192,9 @@ mod tests {
             "no loading note is shown when nothing was queued"
         );
         assert_eq!(
-            storage.pending_recent_posts_fetches(crate::ingest::MAX_RECENT_POSTS_QUEUE + 10).unwrap(),
+            storage
+                .pending_recent_posts_fetches(crate::ingest::MAX_RECENT_POSTS_QUEUE + 10)
+                .unwrap(),
             (0..crate::ingest::MAX_RECENT_POSTS_QUEUE)
                 .map(|index| format!("did:plc:queue-filler-{index}"))
                 .collect::<Vec<_>>(),
@@ -22190,7 +22235,7 @@ mod tests {
                             .map(|value| value.trim_matches(|c| c == '"' || c == ',').to_owned())
                     })
                 })
-                .last()
+                .next_back()
         };
         let subscriber = tracing_subscriber::fmt()
             .without_time()

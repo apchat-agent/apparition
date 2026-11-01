@@ -516,7 +516,10 @@ pub trait Storage: Send + Sync {
     fn complete_profile_fetch(&self, did: &str) -> Result<(), StorageError>;
     /// The per-account recent-posts fetch state, read without touching the
     /// writer. Backends that do not support the recent-posts worker report `None`.
-    fn recent_posts_status(&self, _did: &str) -> Result<Option<RecentPostsFetchStatus>, StorageError> {
+    fn recent_posts_status(
+        &self,
+        _did: &str,
+    ) -> Result<Option<RecentPostsFetchStatus>, StorageError> {
         Ok(None)
     }
     /// Queue one bounded, deduplicated "recent posts" job for one account. The
@@ -1390,7 +1393,10 @@ impl Storage for MemoryStorage {
         Ok(())
     }
 
-    fn recent_posts_status(&self, did: &str) -> Result<Option<RecentPostsFetchStatus>, StorageError> {
+    fn recent_posts_status(
+        &self,
+        did: &str,
+    ) -> Result<Option<RecentPostsFetchStatus>, StorageError> {
         let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
         let status = inner.recent_posts_status.get(did).copied();
         let queued = inner.recent_posts_queued.contains(did);
@@ -1434,11 +1440,17 @@ impl Storage for MemoryStorage {
             .map_err(|_| StorageError::Poisoned)?
             .recent_posts_status
             .insert(did.to_owned(), (fetched_at_ms, 0));
-        self.recent_posts_counters.done.fetch_add(1, Ordering::Relaxed);
+        self.recent_posts_counters
+            .done
+            .fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
-    fn record_recent_posts_failure(&self, did: &str, next_retry_at_ms: i64) -> Result<(), StorageError> {
+    fn record_recent_posts_failure(
+        &self,
+        did: &str,
+        next_retry_at_ms: i64,
+    ) -> Result<(), StorageError> {
         let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
         inner
             .recent_posts_status
@@ -2899,12 +2911,16 @@ fn build_profile_index(
     Ok(index)
 }
 
-fn build_recent_posts_state(
-    connection: &Connection,
-) -> Result<(HashMap<String, (i64, i64)>, (VecDeque<String>, HashSet<String>)), StorageError> {
+type RecentPostsState = (
+    HashMap<String, (i64, i64)>,
+    (VecDeque<String>, HashSet<String>),
+);
+
+fn build_recent_posts_state(connection: &Connection) -> Result<RecentPostsState, StorageError> {
     let mut status = HashMap::new();
-    let mut statement = connection
-        .prepare("SELECT did, fetched_at_ms, next_retry_at_ms FROM recent_posts_status ORDER BY did")?;
+    let mut statement = connection.prepare(
+        "SELECT did, fetched_at_ms, next_retry_at_ms FROM recent_posts_status ORDER BY did",
+    )?;
     for row in statement.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -2918,9 +2934,8 @@ fn build_recent_posts_state(
     drop(statement);
     let mut queue = VecDeque::new();
     let mut queued = HashSet::new();
-    let mut statement = connection.prepare(
-        "SELECT did FROM recent_posts_queue ORDER BY seq LIMIT ?1",
-    )?;
+    let mut statement =
+        connection.prepare("SELECT did FROM recent_posts_queue ORDER BY seq LIMIT ?1")?;
     for row in statement.query_map([MAX_RECENT_POSTS_QUEUE as i64], |row| {
         row.get::<_, String>(0)
     })? {
@@ -3370,7 +3385,8 @@ impl SqliteStorage {
         let recent_posts_state_started = Instant::now();
         let (recent_posts_status_rows, recent_posts_queue_rows) =
             build_recent_posts_state(&connection)?;
-        let recent_posts_state_build_ms = recent_posts_state_started.elapsed().as_secs_f64() * 1000.0;
+        let recent_posts_state_build_ms =
+            recent_posts_state_started.elapsed().as_secs_f64() * 1000.0;
         tracing::info!(
             accounts = recent_posts_status_rows.len(),
             queued = recent_posts_queue_rows.0.len(),
@@ -4917,7 +4933,10 @@ impl Storage for SqliteStorage {
         })
     }
 
-    fn recent_posts_status(&self, did: &str) -> Result<Option<RecentPostsFetchStatus>, StorageError> {
+    fn recent_posts_status(
+        &self,
+        did: &str,
+    ) -> Result<Option<RecentPostsFetchStatus>, StorageError> {
         let status = self
             .recent_posts_status
             .read()
@@ -4943,7 +4962,10 @@ impl Storage for SqliteStorage {
 
     fn enqueue_recent_posts_fetch(&self, did: &str) -> Result<RecentPostsEnqueue, StorageError> {
         {
-            let mut queue = self.recent_posts_queue.write().map_err(|_| StorageError::Poisoned)?;
+            let mut queue = self
+                .recent_posts_queue
+                .write()
+                .map_err(|_| StorageError::Poisoned)?;
             if queue.1.contains(did) {
                 return Ok(RecentPostsEnqueue::Duplicate);
             }
@@ -4980,7 +5002,9 @@ impl Storage for SqliteStorage {
             .write()
             .map_err(|_| StorageError::Poisoned)?
             .insert(did.to_owned(), (fetched_at_ms, 0));
-        self.recent_posts_counters.done.fetch_add(1, Ordering::Relaxed);
+        self.recent_posts_counters
+            .done
+            .fetch_add(1, Ordering::Relaxed);
         let writer_did = did.to_owned();
         self.writer.fire(move |connection| {
             connection.execute(
@@ -4995,7 +5019,11 @@ impl Storage for SqliteStorage {
         Ok(())
     }
 
-    fn record_recent_posts_failure(&self, did: &str, next_retry_at_ms: i64) -> Result<(), StorageError> {
+    fn record_recent_posts_failure(
+        &self,
+        did: &str,
+        next_retry_at_ms: i64,
+    ) -> Result<(), StorageError> {
         let fetched_at_ms = self
             .recent_posts_status
             .read()
@@ -5038,7 +5066,10 @@ impl Storage for SqliteStorage {
 
     fn complete_recent_posts_fetch(&self, did: &str) -> Result<(), StorageError> {
         {
-            let mut queue = self.recent_posts_queue.write().map_err(|_| StorageError::Poisoned)?;
+            let mut queue = self
+                .recent_posts_queue
+                .write()
+                .map_err(|_| StorageError::Poisoned)?;
             queue.0.retain(|queued| queued != did);
             queue.1.remove(did);
         }
@@ -7799,9 +7830,18 @@ mod recent_posts_storage_tests {
             RecentPostsEnqueue::Overflowed,
             "the queue is bounded at {MAX_RECENT_POSTS_QUEUE} jobs"
         );
-        let pending = storage.pending_recent_posts_fetches(MAX_RECENT_POSTS_QUEUE + 10).unwrap();
-        assert_eq!(pending.len(), MAX_RECENT_POSTS_QUEUE, "the bound holds the queue");
-        assert!(!pending.iter().any(|did| did == overflow), "overflow is dropped, not blocked");
+        let pending = storage
+            .pending_recent_posts_fetches(MAX_RECENT_POSTS_QUEUE + 10)
+            .unwrap();
+        assert_eq!(
+            pending.len(),
+            MAX_RECENT_POSTS_QUEUE,
+            "the bound holds the queue"
+        );
+        assert!(
+            !pending.iter().any(|did| did == overflow),
+            "overflow is dropped, not blocked"
+        );
         let (queued, _done, _failed, dropped) = storage.recent_posts_counters();
         assert_eq!(queued, MAX_RECENT_POSTS_QUEUE as u64);
         assert_eq!(dropped, 1, "the dropped overflow is counted");
@@ -7935,7 +7975,10 @@ mod recent_posts_storage_tests {
             Some((1_000, 0, true)),
             "the queue and the fetch timestamp reload from the database at open"
         );
-        assert_eq!(reopened.pending_recent_posts_fetches(10).unwrap(), vec![did.to_owned()]);
+        assert_eq!(
+            reopened.pending_recent_posts_fetches(10).unwrap(),
+            vec![did.to_owned()]
+        );
         drop(reopened);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(format!("{}-wal", path.display()));

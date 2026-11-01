@@ -94,8 +94,7 @@ pub fn on_profile_visit<S: Storage>(
         };
     }
     let already_queued = status.is_some_and(|status| status.queued);
-    let in_backoff =
-        status.is_some_and(|status| status.next_retry_at_ms > now_ms);
+    let in_backoff = status.is_some_and(|status| status.next_retry_at_ms > now_ms);
     if already_queued {
         return RecentPostsVisit {
             label: "queued",
@@ -134,11 +133,8 @@ pub fn on_profile_visit<S: Storage>(
 /// Microseconds since the UNIX epoch from an RFC 3339 `createdAt` value, the
 /// same format [`crate::backfill`] parses for repository records.
 pub fn parse_created_at_micros(value: &str) -> Option<u64> {
-    let parsed = time::OffsetDateTime::parse(
-        value,
-        &time::format_description::well_known::Rfc3339,
-    )
-    .ok()?;
+    let parsed =
+        time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()?;
     u64::try_from(parsed.unix_timestamp_nanos() / 1_000).ok()
 }
 
