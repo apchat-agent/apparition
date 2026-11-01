@@ -56,13 +56,14 @@ fn backfill_max_age_days_defaults_to_thirty_and_is_configurable() {
         "backfill keeps only 30 days of post/like/repost history by default"
     );
 
-    let from_env =
-        Config::from_toml_and_env("", [("APPVIEW_BACKFILL_MAX_AGE_DAYS", "7")]).unwrap();
+    let from_env = Config::from_toml_and_env("", [("APPVIEW_BACKFILL_MAX_AGE_DAYS", "7")]).unwrap();
     assert!(format!("{from_env:?}").contains("backfill_max_age_days: 7"));
 
-    let from_toml =
-        Config::from_toml_and_env("backfill_max_age_days = 14", std::iter::empty::<(&str, &str)>())
-            .unwrap();
+    let from_toml = Config::from_toml_and_env(
+        "backfill_max_age_days = 14",
+        std::iter::empty::<(&str, &str)>(),
+    )
+    .unwrap();
     assert!(format!("{from_toml:?}").contains("backfill_max_age_days: 14"));
 
     let env_over_toml = Config::from_toml_and_env(
@@ -75,7 +76,8 @@ fn backfill_max_age_days_defaults_to_thirty_and_is_configurable() {
 
 #[test]
 fn backfill_max_age_days_accepts_zero_and_rejects_garbage() {
-    let unlimited = Config::from_toml_and_env("", [("APPVIEW_BACKFILL_MAX_AGE_DAYS", "0")]).unwrap();
+    let unlimited =
+        Config::from_toml_and_env("", [("APPVIEW_BACKFILL_MAX_AGE_DAYS", "0")]).unwrap();
     assert!(
         format!("{unlimited:?}").contains("backfill_max_age_days: 0"),
         "0 means no window: index the whole repository as before"
