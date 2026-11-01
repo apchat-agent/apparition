@@ -31,9 +31,10 @@ pub const RECENT_POSTS_RETRY_BACKOFF: Duration = Duration::from_secs(60);
 /// How many posts one `listRecords` page asks for — the recent-posts fetch
 /// and the older-on-scroll walk share it: one `com.atproto.repo.listRecords`
 /// request with this `limit` and NO `reverse` (see [`list_records_url`]).
-/// Lane av75q step 4 sets it to the owner's page of 25; the local profile
-/// page size (50) is unchanged.
-pub const RECENT_POSTS_FETCH_LIMIT: usize = 100;
+/// 25 per call since 2026-11-01 (owner, lane av75q step 4); pinned by a
+/// literal `25` in the URL tests. The local profile page size (50) is
+/// unchanged.
+pub const RECENT_POSTS_FETCH_LIMIT: usize = 25;
 
 fn list_records_page_url(
     pds_endpoint: &str,
