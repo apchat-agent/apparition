@@ -2953,8 +2953,8 @@ input[type="checkbox"] {
     margin: calc(0.6rem - 19px) -0.2rem;
   }
 
-  body:has(.mobile-nav) .mobile-nav a > span,
-  body:has(.mobile-nav) .mobile-nav button > span {
+  body:has(.mobile-nav) .mobile-nav a > span:not(.notification-badge),
+  body:has(.mobile-nav) .mobile-nav button > span:not(.notification-badge) {
     position: absolute;
     width: 1px;
     height: 1px;

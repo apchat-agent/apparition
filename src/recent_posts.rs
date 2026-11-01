@@ -69,6 +69,15 @@ pub fn on_profile_visit<S: Storage>(
     subject: &str,
     local_post_count: usize,
 ) -> RecentPostsVisit {
+    // A tracked account (registered or followed by a registered user) already
+    // arrives through the firehose; fetching it again would only add PDS load
+    // and writer traffic for records the index has.
+    if storage.is_tracked_did(subject).unwrap_or(false) {
+        return RecentPostsVisit {
+            label: "cached",
+            show_loading_note: false,
+        };
+    }
     let now_ms = now_wall_ms();
     let status = match storage.recent_posts_status(subject) {
         Ok(status) => status,
