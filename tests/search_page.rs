@@ -722,6 +722,7 @@ async fn a_search_api_failure_shows_a_readable_page_and_logs_status_and_body_exc
     let warnings = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::registry().with(WarningCapture(warnings.clone()));
     let _guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache(); // see the cursor-page 403 test below
     let html = get_html(&router, "/search?q=minc", &cookie).await;
     drop(_guard);
     assert!(
@@ -1046,6 +1047,7 @@ async fn a_signed_search_failure_warns_with_the_real_error_and_falls_back_to_ano
     let warnings = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::registry().with(WarningCapture(warnings.clone()));
     let _guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache(); // see the cursor-page 403 test below
     let html = get_html(&router, "/search?q=minc", &cookie).await;
     drop(_guard);
     assert_eq!(
@@ -1081,6 +1083,10 @@ async fn a_403_on_an_anonymous_cursor_page_asks_for_a_fresh_sign_in_instead_of_t
     let warnings = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::registry().with(WarningCapture(warnings.clone()));
     let _guard = tracing::subscriber::set_default(subscriber);
+    // set_default is thread-local; a callsite first hit by a parallel test thread with no
+    // subscriber can keep a cached "never" interest and skip this capture (CI run 41331932048,
+    // 2/120 under a 4x parallel stress). Recompute every callsite's interest now.
+    tracing::callsite::rebuild_interest_cache();
     let html = get_html(
         &router,
         "/search?q=minc&type=posts&cursor=cursor-page-2",
