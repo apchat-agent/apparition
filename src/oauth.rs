@@ -6141,6 +6141,10 @@ struct WebPageTiming {
     tabs_ms: u64,
     timeline_fetch_index_ms: u64,
     timeline_fetch_live_ms: u64,
+    /// `cached` | `queued` | `fresh` from the recent-posts cache (owner
+    /// 2026-11-01); `none` on pages without a recent-posts decision. Not a
+    /// duration: it renders and logs without an ms suffix.
+    profile_recent_posts: &'static str,
     feed_timeline_ms: u64,
     mutes_ms: u64,
     list_blocks_ms: u64,
@@ -6180,6 +6184,7 @@ impl WebPageTiming {
             tabs_ms: 0,
             timeline_fetch_index_ms: 0,
             timeline_fetch_live_ms: 0,
+            profile_recent_posts: "none",
             feed_timeline_ms: 0,
             mutes_ms: 0,
             list_blocks_ms: 0,
@@ -6256,6 +6261,7 @@ impl Drop for WebPageTiming {
             tabs_ms = self.tabs_ms,
             timeline_fetch_index_ms = self.timeline_fetch_index_ms,
             timeline_fetch_live_ms = self.timeline_fetch_live_ms,
+            profile_recent_posts = self.profile_recent_posts,
             feed_timeline_ms = self.feed_timeline_ms,
             mutes_ms = self.mutes_ms,
             list_blocks_ms = self.list_blocks_ms,
@@ -6341,6 +6347,12 @@ impl Drop for WebPageTiming {
                 fields.insert(
                     "relationship_answer".to_owned(),
                     json!(self.relationship_answer),
+                );
+            }
+            if self.profile_recent_posts != "none" {
+                fields.insert(
+                    "profile_recent_posts".to_owned(),
+                    json!(self.profile_recent_posts),
                 );
             }
             detail.set(self.page, Value::Object(fields));
@@ -10263,6 +10275,7 @@ where
     // The page renders what is local right now and never waits.
     let recent_posts_visit =
         crate::recent_posts::on_profile_visit(state.storage.as_ref(), subject, records.len());
+    page_timing.profile_recent_posts = recent_posts_visit.label;
     let content_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
     let parent_started = std::time::Instant::now();
     let mut parent_stats = ParentHydrationStats::default();
@@ -10440,6 +10453,13 @@ where
     } else {
         String::new()
     };
+    // Step 5: the footer names the recent-posts state (cached | queued |
+    // fresh) so it is visible from the outside without the logs.
+    let older = format!(
+        "{}{}",
+        older,
+        profile_recent_posts_footer(recent_posts_visit.label)
+    );
     let content = render_profile_page_content(ProfilePageContent {
         profile: &profile,
         display_name,
@@ -10484,6 +10504,17 @@ struct ProfilePageContent<'a> {
     stats: &'a str,
     posts: &'a str,
     older: &'a str,
+}
+
+fn profile_recent_posts_footer(state: &str) -> String {
+    let text = match state {
+        "queued" => "recent posts: loading in the background",
+        "fresh" => "recent posts: fetched a moment ago",
+        _ => "recent posts: from the local index",
+    };
+    format!(
+        "<p class=\"profile-recent-posts\" data-profile-recent-posts=\"{state}\">{text}</p>"
+    )
 }
 
 fn render_profile_page_content(page: ProfilePageContent<'_>) -> String {
@@ -22154,7 +22185,9 @@ mod tests {
                 .filter(|line| line.contains("web page phases"))
                 .filter_map(|line| {
                     line.split_whitespace().find_map(|field| {
-                        field.strip_prefix(&format!("{name}=")).map(str::to_owned)
+                        field
+                            .strip_prefix(&format!("{name}="))
+                            .map(|value| value.trim_matches(|c| c == '"' || c == ',').to_owned())
                     })
                 })
                 .last()

@@ -2641,6 +2641,20 @@ a.quoted-post-card:hover,
   color: var(--muted);
 }
 
+.recent-posts-loading {
+  margin: 0.8rem 0;
+  padding: 0.85rem 1rem;
+  border-radius: 0.75rem;
+  background: var(--surface-raised);
+  color: var(--muted);
+}
+
+.profile-recent-posts {
+  margin: 1.1rem 0 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
 .login-card,
 .error-card {
   max-width: 30rem;
