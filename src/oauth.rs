@@ -19878,6 +19878,174 @@ mod tests {
         server.abort();
     }
 
+    fn held_writer_page_path(label: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!(
+                "av70q-held-writer-{label}-{}-{}.sqlite3",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))
+    }
+
+    fn remove_held_writer_database(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[tokio::test]
+    async fn a_page_of_uncounted_posts_renders_while_the_writer_is_held() {
+        // Live 2026-11-01 01:12Z: render_ms 26510 because every uncounted post made the
+        // page wait on `writer.call` (post_counts miss → 4 COUNT scans + INSERT in the
+        // writer transaction) behind a writer seconds behind. A held writer must not
+        // stall the page: counts are computed on a read connection and the cache fill
+        // is handed to the writer without waiting.
+        let path = held_writer_page_path("render");
+        remove_held_writer_database(&path);
+        let storage = Arc::new(crate::ingest::SqliteStorage::open(&path).unwrap());
+        let viewer = FEED_VIEWER_DID;
+        let mut posts = Vec::new();
+        for (index, author) in ["did:plc:held-a", "did:plc:held-b", "did:plc:held-c"]
+            .into_iter()
+            .enumerate()
+        {
+            let post = test_web_post(author, &format!("p{index}"), 10 + index as u64, "held page post", None);
+            storage.put_record(&post).unwrap();
+            posts.push(post);
+        }
+        // distinct counts per post: 3 likes / 2 reposts / 1 reply, then 1 like, then none.
+        for (like_index, liker) in ["did:plc:f1", "did:plc:f2", "did:plc:f3"]
+            .into_iter()
+            .enumerate()
+        {
+            storage
+                .put_record(&web_notice_like(liker, &posts[0].uri, like_index as u64))
+                .unwrap();
+        }
+        for (repost_index, reposter) in ["did:plc:r1", "did:plc:r2"].into_iter().enumerate() {
+            storage
+                .put_record(&web_notice_repost(reposter, &posts[0].uri, repost_index as u64))
+                .unwrap();
+        }
+        storage
+            .put_record(&test_web_post(
+                "did:plc:replier",
+                "reply-0",
+                20,
+                "reply",
+                Some(&posts[0].uri),
+            ))
+            .unwrap();
+        storage
+            .put_record(&test_web_post("did:plc:f4", "p-like", 21, "like-ish", None))
+            .unwrap();
+        // post[1] gets one like from the viewer so the like button shows intent too.
+        storage
+            .put_record(&web_notice_like(viewer, &posts[1].uri, 0))
+            .unwrap();
+
+        let quote_records = posts.iter().collect::<Vec<_>>();
+        let page_records = posts.iter().collect::<Vec<_>>();
+        let gate = storage.hold_writer(Duration::from_secs(2));
+        gate.recv_timeout(Duration::from_secs(1))
+            .expect("the writer picked up the hold");
+
+        let hydrate_started = std::time::Instant::now();
+        let hydration = hydrate_page_content(
+            &QuoteHydrationTestFlow::new(Vec::<IndexedRecord>::new()),
+            viewer,
+            storage.clone(),
+            &page_records,
+            &quote_records,
+            std::iter::empty(),
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        let hydrate_ms = hydrate_started.elapsed().as_millis() as u64;
+
+        let render_started = std::time::Instant::now();
+        let items = render_timeline_post_items(
+            storage.as_ref(),
+            &page_records,
+            &[],
+            &PageParentIndex::new(),
+            &TimelineRenderContext {
+                viewer_did: viewer,
+                rights: FormRights::default(),
+                quote_index: &hydration.quote_index,
+                list_blocks: &HashMap::new(),
+            },
+        );
+        let render_ms = render_started.elapsed().as_millis() as u64;
+
+        assert_eq!(
+            items
+                .matches("<span class=\"action-count\">3</span>")
+                .count(),
+            1,
+            "the held writer must not change the like count the page shows: {render_ms} ms"
+        );
+        assert!(
+            items.contains("<span class=\"action-count\">2</span>"),
+            "the repost count must render while the writer is held"
+        );
+        assert!(
+            hydrate_ms < 1_500,
+            "hydration waited behind the held writer: hydrate={hydrate_ms} ms \
+             profile={} ms quote={} ms labels={} ms",
+            hydration.profile_hydration_ms,
+            hydration.quote_hydration_ms,
+            hydration.account_labels_ms,
+        );
+        assert!(
+            render_ms < 1_500,
+            "rendering a page of uncounted posts waited {render_ms} ms behind the held writer",
+        );
+
+        storage.writer_barrier().unwrap();
+        let counts: (i64, i64, i64) = storage
+            .read_conn()
+            .unwrap()
+            .query_row(
+                "SELECT like_count,repost_count,reply_count FROM post_counts WHERE uri=?1",
+                [posts[0].uri.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (3, 2, 1), "the cache fill must land after the writer drains");
+        drop(storage);
+        remove_held_writer_database(&path);
+    }
+
+    fn web_notice_like(did: &str, subject_uri: &str, rkey_index: u64) -> IndexedRecord {
+        IndexedRecord {
+            did: did.to_owned(),
+            collection: "app.bsky.feed.like".to_owned(),
+            rkey: format!("like-{rkey_index}"),
+            uri: format!("at://{did}/app.bsky.feed.like/like-{rkey_index}"),
+            cid: None,
+            time_us: 100 + rkey_index,
+            record: json!({"subject": {"uri": subject_uri}}),
+        }
+    }
+
+    fn web_notice_repost(did: &str, subject_uri: &str, rkey_index: u64) -> IndexedRecord {
+        IndexedRecord {
+            did: did.to_owned(),
+            collection: "app.bsky.feed.repost".to_owned(),
+            rkey: format!("repost-{rkey_index}"),
+            uri: format!("at://{did}/app.bsky.feed.repost/repost-{rkey_index}"),
+            cid: None,
+            time_us: 100 + rkey_index,
+            record: json!({"subject": {"uri": subject_uri}}),
+        }
+    }
+
     const CORNELL_FIXTURE_DID: &str = "did:plc:oubsyca6hhgqhmbbk27lvs7c";
     const CORNELL_FIXTURE_NAME: &str = "Account Activity Labeler";
 

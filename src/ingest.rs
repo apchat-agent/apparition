@@ -3143,6 +3143,29 @@ impl SqliteStorage {
         Ok(connection)
     }
 
+    /// Holds the writer thread busy for `duration`, starting once the returned
+    /// receiver signals. Public so a test (or an investigation) can reproduce
+    /// "the writer is seconds behind" and watch which page paths wait on it;
+    /// production code must never hold the writer on purpose.
+    pub fn hold_writer(&self, duration: Duration) -> std::sync::mpsc::Receiver<()> {
+        let (started, gate) = std::sync::mpsc::channel();
+        self.writer.fire(move |connection| {
+            let awake: i64 = connection.query_row("SELECT 1", [], |row| row.get(0))?;
+            let _ = awake;
+            let _ = started.send(());
+            std::thread::sleep(duration);
+            Ok(None)
+        });
+        gate
+    }
+
+    /// Waits until every write already queued on the writer has been applied.
+    /// Fire-and-forget request-path writes are only eventually visible; tests
+    /// and investigations use this to observe them once the writer catches up.
+    pub fn writer_barrier(&self) -> Result<(), StorageError> {
+        self.writer.flush()
+    }
+
     /// A post's interaction summary and the SQLite work performed by its
     /// statements. Kept public for bounded-work regression tests and
     /// investigations.
