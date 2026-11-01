@@ -121,7 +121,7 @@ const OAUTH_STORE_WRITER_BATCH_DELAY: Duration = Duration::from_millis(5);
 const OAUTH_STORE_WRITER_METRICS_INTERVAL: Duration = Duration::from_secs(60);
 static NEXT_OAUTH_MEMORY_DATABASE_ID: AtomicUsize = AtomicUsize::new(1);
 const WEB_STYLESHEET_URL: &str = "/static/app.css?v=m45";
-const WEB_SCRIPT_URL: &str = "/static/app.js?v=js25";
+const WEB_SCRIPT_URL: &str = "/static/app.js?v=js26";
 const WEB_NOJS_STYLESHEET_URL: &str = "/static/nojs.css?v=m45";
 const HLS_SCRIPT_URL: &str = "/static/vendor/hls.min.js?v=1.7.3";
 const IMMUTABLE_CACHE: &str = "public, max-age=31536000, immutable";
@@ -4914,17 +4914,7 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
             let pds_endpoint = document
                 .pds_endpoint()
                 .ok_or_else(|| "author DID document has no valid PDS endpoint".to_owned())?;
-            let mut url =
-                reqwest::Url::parse(&format!("{pds_endpoint}/xrpc/com.atproto.repo.listRecords"))
-                    .map_err(|_| "author PDS URL is invalid".to_owned())?;
-            url.query_pairs_mut()
-                .append_pair("repo", did)
-                .append_pair("collection", "app.bsky.feed.post")
-                .append_pair(
-                    "limit",
-                    &crate::recent_posts::RECENT_POSTS_FETCH_LIMIT.to_string(),
-                )
-                .append_pair("reverse", "true");
+            let url = crate::recent_posts::list_records_url(&pds_endpoint, did)?;
             let mut headers = http::HeaderMap::new();
             headers.insert(
                 http::header::ACCEPT,
@@ -10815,8 +10805,9 @@ where
         posts
     };
     // Step 4: while the recent-posts job is queued or running and the page has
-    // few/no posts, say so; the next load shows the fetched posts. No new
-    // client-side code: the note rides the same page the fetch lands behind.
+    // few/no posts, say so; the next load shows the fetched posts. app.js
+    // (refreshWhileRecentPostsLoad) re-checks the page and reloads once the
+    // note is gone; without JS the next manual load shows them.
     let posts = if recent_posts_visit.show_loading_note {
         format!("<li class=\"recent-posts-loading\">Loading recent posts…</li>{posts}")
     } else {
@@ -18137,7 +18128,7 @@ mod tests {
         assert!(css.contains(".infinite-scroll-status {"));
         assert!(css.contains(".infinite-scroll-retry[hidden] {\n  display: none;"));
         assert!(WEB_STYLESHEET_URL.contains("v=m45"));
-        assert!(WEB_SCRIPT_URL.contains("v=js25"));
+        assert!(WEB_SCRIPT_URL.contains("v=js26"));
     }
 
     #[test]

@@ -2363,3 +2363,40 @@ Deno.test("the mobile nav hides its text labels but keeps the unread notificatio
     assert(selector.includes(":not(.notification-badge)"), `the label-hiding selector must spare the badge: ${selector}`);
   }
 });
+
+Deno.test("a profile loading its recent posts re-checks a bounded number of times and reloads once they are in", async () => {
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  const start = source.indexOf("function refreshWhileRecentPostsLoad");
+  assert(start >= 0, "app.js should define the recent-posts refresh helper");
+  const end = source.indexOf("\n}", start) + 2;
+  assert(source.includes("refreshWhileRecentPostsLoad();"), "app.js should run the helper on page load");
+  const refresh = new Function(`${source.slice(start, end)}; return refreshWhileRecentPostsLoad;`)();
+  const run = async ({ note, pages }) => {
+    let reloads = 0;
+    let fetches = 0;
+    const queue = [];
+    const pageDocument = {
+      querySelector: (selector) => (selector === ".recent-posts-loading" && note ? {} : null),
+      defaultView: { location: { href: "/profile?did=did:plc:x", reload() { reloads += 1; } } },
+    };
+    const fetchPage = async (url) => {
+      assertEquals(url, "/profile?did=did:plc:x");
+      const body = pages[Math.min(fetches, pages.length - 1)];
+      fetches += 1;
+      return { ok: true, text: async () => body };
+    };
+    refresh(pageDocument, fetchPage, (fn) => queue.push(fn), 4, 1);
+    while (queue.length) await queue.shift()();
+    return { reloads, fetches };
+  };
+  const loading = '<li class="recent-posts-loading">Loading recent posts…</li>';
+  let result = await run({ note: true, pages: [loading, loading, "<li>post</li>"] });
+  assertEquals(result.fetches, 3);
+  assertEquals(result.reloads, 1);
+  result = await run({ note: true, pages: [loading] });
+  assertEquals(result.fetches, 4);
+  assertEquals(result.reloads, 0);
+  result = await run({ note: false, pages: ["<li>post</li>"] });
+  assertEquals(result.fetches, 0);
+  assertEquals(result.reloads, 0);
+});

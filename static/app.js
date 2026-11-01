@@ -1415,6 +1415,29 @@ function fillDeferredQuotes(root = document) {
 fillDeferredQuotes();
 fillProfileIdentities();
 
+// A sparse profile says "Loading recent posts…" while the server fetches them from the author's PDS (worker polls every
+// 2 s, a fetch takes ~1 s). Re-check the same page a bounded number of times and reload once the note is gone, so the
+// posts appear without a manual refresh; a job that keeps failing stops the checks after the last try.
+function refreshWhileRecentPostsLoad(pageDocument = document, fetchPage = fetch, schedule = setTimeout, tries = 12, intervalMs = 2500) {
+  if (!pageDocument.querySelector(".recent-posts-loading")) return;
+  const location = pageDocument.defaultView.location;
+  const check = async (left) => {
+    try {
+      const response = await fetchPage(location.href, { credentials: "same-origin", headers: { Accept: "text/html" } });
+      if (response.ok && !(await response.text()).includes("recent-posts-loading")) {
+        location.reload();
+        return;
+      }
+    } catch {
+      // A failed check counts as a try; the next one retries.
+    }
+    if (left > 1) schedule(() => check(left - 1), intervalMs);
+  };
+  schedule(() => check(tries), intervalMs);
+}
+
+refreshWhileRecentPostsLoad();
+
 // Measuring overlay for the phone bottom bar (owner, 2026-10-30): open any page with ?bar-debug=1 and a small box at the
 // TOP of the screen reports why the bar sits too high on a phone we cannot measure. Without the parameter nothing here
 // runs: no probe element, no listeners, no DOM.

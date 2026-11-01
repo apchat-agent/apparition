@@ -1929,7 +1929,7 @@ async fn web_pages_share_the_mobile_stylesheet_and_viewport_without_inline_code(
         assert_eq!(html.matches("<script").count(), 2, "{path}");
         assert!(html.contains("<script src=\"/static/vendor/hls.min.js?v=1.7.3\" defer></script>"));
         assert!(
-            html.contains("<script src=\"/static/app.js?v=js25\" defer></script>"),
+            html.contains("<script src=\"/static/app.js?v=js26\" defer></script>"),
             "{path}"
         );
     }
@@ -2355,7 +2355,7 @@ async fn sign_in_error_page_uses_the_shared_mobile_document_shell() {
     // The shared shell loads both local deferred scripts, never inline code.
     assert_eq!(html.matches("<script").count(), 2);
     assert!(html.contains("<script src=\"/static/vendor/hls.min.js?v=1.7.3\" defer></script>"));
-    assert!(html.contains("<script src=\"/static/app.js?v=js25\" defer></script>"));
+    assert!(html.contains("<script src=\"/static/app.js?v=js26\" defer></script>"));
 }
 
 #[tokio::test]

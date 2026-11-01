@@ -30,8 +30,22 @@ pub const RECENT_POSTS_TTL: Duration = Duration::from_secs(15 * 60);
 pub const RECENT_POSTS_RETRY_BACKOFF: Duration = Duration::from_secs(60);
 /// How many newest posts one fetch asks for — the owner's "newest ~50-100
 /// posts" as one page: a single `com.atproto.repo.listRecords` request with
-/// `limit=100` and `reverse=true`.
+/// `limit=100` and NO `reverse` (see [`list_records_url`]).
 pub const RECENT_POSTS_FETCH_LIMIT: usize = 100;
+
+/// The one `listRecords` page a recent-posts fetch asks the author's PDS for.
+/// listRecords is newest-first by default; `reverse=true` turns it into
+/// OLDEST-first (measured on a bsky.network PDS 2026-11-01: reverse=true gave
+/// Oct 2023 posts, the default gave today's), so the flag must stay off.
+pub(crate) fn list_records_url(pds_endpoint: &str, did: &str) -> Result<reqwest::Url, String> {
+    let mut url = reqwest::Url::parse(&format!("{pds_endpoint}/xrpc/com.atproto.repo.listRecords"))
+        .map_err(|_| "author PDS URL is invalid".to_owned())?;
+    url.query_pairs_mut()
+        .append_pair("repo", did)
+        .append_pair("collection", "app.bsky.feed.post")
+        .append_pair("limit", &RECENT_POSTS_FETCH_LIMIT.to_string());
+    Ok(url)
+}
 /// Queued jobs one worker poll processes before it sleeps again.
 pub const RECENT_POSTS_WORKER_BATCH: usize = 8;
 /// A page showing fewer posts than this counts as "few/no posts" and shows
@@ -270,5 +284,26 @@ impl<F: OAuthFlow, S: Storage + 'static> RecentPostsWorker<F, S> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_recent_posts_page_asks_for_the_newest_posts_not_the_oldest() {
+        let url = list_records_url("https://pds.example", "did:plc:recent").unwrap();
+        let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
+        assert_eq!(url.path(), "/xrpc/com.atproto.repo.listRecords");
+        assert!(pairs.contains(&("repo".into(), "did:plc:recent".into())));
+        assert!(pairs.contains(&("collection".into(), "app.bsky.feed.post".into())));
+        assert!(pairs.contains(&("limit".into(), RECENT_POSTS_FETCH_LIMIT.to_string())));
+        // listRecords is newest-first unless asked otherwise; any `reverse`
+        // flips it to the account's oldest posts (the 2026-11-01 bug).
+        assert!(
+            pairs.iter().all(|(key, _)| key != "reverse"),
+            "a recent-posts fetch must not pass reverse: {url}"
+        );
     }
 }
