@@ -187,6 +187,9 @@ pub struct FeedTimelineTiming {
 const LIVE_POST_CACHE_ENTRIES: usize = 20_000;
 const LIVE_POST_CACHE_SECS: u64 = 6 * 60 * 60;
 const GONE_POST_CACHE_SECS: u64 = 10 * 60;
+/// A public profile seen again with the same content is rewritten only when the stored copy is
+/// older than this, well inside oauth.rs PROFILE_MAX_AGE (24 h), so it never goes stale.
+const PUBLIC_PROFILE_REWRITE_AFTER: Duration = Duration::from_secs(6 * 60 * 60);
 const PUBLIC_POST_BATCH_SIZE: usize = 25;
 const PUBLIC_POST_BATCH_CONCURRENCY: usize = 4;
 const MAX_PUBLIC_POST_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
@@ -2136,5 +2139,44 @@ mod tests {
         let _ = std::fs::remove_file(&db);
         let _ = std::fs::remove_file(db.with_extension("sqlite-wal"));
         let _ = std::fs::remove_file(db.with_extension("sqlite-shm"));
+    }
+
+    #[test]
+    fn persisting_an_unchanged_recent_public_profile_does_not_rewrite_it() {
+        use crate::ingest::{MemoryStorage, Storage};
+        let storage = MemoryStorage::default();
+        let profile = super::PublicProfileView {
+            did: "did:plc:author".to_owned(),
+            handle: Some("author.test".to_owned()),
+            display_name: Some("Author".to_owned()),
+            avatar: None,
+            labels: Vec::new(),
+        };
+        let stored_time = |storage: &MemoryStorage| {
+            storage
+                .get_record("did:plc:author", "app.bsky.actor.profile", "self")
+                .unwrap()
+                .expect("profile stored")
+                .time_us
+        };
+        super::persist_public_profiles(&storage, [profile.clone()]).unwrap();
+        let first = stored_time(&storage);
+        std::thread::sleep(Duration::from_millis(5));
+        super::persist_public_profiles(&storage, [profile.clone()]).unwrap();
+        assert_eq!(stored_time(&storage), first, "same content seen again soon: no write");
+
+        let mut renamed = profile.clone();
+        renamed.display_name = Some("Renamed".to_owned());
+        super::persist_public_profiles(&storage, [renamed.clone()]).unwrap();
+        assert!(stored_time(&storage) > first, "changed content is written");
+
+        let mut old = storage
+            .get_record("did:plc:author", "app.bsky.actor.profile", "self")
+            .unwrap()
+            .unwrap();
+        old.time_us -= super::PUBLIC_PROFILE_REWRITE_AFTER.as_micros() as u64 + 1;
+        storage.put_record(&old).unwrap();
+        super::persist_public_profiles(&storage, [renamed]).unwrap();
+        assert!(stored_time(&storage) > old.time_us, "an old copy is refreshed so it stays fresh");
     }
 }
