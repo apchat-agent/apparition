@@ -20147,6 +20147,188 @@ mod tests {
         remove_held_writer_database(&path);
     }
 
+    #[derive(Clone)]
+    struct HeldWriterAuthorPersistenceFlow {
+        fetched_posts: Arc<HashMap<String, IndexedRecord>>,
+        profiles: Arc<HashMap<String, crate::feeds::PublicProfileView>>,
+    }
+
+    impl HeldWriterAuthorPersistenceFlow {
+        fn new(
+            fetched_posts: impl IntoIterator<Item = IndexedRecord>,
+            profiles: impl IntoIterator<Item = crate::feeds::PublicProfileView>,
+        ) -> Self {
+            Self {
+                fetched_posts: Arc::new(
+                    fetched_posts
+                        .into_iter()
+                        .map(|record| (record.uri.clone(), record))
+                        .collect(),
+                ),
+                profiles: Arc::new(
+                    profiles
+                        .into_iter()
+                        .map(|profile| (profile.did.clone(), profile))
+                        .collect(),
+                ),
+            }
+        }
+    }
+
+    impl OAuthFlow for HeldWriterAuthorPersistenceFlow {
+        fn authorize<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: Vec<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async { Err("test flow does not authorize".to_owned()) })
+        }
+
+        fn callback<'a>(
+            &'a self,
+            _: OAuthCallback,
+        ) -> Pin<Box<dyn Future<Output = Result<OAuthAccount, String>> + Send + 'a>> {
+            Box::pin(async { Err("test flow does not callback".to_owned()) })
+        }
+
+        fn logout<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn fetch_public_posts<'a>(
+            &'a self,
+            uris: &'a [String],
+        ) -> Pin<
+            Box<dyn Future<Output = HashMap<String, crate::feeds::FetchedPublicPost>> + Send + 'a>,
+        > {
+            let uris = uris.to_vec();
+            let records = self.fetched_posts.clone();
+            Box::pin(async move {
+                uris.into_iter()
+                    .filter_map(|uri| {
+                        records.get(&uri).cloned().map(|record| {
+                            let author_did = record.did.clone();
+                            (
+                                uri,
+                                crate::feeds::FetchedPublicPost {
+                                    author: Some(crate::feeds::PublicProfileView {
+                                        did: author_did,
+                                        handle: Some("held-quote.test".to_owned()),
+                                        display_name: Some("Held Quote Author".to_owned()),
+                                        avatar: None,
+                                        labels: Vec::new(),
+                                    }),
+                                    record,
+                                },
+                            )
+                        })
+                    })
+                    .collect()
+            })
+        }
+
+        fn supports_public_post_batching(&self) -> bool {
+            true
+        }
+
+        fn page_account_data_for_page<'a>(
+            &'a self,
+            _: &'a str,
+            actor_dids: Vec<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<PageAccountData, String>> + Send + 'a>> {
+            let profiles = self.profiles.clone();
+            Box::pin(async move {
+                Ok(PageAccountData {
+                    labels: Vec::new(),
+                    profiles: actor_dids
+                        .iter()
+                        .filter_map(|did| profiles.get(did))
+                        .cloned()
+                        .collect(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn page_hydration_does_not_wait_to_persist_fetched_authors() {
+        // Live 2026-11-01 01:12Z: every content phase of the profile page waited
+        // ~13.3 s because hydrate_page_content persisted freshly fetched author
+        // profiles through `writer.call` (quote authors and account-data
+        // profiles). Even the account-labels phase showed the wait: quote and
+        // label hydration share one task, so the blocking persist starves the
+        // labels, which never touch SQLite at all. Persisting a fetched author
+        // is a cache warm for the NEXT page; it must never hold THIS one.
+        let path = held_writer_page_path("hydration");
+        remove_held_writer_database(&path);
+        let storage = Arc::new(crate::ingest::SqliteStorage::open(&path).unwrap());
+        let quoter = "did:plc:held-quoter";
+        let quote_author = "did:plc:held-quote-author";
+        let mut quoting = test_web_post(quoter, "quoting", 10, "quoting a public post", None);
+        let quoted = test_web_post(quote_author, "quoted", 5, "quoted post", None);
+        quoting.record["embed"] = quote_embed(&quoted.uri);
+        storage.put_record(&quoting).unwrap();
+        let flow = HeldWriterAuthorPersistenceFlow::new(
+            [quoted.clone()],
+            [
+                public_profile_fixture(quoter, "quoter.test", "Quoting Author"),
+                public_profile_fixture(quote_author, "quote-author.test", "Quote Author"),
+            ],
+        );
+        let page_records = vec![&quoting];
+
+        let gate = storage.hold_writer(Duration::from_secs(2));
+        gate.recv_timeout(Duration::from_secs(1))
+            .expect("the writer picked up the hold");
+
+        let started = Instant::now();
+        let hydration = hydrate_page_content(
+            &flow,
+            FEED_VIEWER_DID,
+            storage.clone(),
+            &page_records,
+            &page_records,
+            std::iter::empty(),
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            hydration
+                .quote_index
+                .get(&quoted.uri)
+                .is_some_and(|state| matches!(state, QuoteRenderState::Found(_))),
+            "the quoted post must still be hydrated"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1_500),
+            "page hydration waited {elapsed:?} to persist fetched authors: \
+             profile={} ms quote={} ms labels={} ms",
+            hydration.profile_hydration_ms,
+            hydration.quote_hydration_ms,
+            hydration.account_labels_ms,
+        );
+
+        storage.writer_barrier().unwrap();
+        for did in [quoter, quote_author] {
+            assert!(
+                storage
+                    .get_record(did, "app.bsky.actor.profile", "self")
+                    .unwrap()
+                    .is_some(),
+                "the profile for {did} must still be persisted after the page"
+            );
+        }
+        drop(storage);
+        remove_held_writer_database(&path);
+    }
+
     fn web_notice_like(did: &str, subject_uri: &str, rkey_index: u64) -> IndexedRecord {
         IndexedRecord {
             did: did.to_owned(),
