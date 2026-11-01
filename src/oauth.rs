@@ -25247,6 +25247,356 @@ mod tests {
             "both lock failures must be logged as retries: {output}"
         );
     }
+
+    const RENDER_PAGE_VIEWER: &str = "did:plc:av71q-render-viewer";
+
+    fn render_phase_page_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "av71q-render-{}-{}-{}.sqlite3",
+            label,
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn remove_render_phase_database(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    fn render_page_author(index: usize) -> String {
+        format!("did:plc:av71q-render-author-{index}")
+    }
+
+    fn render_page_parent(index: usize) -> String {
+        format!("did:plc:av71q-render-parent-{index}")
+    }
+
+    struct RenderPageSeed {
+        posts: Vec<IndexedRecord>,
+        parents: Vec<IndexedRecord>,
+    }
+
+    /// The step-1 measurement page: 30 posts by 10 authors on a temporary
+    /// SQLite database, with three replies whose parents live in storage but
+    /// not on the page (so each renders a parent card), two parent authors.
+    /// One author keeps an unresolved handle so the refresh-queue path runs.
+    fn seed_render_phase_page<S: Storage>(storage: &S) -> RenderPageSeed {
+        for index in 0..10 {
+            let author = render_page_author(index);
+            if index != 9 {
+                storage
+                    .set_verified_handle(&author, &format!("author-{index}.test"))
+                    .unwrap();
+            }
+            let mut profile = json!({"displayName": format!("Render Author {index}")});
+            if index % 3 == 0 {
+                profile["publicAvatar"] = json!(format!(
+                    "https://cdn.bsky.app/img/avatar/plain/{author}/bafkav{index}@jpeg"
+                ));
+            }
+            if index == 8 {
+                profile = json!({});
+            }
+            storage
+                .put_record(&IndexedRecord {
+                    did: author.clone(),
+                    collection: "app.bsky.actor.profile".to_owned(),
+                    rkey: "self".to_owned(),
+                    uri: format!("at://{author}/app.bsky.actor.profile/self"),
+                    cid: None,
+                    time_us: 10,
+                    record: profile,
+                })
+                .unwrap();
+            storage
+                .put_record(&IndexedRecord {
+                    did: RENDER_PAGE_VIEWER.to_owned(),
+                    collection: "app.bsky.graph.follow".to_owned(),
+                    rkey: format!("follow-{index}"),
+                    uri: format!(
+                        "at://{RENDER_PAGE_VIEWER}/app.bsky.graph.follow/follow-{index}"
+                    ),
+                    cid: None,
+                    time_us: 20 + index as u64,
+                    record: json!({"subject": author, "createdAt": "2026-10-29T12:00:00Z"}),
+                })
+                .unwrap();
+        }
+        let parents = [0usize, 1]
+            .into_iter()
+            .map(|index| {
+                let author = render_page_parent(index);
+                storage
+                    .set_verified_handle(&author, &format!("parent-{index}.test"))
+                    .unwrap();
+                storage
+                    .put_record(&IndexedRecord {
+                        did: author.clone(),
+                        collection: "app.bsky.actor.profile".to_owned(),
+                        rkey: "self".to_owned(),
+                        uri: format!("at://{author}/app.bsky.actor.profile/self"),
+                        cid: None,
+                        time_us: 10,
+                        record: json!({"displayName": format!("Render Parent {index}")}),
+                    })
+                    .unwrap();
+                test_web_post(
+                    &author,
+                    &format!("av71q-render-parent-post-{index}"),
+                    5,
+                    &format!("parent post {index}"),
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        for parent in &parents {
+            storage.put_record(parent).unwrap();
+        }
+        let posts = (0..30)
+            .map(|index| {
+                let author = render_page_author(index % 10);
+                let parent_uri = match index {
+                    3 | 11 => Some(parents[0].uri.as_str()),
+                    19 => Some(parents[1].uri.as_str()),
+                    _ => None,
+                };
+                test_web_post(
+                    &author,
+                    &format!("av71q-render-post-{index}"),
+                    1_000_000 + index as u64,
+                    &format!("render page post {index}"),
+                    parent_uri,
+                )
+            })
+            .collect::<Vec<_>>();
+        for post in &posts {
+            storage.put_record(post).unwrap();
+        }
+        RenderPageSeed { posts, parents }
+    }
+
+    fn render_phase_session_token(public: &OAuthPublic, storage: &impl Storage) -> String {
+        let generation = storage
+            .rotate_web_session(RENDER_PAGE_VIEWER, "av71q-render-session")
+            .unwrap();
+        public.issue_session_cookie(
+            RENDER_PAGE_VIEWER,
+            "av71q-render-session",
+            generation,
+            SessionPermissions {
+                write: false,
+                feed: true,
+                blob: false,
+                video: false,
+                follow: false,
+                block: false,
+                mute: false,
+                list: false,
+                preferences: false,
+                like: false,
+                repost: false,
+                post: false,
+            },
+        )
+    }
+
+    #[derive(Clone)]
+    struct RenderPhaseFeedFlow {
+        generator_uri: String,
+        posts: Vec<IndexedRecord>,
+    }
+
+    impl OAuthFlow for RenderPhaseFeedFlow {
+        fn authorize<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: Vec<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async { Err("test flow does not authorize".to_owned()) })
+        }
+
+        fn callback<'a>(
+            &'a self,
+            _: OAuthCallback,
+        ) -> Pin<Box<dyn Future<Output = Result<OAuthAccount, String>> + Send + 'a>> {
+            Box::pin(async { Err("test flow does not callback".to_owned()) })
+        }
+
+        fn logout<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn feed_timeline<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: Option<&'a str>,
+            _: Arc<dyn Storage>,
+        ) -> Pin<Box<dyn Future<Output = Result<FeedTimeline, String>> + Send + 'a>> {
+            let generator_uri = self.generator_uri.clone();
+            let feed = self
+                .posts
+                .iter()
+                .map(|record| crate::feeds::HydratedFeedPost {
+                    record: record.clone(),
+                    reposted_by: None,
+                })
+                .collect::<Vec<_>>();
+            Box::pin(async move {
+                Ok(FeedTimeline {
+                    generator: ResolvedFeed {
+                        uri: generator_uri,
+                        display_name: "Render Phase Feed".to_owned(),
+                        description: None,
+                        avatar: None,
+                        service_did: String::new(),
+                        endpoint: String::new(),
+                        unavailable: false,
+                    },
+                    timeline: crate::feeds::HydratedFeedPage {
+                        feed,
+                        cursor: None,
+                        dropped_count: 0,
+                    },
+                    timing: FeedTimelineTiming::default(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_rendered_page_reports_its_render_subphases_in_the_log_line() {
+        // Live 2026-11-01 06:16:40Z: the owner's custom-feed page spent
+        // render_ms 1923 of a 2846 ms request and the phases line said nothing
+        // about what inside the render cost that. Every page that renders post
+        // cards must break its render time into author/parent identity
+        // lookups, interaction-summary fallbacks, embeds/quotes and the page
+        // shell, with the identity-lookup and profile-count-query counts.
+        let path = render_phase_page_path("phases");
+        remove_render_phase_database(&path);
+        let storage = Arc::new(crate::ingest::SqliteStorage::open(&path).unwrap());
+        let seed = seed_render_phase_page(storage.as_ref());
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let token = render_phase_session_token(&public, storage.as_ref());
+        let generator_uri = format!(
+            "at://{RENDER_PAGE_VIEWER}/app.bsky.feed.generator/av71q-render-feed"
+        );
+        let flow = RenderPhaseFeedFlow {
+            generator_uri: generator_uri.clone(),
+            posts: seed.posts.clone(),
+        };
+        let app = public.router_with_flow(flow, storage.clone());
+        let logs = FeedTestLogs::default();
+        let thread_uri = format!(
+            "/thread?uri={}",
+            form_encoded(&seed.posts[3].uri)
+        );
+        let paths = [
+            "/app?limit=100".to_owned(),
+            format!("/app/feed?uri={}", form_encoded(&generator_uri)),
+            thread_uri,
+            format!("/profile?did={}", render_page_author(0)),
+        ];
+        let mut bodies = Vec::new();
+        for path in &paths {
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(logs.clone())
+                .finish();
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(path.clone())
+                        .header("cookie", format!("{SESSION_COOKIE}={token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .with_subscriber(subscriber)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "for {path}");
+            let bytes = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec();
+            bodies.push(String::from_utf8(bytes).unwrap());
+        }
+        let home = &bodies[0];
+        assert_eq!(home.matches("<article class=\"post-card\"").count(), 30);
+        assert!(home.contains("class=\"reply-parent-card\""), "a parent card");
+        assert!(home.contains("@author-0.test") && home.contains("@parent-0.test"));
+        assert!(home.contains("@did:plc:av71q-render-author-9"));
+        assert_eq!(
+            seed
+                .parents
+                .iter()
+                .filter(|parent| home.contains(&parent.uri))
+                .count(),
+            2
+        );
+        let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        let lines = output
+            .lines()
+            .filter(|line| line.contains("web page phases"))
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 4, "one phases line per page: {output}");
+        let metric = |line: &str, name: &str| -> i64 {
+            line.split_whitespace()
+                .find_map(|field| {
+                    field
+                        .strip_prefix(&format!("{name}="))
+                        .and_then(|value| value.parse().ok())
+                })
+                .unwrap_or_else(|| panic!("missing {name} in {line}"))
+        };
+        for line in &lines {
+            for timer in [
+                "render_profiles_ms",
+                "render_interactions_ms",
+                "render_embeds_ms",
+                "render_shell_ms",
+            ] {
+                assert!(
+                    line.contains(&format!("{timer}=")),
+                    "the phases line must carry the render sub-timer {timer}: {line}"
+                );
+                assert!(metric(line, timer) >= 0, "{line}");
+            }
+            for counter in ["render_profile_lookups", "render_profile_count_queries"] {
+                assert!(
+                    line.contains(&format!("{counter}=")),
+                    "the phases line must carry the render counter {counter}: {line}"
+                );
+                assert!(
+                    metric(line, counter) > 0,
+                    "a page of 30 posts must report nonzero {counter}: {line}"
+                );
+            }
+            assert!(
+                !line.contains("render_profile_lookups_ms")
+                    && !line.contains("render_profile_count_queries_ms"),
+                "counters must not carry an ms unit: {line}"
+            );
+        }
+        drop(app);
+        let storage = Arc::into_inner(storage).expect("the router was the last storage handle");
+        storage.writer_barrier().unwrap();
+        drop(storage);
+        remove_render_phase_database(&path);
+    }
 }
 
 #[cfg(not(unix))]
