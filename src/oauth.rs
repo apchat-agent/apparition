@@ -24415,6 +24415,70 @@ mod tests {
         );
     }
 
+    // Reviewer test (claude-helper, 2026-11-01, mutant M13 survived): an author PDS answer can
+    // carry records that are not this account's posts; none of them may be stored.
+    #[tokio::test]
+    async fn older_posts_from_the_pds_store_only_this_accounts_own_posts() {
+        let storage = Arc::new(MemoryStorage::default());
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let viewer = "did:plc:older-foreign-viewer";
+        let subject = "did:plc:older-foreign-author";
+        let other = "did:plc:older-foreign-someone-else";
+        let base_us = 1_900_000_000_000_000_u64;
+        storage
+            .put_record(&scroll_posts(subject, "a0", base_us, "scroll local 0"))
+            .unwrap();
+        let mut wrong_collection =
+            scroll_posts(subject, "r01", base_us - 2_000_000_000, "scroll pds 01");
+        wrong_collection.collection = "app.bsky.feed.like".to_owned();
+        wrong_collection.uri = format!("at://{subject}/app.bsky.feed.like/r01");
+        let pds_posts = vec![
+            scroll_posts(subject, "r00", base_us - 1_000_000_000, "scroll pds 00"),
+            wrong_collection,
+            scroll_posts(other, "r02", base_us - 3_000_000_000, "scroll pds 02"),
+            scroll_posts(subject, "r03", base_us - 4_000_000_000, "scroll pds 03"),
+        ];
+        let flow = OlderScrollFlow::new(pds_posts);
+        let token = recent_posts_session(&storage, &public, viewer);
+        let app = public.router_with_flow(flow.clone(), storage.clone());
+        let cookie = format!("{SESSION_COOKIE}={token}");
+
+        let (status, html) =
+            recent_posts_get(&app, format!("/profile?did={subject}&limit=1"), &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        let older = older_link_href(&html).expect("page 1 links to older posts");
+        let (status, _) = recent_posts_get(&app, older, &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            flow.cursors().len(),
+            1,
+            "the older page fetched once from the PDS"
+        );
+
+        let own = storage
+            .author_posts(subject, None, 50, true)
+            .unwrap()
+            .iter()
+            .map(|record| record.uri.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            own,
+            vec![
+                format!("at://{subject}/app.bsky.feed.post/a0"),
+                format!("at://{subject}/app.bsky.feed.post/r00"),
+                format!("at://{subject}/app.bsky.feed.post/r03"),
+            ],
+            "only this account's own posts are stored, the like-collection record is not"
+        );
+        assert!(
+            storage
+                .author_posts(other, None, 50, true)
+                .unwrap()
+                .is_empty(),
+            "a post of another account in the PDS answer is not stored"
+        );
+    }
+
     #[tokio::test]
     async fn a_failing_author_pds_still_renders_the_local_posts_and_logs_the_real_error() {
         let storage = Arc::new(MemoryStorage::default());
