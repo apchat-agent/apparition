@@ -22058,6 +22058,154 @@ mod tests {
             "the visit still queues its background job"
         );
     }
+
+    #[tokio::test]
+    async fn the_profile_footer_reports_the_recent_posts_state() {
+        let storage = Arc::new(MemoryStorage::default());
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let viewer = "did:plc:recent-posts-footer-viewer";
+        let subject = "did:plc:recent-posts-footer";
+        let fetched = vec![test_web_post(
+            subject,
+            "one",
+            1_800_000_000_000_000,
+            "the footer fetched post",
+            None,
+        )];
+        let flow = RecentPostsTestFlow::new([(subject.to_owned(), fetched)]);
+        let token = recent_posts_session(&storage, &public, viewer);
+        let app = public.router_with_flow(flow.clone(), storage.clone());
+        let cookie = format!("{SESSION_COOKIE}={token}");
+        let worker = RecentPostsWorker::new(flow.clone(), storage.clone(), Duration::from_secs(30));
+        let (status, html) = recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            html.contains("data-profile-recent-posts=\"queued\""),
+            "the footer reports the queued state on the first visit"
+        );
+        worker.run_once().await.unwrap();
+        let (status, html) = recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            html.contains("data-profile-recent-posts=\"fresh\""),
+            "the footer reports the fresh cache after the worker fetched"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_overflowed_recent_posts_job_is_dropped_and_the_footer_reports_the_page_as_cached() {
+        let storage = Arc::new(MemoryStorage::default());
+        for index in 0..crate::ingest::MAX_RECENT_POSTS_QUEUE {
+            storage
+                .enqueue_recent_posts_fetch(&format!("did:plc:queue-filler-{index}"))
+                .unwrap();
+        }
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let viewer = "did:plc:recent-posts-overflow-viewer";
+        let subject = "did:plc:recent-posts-overflowed";
+        let flow = RecentPostsTestFlow::new([]);
+        let token = recent_posts_session(&storage, &public, viewer);
+        let app = public.router_with_flow(flow, storage.clone());
+        let cookie = format!("{SESSION_COOKIE}={token}");
+        let (status, html) = recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
+        assert_eq!(status, StatusCode::OK, "the page renders even when the job is dropped");
+        assert!(
+            html.contains("data-profile-recent-posts=\"cached\""),
+            "a visit whose job was dropped at the queue bound reports cached, not queued"
+        );
+        assert!(
+            !html.contains("recent-posts-loading"),
+            "no loading note is shown when nothing was queued"
+        );
+        assert_eq!(
+            storage.pending_recent_posts_fetches(crate::ingest::MAX_RECENT_POSTS_QUEUE + 10).unwrap(),
+            (0..crate::ingest::MAX_RECENT_POSTS_QUEUE)
+                .map(|index| format!("did:plc:queue-filler-{index}"))
+                .collect::<Vec<_>>(),
+            "the bound held; the new job never entered the queue"
+        );
+        let (_queued, _done, _failed, dropped) = storage.recent_posts_counters();
+        assert_eq!(dropped, 1, "the overflow was counted");
+    }
+
+    #[tokio::test]
+    async fn the_web_page_phases_line_carries_profile_recent_posts_as_a_plain_state() {
+        let storage = Arc::new(MemoryStorage::default());
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let viewer = "did:plc:recent-posts-phases-viewer";
+        let subject = "did:plc:recent-posts-phases";
+        let fetched = vec![test_web_post(
+            subject,
+            "one",
+            1_800_000_000_000_000,
+            "the phases fetched post",
+            None,
+        )];
+        let flow = RecentPostsTestFlow::new([(subject.to_owned(), fetched)]);
+        let token = recent_posts_session(&storage, &public, viewer);
+        let app = public.router_with_flow(flow.clone(), storage.clone());
+        let cookie = format!("{SESSION_COOKIE}={token}");
+        let worker = RecentPostsWorker::new(flow.clone(), storage.clone(), Duration::from_secs(30));
+        let logs = FeedTestLogs::default();
+        let phase_value = |logs: &FeedTestLogs, name: &str| -> Option<String> {
+            let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+            output
+                .lines()
+                .filter(|line| line.contains("web page phases"))
+                .filter_map(|line| {
+                    line.split_whitespace().find_map(|field| {
+                        field.strip_prefix(&format!("{name}=")).map(str::to_owned)
+                    })
+                })
+                .last()
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(logs.clone())
+            .finish();
+        app.clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/profile?did={subject}"))
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+        assert_eq!(
+            phase_value(&logs, "profile_recent_posts").as_deref(),
+            Some("queued"),
+            "the phases line names the queued state as a plain value, not an ms duration"
+        );
+        worker.run_once().await.unwrap();
+        let logs_after = FeedTestLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(logs_after.clone())
+            .finish();
+        app.clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/profile?did={subject}"))
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+        assert_eq!(
+            phase_value(&logs_after, "profile_recent_posts").as_deref(),
+            Some("fresh"),
+            "the visit served from the fresh cache reports the fresh state"
+        );
+    }
 }
 
 #[cfg(not(unix))]

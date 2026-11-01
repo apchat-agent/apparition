@@ -7864,6 +7864,51 @@ mod recent_posts_storage_tests {
     }
 
     #[test]
+    fn the_writer_minute_metrics_line_carries_the_recent_posts_counts() {
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for CaptureWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = CaptureWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                CaptureWriter(Arc::clone(&self.0))
+            }
+        }
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let metrics = SqliteWriterMetrics::default();
+        let counters = Arc::new(RecentPostsCounters::default());
+        counters.queued.store(7, Ordering::Relaxed);
+        counters.done.store(4, Ordering::Relaxed);
+        counters.failed.store(2, Ordering::Relaxed);
+        counters.dropped.store(1, Ordering::Relaxed);
+        *metrics.recent_posts.lock().unwrap() = counters;
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(Capture(Arc::clone(&output)))
+                .finish(),
+        );
+        metrics.report(&ReadPoolMetrics::default(), &WalMetrics::default());
+        drop(_guard);
+        let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("SQLite writer minute metrics"), "{text}");
+        assert!(text.contains("recent_posts_queued=7"), "{text}");
+        assert!(text.contains("recent_posts_done=4"), "{text}");
+        assert!(text.contains("recent_posts_failed=2"), "{text}");
+        assert!(text.contains("recent_posts_dropped=1"), "{text}");
+    }
+
+    #[test]
     fn recent_posts_status_and_queue_survive_a_restart() {
         let path = std::env::temp_dir().join(format!(
             "appview-rs-recent-posts-{}-{}.sqlite3",
