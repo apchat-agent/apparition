@@ -73,6 +73,7 @@ Open [http://127.0.0.1:3000/login](http://127.0.0.1:3000/login), enter an AT Pro
 | `scope_mode` | `APPVIEW_SCOPE` | `scoped` | `scoped` or `full` indexing |
 | `backfill_enabled` | `APPVIEW_BACKFILL_ENABLED` | `false` | Opt in to repository backfill for registered and followed accounts |
 | `backfill_records_per_second` | `APPVIEW_BACKFILL_RECORDS_PER_SECOND` | `300` | Maximum repository records imported per second |
+| `backfill_max_age_days` | `APPVIEW_BACKFILL_MAX_AGE_DAYS` | `30` | How many days of posts/likes/reposts a backfill indexes; `0` means no window and imports the whole repository. Follows, blocks and profiles are always fully indexed |
 | `jetstream_urls` | `APPVIEW_JETSTREAM_URLS` | east Jetstream URL | TOML string array, or comma-separated URLs in the environment |
 | `jetstream_idle_timeout_secs` | `APPVIEW_JETSTREAM_IDLE_TIMEOUT_SECS` | `60` | Reconnect when a Jetstream connection sends no websocket messages for this long |
 | `jetstream_event_timeout_secs` | `APPVIEW_JETSTREAM_EVENT_TIMEOUT_SECS` | `60` | Drop and reconnect if one event takes longer than this to process |
@@ -84,6 +85,8 @@ Open [http://127.0.0.1:3000/login](http://127.0.0.1:3000/login), enter an AT Pro
 Use `scoped` for a small self-hosted instance. It indexes registered users, their follows, and interactions on their posts. `full` indexes every supported account and will use substantially more disk as the firehose continues. Neither mode currently has a retention or compaction policy.
 
 Repository backfill is off by default. To import existing records for registered accounts and their follows, set `backfill_enabled = true` in `appview.toml` or `APPVIEW_BACKFILL_ENABLED=true`. The worker fetches each repository from its PDS and imports it at up to `backfill_records_per_second` records per second (default 300). Backfill uses network bandwidth and database space; keep it off if you only want to index events observed after startup.
+
+Because `getRepo` has no date filter, the worker fetches the whole repository but indexes only the recent history by default: posts, likes and reposts older than `backfill_max_age_days` days (default 30) are skipped and counted in the "repository backfill completed" log line (`skipped_old_records`). Follows, blocks and profile records are current state, not history, so they are always fully indexed. Set `backfill_max_age_days = 0` to go back to importing everything. Older posts are not lost: the profile page fetches them from the account's own PDS, a page at a time, while someone scrolls.
 
 In scoped mode, incoming likes and reposts are indexed when their subject is a registered or followed DID's post. Replies, quotes, and facet mentions are also indexed when they point to a registered or followed DID. This makes counts and notifications accurate for events seen from the current Jetstream cursor onward; older likes, reposts, and replies are not backfilled.
 

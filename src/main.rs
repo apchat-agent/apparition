@@ -108,7 +108,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         AtriumRepoVerifier,
         HostRateLimiter::new(Duration::from_millis(500)),
     )
-    .with_records_per_second(config.backfill_records_per_second);
+    .with_records_per_second(config.backfill_records_per_second)
+    .with_max_age_days(config.backfill_max_age_days);
     let worker = BackfillWorker::new(
         storage.clone(),
         resolver,

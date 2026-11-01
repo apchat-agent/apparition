@@ -23,6 +23,11 @@ use tokio::sync::Mutex;
 
 const MAX_REPO_CAR_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_BACKFILL_RECORDS_PER_SECOND: u64 = 300;
+/// How many days of posts/likes/reposts a backfill keeps by default
+/// (owner 2026-11-01: "keep only recent history by default, and fetch older
+/// posts only for an account someone is actually reading, as they scroll").
+/// 0 disables the window and indexes the whole repository as before.
+pub const DEFAULT_BACKFILL_MAX_AGE_DAYS: u64 = 30;
 const INDEXED_COLLECTIONS: &[&str] = &[
     "app.bsky.feed.post",
     "app.bsky.feed.like",
@@ -31,6 +36,11 @@ const INDEXED_COLLECTIONS: &[&str] = &[
     "app.bsky.graph.block",
     "app.bsky.actor.profile",
 ];
+/// The history collections a backfill windows by `createdAt`. The graph and
+/// profile collections are deliberately NOT windowed: follows, blocks and
+/// profile records describe the account's CURRENT state, not its history, and
+/// dropping them would silently change who a user follows.
+const WINDOWED_COLLECTIONS: &[&str] = crate::ingest::WINDOWED_SNAPSHOT_COLLECTIONS;
 
 #[derive(Debug, Error)]
 pub enum BackfillError {
@@ -359,6 +369,7 @@ where
     verifier: V,
     limiter: Arc<HostRateLimiter>,
     records_per_second: u64,
+    max_age_days: u64,
 }
 
 impl<S, F, V> RepoBackfiller<S, F, V>
@@ -374,11 +385,17 @@ where
             verifier,
             limiter: Arc::new(limiter),
             records_per_second: DEFAULT_BACKFILL_RECORDS_PER_SECOND,
+            max_age_days: DEFAULT_BACKFILL_MAX_AGE_DAYS,
         }
     }
 
     pub fn with_records_per_second(mut self, records_per_second: u64) -> Self {
         self.records_per_second = records_per_second.max(1);
+        self
+    }
+
+    pub fn with_max_age_days(mut self, max_age_days: u64) -> Self {
+        self.max_age_days = max_age_days;
         self
     }
 
@@ -400,15 +417,35 @@ where
         self.limiter.wait(&host).await;
         let car = self.fetcher.fetch_repo(pds, did).await?;
         let verified = self.verifier.verify(&car, did, signing_did_key).await?;
+        // One clock read per backfill: the skip cutoff and the window start
+        // the snapshot replace gets must come from the same instant, or a
+        // record skipped as "too old" here could be deleted as "inside the
+        // window" there.
+        let now_us = now_micros();
+        let window_start_us = (self.max_age_days > 0)
+            .then(|| now_us.saturating_sub(self.max_age_days.saturating_mul(86_400_000_000)));
         let mut records = Vec::new();
         let mut following = Vec::new();
+        let mut skipped_old_records = 0_usize;
         for repo_record in verified.records {
-            let record_time = repo_record
+            let created_us = repo_record
                 .record
                 .get("createdAt")
                 .and_then(Value::as_str)
-                .and_then(parse_rfc3339_micros)
-                .unwrap_or_default();
+                .and_then(parse_rfc3339_micros);
+            let record_time = created_us.unwrap_or_default();
+            // A windowed record with a missing or unparsable createdAt is
+            // KEPT: its age cannot be established, and skipping it would
+            // silently delete (the snapshot delete would never restore) a
+            // record the account still has. Keep it and let it be re-decided
+            // once the record carries a real timestamp.
+            if let (Some(window_start), Some(created_us)) = (window_start_us, created_us)
+                && WINDOWED_COLLECTIONS.contains(&repo_record.collection.as_str())
+                && created_us < window_start
+            {
+                skipped_old_records += 1;
+                continue;
+            }
             if repo_record.collection == "app.bsky.graph.follow"
                 && let Some(subject) = repo_record.record.get("subject").and_then(Value::as_str)
             {
@@ -440,11 +477,20 @@ where
         tracing::info!(
             did,
             indexed_records = count,
+            skipped_old_records,
             host,
             "repository backfill completed"
         );
         Ok(count)
     }
+}
+
+fn now_micros() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
+        .min(u64::MAX as u128) as u64
 }
 
 fn parse_rfc3339_micros(value: &str) -> Option<u64> {

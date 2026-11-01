@@ -713,7 +713,7 @@ async fn backfill_worker_backs_off_after_a_failed_repository_fetch() {
 mod windowed_backfill {
     use appview_rs::{
         backfill::{
-            BackfillError, HostRateLimiter, RepoBackfiller, RepoFetcher, RepoVerifier, RepoRecord,
+            BackfillError, HostRateLimiter, RepoBackfiller, RepoFetcher, RepoRecord, RepoVerifier,
             VerifiedRepo,
         },
         ingest::{MemoryStorage, Storage},
@@ -735,12 +735,7 @@ mod windowed_backfill {
 
     struct ScriptedVerifier(Vec<RepoRecord>);
     impl RepoVerifier for ScriptedVerifier {
-        async fn verify(
-            &self,
-            _: &[u8],
-            _: &str,
-            _: &str,
-        ) -> Result<VerifiedRepo, BackfillError> {
+        async fn verify(&self, _: &[u8], _: &str, _: &str) -> Result<VerifiedRepo, BackfillError> {
             Ok(VerifiedRepo {
                 records: self.0.clone(),
             })
@@ -772,7 +767,11 @@ mod windowed_backfill {
         for days in [5, 29, 31, 400] {
             records.push(aged_record("app.bsky.feed.post", &format!("p{days}"), days));
             records.push(aged_record("app.bsky.feed.like", &format!("l{days}"), days));
-            records.push(aged_record("app.bsky.feed.repost", &format!("r{days}"), days));
+            records.push(aged_record(
+                "app.bsky.feed.repost",
+                &format!("r{days}"),
+                days,
+            ));
         }
         records.push(aged_record("app.bsky.graph.follow", "f400", 400));
         records.push(aged_record("app.bsky.graph.block", "b400", 400));
@@ -780,7 +779,9 @@ mod windowed_backfill {
         records
     }
 
-    fn backfiller(storage: Arc<MemoryStorage>) -> RepoBackfiller<MemoryStorage, ScriptedFetcher, ScriptedVerifier> {
+    fn backfiller(
+        storage: Arc<MemoryStorage>,
+    ) -> RepoBackfiller<MemoryStorage, ScriptedFetcher, ScriptedVerifier> {
         RepoBackfiller::new(
             storage,
             ScriptedFetcher,
@@ -808,10 +809,7 @@ mod windowed_backfill {
     }
 
     fn indexed(storage: &MemoryStorage, collection: &str, rkey: &str) -> bool {
-        storage
-            .get_record(DID, collection, rkey)
-            .unwrap()
-            .is_some()
+        storage.get_record(DID, collection, rkey).unwrap().is_some()
     }
 
     #[tokio::test]
@@ -833,7 +831,10 @@ mod windowed_backfill {
                 .unwrap()
         };
 
-        assert_eq!(count, 9, "the 5- and 29-day windowed records plus all 400-day graph records");
+        assert_eq!(
+            count, 9,
+            "the 5- and 29-day windowed records plus all 400-day graph records"
+        );
         for days in [5, 29] {
             for (collection, prefix) in [
                 ("app.bsky.feed.post", "p"),
@@ -871,6 +872,29 @@ mod windowed_backfill {
             completed.contains("skipped_old_records=6"),
             "the completed line must carry the skipped count: {completed}"
         );
+    }
+
+    #[tokio::test]
+    async fn max_age_zero_indexes_the_whole_repository() {
+        let storage = Arc::new(MemoryStorage::default());
+        let backfiller = backfiller(storage.clone()).with_max_age_days(0);
+        let count = backfiller
+            .backfill(DID, "https://pds.example", "did:key:zDnaem-window-test-key")
+            .await
+            .unwrap();
+        assert_eq!(count, 15);
+        for days in [5, 29, 31, 400] {
+            for (collection, prefix) in [
+                ("app.bsky.feed.post", "p"),
+                ("app.bsky.feed.like", "l"),
+                ("app.bsky.feed.repost", "r"),
+            ] {
+                assert!(
+                    indexed(&storage, collection, &format!("{prefix}{days}")),
+                    "with no window a {days}-day-old {collection} must be indexed"
+                );
+            }
+        }
     }
 
     #[tokio::test]

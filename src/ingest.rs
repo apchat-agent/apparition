@@ -248,6 +248,19 @@ pub struct NotificationKeyWindow {
     pub to_us: Option<u64>,
 }
 
+/// The record collections a repository backfill windows by age (owner
+/// 2026-11-01: keep only recent posts/likes/reposts; older history is fetched
+/// per account while someone scrolls their profile). A snapshot replace must
+/// never delete rows of these collections that are OLDER than the window it
+/// covers, or re-backfilling an account would wipe posts that scrolling or
+/// Jetstream stored. Graph and profile records are current state and are not
+/// windowed.
+pub const WINDOWED_SNAPSHOT_COLLECTIONS: &[&str] = &[
+    "app.bsky.feed.post",
+    "app.bsky.feed.like",
+    "app.bsky.feed.repost",
+];
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordCursor {
     pub time_us: u64,

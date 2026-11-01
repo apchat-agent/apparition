@@ -23,6 +23,8 @@ pub struct Config {
     pub jetstream_stale_cursor_threshold_secs: u64,
     #[serde(default = "default_backfill_records_per_second")]
     pub backfill_records_per_second: u64,
+    #[serde(default = "default_backfill_max_age_days")]
+    pub backfill_max_age_days: u64,
     #[serde(default = "default_profile_counts_cache_ttl_secs")]
     pub profile_counts_cache_ttl_secs: u64,
     #[serde(default)]
@@ -57,6 +59,7 @@ impl Default for Config {
             jetstream_event_timeout_secs: default_jetstream_event_timeout_secs(),
             jetstream_stale_cursor_threshold_secs: default_jetstream_stale_cursor_threshold_secs(),
             backfill_records_per_second: default_backfill_records_per_second(),
+            backfill_max_age_days: default_backfill_max_age_days(),
             profile_counts_cache_ttl_secs: default_profile_counts_cache_ttl_secs(),
             backfill_enabled: false,
             appview_did: default_appview_did(),
@@ -87,6 +90,10 @@ pub enum ConfigError {
     },
     #[error("APPVIEW_BACKFILL_RECORDS_PER_SECOND must be a positive integer, got {0}")]
     InvalidBackfillRate(String),
+    #[error(
+        "APPVIEW_BACKFILL_MAX_AGE_DAYS must be an unsigned integer number of days (0 means no limit), got {0}"
+    )]
+    InvalidBackfillMaxAge(String),
     #[error("APPVIEW_BACKFILL_ENABLED must be 'true' or 'false', got {0}")]
     InvalidBackfillEnabled(String),
     #[error("loopback OAuth requires APPVIEW_LISTEN to be a loopback socket address, got {0}")]
@@ -136,6 +143,9 @@ impl Config {
                 }
                 "APPVIEW_BACKFILL_RECORDS_PER_SECOND" => {
                     config.backfill_records_per_second = parse_backfill_rate(value)?;
+                }
+                "APPVIEW_BACKFILL_MAX_AGE_DAYS" => {
+                    config.backfill_max_age_days = parse_backfill_max_age_days(value)?;
                 }
                 "APPVIEW_PROFILE_COUNTS_CACHE_TTL_SECS" => {
                     config.profile_counts_cache_ttl_secs =
@@ -211,6 +221,10 @@ impl Config {
                 env::var("APPVIEW_BACKFILL_RECORDS_PER_SECOND").unwrap_or_default(),
             ),
             (
+                "APPVIEW_BACKFILL_MAX_AGE_DAYS",
+                env::var("APPVIEW_BACKFILL_MAX_AGE_DAYS").unwrap_or_default(),
+            ),
+            (
                 "APPVIEW_PROFILE_COUNTS_CACHE_TTL_SECS",
                 env::var("APPVIEW_PROFILE_COUNTS_CACHE_TTL_SECS").unwrap_or_default(),
             ),
@@ -266,6 +280,9 @@ impl Config {
                     "APPVIEW_BACKFILL_RECORDS_PER_SECOND" => {
                         config.backfill_records_per_second = parse_backfill_rate(&value)?;
                     }
+                    "APPVIEW_BACKFILL_MAX_AGE_DAYS" => {
+                        config.backfill_max_age_days = parse_backfill_max_age_days(&value)?;
+                    }
                     "APPVIEW_PROFILE_COUNTS_CACHE_TTL_SECS" => {
                         config.profile_counts_cache_ttl_secs = parse_timeout(key, &value)?;
                     }
@@ -301,6 +318,12 @@ fn parse_login_allowlist(value: &str) -> Vec<String> {
         .filter(|entry| !entry.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+fn parse_backfill_max_age_days(value: &str) -> Result<u64, ConfigError> {
+    value
+        .parse::<u64>()
+        .map_err(|_| ConfigError::InvalidBackfillMaxAge(value.to_owned()))
 }
 
 fn parse_backfill_rate(value: &str) -> Result<u64, ConfigError> {
@@ -349,6 +372,10 @@ fn default_jetstream_stale_cursor_threshold_secs() -> u64 {
 
 fn default_backfill_records_per_second() -> u64 {
     300
+}
+
+fn default_backfill_max_age_days() -> u64 {
+    30
 }
 
 fn default_profile_counts_cache_ttl_secs() -> u64 {
