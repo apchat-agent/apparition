@@ -33,6 +33,10 @@ const BACKFILL_RETRY_MAX: Duration = Duration::from_secs(60 * 60);
 const MAX_BACKFILL_QUEUE: usize = 1_000;
 const BACKFILL_BATCH_SIZE: usize = 8;
 const MAX_PROFILE_FETCH_QUEUE: usize = 10_000;
+/// Bound on the deduplicated per-account "recent posts" queue (owner 2026-11-01:
+/// an unfollowed profile lookup should load their recent posts in a worker, and
+/// cache). Overflow is dropped and counted, never blocked.
+pub const MAX_RECENT_POSTS_QUEUE: usize = 500;
 const SQLITE_WRITER_QUEUE: usize = 256;
 /// Coarse bound on post-count fills tracked as waiting for the writer. The
 /// writer's own queue (256 slots, full means dropped) is the tighter bound;
@@ -147,6 +151,49 @@ pub struct PostInteractionSummary {
 pub struct ProfileIndexEntry {
     pub has_profile: bool,
     pub fetched_at_ms: i64,
+}
+
+/// What one profile visit's enqueue attempt did to the bounded recent-posts queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecentPostsEnqueue {
+    /// A job for this account was newly queued.
+    Queued,
+    /// A job for this account was already queued (the queue deduplicates).
+    Duplicate,
+    /// The queue was at its bound; the job was dropped and counted.
+    Overflowed,
+}
+
+/// Per-account recent-posts fetch state: when posts were last stored (0 = never),
+/// when a failed fetch may be retried (0 = no backoff), and whether a job is
+/// currently queued or running for the account.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecentPostsFetchStatus {
+    pub fetched_at_ms: i64,
+    pub next_retry_at_ms: i64,
+    pub queued: bool,
+}
+
+/// Cumulative recent-posts counters a running service exposes: jobs queued,
+/// fetches done, fetches failed, and jobs dropped at the queue bound. The
+/// `SQLite writer minute metrics` line reports these counts.
+#[derive(Default, Debug)]
+pub struct RecentPostsCounters {
+    pub queued: AtomicU64,
+    pub done: AtomicU64,
+    pub failed: AtomicU64,
+    pub dropped: AtomicU64,
+}
+
+impl RecentPostsCounters {
+    pub fn snapshot(&self) -> (u64, u64, u64, u64) {
+        (
+            self.queued.load(Ordering::Relaxed),
+            self.done.load(Ordering::Relaxed),
+            self.failed.load(Ordering::Relaxed),
+            self.dropped.load(Ordering::Relaxed),
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -467,6 +514,46 @@ pub trait Storage: Send + Sync {
     fn enqueue_profile_fetches(&self, dids: &[String]) -> Result<(), StorageError>;
     fn pending_profile_fetches(&self, limit: usize) -> Result<Vec<String>, StorageError>;
     fn complete_profile_fetch(&self, did: &str) -> Result<(), StorageError>;
+    /// The per-account recent-posts fetch state, read without touching the
+    /// writer. Backends that do not support the recent-posts worker report `None`.
+    fn recent_posts_status(&self, _did: &str) -> Result<Option<RecentPostsFetchStatus>, StorageError> {
+        Ok(None)
+    }
+    /// Queue one bounded, deduplicated "recent posts" job for one account. The
+    /// queue is bounded by [`MAX_RECENT_POSTS_QUEUE`]; overflow is dropped and
+    /// counted, never blocked.
+    fn enqueue_recent_posts_fetch(&self, _did: &str) -> Result<RecentPostsEnqueue, StorageError> {
+        Ok(RecentPostsEnqueue::Duplicate)
+    }
+    /// Record that a recent-posts fetch succeeded at `fetched_at_ms` (wall clock)
+    /// and clear any failure backoff.
+    fn record_recent_posts_fetched(
+        &self,
+        _did: &str,
+        _fetched_at_ms: i64,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+    /// Record that a recent-posts fetch failed: keep the previous fetch time and
+    /// do not retry before `next_retry_at_ms` (wall clock).
+    fn record_recent_posts_failure(
+        &self,
+        _did: &str,
+        _next_retry_at_ms: i64,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+    fn pending_recent_posts_fetches(&self, _limit: usize) -> Result<Vec<String>, StorageError> {
+        Ok(Vec::new())
+    }
+    fn complete_recent_posts_fetch(&self, _did: &str) -> Result<(), StorageError> {
+        Ok(())
+    }
+    /// The cumulative queued / done / failed / dropped counts this storage
+    /// exposes for the recent-posts worker.
+    fn recent_posts_counters(&self) -> (u64, u64, u64, u64) {
+        (0, 0, 0, 0)
+    }
     fn notifications_for(
         &self,
         did: &str,
@@ -670,6 +757,7 @@ pub(crate) fn ensure_private_database_file(path: &Path) -> Result<(), std::io::E
 pub struct MemoryStorage {
     inner: Mutex<MemoryState>,
     notification_hub: NotificationHub,
+    recent_posts_counters: RecentPostsCounters,
     #[cfg(test)]
     record_uri_single_lookups: AtomicUsize,
     #[cfg(test)]
@@ -724,6 +812,9 @@ struct MemoryState {
     recent_profiles: HashMap<String, Vec<String>>,
     last_active_feed_tabs: HashMap<String, String>,
     profile_fetch_queue: VecDeque<String>,
+    recent_posts_queue: VecDeque<String>,
+    recent_posts_queued: HashSet<String>,
+    recent_posts_status: HashMap<String, (i64, i64)>,
     notification_last_seen: HashMap<String, u64>,
 }
 
@@ -1297,6 +1388,90 @@ impl Storage for MemoryStorage {
         let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
         inner.profile_fetch_queue.retain(|queued| queued != did);
         Ok(())
+    }
+
+    fn recent_posts_status(&self, did: &str) -> Result<Option<RecentPostsFetchStatus>, StorageError> {
+        let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        let status = inner.recent_posts_status.get(did).copied();
+        let queued = inner.recent_posts_queued.contains(did);
+        if status.is_none() && !queued {
+            return Ok(None);
+        }
+        let (fetched_at_ms, next_retry_at_ms) = status.unwrap_or_default();
+        Ok(Some(RecentPostsFetchStatus {
+            fetched_at_ms,
+            next_retry_at_ms,
+            queued,
+        }))
+    }
+
+    fn enqueue_recent_posts_fetch(&self, did: &str) -> Result<RecentPostsEnqueue, StorageError> {
+        let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        if inner.recent_posts_queued.contains(did) {
+            return Ok(RecentPostsEnqueue::Duplicate);
+        }
+        if inner.recent_posts_queue.len() >= MAX_RECENT_POSTS_QUEUE {
+            self.recent_posts_counters
+                .dropped
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(RecentPostsEnqueue::Overflowed);
+        }
+        inner.recent_posts_queued.insert(did.to_owned());
+        inner.recent_posts_queue.push_back(did.to_owned());
+        self.recent_posts_counters
+            .queued
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(RecentPostsEnqueue::Queued)
+    }
+
+    fn record_recent_posts_fetched(
+        &self,
+        did: &str,
+        fetched_at_ms: i64,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .recent_posts_status
+            .insert(did.to_owned(), (fetched_at_ms, 0));
+        self.recent_posts_counters.done.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn record_recent_posts_failure(&self, did: &str, next_retry_at_ms: i64) -> Result<(), StorageError> {
+        let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        inner
+            .recent_posts_status
+            .entry(did.to_owned())
+            .and_modify(|entry| entry.1 = next_retry_at_ms)
+            .or_insert((0, next_retry_at_ms));
+        self.recent_posts_counters
+            .failed
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn pending_recent_posts_fetches(&self, limit: usize) -> Result<Vec<String>, StorageError> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .recent_posts_queue
+            .iter()
+            .take(limit.max(1))
+            .cloned()
+            .collect())
+    }
+
+    fn complete_recent_posts_fetch(&self, did: &str) -> Result<(), StorageError> {
+        let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        inner.recent_posts_queue.retain(|queued| queued != did);
+        inner.recent_posts_queued.remove(did);
+        Ok(())
+    }
+
+    fn recent_posts_counters(&self) -> (u64, u64, u64, u64) {
+        self.recent_posts_counters.snapshot()
     }
 
     fn notifications_for(
@@ -2009,6 +2184,10 @@ struct SqliteWriterMetrics {
     transaction_count: AtomicU64,
     transaction_total_ns: AtomicU64,
     transaction_max_ns: AtomicU64,
+    /// The recent-posts worker's cumulative counts, shared with `SqliteStorage`
+    /// so the minute line can carry them; swapped to the storage's counters
+    /// once at open (the default is a private scratch instance).
+    recent_posts: Mutex<Arc<RecentPostsCounters>>,
 }
 
 #[derive(Default)]
@@ -2073,6 +2252,11 @@ impl SqliteWriterMetrics {
         let count = self.transaction_count.swap(0, Ordering::Relaxed);
         let total_ns = self.transaction_total_ns.swap(0, Ordering::Relaxed);
         let max_ns = self.transaction_max_ns.swap(0, Ordering::Relaxed);
+        let (recent_posts_queued, recent_posts_done, recent_posts_failed, recent_posts_dropped) =
+            self.recent_posts
+                .lock()
+                .map(|counters| counters.snapshot())
+                .unwrap_or_default();
         tracing::info!(
             writer_queue_depth_max = self
                 .queue_depth_max
@@ -2095,6 +2279,10 @@ impl SqliteWriterMetrics {
             wal_reset = wal_metrics.reset.load(Ordering::Relaxed),
             backfill_wait_ms =
                 wal_metrics.backfill_wait_ns.swap(0, Ordering::Relaxed) as f64 / 1_000_000.0,
+            recent_posts_queued,
+            recent_posts_done,
+            recent_posts_failed,
+            recent_posts_dropped,
             "SQLite writer minute metrics"
         );
     }
@@ -2167,6 +2355,15 @@ impl SqliteWriter {
             metrics,
             pressure,
         })
+    }
+
+    /// Points the minute metrics line at the recent-posts counters shared with
+    /// `SqliteStorage`. Called once at open, before any report can run; the
+    /// writer thread reads through this same `Arc<SqliteWriterMetrics>`.
+    fn share_recent_posts_counters(&self, counters: Arc<RecentPostsCounters>) {
+        if let Ok(mut recent) = self.metrics.recent_posts.lock() {
+            *recent = counters;
+        }
     }
 
     fn call<R: Send + 'static>(
@@ -2524,6 +2721,9 @@ pub struct SqliteStorage {
     wal_metrics: Arc<WalMetrics>,
     tracked: Arc<RwLock<TrackedSet>>,
     profile_index: Arc<RwLock<HashMap<String, ProfileIndexEntry>>>,
+    recent_posts_status: Arc<RwLock<HashMap<String, (i64, i64)>>>,
+    recent_posts_queue: Arc<RwLock<(VecDeque<String>, HashSet<String>)>>,
+    recent_posts_counters: Arc<RecentPostsCounters>,
     notification_hub: NotificationHub,
     pending_counts_fills: Arc<RwLock<HashSet<String>>>,
     pending_record_writes: Arc<RwLock<HashMap<PendingRecordKey, IndexedRecord>>>,
@@ -2697,6 +2897,38 @@ fn build_profile_index(
         );
     }
     Ok(index)
+}
+
+fn build_recent_posts_state(
+    connection: &Connection,
+) -> Result<(HashMap<String, (i64, i64)>, (VecDeque<String>, HashSet<String>)), StorageError> {
+    let mut status = HashMap::new();
+    let mut statement = connection
+        .prepare("SELECT did, fetched_at_ms, next_retry_at_ms FROM recent_posts_status ORDER BY did")?;
+    for row in statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })? {
+        let (did, fetched_at_ms, next_retry_at_ms) = row?;
+        status.insert(did, (fetched_at_ms, next_retry_at_ms));
+    }
+    drop(statement);
+    let mut queue = VecDeque::new();
+    let mut queued = HashSet::new();
+    let mut statement = connection.prepare(
+        "SELECT did FROM recent_posts_queue ORDER BY seq LIMIT ?1",
+    )?;
+    for row in statement.query_map([MAX_RECENT_POSTS_QUEUE as i64], |row| {
+        row.get::<_, String>(0)
+    })? {
+        let did = row?;
+        queued.insert(did.clone());
+        queue.push_back(did);
+    }
+    Ok((status, (queue, queued)))
 }
 
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
@@ -3050,12 +3282,21 @@ impl SqliteStorage {
                  seq INTEGER PRIMARY KEY AUTOINCREMENT,
                  did TEXT NOT NULL UNIQUE
              );
-             CREATE TABLE IF NOT EXISTS recent_profile_clicks (
-                 seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                 viewer_did TEXT NOT NULL,
-                 profile_did TEXT NOT NULL,
-                 UNIQUE(viewer_did, profile_did)
-             );",
+              CREATE TABLE IF NOT EXISTS recent_profile_clicks (
+                  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                  viewer_did TEXT NOT NULL,
+                  profile_did TEXT NOT NULL,
+                  UNIQUE(viewer_did, profile_did)
+              );
+              CREATE TABLE IF NOT EXISTS recent_posts_status (
+                  did TEXT PRIMARY KEY,
+                  fetched_at_ms INTEGER NOT NULL,
+                  next_retry_at_ms INTEGER NOT NULL
+              );
+              CREATE TABLE IF NOT EXISTS recent_posts_queue (
+                  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                  did TEXT NOT NULL UNIQUE
+              );",
         )?;
         connection.execute_batch(
             "CREATE INDEX IF NOT EXISTS recent_profile_clicks_viewer_order
@@ -3094,6 +3335,13 @@ impl SqliteStorage {
              )",
             [MAX_BACKFILL_QUEUE],
         )?;
+        connection.execute(
+            "DELETE FROM recent_posts_queue
+             WHERE seq NOT IN (
+                 SELECT seq FROM recent_posts_queue ORDER BY seq LIMIT ?1
+             )",
+            [MAX_RECENT_POSTS_QUEUE as i64],
+        )?;
         migrate_notification_events(&connection)?;
         // SQLite's automatic checkpoint runs inside a commit under the connection
         // lock. A side connection checkpoints instead; PASSIVE does not block writers.
@@ -3119,6 +3367,16 @@ impl SqliteStorage {
             profile_index_build_ms,
             "Built in-memory profile index"
         );
+        let recent_posts_state_started = Instant::now();
+        let (recent_posts_status_rows, recent_posts_queue_rows) =
+            build_recent_posts_state(&connection)?;
+        let recent_posts_state_build_ms = recent_posts_state_started.elapsed().as_secs_f64() * 1000.0;
+        tracing::info!(
+            accounts = recent_posts_status_rows.len(),
+            queued = recent_posts_queue_rows.0.len(),
+            recent_posts_state_build_ms,
+            "Built in-memory recent-posts state"
+        );
         let mut read_connections = Vec::new();
         for _ in 0..SQLITE_READ_CONNECTIONS {
             let reader = Connection::open(&database_path)?;
@@ -3128,12 +3386,14 @@ impl SqliteStorage {
         let read_metrics = Arc::new(ReadPoolMetrics::default());
         let wal_metrics = Arc::new(WalMetrics::default());
         let pressure = Arc::new(StoragePressure::default());
+        let recent_posts_counters = Arc::new(RecentPostsCounters::default());
         let writer = SqliteWriter::new(
             connection,
             Arc::clone(&read_metrics),
             Arc::clone(&wal_metrics),
             Arc::clone(&pressure),
         )?;
+        writer.share_recent_posts_counters(Arc::clone(&recent_posts_counters));
         let stop = Arc::new(AtomicBool::new(false));
         let backlog = Arc::new(AtomicU64::new(0));
         let checkpointer_worker = if !is_memory {
@@ -3161,6 +3421,9 @@ impl SqliteStorage {
             wal_metrics,
             tracked: Arc::new(RwLock::new(tracked_set)),
             profile_index: Arc::new(RwLock::new(profile_index)),
+            recent_posts_status: Arc::new(RwLock::new(recent_posts_status_rows)),
+            recent_posts_queue: Arc::new(RwLock::new(recent_posts_queue_rows)),
+            recent_posts_counters,
             notification_hub: NotificationHub::default(),
             pending_counts_fills: Arc::new(RwLock::new(HashSet::new())),
             pending_record_writes: Arc::new(RwLock::new(HashMap::new())),
@@ -4652,6 +4915,143 @@ impl Storage for SqliteStorage {
             connection.execute("DELETE FROM profile_fetch_queue WHERE did=?1", [writer_did])?;
             Ok(())
         })
+    }
+
+    fn recent_posts_status(&self, did: &str) -> Result<Option<RecentPostsFetchStatus>, StorageError> {
+        let status = self
+            .recent_posts_status
+            .read()
+            .map_err(|_| StorageError::Poisoned)?
+            .get(did)
+            .copied();
+        let queued = self
+            .recent_posts_queue
+            .read()
+            .map_err(|_| StorageError::Poisoned)?
+            .1
+            .contains(did);
+        if status.is_none() && !queued {
+            return Ok(None);
+        }
+        let (fetched_at_ms, next_retry_at_ms) = status.unwrap_or_default();
+        Ok(Some(RecentPostsFetchStatus {
+            fetched_at_ms,
+            next_retry_at_ms,
+            queued,
+        }))
+    }
+
+    fn enqueue_recent_posts_fetch(&self, did: &str) -> Result<RecentPostsEnqueue, StorageError> {
+        {
+            let mut queue = self.recent_posts_queue.write().map_err(|_| StorageError::Poisoned)?;
+            if queue.1.contains(did) {
+                return Ok(RecentPostsEnqueue::Duplicate);
+            }
+            if queue.0.len() >= MAX_RECENT_POSTS_QUEUE {
+                self.recent_posts_counters
+                    .dropped
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(RecentPostsEnqueue::Overflowed);
+            }
+            queue.1.insert(did.to_owned());
+            queue.0.push_back(did.to_owned());
+        }
+        self.recent_posts_counters
+            .queued
+            .fetch_add(1, Ordering::Relaxed);
+        let writer_did = did.to_owned();
+        self.writer.fire(move |connection| {
+            connection.execute(
+                "INSERT OR IGNORE INTO recent_posts_queue(did)
+                 SELECT ?1 WHERE (SELECT COUNT(*) FROM recent_posts_queue) < ?2",
+                params![writer_did, MAX_RECENT_POSTS_QUEUE as i64],
+            )?;
+            Ok(None)
+        });
+        Ok(RecentPostsEnqueue::Queued)
+    }
+
+    fn record_recent_posts_fetched(
+        &self,
+        did: &str,
+        fetched_at_ms: i64,
+    ) -> Result<(), StorageError> {
+        self.recent_posts_status
+            .write()
+            .map_err(|_| StorageError::Poisoned)?
+            .insert(did.to_owned(), (fetched_at_ms, 0));
+        self.recent_posts_counters.done.fetch_add(1, Ordering::Relaxed);
+        let writer_did = did.to_owned();
+        self.writer.fire(move |connection| {
+            connection.execute(
+                "INSERT INTO recent_posts_status(did,fetched_at_ms,next_retry_at_ms)
+                 VALUES(?1,?2,0)
+                 ON CONFLICT(did) DO UPDATE SET
+                     fetched_at_ms=excluded.fetched_at_ms,next_retry_at_ms=0",
+                params![writer_did, fetched_at_ms],
+            )?;
+            Ok(None)
+        });
+        Ok(())
+    }
+
+    fn record_recent_posts_failure(&self, did: &str, next_retry_at_ms: i64) -> Result<(), StorageError> {
+        let fetched_at_ms = self
+            .recent_posts_status
+            .read()
+            .map_err(|_| StorageError::Poisoned)?
+            .get(did)
+            .map(|entry| entry.0)
+            .unwrap_or_default();
+        self.recent_posts_status
+            .write()
+            .map_err(|_| StorageError::Poisoned)?
+            .insert(did.to_owned(), (fetched_at_ms, next_retry_at_ms));
+        self.recent_posts_counters
+            .failed
+            .fetch_add(1, Ordering::Relaxed);
+        let writer_did = did.to_owned();
+        self.writer.fire(move |connection| {
+            connection.execute(
+                "INSERT INTO recent_posts_status(did,fetched_at_ms,next_retry_at_ms)
+                 VALUES(?1,?2,?3)
+                 ON CONFLICT(did) DO UPDATE SET
+                     fetched_at_ms=excluded.fetched_at_ms,next_retry_at_ms=excluded.next_retry_at_ms",
+                params![writer_did, fetched_at_ms, next_retry_at_ms],
+            )?;
+            Ok(None)
+        });
+        Ok(())
+    }
+
+    fn pending_recent_posts_fetches(&self, limit: usize) -> Result<Vec<String>, StorageError> {
+        Ok(self
+            .recent_posts_queue
+            .read()
+            .map_err(|_| StorageError::Poisoned)?
+            .0
+            .iter()
+            .take(limit.max(1))
+            .cloned()
+            .collect())
+    }
+
+    fn complete_recent_posts_fetch(&self, did: &str) -> Result<(), StorageError> {
+        {
+            let mut queue = self.recent_posts_queue.write().map_err(|_| StorageError::Poisoned)?;
+            queue.0.retain(|queued| queued != did);
+            queue.1.remove(did);
+        }
+        let writer_did = did.to_owned();
+        self.writer.fire(move |connection| {
+            connection.execute("DELETE FROM recent_posts_queue WHERE did=?1", [writer_did])?;
+            Ok(None)
+        });
+        Ok(())
+    }
+
+    fn recent_posts_counters(&self) -> (u64, u64, u64, u64) {
+        self.recent_posts_counters.snapshot()
     }
 
     fn notifications_for(
@@ -7359,6 +7759,139 @@ mod remembered_feed_tab_storage_tests {
                 Some("following".to_owned())
             );
         }
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{}-wal", path.display()));
+        let _ = fs::remove_file(format!("{}-shm", path.display()));
+    }
+}
+
+#[cfg(test)]
+mod recent_posts_storage_tests {
+    use super::*;
+
+    fn fill_queue(storage: &dyn Storage, count: usize) {
+        for index in 0..count {
+            assert_eq!(
+                storage
+                    .enqueue_recent_posts_fetch(&format!("did:plc:fill{index}"))
+                    .unwrap(),
+                RecentPostsEnqueue::Queued
+            );
+        }
+    }
+
+    fn check_bounds(storage: &dyn Storage) {
+        let first = "did:plc:recent-posts-first";
+        assert_eq!(
+            storage.enqueue_recent_posts_fetch(first).unwrap(),
+            RecentPostsEnqueue::Queued,
+            "the first enqueue queues a job"
+        );
+        assert_eq!(
+            storage.enqueue_recent_posts_fetch(first).unwrap(),
+            RecentPostsEnqueue::Duplicate,
+            "the queue deduplicates per account"
+        );
+        fill_queue(storage, MAX_RECENT_POSTS_QUEUE - 1);
+        let overflow = "did:plc:recent-posts-overflow";
+        assert_eq!(
+            storage.enqueue_recent_posts_fetch(overflow).unwrap(),
+            RecentPostsEnqueue::Overflowed,
+            "the queue is bounded at {MAX_RECENT_POSTS_QUEUE} jobs"
+        );
+        let pending = storage.pending_recent_posts_fetches(MAX_RECENT_POSTS_QUEUE + 10).unwrap();
+        assert_eq!(pending.len(), MAX_RECENT_POSTS_QUEUE, "the bound holds the queue");
+        assert!(!pending.iter().any(|did| did == overflow), "overflow is dropped, not blocked");
+        let (queued, _done, _failed, dropped) = storage.recent_posts_counters();
+        assert_eq!(queued, MAX_RECENT_POSTS_QUEUE as u64);
+        assert_eq!(dropped, 1, "the dropped overflow is counted");
+        storage.complete_recent_posts_fetch(first).unwrap();
+        assert_eq!(
+            storage.enqueue_recent_posts_fetch(overflow).unwrap(),
+            RecentPostsEnqueue::Queued,
+            "completing a job frees queue space"
+        );
+    }
+
+    #[test]
+    fn recent_posts_queue_is_deduplicated_bounded_and_counted() {
+        check_bounds(&MemoryStorage::default());
+    }
+
+    #[test]
+    fn recent_posts_queue_bounds_hold_for_sqlite_storage_without_waiting_on_the_writer() {
+        let storage = SqliteStorage::open(":memory:").unwrap();
+        check_bounds(&storage);
+    }
+
+    #[test]
+    fn recent_posts_status_records_fetches_and_failure_backoff() {
+        let storage = MemoryStorage::default();
+        let did = "did:plc:recent-posts-status";
+        assert_eq!(storage.recent_posts_status(did).unwrap(), None);
+        assert_eq!(
+            storage.enqueue_recent_posts_fetch(did).unwrap(),
+            RecentPostsEnqueue::Queued
+        );
+        assert_eq!(
+            storage.recent_posts_status(did).unwrap(),
+            Some(RecentPostsFetchStatus {
+                fetched_at_ms: 0,
+                next_retry_at_ms: 0,
+                queued: true,
+            })
+        );
+        storage.record_recent_posts_failure(did, 5_000).unwrap();
+        assert_eq!(
+            storage.recent_posts_status(did).unwrap(),
+            Some(RecentPostsFetchStatus {
+                fetched_at_ms: 0,
+                next_retry_at_ms: 5_000,
+                queued: true,
+            })
+        );
+        storage.complete_recent_posts_fetch(did).unwrap();
+        storage.record_recent_posts_fetched(did, 9_000).unwrap();
+        assert_eq!(
+            storage.recent_posts_status(did).unwrap(),
+            Some(RecentPostsFetchStatus {
+                fetched_at_ms: 9_000,
+                next_retry_at_ms: 0,
+                queued: false,
+            }),
+            "a successful fetch clears the backoff"
+        );
+    }
+
+    #[test]
+    fn recent_posts_status_and_queue_survive_a_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "appview-rs-recent-posts-{}-{}.sqlite3",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let did = "did:plc:recent-posts-restart";
+        {
+            let storage = SqliteStorage::open(&path).unwrap();
+            assert_eq!(
+                storage.enqueue_recent_posts_fetch(did).unwrap(),
+                RecentPostsEnqueue::Queued
+            );
+            storage.record_recent_posts_fetched(did, 1_000).unwrap();
+            storage.writer_barrier().unwrap();
+        }
+        let reopened = SqliteStorage::open(&path).unwrap();
+        let status = reopened.recent_posts_status(did).unwrap();
+        assert_eq!(
+            status.map(|status| (status.fetched_at_ms, status.next_retry_at_ms, status.queued)),
+            Some((1_000, 0, true)),
+            "the queue and the fetch timestamp reload from the database at open"
+        );
+        assert_eq!(reopened.pending_recent_posts_fetches(10).unwrap(), vec![did.to_owned()]);
+        drop(reopened);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(format!("{}-wal", path.display()));
         let _ = fs::remove_file(format!("{}-shm", path.display()));

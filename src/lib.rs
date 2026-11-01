@@ -10,6 +10,7 @@ pub mod link_card;
 pub mod net;
 pub mod oauth;
 pub mod profile_counts;
+pub mod recent_posts;
 pub mod search;
 pub mod timing_console;
 

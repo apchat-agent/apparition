@@ -743,6 +743,17 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<FetchedAuthorProfile, String>> + Send + 'a>> {
         Box::pin(async { Err("profile fetch is not available".to_owned()) })
     }
+    /// The newest posts of one account, newest first, for the profile-page
+    /// "recent posts" worker (owner 2026-11-01: an unfollowed profile lookup
+    /// should load their recent posts in a worker, and cache). The real flow
+    /// asks the account's own PDS for one unauthenticated
+    /// `com.atproto.repo.listRecords` page of `app.bsky.feed.post`.
+    fn fetch_recent_posts<'a>(
+        &'a self,
+        _did: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<IndexedRecord>, String>> + Send + 'a>> {
+        Box::pin(async { Err("recent posts fetch is not available".to_owned()) })
+    }
     fn resolve_author_handle<'a>(
         &'a self,
         _did: &'a str,
@@ -15585,6 +15596,7 @@ mod tests {
     use super::*;
     use crate::identity::{DidDocument, DidService, IdentityBackend, ResolutionError};
     use crate::ingest::IndexedRecord;
+    use crate::recent_posts::RecentPostsWorker;
     use atrium_oauth::store::session::Session;
     use axum::http::Uri;
     use http_body_util::BodyExt;
@@ -21532,6 +21544,239 @@ mod tests {
             "the accent rule must come after `.post-text a {{` so it wins the cascade"
         );
         assert!(WEB_STYLESHEET_URL.contains("v=m44"));
+    }
+
+    /// A fake PDS/appview for the recent-posts worker: it counts fetches, can
+    /// hold one for the test's timing assertion, can fail with a real cause,
+    /// and serves prepared posts per account.
+    #[derive(Clone)]
+    struct RecentPostsTestFlow {
+        calls: Arc<AtomicUsize>,
+        posts: Arc<HashMap<String, Vec<IndexedRecord>>>,
+        hold: Duration,
+        failure: Option<String>,
+    }
+
+    impl RecentPostsTestFlow {
+        fn new(entries: impl IntoIterator<Item = (String, Vec<IndexedRecord>)>) -> Self {
+            Self {
+                calls: Arc::new(AtomicUsize::new(0)),
+                posts: Arc::new(entries.into_iter().collect()),
+                hold: Duration::ZERO,
+                failure: None,
+            }
+        }
+
+        fn with_fetch_hold(mut self, hold: Duration) -> Self {
+            self.hold = hold;
+            self
+        }
+
+        fn failing(mut self, message: &str) -> Self {
+            self.failure = Some(message.to_owned());
+            self
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::Relaxed)
+        }
+    }
+
+    impl OAuthFlow for RecentPostsTestFlow {
+        fn authorize<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: Vec<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async { Err("test flow does not authorize".to_owned()) })
+        }
+
+        fn callback<'a>(
+            &'a self,
+            _: OAuthCallback,
+        ) -> Pin<Box<dyn Future<Output = Result<OAuthAccount, String>> + Send + 'a>> {
+            Box::pin(async { Err("test flow does not callback".to_owned()) })
+        }
+
+        fn logout<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn fetch_recent_posts<'a>(
+            &'a self,
+            did: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<IndexedRecord>, String>> + Send + 'a>>
+        {
+            let calls = Arc::clone(&self.calls);
+            let posts = Arc::clone(&self.posts);
+            let hold = self.hold;
+            let failure = self.failure.clone();
+            let did = did.to_owned();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                if !hold.is_zero() {
+                    tokio::time::sleep(hold).await;
+                }
+                if let Some(message) = failure {
+                    return Err(message);
+                }
+                Ok(posts.get(&did).cloned().unwrap_or_default())
+            })
+        }
+    }
+
+    async fn recent_posts_get(app: &Router, uri: String, cookie: &str) -> (StatusCode, String) {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(uri)
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 8_388_608)
+            .await
+            .unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    fn recent_posts_session(storage: &MemoryStorage, public: &OAuthPublic, viewer: &str) -> String {
+        let generation = storage
+            .rotate_web_session(viewer, "recent-posts-session")
+            .unwrap();
+        public.issue_session_cookie(
+            viewer,
+            "recent-posts-session",
+            generation,
+            SessionPermissions {
+                write: false,
+                feed: true,
+                blob: false,
+                video: false,
+                follow: false,
+                block: false,
+                mute: false,
+                list: false,
+                preferences: false,
+                like: false,
+                repost: false,
+                post: false,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn first_profile_visit_returns_at_once_queues_one_job_and_the_next_visit_shows_the_posts()
+    {
+        let storage = Arc::new(MemoryStorage::default());
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let viewer = "did:plc:recent-posts-viewer";
+        let subject = "did:plc:recent-posts-untracked";
+        let fetched = vec![
+            test_web_post(subject, "newest", 1_800_000_000_000_000, "the newest fetched post", None),
+            test_web_post(subject, "middle", 1_700_000_000_000_000, "the middle fetched post", None),
+            test_web_post(subject, "oldest", 1_600_000_000_000_000, "the oldest fetched post", None),
+        ];
+        let flow = RecentPostsTestFlow::new([(subject.to_owned(), fetched)])
+            .with_fetch_hold(Duration::from_secs(2));
+        let token = recent_posts_session(&storage, &public, viewer);
+        let app = public.router_with_flow(flow.clone(), storage.clone());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let worker =
+            RecentPostsWorker::new(flow.clone(), storage.clone(), Duration::from_millis(20));
+        let worker_task = tokio::spawn(async move {
+            let _ = worker.run(shutdown_rx).await;
+        });
+        let cookie = format!("{SESSION_COOKIE}={token}");
+        let first_visit_started = std::time::Instant::now();
+        let (status, _first_html) =
+            recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
+        let first_visit_elapsed = first_visit_started.elapsed();
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            first_visit_elapsed < Duration::from_millis(1_500),
+            "the first visit must not wait for the fetch (it took {first_visit_elapsed:?}) even \
+             while the fake PDS holds every recent-posts fetch for 2 s"
+        );
+        assert_eq!(
+            storage.pending_recent_posts_fetches(10).unwrap(),
+            vec![subject.to_owned()],
+            "the first visit queued exactly one recent-posts job"
+        );
+        let mut stored = Vec::new();
+        let mut pending = storage.pending_recent_posts_fetches(10).unwrap();
+        for _ in 0..120 {
+            stored = storage.author_posts(subject, None, 10, true).unwrap();
+            pending = storage.pending_recent_posts_fetches(10).unwrap();
+            if stored.len() == 3 && pending.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            stored.len(),
+            3,
+            "the worker stored the fetched posts as normal records; pending: {pending:?}"
+        );
+        let _ = shutdown_tx.send(true);
+        let _ = worker_task.await;
+        let (status, html) =
+            recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        let newest = html
+            .find("the newest fetched post")
+            .expect("the next visit shows the newest fetched post");
+        let middle = html
+            .find("the middle fetched post")
+            .expect("the next visit shows every fetched post");
+        let oldest = html
+            .find("the oldest fetched post")
+            .expect("the next visit shows every fetched post");
+        assert!(
+            newest < middle && middle < oldest,
+            "the fetched posts render newest-first on the profile page"
+        );
+    }
+
+    #[tokio::test]
+    async fn ten_concurrent_visits_to_one_account_queue_exactly_one_recent_posts_job() {
+        let storage = Arc::new(MemoryStorage::default());
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let viewer = "did:plc:recent-posts-crowd-viewer";
+        let subject = "did:plc:recent-posts-crowded";
+        let flow = RecentPostsTestFlow::new([]);
+        let token = recent_posts_session(&storage, &public, viewer);
+        let app = public.router_with_flow(flow, storage.clone());
+        let cookie = format!("{SESSION_COOKIE}={token}");
+        let mut visits = Vec::new();
+        for _ in 0..10 {
+            let app = app.clone();
+            let cookie = cookie.clone();
+            let subject = subject.to_owned();
+            visits.push(tokio::spawn(async move {
+                recent_posts_get(&app, format!("/profile?did={subject}"), &cookie)
+                    .await
+                    .0
+            }));
+        }
+        for visit in visits {
+            assert_eq!(visit.await.unwrap(), StatusCode::OK);
+        }
+        assert_eq!(
+            storage.pending_recent_posts_fetches(20).unwrap(),
+            vec![subject.to_owned()],
+            "ten concurrent visits to one account queue one deduplicated job"
+        );
+        let (queued, _done, _failed, _dropped) = storage.recent_posts_counters();
+        assert_eq!(queued, 1, "the queue counts that single job once");
     }
 }
 
