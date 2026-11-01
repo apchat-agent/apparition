@@ -7222,10 +7222,18 @@ mod recent_profile_storage_tests {
 
     #[test]
     fn recent_profiles_are_unique_capped_ordered_and_viewer_scoped() {
-        for storage in [
-            Box::new(MemoryStorage::default()) as Box<dyn Storage>,
-            Box::new(SqliteStorage::open(":memory:").unwrap()) as Box<dyn Storage>,
-        ] {
+        let memory = MemoryStorage::default();
+        check_recent_profile_storage(&memory, &|_| ());
+        let sqlite = SqliteStorage::open(":memory:").unwrap();
+        check_recent_profile_storage(&sqlite, &|storage: &SqliteStorage| {
+            // The remember write is fire-and-forget; let the writer land it
+            // before asserting on the read side.
+            storage.writer_barrier().unwrap()
+        });
+    }
+
+    fn check_recent_profile_storage<S: Storage>(storage: &S, settle: &dyn Fn(&S)) {
+        {
             for index in 0..12 {
                 storage
                     .remember_recent_profile(
@@ -7240,6 +7248,7 @@ mod recent_profile_storage_tests {
             storage
                 .remember_recent_profile("did:plc:viewer-two", "did:plc:other")
                 .unwrap();
+            settle(storage);
             assert_eq!(
                 storage
                     .recent_profiles_for_viewer("did:plc:viewer-one")
