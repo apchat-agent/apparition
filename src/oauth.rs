@@ -10261,7 +10261,7 @@ where
     // cache is fresh or its last fetch is inside the retry backoff (owner
     // 2026-11-01: "should load their posts ... in a worker" / "And cache").
     // The page renders what is local right now and never waits.
-    let _recent_posts_visit =
+    let recent_posts_visit =
         crate::recent_posts::on_profile_visit(state.storage.as_ref(), subject, records.len());
     let content_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
     let parent_started = std::time::Instant::now();
@@ -21978,6 +21978,75 @@ mod tests {
         );
         let (_queued, _done, failed, _dropped) = storage.recent_posts_counters();
         assert_eq!(failed, 1, "the failed fetch counted once");
+    }
+
+    #[tokio::test]
+    async fn a_sparse_profile_shows_a_loading_note_while_its_job_runs_and_loses_it_once_done() {
+        let storage = Arc::new(MemoryStorage::default());
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let viewer = "did:plc:recent-posts-note-viewer";
+        let subject = "did:plc:recent-posts-note";
+        let fetched = vec![test_web_post(
+            subject,
+            "one",
+            1_800_000_000_000_000,
+            "the note fetched post",
+            None,
+        )];
+        let flow = RecentPostsTestFlow::new([(subject.to_owned(), fetched)]);
+        let token = recent_posts_session(&storage, &public, viewer);
+        let app = public.router_with_flow(flow.clone(), storage.clone());
+        let cookie = format!("{SESSION_COOKIE}={token}");
+        let worker = RecentPostsWorker::new(flow.clone(), storage.clone(), Duration::from_secs(30));
+        let (status, html) = recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            html.contains("recent-posts-loading") && html.contains("Loading recent posts"),
+            "a page with no posts while its job is queued shows the short loading note"
+        );
+        worker.run_once().await.unwrap();
+        let (status, html) = recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !html.contains("recent-posts-loading"),
+            "the note is gone once the fetched posts are local"
+        );
+        assert!(html.contains("the note fetched post"));
+    }
+
+    #[tokio::test]
+    async fn a_profile_with_plenty_of_indexed_posts_never_shows_the_loading_note() {
+        let storage = Arc::new(MemoryStorage::default());
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let viewer = "did:plc:recent-posts-dense-viewer";
+        let subject = "did:plc:recent-posts-dense";
+        for index in 0..10 {
+            storage
+                .put_record(&test_web_post(
+                    subject,
+                    &format!("post-{index}"),
+                    1_700_000_000_000_000 + index,
+                    &format!("indexed post {index}"),
+                    None,
+                ))
+                .unwrap();
+        }
+        let flow = RecentPostsTestFlow::new([]);
+        let token = recent_posts_session(&storage, &public, viewer);
+        let app = public.router_with_flow(flow.clone(), storage.clone());
+        let cookie = format!("{SESSION_COOKIE}={token}");
+        let (status, html) = recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("indexed post 9"), "the indexed posts render");
+        assert!(
+            !html.contains("recent-posts-loading"),
+            "a page that already has posts shows no loading note even while a job is queued"
+        );
+        assert_eq!(
+            storage.pending_recent_posts_fetches(20).unwrap(),
+            vec![subject.to_owned()],
+            "the visit still queues its background job"
+        );
     }
 }
 
