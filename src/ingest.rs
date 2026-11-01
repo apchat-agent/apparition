@@ -647,6 +647,8 @@ pub struct MemoryStorage {
     record_uri_batch_lookups: AtomicUsize,
     #[cfg(test)]
     record_uri_batch_delay_ms: AtomicU64,
+    #[cfg(test)]
+    put_record_delay_ms: AtomicU64,
 }
 
 #[cfg(test)]
@@ -656,6 +658,13 @@ impl MemoryStorage {
             self.record_uri_single_lookups.load(Ordering::Relaxed),
             self.record_uri_batch_lookups.load(Ordering::Relaxed),
         )
+    }
+
+    pub(crate) fn set_put_record_delay(&self, delay: Duration) {
+        self.put_record_delay_ms.store(
+            delay.as_millis().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
     }
 
     pub(crate) fn set_record_uri_batch_delay(&self, delay: Duration) {
@@ -696,6 +705,13 @@ struct BackfillRetry {
 
 impl Storage for MemoryStorage {
     fn put_record(&self, record: &IndexedRecord) -> Result<(), StorageError> {
+        #[cfg(test)]
+        {
+            let delay = self.put_record_delay_ms.load(Ordering::Relaxed);
+            if delay > 0 {
+                std::thread::sleep(Duration::from_millis(delay));
+            }
+        }
         let affected = notification_edges(record)
             .into_iter()
             .map(|(_, subject_did, _, _)| subject_did)

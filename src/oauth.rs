@@ -18437,6 +18437,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parent_hydration_does_not_wait_for_persisting_public_parent_authors() {
+        let storage = Arc::new(MemoryStorage::default());
+        let parent = test_web_post("did:plc:public-parent", "parent", 1, "Public parent", None);
+        let reply = test_web_post(
+            "did:plc:local-reply",
+            "reply",
+            2,
+            "Reply",
+            Some(&parent.uri),
+        );
+        let flow = QuoteHydrationTestFlow::with_public_authors([parent.clone()]);
+        storage.set_put_record_delay(Duration::from_millis(500));
+        let page_records = [&reply];
+        let mut stats = ParentHydrationStats::default();
+        let started = Instant::now();
+
+        let parents = hydrate_page_parents(
+            &flow,
+            storage.clone(),
+            &page_records,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            false,
+            &mut stats,
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(parents.get(&parent.uri).is_some_and(Option::is_some));
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "the page waited {elapsed:?} for a 500 ms profile write"
+        );
+        let written = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if storage
+                    .get_record("did:plc:public-parent", "app.bsky.actor.profile", "self")
+                    .unwrap()
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            written.is_ok(),
+            "the author profile is still persisted afterwards"
+        );
+    }
+
+    #[tokio::test]
     async fn parent_author_cache_miss_does_not_block_and_refresh_fills_the_handle() {
         let storage = Arc::new(MemoryStorage::default());
         let viewer = "did:plc:reply-viewer";
@@ -18502,6 +18555,7 @@ mod tests {
         batches: Arc<Mutex<Vec<Vec<String>>>>,
         requested: Arc<Mutex<HashSet<String>>>,
         public_delay: Duration,
+        public_authors: bool,
     }
 
     impl QuoteHydrationTestFlow {
@@ -18517,6 +18571,14 @@ mod tests {
                 batches: Arc::new(Mutex::new(Vec::new())),
                 requested: Arc::new(Mutex::new(HashSet::new())),
                 public_delay: Duration::ZERO,
+                public_authors: false,
+            }
+        }
+
+        fn with_public_authors(records: impl IntoIterator<Item = IndexedRecord>) -> Self {
+            Self {
+                public_authors: true,
+                ..Self::new(records)
             }
         }
 
@@ -18581,6 +18643,7 @@ mod tests {
             let batches = self.batches.clone();
             let requested = self.requested.clone();
             let public_delay = self.public_delay;
+            let public_authors = self.public_authors;
             Box::pin(async move {
                 tokio::time::sleep(public_delay).await;
                 let mut fresh = Vec::new();
@@ -18602,8 +18665,16 @@ mod tests {
                             (
                                 uri,
                                 crate::feeds::FetchedPublicPost {
+                                    author: public_authors.then(|| {
+                                        crate::feeds::PublicProfileView {
+                                            did: record.did.clone(),
+                                            handle: Some("public-author.test".to_owned()),
+                                            display_name: Some("Public Author".to_owned()),
+                                            avatar: None,
+                                            labels: Vec::new(),
+                                        }
+                                    }),
                                     record,
-                                    author: None,
                                 },
                             )
                         })
