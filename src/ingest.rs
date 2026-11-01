@@ -6943,6 +6943,46 @@ mod sqlite_writer_tests {
     }
 
     #[test]
+    fn remembering_a_recent_profile_does_not_wait_on_the_writer() {
+        // A profile page GET arrived-from-search remembers the click before
+        // rendering; the page does not need the row to land. It must not stall
+        // behind a held writer (same class as the last-active-tab write).
+        let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
+        let writer_storage = Arc::clone(&storage);
+        let (started_tx, started_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            writer_storage
+                .writer
+                .call(move |connection| {
+                    started_tx.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(250));
+                    let _ = connection;
+                    Ok(())
+                })
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        let request_started = Instant::now();
+        storage
+            .remember_recent_profile("did:plc:viewer", "did:plc:visited")
+            .unwrap();
+        let elapsed = request_started.elapsed();
+        holder.join().unwrap();
+        storage.writer_barrier().unwrap();
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "remembering a recent profile waited {elapsed:?} on the writer"
+        );
+        assert_eq!(
+            storage
+                .recent_profiles_for_viewer("did:plc:viewer")
+                .unwrap(),
+            ["did:plc:visited"],
+            "the remembered profile must land once the writer drains"
+        );
+    }
+
+    #[test]
     fn queued_profile_writes_are_readable_deduped_and_bounded() {
         let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
         let profile = |did: &str, name: &str, time_us: u64| IndexedRecord {
