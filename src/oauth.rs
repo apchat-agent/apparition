@@ -21586,6 +21586,8 @@ mod tests {
         // through the viewer's PDS proxy, None means it came anonymous to the public AppView.
         get_posts_requests: Vec<GetPostsCall>,
         get_posts_fail_proxied: bool,
+        // How long the fake PDS sits on a proxied getPosts before answering (a hung PDS).
+        get_posts_proxied_delay: Duration,
     }
 
     type GetPostsCall = (String, Option<String>);
@@ -21844,11 +21846,21 @@ mod tests {
                             .get("atproto-proxy")
                             .and_then(|value| value.to_str().ok())
                             .map(str::to_owned);
-                        let fail = {
+                        let (fail, delay) = {
                             let mut state = state.lock().unwrap();
                             state.get_posts_requests.push((query, proxy.clone()));
-                            state.get_posts_fail_proxied && proxy.is_some()
+                            (
+                                state.get_posts_fail_proxied && proxy.is_some(),
+                                if proxy.is_some() {
+                                    state.get_posts_proxied_delay
+                                } else {
+                                    Duration::ZERO
+                                },
+                            )
                         };
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
                         if fail {
                             return (
                                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -22307,6 +22319,36 @@ mod tests {
             warns, 1,
             "one WARN line per proxied batch that fell back: {text}"
         );
+        server.abort();
+    }
+
+    // Reviewer RED (claude-helper, av77q review): a PDS that hangs instead of failing must not
+    // hold the page past the proxied call's own budget; the public AppView still answers.
+    #[tokio::test]
+    async fn a_hung_proxied_get_posts_falls_back_to_the_public_appview_within_the_page_budget() {
+        let (flow, state, server) = feed_test_flow(false).await;
+        grant_get_posts_scope(&flow).await;
+        state.lock().unwrap().get_posts_proxied_delay = Duration::from_secs(30);
+        let storage = Arc::new(MemoryStorage::default());
+
+        let started = std::time::Instant::now();
+        let page = flow
+            .feed_timeline(FEED_VIEWER_DID, FEED_URI, None, storage)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            feed_hydration_uris(&page),
+            REAL_POST_URIS.to_vec(),
+            "a hung proxied batch must not lose posts (took {elapsed:?})"
+        );
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "the public fallback must answer well inside the 8 s page budget, took {elapsed:?}"
+        );
+        let (_proxied, anonymous) = get_posts_calls(&state);
+        assert_eq!(anonymous.len(), 1, "the public fake answered the fallback");
         server.abort();
     }
 
