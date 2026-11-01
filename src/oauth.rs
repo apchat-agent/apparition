@@ -4900,6 +4900,98 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
         })
     }
 
+    fn fetch_recent_posts<'a>(
+        &'a self,
+        did: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<IndexedRecord>, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let document = self
+                .identity_resolver
+                .resolve_did_document(did)
+                .await
+                .map_err(|error| format!("author identity resolution failed: {error}"))?;
+            let pds_endpoint = document
+                .pds_endpoint()
+                .ok_or_else(|| "author DID document has no valid PDS endpoint".to_owned())?;
+            let mut url =
+                reqwest::Url::parse(&format!("{pds_endpoint}/xrpc/com.atproto.repo.listRecords"))
+                    .map_err(|_| "author PDS URL is invalid".to_owned())?;
+            url.query_pairs_mut()
+                .append_pair("repo", did)
+                .append_pair("collection", "app.bsky.feed.post")
+                .append_pair(
+                    "limit",
+                    &crate::recent_posts::RECENT_POSTS_FETCH_LIMIT.to_string(),
+                )
+                .append_pair("reverse", "true");
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                http::header::ACCEPT,
+                http::HeaderValue::from_static("application/json"),
+            );
+            let response = self
+                .http_client
+                .get(&url, headers, 1024 * 1024)
+                .await
+                .map_err(|error| format!("author PDS recent posts request failed: {error}"))?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(format!(
+                    "author PDS recent posts request returned HTTP {status}"
+                ));
+            }
+            let value: Value = serde_json::from_slice(response.body())
+                .map_err(|error| format!("author PDS returned invalid recent-posts JSON: {error}"))?;
+            let records = value
+                .get("records")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    "author PDS recent posts response has no records array".to_owned()
+                })?;
+            let expected_prefix = format!("at://{did}/app.bsky.feed.post/");
+            let mut posts = Vec::new();
+            for entry in records
+                .iter()
+                .take(crate::recent_posts::RECENT_POSTS_FETCH_LIMIT)
+            {
+                let Some(uri) = entry.get("uri").and_then(Value::as_str) else {
+                    tracing::debug!("skipping an author PDS recent-posts record without a uri");
+                    continue;
+                };
+                let Some(rkey) = uri.strip_prefix(expected_prefix.as_str()) else {
+                    tracing::debug!(
+                        uri,
+                        "skipping an author PDS record outside the requested post collection"
+                    );
+                    continue;
+                };
+                if rkey.is_empty() || rkey.contains('/') {
+                    tracing::debug!(uri, "skipping an author PDS record with an invalid rkey");
+                    continue;
+                }
+                let Some(record) = entry.get("value") else {
+                    tracing::debug!(uri, "skipping an author PDS record without a value");
+                    continue;
+                };
+                let time_us = record
+                    .get("createdAt")
+                    .and_then(Value::as_str)
+                    .and_then(crate::recent_posts::parse_created_at_micros)
+                    .unwrap_or_default();
+                posts.push(IndexedRecord {
+                    did: did.to_owned(),
+                    collection: "app.bsky.feed.post".to_owned(),
+                    rkey: rkey.to_owned(),
+                    uri: uri.to_owned(),
+                    cid: entry.get("cid").and_then(Value::as_str).map(str::to_owned),
+                    time_us,
+                    record: record.clone(),
+                });
+            }
+            Ok(posts)
+        })
+    }
+
     fn like<'a>(
         &'a self,
         did: &'a str,
@@ -10165,6 +10257,17 @@ where
     page_timing.timeline_fetch_index_ms = timeline_started.elapsed().as_millis() as u64;
     let has_more = records.len() > limit;
     let records = records.iter().take(limit).collect::<Vec<_>>();
+    // Queue one deduplicated, bounded "recent posts" job for the account being
+    // viewed (owner 2026-11-01: an unfollowed profile lookup should load their
+    // recent posts in a worker). The page renders what is local right now and
+    // never waits for the fetch or the write.
+    if let Err(error) = state.storage.enqueue_recent_posts_fetch(subject) {
+        tracing::warn!(
+            %error,
+            subject = %subject,
+            "could not queue a recent-posts fetch; serving the local page"
+        );
+    }
     let content_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
     let parent_started = std::time::Instant::now();
     let mut parent_stats = ParentHydrationStats::default();

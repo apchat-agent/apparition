@@ -14,6 +14,7 @@ use appview_rs::{
     net::SafeHttpClient,
     oauth::{OAuthPublic, ProfileRefreshWorker, SqliteOAuthStore, WebShutdown},
     profile_counts::{PUBLIC_APPVIEW_BASE, ProfileCountsClient, RelationshipClient},
+    recent_posts::RecentPostsWorker,
 };
 use std::{
     error::Error, future::IntoFuture, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration,
@@ -54,6 +55,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .map_err(std::io::Error::other)?;
     let profile_refresh_worker =
         ProfileRefreshWorker::new(oauth_flow.clone(), storage.clone(), Duration::from_secs(2));
+    let recent_posts_worker =
+        RecentPostsWorker::new(oauth_flow.clone(), storage.clone(), Duration::from_secs(2));
     let ingestor = Ingestor::new(storage.clone(), config.scope_mode)
         .with_identity_cache(identity_cache.clone());
     let consumer = JetstreamConsumer::new(ingestor, Duration::from_secs(1))
@@ -160,6 +163,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             error!(%error, "author profile refresh worker stopped");
         }
     });
+    let recent_posts_shutdown = shutdown_rx.clone();
+    let recent_posts_task = tokio::spawn(async move {
+        if let Err(error) = recent_posts_worker.run(recent_posts_shutdown).await {
+            error!(%error, "recent posts worker stopped");
+        }
+    });
 
     info!(
         %address,
@@ -206,6 +215,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let _ = backfill_task.await;
         let _ = handle_refresh_task.await;
         let _ = profile_refresh_task.await;
+        let _ = recent_posts_task.await;
         Ok::<(), std::io::Error>(())
     })
     .await;

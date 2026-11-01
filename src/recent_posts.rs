@@ -131,6 +131,17 @@ pub fn on_profile_visit<S: Storage>(
     }
 }
 
+/// Microseconds since the UNIX epoch from an RFC 3339 `createdAt` value, the
+/// same format [`crate::backfill`] parses for repository records.
+pub fn parse_created_at_micros(value: &str) -> Option<u64> {
+    let parsed = time::OffsetDateTime::parse(
+        value,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .ok()?;
+    u64::try_from(parsed.unix_timestamp_nanos() / 1_000).ok()
+}
+
 /// Drains the bounded recent-posts queue in the background: for each queued
 /// account whose cache is not fresh and not in backoff, fetch the newest posts
 /// and store them as normal records through the existing writer. The web page
@@ -155,8 +166,53 @@ impl<F: OAuthFlow, S: Storage + 'static> RecentPostsWorker<F, S> {
     }
 
     async fn run_once_inner(&self) -> Result<usize, StorageError> {
-        // The queue exists; the fetch loop lands with the next change.
-        Ok(0)
+        let pending = self
+            .storage
+            .pending_recent_posts_fetches(RECENT_POSTS_WORKER_BATCH)?;
+        let mut completed = 0;
+        for did in pending {
+            match self.flow.fetch_recent_posts(&did).await {
+                Ok(records) => {
+                    let expected_prefix = format!("at://{did}/app.bsky.feed.post/");
+                    let mut stored = 0_usize;
+                    let mut skipped = 0_usize;
+                    for record in records.iter().take(RECENT_POSTS_FETCH_LIMIT) {
+                        if record.did != did
+                            || record.collection != "app.bsky.feed.post"
+                            || !record.uri.starts_with(expected_prefix.as_str())
+                        {
+                            tracing::warn!(
+                                did = %did,
+                                uri = %record.uri,
+                                "the recent-posts fetch returned a record outside this account's post collection; skipped it"
+                            );
+                            skipped += 1;
+                            continue;
+                        }
+                        // Normal records through the existing writer: the page
+                        // that queued this job never waits on it.
+                        self.storage.put_record(record)?;
+                        stored += 1;
+                    }
+                    tracing::debug!(
+                        did = %did,
+                        stored,
+                        skipped,
+                        "stored a recent-posts page for one account"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        did = %did,
+                        error = %error,
+                        "the recent-posts fetch failed"
+                    );
+                }
+            }
+            self.storage.complete_recent_posts_fetch(&did)?;
+            completed += 1;
+        }
+        Ok(completed)
     }
 
     pub async fn run(
