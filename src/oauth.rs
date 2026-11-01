@@ -21881,6 +21881,109 @@ mod tests {
         let (queued, _done, _failed, _dropped) = storage.recent_posts_counters();
         assert_eq!(queued, 1, "the queue counts that single job once");
     }
+
+    #[tokio::test]
+    async fn no_refetch_is_queued_within_the_recent_posts_ttl_and_exactly_one_after_it() {
+        let storage = Arc::new(MemoryStorage::default());
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let viewer = "did:plc:recent-posts-ttl-viewer";
+        let subject = "did:plc:recent-posts-ttl";
+        let fetched = vec![test_web_post(
+            subject,
+            "one",
+            1_800_000_000_000_000,
+            "the ttl fetched post",
+            None,
+        )];
+        let flow = RecentPostsTestFlow::new([(subject.to_owned(), fetched)]);
+        let token = recent_posts_session(&storage, &public, viewer);
+        let app = public.router_with_flow(flow.clone(), storage.clone());
+        let cookie = format!("{SESSION_COOKIE}={token}");
+        let worker = RecentPostsWorker::new(flow.clone(), storage.clone(), Duration::from_secs(30));
+        let (status, _html) =
+            recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        worker.run_once().await.unwrap();
+        assert_eq!(flow.call_count(), 1, "the queued job was fetched once");
+        let (queued, _done, _failed, _dropped) = storage.recent_posts_counters();
+        assert_eq!(queued, 1);
+        recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
+        assert_eq!(
+            flow.call_count(),
+            1,
+            "a visit within the TTL must queue no refetch"
+        );
+        assert_eq!(storage.pending_recent_posts_fetches(20).unwrap(), Vec::<String>::new());
+        let (queued, _done, _failed, _dropped) = storage.recent_posts_counters();
+        assert_eq!(queued, 1, "the TTL visit queued nothing, so the count stays at one");
+        let expired = crate::recent_posts::now_wall_ms()
+            - crate::recent_posts::RECENT_POSTS_TTL.as_millis() as i64 * 2;
+        storage.record_recent_posts_fetched(subject, expired).unwrap();
+        recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
+        assert_eq!(
+            storage.pending_recent_posts_fetches(20).unwrap(),
+            vec![subject.to_owned()],
+            "a visit after the TTL queues exactly one refresh"
+        );
+        let (queued, _done, _failed, _dropped) = storage.recent_posts_counters();
+        assert_eq!(queued, 2, "exactly one refresh was queued");
+    }
+
+    #[tokio::test]
+    async fn a_failed_recent_posts_fetch_logs_the_real_cause_backs_off_and_the_page_renders() {
+        let storage = Arc::new(MemoryStorage::default());
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let viewer = "did:plc:recent-posts-failure-viewer";
+        let subject = "did:plc:recent-posts-failing";
+        let flow = RecentPostsTestFlow::new([])
+            .failing("author PDS recent posts request returned HTTP 429 Too Many Requests");
+        let token = recent_posts_session(&storage, &public, viewer);
+        let app = public.router_with_flow(flow.clone(), storage.clone());
+        let cookie = format!("{SESSION_COOKIE}={token}");
+        let worker = RecentPostsWorker::new(flow.clone(), storage.clone(), Duration::from_secs(30));
+        let (status, html) = recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
+        assert_eq!(status, StatusCode::OK, "the page renders regardless");
+        assert!(html.contains("No indexed posts yet"), "the page shows what is local");
+        let logs = FeedTestLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(logs.clone())
+            .finish();
+        async { worker.run_once().await.unwrap() }
+            .with_subscriber(subscriber)
+            .await;
+        let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("the recent-posts fetch failed"),
+            "the failure is warned about: {output}"
+        );
+        assert!(
+            output.contains("HTTP 429 Too Many Requests"),
+            "the warn line carries the real cause, not just 'request failed': {output}"
+        );
+        let status_entry = storage
+            .recent_posts_status(subject)
+            .unwrap()
+            .expect("the failed fetch is recorded");
+        assert_eq!(status_entry.fetched_at_ms, 0, "a failed fetch is not a cache hit");
+        assert!(
+            status_entry.next_retry_at_ms > crate::recent_posts::now_wall_ms(),
+            "the failure sets a retry backoff"
+        );
+        let (status, _html) =
+            recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
+        assert_eq!(status, StatusCode::OK, "the page still renders during the backoff");
+        worker.run_once().await.unwrap();
+        assert_eq!(
+            flow.call_count(),
+            1,
+            "visits and polls inside the backoff must not re-hit the author PDS on every visit"
+        );
+        let (_queued, _done, failed, _dropped) = storage.recent_posts_counters();
+        assert_eq!(failed, 1, "the failed fetch counted once");
+    }
 }
 
 #[cfg(not(unix))]
