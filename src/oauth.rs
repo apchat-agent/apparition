@@ -1622,6 +1622,8 @@ type OAuthSessionCache =
 type OAuthSessionRestores = Arc<
     tokio::sync::Mutex<HashMap<String, Arc<OnceCell<Result<Arc<RestoredOAuthSession>, String>>>>>,
 >;
+// Per DID: at most one request at a time may expire a stored session and refresh it.
+type OAuthRefreshLocks = Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
 type SavedFeedCache =
     Arc<tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, Vec<SavedFeedPreference>)>>>;
 type SavedFeedRefreshes = Arc<tokio::sync::Mutex<HashSet<String>>>;
@@ -1759,6 +1761,12 @@ impl HttpClient for OAuthMetadataHttpClient {
             (issuer, refresh)
         });
         if let Some((issuer, refresh)) = token_issuer {
+            if refresh {
+                // Every refresh_token grant, whoever initiated it (the recovery path, the
+                // registry's own time-expired refresh), passes through here on its way to
+                // the authorization endpoint.
+                self.writer_metrics.record_refresh_grant();
+            }
             let response = self.inner.send_http(request).await?;
             if !response.status().is_success() {
                 // Atrium swallows a failed token response inside refresh_token(), so this is
@@ -1931,6 +1939,7 @@ struct SharedOAuthSession {
     store: SqliteOAuthStore,
     cache: OAuthSessionCache,
     restores: OAuthSessionRestores,
+    refresh_locks: OAuthRefreshLocks,
 }
 
 impl HttpClient for SharedOAuthSession {
@@ -1957,6 +1966,10 @@ impl XrpcClient for SharedOAuthSession {
         O: serde::de::DeserializeOwned + Send + Sync,
         E: serde::de::DeserializeOwned + Send + Sync + std::fmt::Debug,
     {
+        // Remember the access token this request started with. If another request's refresh
+        // replaces it while this one waits on the per-account refresh lock, this request must
+        // reuse that refresh instead of expiring the stored session and granting again.
+        let token_before = self.stored_access_token().await;
         let attempt = Arc::new(OAuthTokenAttempt {
             did: self.did.clone(),
             grant_rejected: AtomicBool::new(false),
@@ -1969,10 +1982,47 @@ impl XrpcClient for SharedOAuthSession {
                 .to_ascii_lowercase()
                 .contains("invalid_token")
         {
-            // The PDS rejected this access token. Drop the cached session, mark the stored
-            // session expired so the OAuth client's registry really refreshes it, and retry
-            // once: the first call after a revocation must recover with the new token instead
-            // of handing the stale one back to the caller.
+            // One refresh per account at a time (keyed by DID). Concurrent PDS failures used
+            // to race their expire-and-retry against each other: the stored session is a
+            // read-modify-write that sits outside the OAuth client's own per-DID refresh
+            // lock, so a late write-back resurrected an already-exchanged refresh token and
+            // the authorization server read the next grant as a replay and revoked the
+            // whole token family.
+            let refresh_lock = {
+                let mut locks = self.refresh_locks.lock().await;
+                locks
+                    .entry(self.did.clone())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                    .clone()
+            };
+            let _refresh_guard = refresh_lock.lock().await;
+            let token_now = self.stored_access_token().await;
+            if token_now.is_some() && token_now != token_before {
+                // Another request refreshed this account while we were waiting. Retry on the
+                // refreshed session: the shared in-memory session already carries the new
+                // access token, and a pre-refresh copy syncs it from the registry. No store
+                // expiry, no second grant.
+                tracing::debug!(
+                    did = %self.did,
+                    "reusing the concurrent OAuth refresh instead of refreshing again"
+                );
+                self.store.writer.metrics.record_refresh_reuse();
+                let retry = OAUTH_TOKEN_REQUEST
+                    .scope(attempt.clone(), self.inner.send_xrpc(request))
+                    .await;
+                if retry.is_ok() {
+                    let mut cache = self.cache.lock().await;
+                    cache.entry(self.did.clone()).or_insert((
+                        tokio::time::Instant::now() + OAUTH_SESSION_CACHE_TTL,
+                        self.inner.clone(),
+                    ));
+                }
+                return retry;
+            }
+            // The PDS rejected this access token and nobody refreshed since. Drop the cached
+            // session, mark the stored session expired so the OAuth client's registry really
+            // refreshes it, and retry once: the first call after a revocation must recover
+            // with the new token instead of handing the stale one back to the caller.
             self.cache.lock().await.remove(&self.did);
             self.restores.lock().await.remove(&self.did);
             if self.expire_stored_session().await {
@@ -2013,6 +2063,26 @@ impl XrpcClient for SharedOAuthSession {
 }
 
 impl SharedOAuthSession {
+    /// The access token currently stored for this account, used to detect that another
+    /// request refreshed the session while this one was waiting on the refresh lock.
+    async fn stored_access_token(&self) -> Option<String> {
+        let Ok(did) = self.did.parse::<Did>() else {
+            return None;
+        };
+        match self.store.get(&did).await {
+            Ok(Some(session)) => Some(session.token_set.access_token),
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(
+                    did = %self.did,
+                    error = %error,
+                    "could not read the stored OAuth session while recovering an invalid access token"
+                );
+                None
+            }
+        }
+    }
+
     /// Rewrite the stored session so the OAuth client treats its access token as expired and
     /// the next send exchanges the refresh token instead of replaying a rejected access token.
     async fn expire_stored_session(&self) -> bool {
@@ -2057,6 +2127,7 @@ impl CloneWithProxy for SharedOAuthSession {
             store: self.store.clone(),
             cache: self.cache.clone(),
             restores: self.restores.clone(),
+            refresh_locks: self.refresh_locks.clone(),
         }
     }
 }
@@ -2105,6 +2176,7 @@ pub struct AtriumOAuthFlow<B: crate::identity::IdentityBackend = HttpIdentityBac
     video_service_url: String,
     session_cache: OAuthSessionCache,
     session_restores: OAuthSessionRestores,
+    session_refresh_locks: OAuthRefreshLocks,
     saved_feed_cache: SavedFeedCache,
     saved_feed_refreshes: SavedFeedRefreshes,
     service_auth_cache: ServiceAuthCache,
@@ -2133,6 +2205,7 @@ impl<B: crate::identity::IdentityBackend> Clone for AtriumOAuthFlow<B> {
             video_service_url: self.video_service_url.clone(),
             session_cache: self.session_cache.clone(),
             session_restores: self.session_restores.clone(),
+            session_refresh_locks: self.session_refresh_locks.clone(),
             saved_feed_cache: self.saved_feed_cache.clone(),
             saved_feed_refreshes: self.saved_feed_refreshes.clone(),
             service_auth_cache: self.service_auth_cache.clone(),
@@ -2198,6 +2271,8 @@ struct OAuthWriterMetrics {
     transaction_total_ns: AtomicU64,
     transaction_max_ns: AtomicU64,
     refresh_failures: AtomicU64,
+    refresh_grants: AtomicU64,
+    refresh_reuses: AtomicU64,
 }
 
 impl OAuthWriterMetrics {
@@ -2224,6 +2299,14 @@ impl OAuthWriterMetrics {
         self.refresh_failures.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn record_refresh_grant(&self) {
+        self.refresh_grants.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_refresh_reuse(&self) {
+        self.refresh_reuses.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn report(&self) {
         let count = self.transaction_count.swap(0, Ordering::Relaxed);
         let total_ns = self.transaction_total_ns.swap(0, Ordering::Relaxed);
@@ -2241,6 +2324,8 @@ impl OAuthWriterMetrics {
             oauth_writer_transaction_max_ms = max_ns as f64 / 1_000_000.0,
             oauth_writer_dropped_count = self.dropped.swap(0, Ordering::Relaxed),
             oauth_refresh_failure_count = self.refresh_failures.swap(0, Ordering::Relaxed),
+            oauth_refresh_grant_count = self.refresh_grants.swap(0, Ordering::Relaxed),
+            oauth_refresh_reuse_count = self.refresh_reuses.swap(0, Ordering::Relaxed),
             "OAuth SQLite writer minute metrics"
         );
     }
@@ -2775,6 +2860,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             video_service_url: VIDEO_SERVICE_URL.to_owned(),
             session_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             session_restores: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            session_refresh_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             saved_feed_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             saved_feed_refreshes: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             service_auth_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -2810,6 +2896,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
                 store: self.store.clone(),
                 cache: self.session_cache.clone(),
                 restores: self.session_restores.clone(),
+                refresh_locks: self.session_refresh_locks.clone(),
             });
         }
 
@@ -2866,6 +2953,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             store: self.store.clone(),
             cache: self.session_cache.clone(),
             restores: self.session_restores.clone(),
+            refresh_locks: self.session_refresh_locks.clone(),
         })
     }
 
@@ -21321,6 +21409,10 @@ mod tests {
         let metrics = OAuthWriterMetrics::default();
         metrics.record_refresh_failure();
         metrics.record_refresh_failure();
+        metrics.record_refresh_grant();
+        metrics.record_refresh_grant();
+        metrics.record_refresh_grant();
+        metrics.record_refresh_reuse();
         let subscriber = tracing_subscriber::fmt()
             .without_time()
             .with_ansi(false)
@@ -21334,6 +21426,14 @@ mod tests {
         assert!(
             text.contains("oauth_refresh_failure_count=2"),
             "the minute metrics must report rejected refreshes: {text}"
+        );
+        assert!(
+            text.contains("oauth_refresh_grant_count=3"),
+            "the minute metrics must report how many refreshes ran: {text}"
+        );
+        assert!(
+            text.contains("oauth_refresh_reuse_count=1"),
+            "the minute metrics must report waiters that reused another request's refresh: {text}"
         );
         assert!(
             text.contains("OAuth SQLite writer minute metrics"),
