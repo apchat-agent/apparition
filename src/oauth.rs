@@ -18946,6 +18946,76 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_notifications_page_reads_events_off_the_async_worker() {
+        let storage = Arc::new(MemoryStorage::default());
+        let viewer = "did:plc:off-worker-viewer";
+        let post = IndexedRecord {
+            did: viewer.to_owned(),
+            collection: "app.bsky.feed.post".to_owned(),
+            rkey: "post-1".to_owned(),
+            uri: format!("at://{viewer}/app.bsky.feed.post/post-1"),
+            cid: None,
+            time_us: 1,
+            record: json!({"text": "hello"}),
+        };
+        storage.put_record(&post).unwrap();
+        for index in 0..3 {
+            let author = format!("did:plc:off-worker-liker-{index}");
+            storage
+                .put_record(&IndexedRecord {
+                    did: author.clone(),
+                    collection: "app.bsky.feed.like".to_owned(),
+                    rkey: format!("like-{index}"),
+                    uri: format!("at://{author}/app.bsky.feed.like/like-{index}"),
+                    cid: None,
+                    time_us: 2 + index,
+                    record: json!({"subject": {"uri": post.uri}}),
+                })
+                .unwrap();
+        }
+        storage.set_notification_window_read_delay(Duration::from_millis(250));
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let generation = storage
+            .rotate_web_session(viewer, "off-worker-session")
+            .unwrap();
+        let token = public.issue_session_cookie(
+            viewer,
+            "off-worker-session",
+            generation,
+            read_only_session_permissions(),
+        );
+        let app = public.router_with_flow(DisabledOAuthFlow, storage);
+        let ticks = Arc::new(AtomicU64::new(0));
+        let counter = {
+            let ticks = ticks.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    ticks.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/notifications")
+                    .header("cookie", format!("{SESSION_COOKIE}={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        counter.abort();
+        assert_eq!(response.status(), StatusCode::OK);
+        let observed = ticks.load(Ordering::Relaxed);
+        assert!(
+            observed >= 10,
+            "the notification page blocked the async worker: the tick counter              only advanced {observed} times during a request whose storage              reads alone slept for 250ms"
+        );
+    }
+
     #[test]
     fn grouped_like_row_shows_other_count_avatars_and_subject_snippet() {
         let storage = MemoryStorage::default();

@@ -878,6 +878,8 @@ pub struct MemoryStorage {
     record_uri_batch_delay_ms: AtomicU64,
     #[cfg(test)]
     put_record_delay_ms: AtomicU64,
+    #[cfg(test)]
+    notification_window_read_delay_ms: AtomicU64,
 }
 
 #[cfg(test)]
@@ -898,6 +900,13 @@ impl MemoryStorage {
 
     pub(crate) fn set_record_uri_batch_delay(&self, delay: Duration) {
         self.record_uri_batch_delay_ms.store(
+            delay.as_millis().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    pub(crate) fn set_notification_window_read_delay(&self, delay: Duration) {
+        self.notification_window_read_delay_ms.store(
             delay.as_millis().min(u64::MAX as u128) as u64,
             Ordering::Relaxed,
         );
@@ -1634,6 +1643,15 @@ impl Storage for MemoryStorage {
         skip: &[NotificationGroupSkip],
         limit: usize,
     ) -> Result<Vec<NotificationEventRow>, StorageError> {
+        #[cfg(test)]
+        {
+            let delay = self
+                .notification_window_read_delay_ms
+                .load(Ordering::Relaxed);
+            if delay > 0 {
+                std::thread::sleep(Duration::from_millis(delay));
+            }
+        }
         let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
         let mut rows = memory_notification_rows(&inner.records, did)
             .filter(|row| before.is_none_or(|cursor| row.sorts_before(cursor)))
