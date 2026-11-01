@@ -17989,6 +17989,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parent_hydration_reads_only_the_rendered_parent_when_the_page_has_no_thread_chain() {
+        let storage = MemoryStorage::default();
+        let mut replies = Vec::new();
+        for index in 0..25_u64 {
+            let did = format!("did:plc:single-round-{index}");
+            let root = test_web_post(&did, "root", 1, "Root", None);
+            let middle = test_web_post(&did, "middle", 2, "Middle", Some(&root.uri));
+            let mut parent = test_web_post(&did, "parent", 3, "Rendered parent", Some(&middle.uri));
+            parent.record["reply"]["root"]["uri"] = json!(root.uri);
+            let mut reply = test_web_post(&did, "reply", 4, "Reply", Some(&parent.uri));
+            reply.record["reply"]["root"]["uri"] = json!(root.uri);
+            storage.put_record(&root).unwrap();
+            storage.put_record(&middle).unwrap();
+            storage.put_record(&parent).unwrap();
+            replies.push(reply);
+        }
+        let page_records = replies.iter().collect::<Vec<_>>();
+
+        let parents = hydrate_page_parents(
+            &DisabledOAuthFlow,
+            &storage,
+            &page_records,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let (single_lookups, batch_lookups) = storage.record_uri_lookup_counts();
+
+        assert_eq!(single_lookups, 0);
+        assert_eq!(
+            batch_lookups, 1,
+            "only the rendered parent should be queried"
+        );
+        assert_eq!(parents.len(), 25);
+        assert!(parents.values().all(|parent| {
+            parent
+                .as_ref()
+                .is_some_and(|record| record.record["text"] == "Rendered parent")
+        }));
+    }
+
+    #[tokio::test]
+    async fn parent_hydration_overlaps_slow_local_lookup_with_fast_public_appview() {
+        let storage = Arc::new(MemoryStorage::default());
+        storage.set_record_uri_batch_delay(Duration::from_millis(500));
+        let parent = test_web_post("did:plc:overlap-parent", "parent", 1, "Public parent", None);
+        let reply = test_web_post(
+            "did:plc:overlap-reply",
+            "reply",
+            2,
+            "Reply",
+            Some(&parent.uri),
+        );
+        let flow = QuoteHydrationTestFlow::new([parent.clone()]);
+        let page_records = [&reply];
+        let started = Instant::now();
+
+        let parents = hydrate_page_parents(
+            &flow,
+            storage.as_ref(),
+            &page_records,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(parents.get(&parent.uri).is_some_and(Option::is_some));
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "parent hydration waited {elapsed:?} for a 500 ms local store"
+        );
+    }
+
+    #[tokio::test]
     async fn parent_author_cache_miss_does_not_block_and_refresh_fills_the_handle() {
         let storage = Arc::new(MemoryStorage::default());
         let viewer = "did:plc:reply-viewer";

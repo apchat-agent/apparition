@@ -643,6 +643,8 @@ pub struct MemoryStorage {
     record_uri_single_lookups: AtomicUsize,
     #[cfg(test)]
     record_uri_batch_lookups: AtomicUsize,
+    #[cfg(test)]
+    record_uri_batch_delay_ms: AtomicU64,
 }
 
 #[cfg(test)]
@@ -652,6 +654,13 @@ impl MemoryStorage {
             self.record_uri_single_lookups.load(Ordering::Relaxed),
             self.record_uri_batch_lookups.load(Ordering::Relaxed),
         )
+    }
+
+    pub(crate) fn set_record_uri_batch_delay(&self, delay: Duration) {
+        self.record_uri_batch_delay_ms.store(
+            delay.as_millis().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -978,8 +987,14 @@ impl Storage for MemoryStorage {
         uris: &[String],
     ) -> Result<HashMap<String, IndexedRecord>, StorageError> {
         #[cfg(test)]
-        self.record_uri_batch_lookups
-            .fetch_add(1, Ordering::Relaxed);
+        {
+            self.record_uri_batch_lookups
+                .fetch_add(1, Ordering::Relaxed);
+            let delay = self.record_uri_batch_delay_ms.load(Ordering::Relaxed);
+            if delay > 0 {
+                std::thread::sleep(Duration::from_millis(delay));
+            }
+        }
         let wanted = uris.iter().map(String::as_str).collect::<HashSet<_>>();
         Ok(self
             .inner
