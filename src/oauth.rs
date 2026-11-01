@@ -6199,6 +6199,7 @@ struct WebPageTiming {
     render_embeds_ms: u64,
     render_shell_ms: u64,
     render_profile_lookups: u64,
+    render_profile_reads: u64,
     render_profile_count_queries: u64,
     ancestors_from_index: usize,
     ancestors_live: usize,
@@ -6247,6 +6248,7 @@ impl WebPageTiming {
             render_embeds_ms: 0,
             render_shell_ms: 0,
             render_profile_lookups: 0,
+            render_profile_reads: 0,
             render_profile_count_queries: 0,
             ancestors_from_index: 0,
             ancestors_live: 0,
@@ -6270,7 +6272,9 @@ impl WebPageTiming {
 /// total` and the phases line said nothing about which part of the render cost
 /// that). The handler builds one per page request, passes it to the render
 /// helpers, and copies the totals into its `WebPageTiming` when the render is
-/// done; the render helpers are synchronous, so the counters need no locks.
+/// done. The counters are atomics and the identity map a `Mutex` so the page
+/// future stays `Send` while it holds a borrow across `.await` points; the
+/// render helpers themselves never run concurrently.
 #[derive(Default)]
 struct WebRenderContext {
     profiles_us: AtomicU64,
@@ -6278,7 +6282,9 @@ struct WebRenderContext {
     embeds_us: AtomicU64,
     shell_us: AtomicU64,
     profile_lookups: AtomicU64,
+    profile_reads: AtomicU64,
     profile_count_queries: AtomicU64,
+    identities: Mutex<HashMap<String, Value>>,
 }
 
 impl WebRenderContext {
@@ -6302,14 +6308,44 @@ impl WebRenderContext {
     /// COUNT query was costing a statement per card. Timed and counted here
     /// so the phases line can say how much of `render_ms` the identity
     /// lookups cost.
+    ///
+    /// Within one render an identity is read from storage at most once: the
+    /// first lookup of a DID caches the card view for the rest of the page.
+    /// The map lives exactly one render on purpose — a profile, a verified
+    /// handle or a pending handle refresh can change between two requests,
+    /// and the next render sees the fresh read without needing any
+    /// invalidation hook.
     fn author_identity<S: Storage>(&self, storage: &S, did: &str) -> Value {
         self.profile_lookups.fetch_add(1, Ordering::Relaxed);
-        self.timed(&self.profiles_us, || {
+        if let Some(view) = self
+            .identities
+            .lock()
+            .ok()
+            .and_then(|identities| identities.get(did).cloned())
+        {
+            return view;
+        }
+        self.profile_reads.fetch_add(1, Ordering::Relaxed);
+        let view = self.timed(&self.profiles_us, || {
             profile_card_view_from_storage(storage, did).unwrap_or_else(|error| {
                 tracing::warn!(%error, did, "could not load a profile identity; showing the did");
                 json!({"did":did,"handle":did})
             })
-        })
+        });
+        if let Ok(mut identities) = self.identities.lock() {
+            identities.insert(did.to_owned(), view.clone());
+        }
+        view
+    }
+
+    /// Puts a value in this render's identity map before any card asks for
+    /// it. Regression tests use it to prove the card and full views render
+    /// byte-identically; nothing else should seed it.
+    #[cfg(test)]
+    fn prime_identity(&self, did: &str, view: Value) {
+        if let Ok(mut identities) = self.identities.lock() {
+            identities.insert(did.to_owned(), view);
+        }
     }
 
     /// The viewer's own identity for the composer avatar, reply bar or shell
@@ -6352,6 +6388,7 @@ impl WebRenderContext {
             + shell_timed_ms;
         timing.render_shell_ms = shell_timed_ms + timing.render_ms.saturating_sub(accounted_ms);
         timing.render_profile_lookups = self.profile_lookups.load(Ordering::Relaxed);
+        timing.render_profile_reads = self.profile_reads.load(Ordering::Relaxed);
         timing.render_profile_count_queries = self.profile_count_queries.load(Ordering::Relaxed);
     }
 }
@@ -6424,6 +6461,7 @@ impl Drop for WebPageTiming {
             render_embeds_ms = self.render_embeds_ms,
             render_shell_ms = self.render_shell_ms,
             render_profile_lookups = self.render_profile_lookups,
+            render_profile_reads = self.render_profile_reads,
             render_profile_count_queries = self.render_profile_count_queries,
             ancestors_from_index = self.ancestors_from_index,
             ancestors_live = self.ancestors_live,
@@ -6480,6 +6518,7 @@ impl Drop for WebPageTiming {
                 ("render_embeds_ms", self.render_embeds_ms),
                 ("render_shell_ms", self.render_shell_ms),
                 ("render_profile_lookups", self.render_profile_lookups),
+                ("render_profile_reads", self.render_profile_reads),
                 (
                     "render_profile_count_queries",
                     self.render_profile_count_queries,
@@ -25908,9 +25947,8 @@ mod tests {
         let seed = seed_render_phase_page(storage.as_ref());
         let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
         let token = render_phase_session_token(&public, storage.as_ref());
-        let generator_uri = format!(
-            "at://{RENDER_PAGE_VIEWER}/app.bsky.feed.generator/av71q-render-feed"
-        );
+        let generator_uri =
+            format!("at://{RENDER_PAGE_VIEWER}/app.bsky.feed.generator/av71q-render-feed");
         let flow = RenderPhaseFeedFlow {
             generator_uri: generator_uri.clone(),
             posts: seed.posts.clone(),
@@ -25965,8 +26003,10 @@ mod tests {
             12,
             "10 authors + 2 parent authors, read once each per render"
         );
-        let refresh_queues = writer_trace
-            .count_containing("INSERT OR IGNORE INTO handle_refresh_queue") as i64;
+        let refresh_queues = writer_trace.count_containing_all(&[
+            "INSERT OR IGNORE INTO handle_refresh_queue",
+            &render_page_author(9),
+        ]) as i64;
         assert_eq!(
             refresh_queues, 1,
             "author-9's unresolved handle must be queued at most once per render"
@@ -25976,6 +26016,55 @@ mod tests {
         storage.writer_barrier().unwrap();
         drop(storage);
         remove_render_phase_database(&path);
+    }
+
+    #[test]
+    fn cards_render_byte_identically_whether_the_identity_came_from_the_card_view_or_the_full_view()
+    {
+        // The card view dropped the count fields; nothing in a post card, a
+        // reply parent card or a grouped thread item may read them. Proved by
+        // rendering the same page twice: once letting the per-render map fill
+        // from `profile_card_view_from_storage`, once with the map primed with
+        // full `profile_view_from_storage` values — byte-for-byte equal.
+        let storage = MemoryStorage::default();
+        let seed = seed_render_phase_page(&storage);
+        let render_page = |prime_full: bool| {
+            let render = WebRenderContext::default();
+            if prime_full {
+                for did in (0..10)
+                    .map(render_page_author)
+                    .chain((0..2).map(render_page_parent))
+                {
+                    let full = profile_view_from_storage(&storage, &did).unwrap();
+                    render.prime_identity(&did, full);
+                }
+            }
+            let list_blocks = HashMap::new();
+            let parents: PageParentIndex = seed
+                .parents
+                .iter()
+                .map(|parent| (parent.uri.clone(), Some(parent.clone())))
+                .collect();
+            let records = seed.posts.iter().collect::<Vec<_>>();
+            render_timeline_post_items(
+                &storage,
+                &records,
+                &vec![String::new(); seed.posts.len()],
+                &parents,
+                &TimelineRenderContext {
+                    viewer_did: RENDER_PAGE_VIEWER,
+                    rights: FormRights::default(),
+                    quote_index: &QuoteRenderIndex::default(),
+                    page_interactions: &HashMap::new(),
+                    list_blocks: &list_blocks,
+                    render: &render,
+                },
+            )
+        };
+        let from_card_view = render_page(false);
+        let from_full_views = render_page(true);
+        assert!(from_card_view.contains("reply-parent-card"));
+        assert_eq!(from_card_view, from_full_views);
     }
 }
 

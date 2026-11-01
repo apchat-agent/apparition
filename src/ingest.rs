@@ -2927,9 +2927,10 @@ pub struct StatementTrace {
 impl StatementTrace {
     /// The SQL that only `profile_counts` runs: one SELECT bundling the three
     /// COUNT subqueries. Counting its executions counts the profile-count
-    /// queries a code path asks the database for.
+    /// queries a code path asks the database for. Ends before the `?1`
+    /// placeholder so it matches the expanded (values-inlined) SQL too.
     pub const PROFILE_COUNTS_SQL: &'static str =
-        "(SELECT COUNT(*) FROM records WHERE collection='app.bsky.feed.post' AND did=?1)";
+        "(SELECT COUNT(*) FROM records WHERE collection='app.bsky.feed.post' AND did=";
 
     fn push(&self, sql: &str) {
         if let Ok(mut statements) = self.statements.lock() {
@@ -2950,6 +2951,20 @@ impl StatementTrace {
         self.statements
             .lock()
             .map(|statements| statements.iter().filter(|sql| sql.contains(needle)).count())
+            .unwrap_or_default()
+    }
+
+    /// Executed statements whose SQL contains every needle at once (expanded
+    /// SQL carries the bound values, so shape plus argument identifies one).
+    pub fn count_containing_all(&self, needles: &[&str]) -> usize {
+        self.statements
+            .lock()
+            .map(|statements| {
+                statements
+                    .iter()
+                    .filter(|sql| needles.iter().all(|needle| sql.contains(needle)))
+                    .count()
+            })
             .unwrap_or_default()
     }
 
@@ -2976,8 +2991,13 @@ fn push_traced_statement(sql: &str) {
 fn route_statement_profile(event: rusqlite::trace::TraceEvent<'_>) {
     // PROFILE fires exactly once per executed statement; STMT can fire again
     // inside triggers, so counting PROFILE keeps one entry per execution.
+    // The expanded SQL (bound values inlined) is recorded when available so
+    // tests can tell statements apart by their arguments, not just shape.
     if let rusqlite::trace::TraceEvent::Profile(statement, _) = event {
-        push_traced_statement(&statement.sql());
+        let sql = statement
+            .expanded_sql()
+            .unwrap_or_else(|| statement.sql().into_owned());
+        push_traced_statement(&sql);
     }
 }
 
