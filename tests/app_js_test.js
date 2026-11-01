@@ -2302,6 +2302,8 @@ Deno.test("the timing console shows count phases without an ms suffix", async ()
       list_blocked_posts: 2,
       relationship_requests: 4,
       ancestors_live: 5,
+      notification_events_read: 115,
+      notification_records_loaded: 50,
     },
     calls: [],
     calls_overflow: 0,
@@ -2332,11 +2334,13 @@ Deno.test("the timing console shows count phases without an ms suffix", async ()
       "list_blocked_posts 2",
       "relationship_requests 4",
       "ancestors_live 5",
+      "notification_events_read 115",
+      "notification_records_loaded 50",
     ]) {
       assert(texts.includes(count), `the count phase must render without a unit: ${JSON.stringify(texts)}`);
     }
     assert(
-      !texts.some((text) => /(parent_rounds|parent_rows|parent_local_pending|list_blocked_posts|relationship_requests|ancestors_live) \d+ ms/.test(text)),
+      !texts.some((text) => /(parent_rounds|parent_rows|parent_local_pending|list_blocked_posts|relationship_requests|ancestors_live|notification_events_read|notification_records_loaded) \d+ ms/.test(text)),
       `no count may carry an ms suffix: ${JSON.stringify(texts)}`,
     );
     const countRow = rows.find((row) => row.textContent === "parent_rows 12");

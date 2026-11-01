@@ -17021,6 +17021,8 @@ mod tests {
             "ancestors_from_index=",
             "ancestors_live=",
             "ancestors_timed_out=",
+            "notification_events_read=",
+            "notification_records_loaded=",
             "outbound_call_count=",
             "outbound_call_ms=",
             "outbound_calls=",
@@ -19024,6 +19026,140 @@ mod tests {
         assert!(
             observed >= 10,
             "the notification page blocked the async worker: the tick counter              only advanced {observed} times during a request whose storage              reads alone slept for 250ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_notifications_page_counts_its_events_and_records_in_the_footer_and_the_log() {
+        let storage = Arc::new(MemoryStorage::default());
+        let viewer = "did:plc:counted-notifications-viewer";
+        let post = IndexedRecord {
+            did: viewer.to_owned(),
+            collection: "app.bsky.feed.post".to_owned(),
+            rkey: "counted-post".to_owned(),
+            uri: format!("at://{viewer}/app.bsky.feed.post/counted-post"),
+            cid: None,
+            time_us: 1,
+            record: json!({"text": "a counted post"}),
+        };
+        storage.put_record(&post).unwrap();
+        for index in 0..3 {
+            let author = format!("did:plc:counted-liker-{index}");
+            storage
+                .put_record(&IndexedRecord {
+                    did: author.clone(),
+                    collection: "app.bsky.feed.like".to_owned(),
+                    rkey: format!("counted-like-{index}"),
+                    uri: format!("at://{author}/app.bsky.feed.like/counted-like-{index}"),
+                    cid: None,
+                    time_us: 2 + index,
+                    record: json!({"subject": {"uri": post.uri}}),
+                })
+                .unwrap();
+        }
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let generation = storage
+            .rotate_web_session(viewer, "counted-notifications-session")
+            .unwrap();
+        let token = public.issue_session_cookie(
+            viewer,
+            "counted-notifications-session",
+            generation,
+            read_only_session_permissions(),
+        );
+        let app = public.router_with_flow(DisabledOAuthFlow, storage);
+        let logs = FeedTestLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(logs.clone())
+            .finish();
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::get("/notifications")
+                    .header("cookie", format!("{SESSION_COOKIE}={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let phase_line = String::from_utf8(logs.0.lock().unwrap().clone())
+            .unwrap()
+            .lines()
+            .find(|line| line.contains("web page phases"))
+            .expect("the notifications page logs its phases")
+            .to_owned();
+        let metric = |name: &str| -> u64 {
+            phase_line
+                .split_whitespace()
+                .find_map(|field| {
+                    field
+                        .strip_prefix(&format!("{name}="))
+                        .and_then(|value| value.parse::<u64>().ok())
+                })
+                .unwrap_or_else(|| panic!("missing {name} in {phase_line}"))
+        };
+        assert!(
+            phase_line.contains("timeline_fetch_index_ms="),
+            "the duration the footer already showed must stay: {phase_line}"
+        );
+        assert!(
+            phase_line.contains("notification_events_read=")
+                && phase_line.contains("notification_records_loaded="),
+            "both counts belong in the phase line: {phase_line}"
+        );
+        assert!(
+            !phase_line.contains("notification_events_read_ms=")
+                && !phase_line.contains("notification_records_loaded_ms="),
+            "counts are counts, never ms: {phase_line}"
+        );
+        assert!(metric("notification_events_read") > 0, "{phase_line}");
+        assert_eq!(
+            metric("notification_records_loaded"),
+            1,
+            "one group head renders, so exactly one record loads: {phase_line}"
+        );
+
+        let response = app
+            .oneshot(
+                axum::http::Request::get("/timing/recent")
+                    .header("cookie", format!("{SESSION_COOKIE}={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = collect_body(response).await;
+        let footer = String::from_utf8(body.clone()).unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        let record = payload["records"]
+            .as_array()
+            .expect("a records array")
+            .iter()
+            .find(|record| record["page"] == json!("notifications"))
+            .expect("the notifications page reached the timing footer");
+        assert!(
+            footer.contains("notification_events_read")
+                && footer.contains("notification_records_loaded"),
+            "both counts belong in the footer: {footer}"
+        );
+        assert!(
+            record["phases"]["notification_events_read"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0,
+            "{record}"
+        );
+        assert_eq!(
+            record["phases"]["notification_records_loaded"],
+            json!(1),
+            "{record}"
         );
     }
 
