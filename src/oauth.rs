@@ -24485,6 +24485,178 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_quick_likes_make_exactly_one_pds_create_record() {
+        // The owner who saw the 13699 ms like error clicked again: the second createRecord
+        // made a duplicate like on the PDS. While the first like's index write is still
+        // pending the viewer must not reach the PDS a second time for the same post.
+        let path = held_writer_page_path("double-like");
+        remove_held_writer_database(&path);
+        let storage = Arc::new(crate::ingest::SqliteStorage::open(&path).unwrap());
+        let post = test_web_post("did:plc:doubled-author", "doubled", 7, "clicked twice", None);
+        storage.put_record(&post).unwrap();
+        let flow = AnswerFlow::default();
+        let flow_state = flow.state.clone();
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        let app = public.router_with_flow(flow, storage.clone());
+        let cookie = answer_session_cookie(&public, storage.as_ref(), ANSWER_VIEWER);
+
+        let gate = storage.hold_writer(Duration::from_secs(3));
+        gate.recv_timeout(Duration::from_secs(1))
+            .expect("the writer picked up the hold");
+
+        let first = post_like(&app, &cookie, like_form_body(&post.uri), true).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(json_response(first).await, json!({"liked": true, "likeCount": 1}));
+        let second = post_like(&app, &cookie, like_form_body(&post.uri), true).await;
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            json_response(second).await,
+            json!({"liked": true, "likeCount": 1}),
+            "the second click gets the same answered state, not a second PDS write"
+        );
+        assert_eq!(
+            flow_state.lock().unwrap().like_calls,
+            1,
+            "a like while the first like's index write is pending must not create a second PDS like"
+        );
+
+        storage.writer_barrier().unwrap();
+        let like_uri = format!("at://{ANSWER_VIEWER}/app.bsky.feed.like/answer-like-r1");
+        assert!(
+            wait_until(
+                || storage
+                    .record_by_uri("app.bsky.feed.like", &like_uri)
+                    .unwrap()
+                    .is_some(),
+                Duration::from_secs(5)
+            )
+            .await,
+            "the single pending like must still be indexed"
+        );
+        assert_eq!(
+            storage
+                .records_for_actor_collection(ANSWER_VIEWER, "app.bsky.feed.like", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(storage);
+        remove_held_writer_database(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unlike_right_after_a_like_deletes_the_pending_like() {
+        // Unlike immediately after a like whose index write is still pending: the local
+        // index has no like row yet, so the handler must delete the rkey the PDS just
+        // created, and once the writer catches up no index row may remain.
+        let path = held_writer_page_path("pending-unlike");
+        remove_held_writer_database(&path);
+        let storage = Arc::new(crate::ingest::SqliteStorage::open(&path).unwrap());
+        let post = test_web_post("did:plc:toggled-author", "toggled", 7, "liked and unliked", None);
+        storage.put_record(&post).unwrap();
+        let flow = AnswerFlow::default();
+        let flow_state = flow.state.clone();
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        let app = public.router_with_flow(flow, storage.clone());
+        let cookie = answer_session_cookie(&public, storage.as_ref(), ANSWER_VIEWER);
+
+        let gate = storage.hold_writer(Duration::from_secs(3));
+        gate.recv_timeout(Duration::from_secs(1))
+            .expect("the writer picked up the hold");
+
+        let like = post_like(&app, &cookie, like_form_body(&post.uri), true).await;
+        assert_eq!(like.status(), StatusCode::OK);
+        drop(json_response(like).await);
+        let unlike = post_like(
+            &app,
+            &cookie,
+            format!("{}&intent=delete", like_form_body(&post.uri)),
+            true,
+        )
+        .await;
+        assert_eq!(unlike.status(), StatusCode::OK);
+        assert_eq!(
+            json_response(unlike).await,
+            json!({"liked": false, "likeCount": 0})
+        );
+        let state = flow_state.lock().unwrap();
+        assert_eq!(state.unlike_calls, 1);
+        assert_eq!(
+            state.unlike_uris.as_slice(),
+            [format!("at://{ANSWER_VIEWER}/app.bsky.feed.like/answer-like-r1").as_str()],
+            "the unlike must delete the rkey the pending like created"
+        );
+        drop(state);
+
+        storage.writer_barrier().unwrap();
+        let like_uri = format!("at://{ANSWER_VIEWER}/app.bsky.feed.like/answer-like-r1");
+        assert!(
+            wait_until(
+                || storage
+                    .records_for_actor_collection(ANSWER_VIEWER, "app.bsky.feed.like", 10)
+                    .is_ok_and(|records| records.is_empty()),
+                Duration::from_secs(5)
+            )
+            .await,
+            "the like and its delete must both settle, leaving no index row"
+        );
+        assert!(
+            storage
+                .records_for_actor_collection(ANSWER_VIEWER, "app.bsky.feed.like", 10)
+                .unwrap()
+                .is_empty(),
+            "no like row may remain after unlike-with-pending-write"
+        );
+        drop(storage);
+        remove_held_writer_database(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_quick_reposts_make_exactly_one_pds_create_record() {
+        let path = held_writer_page_path("double-repost");
+        remove_held_writer_database(&path);
+        let storage = Arc::new(crate::ingest::SqliteStorage::open(&path).unwrap());
+        let post = test_web_post("did:plc:redoubled-author", "redoubled", 7, "reposted twice", None);
+        storage.put_record(&post).unwrap();
+        let flow = AnswerFlow::default();
+        let flow_state = flow.state.clone();
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        let app = public.router_with_flow(flow, storage.clone());
+        let cookie = answer_session_cookie(&public, storage.as_ref(), ANSWER_VIEWER);
+
+        let gate = storage.hold_writer(Duration::from_secs(3));
+        gate.recv_timeout(Duration::from_secs(1))
+            .expect("the writer picked up the hold");
+
+        let body = like_form_body(&post.uri);
+        for attempt in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/repost")
+                        .header("origin", "https://appview.example")
+                        .header("sec-fetch-site", "same-origin")
+                        .header("cookie", &cookie)
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .body(Body::from(body.clone()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SEE_OTHER, "attempt {attempt}");
+        }
+        assert_eq!(
+            flow_state.lock().unwrap().repost_calls,
+            1,
+            "a repost while the first repost's index write is pending must not create a second PDS repost"
+        );
+        drop(storage);
+        remove_held_writer_database(&path);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_like_is_indexed_after_the_writer_lock_clears() {
         // A writer that answers "database is locked" twice and then succeeds: the user saw
