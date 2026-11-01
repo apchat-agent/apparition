@@ -18972,6 +18972,100 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_recent_like_burst_keeps_page_one_and_page_two_bounded() {
+        // The real-life shape the 20 000 test misses: a big burst of likes on
+        // one post is the NEWEST activity, with replies landing in between, so
+        // page 1 ends inside the burst and page 2 starts below its head. Each
+        // page must skip the burst's already-grouped likes in the window read,
+        // not walk them one by one.
+        const HOUR_US: u64 = 3_600_000_000;
+        const VIEWER: &str = "did:plc:recent-burst-viewer";
+        const LIKES: u64 = 6_000;
+        const REPLIES: u64 = 120;
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("av72q-burst-{}.sqlite3", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let storage = crate::ingest::SqliteStorage::open(&path).unwrap();
+        let subject = format!("at://{VIEWER}/app.bsky.feed.post/burst");
+        let mut records = vec![IndexedRecord {
+            did: VIEWER.to_owned(),
+            collection: "app.bsky.feed.post".to_owned(),
+            rkey: "burst".to_owned(),
+            uri: subject.clone(),
+            cid: None,
+            time_us: 1,
+            record: json!({"text": "the burst post"}),
+        }];
+        let start = 200 * 24 * HOUR_US;
+        let span = 40 * HOUR_US;
+        for index in 0..LIKES {
+            let author = format!("did:plc:burst-liker-{index}");
+            records.push(IndexedRecord {
+                did: author.clone(),
+                collection: "app.bsky.feed.like".to_owned(),
+                rkey: format!("l{index}"),
+                uri: format!("at://{author}/app.bsky.feed.like/l{index}"),
+                cid: None,
+                time_us: start + index * (span / LIKES),
+                record: json!({"subject": {"uri": subject}}),
+            });
+        }
+        for index in 0..REPLIES {
+            let author = format!("did:plc:burst-replier-{index}");
+            records.push(IndexedRecord {
+                did: author.clone(),
+                collection: "app.bsky.feed.post".to_owned(),
+                rkey: format!("r{index}"),
+                uri: format!("at://{author}/app.bsky.feed.post/r{index}"),
+                cid: None,
+                time_us: start + index * (span / REPLIES) + 7,
+                record: json!({"text": "reply body", "reply": {"parent": {"uri": subject}, "root": {"uri": subject}}}),
+            });
+        }
+        let updates = records
+            .iter()
+            .map(|record| crate::ingest::JetstreamStorageUpdate {
+                time_us: record.time_us,
+                upsert: Some(record.clone()),
+                delete: None,
+                follows: Vec::new(),
+                backfill_for: Vec::new(),
+                handle_refresh: None,
+            })
+            .collect::<Vec<_>>();
+        storage.apply_jetstream_batch(&updates).unwrap();
+        storage.writer_barrier().unwrap();
+        let page_one = notification_window_page(&storage, VIEWER, None, 50, 0).unwrap();
+        let cursor = page_one.groups.last().unwrap().cursor();
+        let page_two = notification_window_page(&storage, VIEWER, Some(&cursor), 50, 0).unwrap();
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+        assert_eq!(
+            page_one.groups[0].reason, "like",
+            "the burst is the newest group"
+        );
+        assert_eq!(page_one.groups[0].size as u64, LIKES);
+        assert!(page_one.has_more);
+        assert!(
+            page_one.events_read < 500,
+            "page 1 walked {} event rows through a burst it had already grouped",
+            page_one.events_read
+        );
+        assert!(
+            page_two.groups.iter().all(|group| group.reason != "like"),
+            "page 2 must not show the burst again"
+        );
+        assert!(
+            page_two.events_read < 500,
+            "page 2 walked {} event rows of a burst page 1 already showed",
+            page_two.events_read
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn the_notifications_page_reads_events_off_the_async_worker() {
         let storage = Arc::new(MemoryStorage::default());
