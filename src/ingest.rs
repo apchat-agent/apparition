@@ -261,6 +261,16 @@ pub const WINDOWED_SNAPSHOT_COLLECTIONS: &[&str] = &[
     "app.bsky.feed.repost",
 ];
 
+/// Time bounds of one batched snapshot-delete loop: rows up to `cutoff_us`
+/// are candidates, and when `window_start_us` is set the windowed collections
+/// only lose rows from the window start onward (see
+/// [`WINDOWED_SNAPSHOT_COLLECTIONS`]).
+#[derive(Clone, Copy)]
+struct SnapshotDeleteBounds {
+    cutoff_us: i64,
+    window_start_us: Option<i64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordCursor {
     pub time_us: u64,
@@ -539,6 +549,24 @@ pub trait Storage: Send + Sync {
     ) -> Result<(), StorageError> {
         let _ = records_per_second;
         self.replace_repo_snapshot(did, records, following)
+    }
+    /// Snapshot replace for a windowed backfill: `window_start_us` is the
+    /// window start (microseconds since the epoch) the snapshot's coverage
+    /// stops at. Rows of [`WINDOWED_SNAPSHOT_COLLECTIONS`] with `time_us`
+    /// below it are NOT deleted, because this snapshot says nothing about
+    /// them and they may have arrived from an older-on-scroll fetch or the
+    /// firehose. `None` keeps the historical all-or-nothing replace.
+    /// Backends that do not track a window delegate unchanged.
+    fn replace_repo_snapshot_windowed(
+        &self,
+        did: &str,
+        records: &[IndexedRecord],
+        following: &[String],
+        records_per_second: u64,
+        window_start_us: Option<u64>,
+    ) -> Result<(), StorageError> {
+        let _ = window_start_us;
+        self.replace_repo_snapshot_throttled(did, records, following, records_per_second)
     }
     fn delete_record(&self, did: &str, collection: &str, rkey: &str) -> Result<(), StorageError>;
     fn get_record(
@@ -896,6 +924,98 @@ pub struct MemoryStorage {
     notification_window_read_delay_ms: AtomicU64,
 }
 
+impl MemoryStorage {
+    fn replace_snapshot_state(
+        &self,
+        did: &str,
+        records: &[IndexedRecord],
+        following: &[String],
+        window_start_us: Option<u64>,
+    ) -> Result<(), StorageError> {
+        let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut affected = inner
+            .records
+            .values()
+            .filter(|record| record.did == did)
+            .flat_map(notification_edges)
+            .map(|(_, subject_did, _, _)| subject_did)
+            .collect::<Vec<_>>();
+        affected.extend(
+            records
+                .iter()
+                .flat_map(notification_edges)
+                .map(|(_, subject_did, _, _)| subject_did),
+        );
+        inner.records.retain(|(record_did, collection, _), entry| {
+            if record_did != did {
+                return true;
+            }
+            // Same rule as the SQLite snapshot delete: a windowed snapshot
+            // proves nothing about windowed-collection rows older than its
+            // window start, so those rows survive.
+            window_start_us.is_some_and(|window_start| {
+                WINDOWED_SNAPSHOT_COLLECTIONS.contains(&collection.as_str())
+                    && entry.time_us < window_start
+            })
+        });
+        let mut latest_profile = None;
+        let old_follows = inner
+            .follows
+            .iter()
+            .filter(|(actor, _)| actor == did)
+            .map(|(_, subject)| subject.clone())
+            .collect::<Vec<_>>();
+        if inner.tracked.registered.contains(did) {
+            for subject in &old_follows {
+                inner.tracked.apply_follow_delta(subject, -1);
+            }
+        }
+        inner.follows.retain(|(actor, _)| actor != did);
+        inner
+            .backfill_owners
+            .retain(|(owner, target)| owner != did || target == did);
+        for record in records {
+            let key = (
+                record.did.clone(),
+                record.collection.clone(),
+                record.rkey.clone(),
+            );
+            inner.records.insert(key, record.clone());
+            if record.collection == "app.bsky.actor.profile" {
+                latest_profile = Some(record.time_us);
+            }
+        }
+        inner.profile_index.insert(
+            did.to_owned(),
+            ProfileIndexEntry {
+                has_profile: latest_profile.is_some(),
+                fetched_at_ms: latest_profile
+                    .map(profile_time_ms)
+                    .unwrap_or_else(epoch_millis),
+            },
+        );
+        for subject in following {
+            let inserted = inner.follows.insert((did.to_owned(), subject.clone()));
+            if inserted && inner.tracked.registered.contains(did) {
+                inner.tracked.apply_follow_delta(subject, 1);
+            }
+            if inner.tracked.registered.contains(did)
+                && (inner.backfill_queue.contains(subject)
+                    || inner.backfill_queue.len() < MAX_BACKFILL_QUEUE)
+            {
+                inner
+                    .backfill_owners
+                    .insert((did.to_owned(), subject.clone()));
+                inner.backfill_queue.insert(subject.clone());
+                inner.backfill_completed.remove(subject);
+            }
+        }
+        drop(inner);
+        publish_notification_counts(self, &self.notification_hub, affected);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 impl MemoryStorage {
     pub(crate) fn record_uri_lookup_counts(&self) -> (usize, usize) {
@@ -1121,78 +1241,18 @@ impl Storage for MemoryStorage {
         records: &[IndexedRecord],
         following: &[String],
     ) -> Result<(), StorageError> {
-        let mut inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
-        let mut affected = inner
-            .records
-            .values()
-            .filter(|record| record.did == did)
-            .flat_map(notification_edges)
-            .map(|(_, subject_did, _, _)| subject_did)
-            .collect::<Vec<_>>();
-        affected.extend(
-            records
-                .iter()
-                .flat_map(notification_edges)
-                .map(|(_, subject_did, _, _)| subject_did),
-        );
-        inner
-            .records
-            .retain(|(record_did, _, _), _| record_did != did);
-        let mut latest_profile = None;
-        let old_follows = inner
-            .follows
-            .iter()
-            .filter(|(actor, _)| actor == did)
-            .map(|(_, subject)| subject.clone())
-            .collect::<Vec<_>>();
-        if inner.tracked.registered.contains(did) {
-            for subject in &old_follows {
-                inner.tracked.apply_follow_delta(subject, -1);
-            }
-        }
-        inner.follows.retain(|(actor, _)| actor != did);
-        inner
-            .backfill_owners
-            .retain(|(owner, target)| owner != did || target == did);
-        for record in records {
-            let key = (
-                record.did.clone(),
-                record.collection.clone(),
-                record.rkey.clone(),
-            );
-            inner.records.insert(key, record.clone());
-            if record.collection == "app.bsky.actor.profile" {
-                latest_profile = Some(record.time_us);
-            }
-        }
-        inner.profile_index.insert(
-            did.to_owned(),
-            ProfileIndexEntry {
-                has_profile: latest_profile.is_some(),
-                fetched_at_ms: latest_profile
-                    .map(profile_time_ms)
-                    .unwrap_or_else(epoch_millis),
-            },
-        );
-        for subject in following {
-            let inserted = inner.follows.insert((did.to_owned(), subject.clone()));
-            if inserted && inner.tracked.registered.contains(did) {
-                inner.tracked.apply_follow_delta(subject, 1);
-            }
-            if inner.tracked.registered.contains(did)
-                && (inner.backfill_queue.contains(subject)
-                    || inner.backfill_queue.len() < MAX_BACKFILL_QUEUE)
-            {
-                inner
-                    .backfill_owners
-                    .insert((did.to_owned(), subject.clone()));
-                inner.backfill_queue.insert(subject.clone());
-                inner.backfill_completed.remove(subject);
-            }
-        }
-        drop(inner);
-        publish_notification_counts(self, &self.notification_hub, affected);
-        Ok(())
+        self.replace_snapshot_state(did, records, following, None)
+    }
+
+    fn replace_repo_snapshot_windowed(
+        &self,
+        did: &str,
+        records: &[IndexedRecord],
+        following: &[String],
+        _records_per_second: u64,
+        window_start_us: Option<u64>,
+    ) -> Result<(), StorageError> {
+        self.replace_snapshot_state(did, records, following, window_start_us)
     }
 
     fn delete_record(&self, did: &str, collection: &str, rkey: &str) -> Result<(), StorageError> {
@@ -4272,8 +4332,8 @@ impl SqliteStorage {
     fn delete_snapshot_rows(
         &self,
         did: &str,
-        cutoff_us: i64,
         sql: &str,
+        bounds: SnapshotDeleteBounds,
         records_per_second: Option<u64>,
         write_started: Instant,
         records_written: &mut u64,
@@ -4284,10 +4344,21 @@ impl SqliteStorage {
             let writer_sql = sql.to_owned();
             let deleted = self.writer.call(move |connection| {
                 let transaction = connection.transaction()?;
-                let deleted = transaction.execute(
-                    &writer_sql,
-                    params![writer_did, cutoff_us, SNAPSHOT_BATCH as i64],
-                )?;
+                let deleted = match bounds.window_start_us {
+                    Some(window_start_us) => transaction.execute(
+                        &writer_sql,
+                        params![
+                            writer_did,
+                            bounds.cutoff_us,
+                            SNAPSHOT_BATCH as i64,
+                            window_start_us
+                        ],
+                    ),
+                    None => transaction.execute(
+                        &writer_sql,
+                        params![writer_did, bounds.cutoff_us, SNAPSHOT_BATCH as i64],
+                    ),
+                }?;
                 transaction.commit()?;
                 Ok(deleted)
             })?;
@@ -4363,6 +4434,7 @@ impl SqliteStorage {
         records: &[IndexedRecord],
         following: &[String],
         records_per_second: Option<u64>,
+        window_start_us: Option<i64>,
     ) -> Result<(), StorageError> {
         let record_json = records
             .iter()
@@ -4386,34 +4458,67 @@ impl SqliteStorage {
             Ok((follow_rowid_cutoff, scope_rowid_cutoff))
         })?;
         let mut records_written = 0_u64;
-        self.delete_snapshot_rows(
-            did,
-            cutoff_us,
+        // A windowed snapshot only proves what happened since its window
+        // start, so for the windowed collections it may delete rows from the
+        // window start onward only; older rows (from older-on-scroll pages or
+        // the firehose) stand. The other collections are current state and
+        // are replaced in full as always.
+        let windowed = window_start_us.is_some();
+        let records_sql = if windowed {
+            "DELETE FROM records WHERE rowid IN (
+                 SELECT rowid FROM records WHERE did=?1 AND time_us<=?2
+                     AND (time_us>=?4 OR collection NOT IN ('app.bsky.feed.post','app.bsky.feed.like','app.bsky.feed.repost'))
+                 ORDER BY rowid LIMIT ?3
+             )"
+        } else {
             "DELETE FROM records WHERE rowid IN (
                  SELECT rowid FROM records WHERE did=?1 AND time_us<=?2 ORDER BY rowid LIMIT ?3
-             )",
+             )"
+        };
+        self.delete_snapshot_rows(
+            did,
+            records_sql,
+            SnapshotDeleteBounds {
+                cutoff_us,
+                window_start_us,
+            },
             records_per_second,
             write_started,
             &mut records_written,
         )?;
-        self.delete_snapshot_rows(
-            did,
-            cutoff_us,
+        let events_sql = if windowed {
+            "DELETE FROM notification_events WHERE rowid IN (
+                 SELECT rowid FROM notification_events WHERE source_did=?1 AND time_us<=?2
+                     AND (time_us>=?4 OR source_collection NOT IN ('app.bsky.feed.post','app.bsky.feed.like','app.bsky.feed.repost'))
+                 ORDER BY rowid LIMIT ?3
+             )"
+        } else {
             "DELETE FROM notification_events WHERE rowid IN (
                  SELECT rowid FROM notification_events WHERE source_did=?1 AND time_us<=?2 ORDER BY rowid LIMIT ?3
-             )",
+             )"
+        };
+        self.delete_snapshot_rows(
+            did,
+            events_sql,
+            SnapshotDeleteBounds {
+                cutoff_us,
+                window_start_us,
+            },
             records_per_second,
             write_started,
             &mut records_written,
         )?;
         self.delete_snapshot_rows(
             did,
-            scope_rowid_cutoff,
             "DELETE FROM backfill_scope WHERE rowid IN (
                  SELECT rowid FROM backfill_scope
                  WHERE owner_did=?1 AND target_did!=?1 AND rowid<=?2
                  ORDER BY rowid LIMIT ?3
              )",
+            SnapshotDeleteBounds {
+                cutoff_us: scope_rowid_cutoff,
+                window_start_us: None,
+            },
             records_per_second,
             write_started,
             &mut records_written,
@@ -4954,7 +5059,42 @@ impl Storage for SqliteStorage {
                 .flat_map(notification_edges)
                 .map(|(_, subject_did, _, _)| subject_did),
         );
-        self.replace_repo_snapshot_inner(did, records, following, None)?;
+        self.replace_repo_snapshot_inner(did, records, following, None, None)?;
+        self.refresh_profile_index_for_did(did)?;
+        publish_notification_counts(self, &self.notification_hub, affected);
+        Ok(())
+    }
+
+    fn replace_repo_snapshot_windowed(
+        &self,
+        did: &str,
+        records: &[IndexedRecord],
+        following: &[String],
+        records_per_second: u64,
+        window_start_us: Option<u64>,
+    ) -> Result<(), StorageError> {
+        let mut affected = {
+            let connection = self.read_conn()?;
+            let mut statement = connection.prepare(
+                "SELECT DISTINCT subject_did FROM notification_events WHERE source_did=?1",
+            )?;
+            statement
+                .query_map([did], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        affected.extend(
+            records
+                .iter()
+                .flat_map(notification_edges)
+                .map(|(_, subject_did, _, _)| subject_did),
+        );
+        self.replace_repo_snapshot_inner(
+            did,
+            records,
+            following,
+            Some(records_per_second),
+            window_start_us.map(|us| us.min(i64::MAX as u64) as i64),
+        )?;
         self.refresh_profile_index_for_did(did)?;
         publish_notification_counts(self, &self.notification_hub, affected);
         Ok(())
@@ -4982,7 +5122,7 @@ impl Storage for SqliteStorage {
                 .flat_map(notification_edges)
                 .map(|(_, subject_did, _, _)| subject_did),
         );
-        self.replace_repo_snapshot_inner(did, records, following, Some(records_per_second))?;
+        self.replace_repo_snapshot_inner(did, records, following, Some(records_per_second), None)?;
         self.refresh_profile_index_for_did(did)?;
         publish_notification_counts(self, &self.notification_hub, affected);
         Ok(())

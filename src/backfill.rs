@@ -465,12 +465,18 @@ where
         let storage = Arc::clone(&self.storage);
         let snapshot_did = did.to_owned();
         let records_per_second = self.records_per_second;
+        // The snapshot replace gets THIS window start, not a second clock
+        // read: a record skipped above as older than the window must also be
+        // outside the delete below, or a re-backfill would wipe the old
+        // history that older-on-scroll and the firehose had already stored.
+        let snapshot_window_start_us = window_start_us;
         tokio::task::spawn_blocking(move || {
-            storage.replace_repo_snapshot_throttled(
+            storage.replace_repo_snapshot_windowed(
                 &snapshot_did,
                 &records,
                 &following,
                 records_per_second,
+                snapshot_window_start_us,
             )
         })
         .await??;

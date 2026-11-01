@@ -1,8 +1,8 @@
 use appview_rs::{
     backfill::{AtriumRepoVerifier, HostRateLimiter, HttpRepoSource, RepoBackfiller, RepoVerifier},
     identity::{DidDocument, DidService, VerificationMethod},
-        ingest::{IndexedRecord, MemoryStorage, SqliteStorage, Storage},
-    };
+    ingest::{MemoryStorage, Storage},
+};
 use atrium_api::types::string::Did;
 use atrium_crypto::keypair::{Did as _, P256Keypair};
 use atrium_repo::{
@@ -399,6 +399,25 @@ async fn get_repo_car_is_verified_and_reconciled_with_a_per_host_rate_limit() {
             record: json!({"text":"stale"}),
         })
         .unwrap();
+    // The same stale record, but inside the default 30-day backfill window:
+    // the new snapshot proves it is gone, so it must be deleted as before.
+    storage
+        .put_record(&appview_rs::ingest::IndexedRecord {
+            did: did.into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "stale-in-window".into(),
+            uri: format!("at://{did}/app.bsky.feed.post/stale-in-window"),
+            cid: None,
+            time_us: {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_micros() as u64;
+                now - 10 * 86_400_000_000
+            },
+            record: json!({"text":"stale inside the window"}),
+        })
+        .unwrap();
     let backfiller = RepoBackfiller::new(
         storage.clone(),
         HttpRepoSource::with_http_test_hosts(["127.0.0.1".to_owned()]).unwrap(),
@@ -427,11 +446,22 @@ async fn get_repo_car_is_verified_and_reconciled_with_a_per_host_rate_limit() {
             .unwrap()
             .is_some()
     );
+    // The windowed snapshot says nothing about records older than its window
+    // start (2026-11-01 lane av75q): the pre-window stale row stands, like a
+    // 200-day post stored while someone scrolled the profile.
     assert!(
         storage
             .get_record(did, "app.bsky.feed.post", "stale")
             .unwrap()
-            .is_none()
+            .is_some(),
+        "rows older than the backfill window must survive a windowed snapshot"
+    );
+    assert!(
+        storage
+            .get_record(did, "app.bsky.feed.post", "stale-in-window")
+            .unwrap()
+            .is_none(),
+        "rows inside the window that the snapshot does not carry are deleted as before"
     );
 
     let bad_key = P256Keypair::create(&mut rand::thread_rng()).did();
@@ -713,7 +743,7 @@ async fn backfill_worker_backs_off_after_a_failed_repository_fetch() {
 mod windowed_backfill {
     use appview_rs::{
         backfill::{
-            BackfillError, HostRateLimiter, RepoBackfiller, RepoFetcher, RepoVerifier, RepoRecord,
+            BackfillError, HostRateLimiter, RepoBackfiller, RepoFetcher, RepoRecord, RepoVerifier,
             VerifiedRepo,
         },
         ingest::{IndexedRecord, MemoryStorage, SqliteStorage, Storage},
@@ -808,8 +838,44 @@ mod windowed_backfill {
         }
     }
 
-    fn indexed<S: Storage>(storage: &S, collection: &str, rkey: &str) -> bool {
-        storage.get_record(DID, collection, rkey).unwrap().is_some()
+    // A thread-local `set_default` is not enough to catch the completed line:
+    // `backfill` logs it after awaiting `spawn_blocking`, and the continuation
+    // can run on a runtime thread that never held the guard (observed flake
+    // 2026-11-01). One process-global subscriber with a shared buffer catches
+    // it on any thread; the assertion filters by the test's own DID.
+    fn shared_logs() -> &'static CaptureLogs {
+        static CAPTURE: std::sync::OnceLock<CaptureLogs> = std::sync::OnceLock::new();
+        static INIT: std::sync::Once = std::sync::Once::new();
+        let logs = CAPTURE.get_or_init(CaptureLogs::default);
+        INIT.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(logs.clone())
+                .finish();
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+        logs
+    }
+
+    fn capture_len(logs: &CaptureLogs) -> usize {
+        logs.0.lock().unwrap().len()
+    }
+
+    fn completed_line_after(logs: &CaptureLogs, mark: usize, did: &str) -> Option<String> {
+        let bytes = logs.0.lock().unwrap()[mark..].to_vec();
+        String::from_utf8_lossy(&bytes)
+            .lines()
+            .find(|line| {
+                line.contains("repository backfill completed")
+                    && line.contains(&format!("did=\"{did}\""))
+            })
+            .map(str::to_owned)
+    }
+
+    fn indexed<S: Storage>(storage: &S, did: &str, collection: &str, rkey: &str) -> bool {
+        storage.get_record(did, collection, rkey).unwrap().is_some()
     }
 
     fn now_us() -> u64 {
@@ -820,6 +886,7 @@ mod windowed_backfill {
     }
 
     fn seeded(
+        did: &str,
         collection: &str,
         rkey: &str,
         age_days: i64,
@@ -836,10 +903,10 @@ mod windowed_backfill {
             }
         }
         IndexedRecord {
-            did: DID.to_owned(),
+            did: did.to_owned(),
             collection: collection.to_owned(),
             rkey: rkey.to_owned(),
-            uri: format!("at://{DID}/{collection}/{rkey}"),
+            uri: format!("at://{did}/{collection}/{rkey}"),
             cid: Some(format!("cid-{rkey}")),
             time_us,
             record,
@@ -847,101 +914,22 @@ mod windowed_backfill {
     }
 
     #[tokio::test]
-    async fn windowed_backfill_does_not_delete_history_older_than_the_window() {
-        // The bug this reproduces: `replace_repo_snapshot_inner` deletes every
-        // row of the did with time_us <= now before writing the snapshot, so a
-        // re-backfill with a 30-day window wipes 200-day posts that scrolling
-        // (or Jetstream) had already stored.
-        let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
-        let viewer = "did:plc:windowviewer";
-        let subject = format!("at://{viewer}/app.bsky.feed.post/vp1");
-        storage
-            .put_record(&seeded(
-                "app.bsky.feed.post",
-                "old-scroll",
-                200,
-                json!({"text": "stored by scrolling before"}),
-            ))
-            .unwrap();
-        storage
-            .put_record(&seeded(
-                "app.bsky.feed.like",
-                "old-like",
-                200,
-                json!({"subject": {"uri": subject}}),
-            ))
-            .unwrap();
-        storage
-            .put_record(&seeded(
-                "app.bsky.feed.post",
-                "recent-gone",
-                10,
-                json!({"text": "deleted at the source"}),
-            ))
-            .unwrap();
-        storage
-            .put_record(&seeded(
-                "app.bsky.feed.like",
-                "recent-like-gone",
-                10,
-                json!({"subject": {"uri": subject}}),
-            ))
-            .unwrap();
-
-        let backfiller = RepoBackfiller::new(
-            storage.clone(),
-            ScriptedFetcher,
-            ScriptedVerifier(vec![aged_record("app.bsky.feed.post", "p5", 5)]),
-            HostRateLimiter::new(std::time::Duration::ZERO),
-        );
-        let count = backfiller
-            .backfill(DID, "https://pds.example", "did:key:zDnaem-window-test-key")
-            .await
-            .unwrap();
-        assert_eq!(count, 1);
-
-        assert!(
-            indexed(storage.as_ref(), "app.bsky.feed.post", "old-scroll"),
-            "a 200-day post stored by scrolling must survive a re-backfill whose snapshot stops at the window"
-        );
-        assert!(
-            indexed(storage.as_ref(), "app.bsky.feed.like", "old-like"),
-            "an old like must survive for the same reason"
-        );
-        assert!(
-            !indexed(storage.as_ref(), "app.bsky.feed.post", "recent-gone"),
-            "a post inside the window that is gone from the new snapshot must still be deleted (as today)"
-        );
-        assert!(
-            !indexed(storage.as_ref(), "app.bsky.feed.like", "recent-like-gone"),
-            "an in-window like gone from the snapshot must still be deleted, with its notification event"
-        );
-        assert!(indexed(storage.as_ref(), "app.bsky.feed.post", "p5"));
-        assert_eq!(
-            storage.notification_count(viewer).unwrap(),
-            1,
-            "the old like's notification event survives; the deleted in-window like's event does not"
-        );
-    }
-
-    #[tokio::test]
     async fn default_window_indexes_only_recent_posts_likes_reposts_and_keeps_all_graph_state() {
+        // A DID of its own so the shared log capture can single out this
+        // test's completed line from the other windowed tests' lines.
+        const WINDOW_DID: &str = "did:plc:windowdefault";
         let storage = Arc::new(MemoryStorage::default());
         let backfiller = backfiller(storage.clone());
-        let logs = CaptureLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::INFO)
-            .with_writer(logs.clone())
-            .finish();
-        let count = {
-            let _guard = tracing::subscriber::set_default(subscriber);
-            backfiller
-                .backfill(DID, "https://pds.example", "did:key:zDnaem-window-test-key")
-                .await
-                .unwrap()
-        };
+        let logs = shared_logs();
+        let mark = capture_len(logs);
+        let count = backfiller
+            .backfill(
+                WINDOW_DID,
+                "https://pds.example",
+                "did:key:zDnaem-window-test-key",
+            )
+            .await
+            .unwrap();
 
         assert_eq!(
             count, 9,
@@ -954,7 +942,12 @@ mod windowed_backfill {
                 ("app.bsky.feed.repost", "r"),
             ] {
                 assert!(
-                    indexed(storage.as_ref(), collection, &format!("{prefix}{days}")),
+                    indexed(
+                        storage.as_ref(),
+                        WINDOW_DID,
+                        collection,
+                        &format!("{prefix}{days}")
+                    ),
                     "a {days}-day-old {collection} must be indexed inside the window"
                 );
             }
@@ -966,20 +959,40 @@ mod windowed_backfill {
                 ("app.bsky.feed.repost", "r"),
             ] {
                 assert!(
-                    !indexed(storage.as_ref(), collection, &format!("{prefix}{days}")),
+                    !indexed(
+                        storage.as_ref(),
+                        WINDOW_DID,
+                        collection,
+                        &format!("{prefix}{days}")
+                    ),
                     "a {days}-day-old {collection} must not be indexed outside the window"
                 );
             }
         }
-        assert!(indexed(storage.as_ref(), "app.bsky.graph.follow", "f400"));
-        assert!(indexed(storage.as_ref(), "app.bsky.graph.block", "b400"));
-        assert!(indexed(storage.as_ref(), "app.bsky.actor.profile", "self"));
+        assert!(indexed(
+            storage.as_ref(),
+            WINDOW_DID,
+            "app.bsky.graph.follow",
+            "f400"
+        ));
+        assert!(indexed(
+            storage.as_ref(),
+            WINDOW_DID,
+            "app.bsky.graph.block",
+            "b400"
+        ));
+        assert!(indexed(
+            storage.as_ref(),
+            WINDOW_DID,
+            "app.bsky.actor.profile",
+            "self"
+        ));
 
-        let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-        let completed = output
-            .lines()
-            .find(|line| line.contains("repository backfill completed"))
-            .expect("the completed line must be logged");
+        let completed = completed_line_after(logs, mark, WINDOW_DID).unwrap_or_else(|| {
+            let all = logs.0.lock().unwrap().clone();
+            let dump = String::from_utf8_lossy(&all[mark..]).to_string();
+            panic!("completed line missing; capture after mark:\n{dump}\n====")
+        });
         assert!(
             completed.contains("skipped_old_records=6"),
             "the completed line must carry the skipped count: {completed}"
@@ -1002,7 +1015,12 @@ mod windowed_backfill {
                 ("app.bsky.feed.repost", "r"),
             ] {
                 assert!(
-                    indexed(storage.as_ref(), collection, &format!("{prefix}{days}")),
+                    indexed(
+                        storage.as_ref(),
+                        DID,
+                        collection,
+                        &format!("{prefix}{days}")
+                    ),
                     "with no window a {days}-day-old {collection} must be indexed"
                 );
             }
@@ -1036,8 +1054,105 @@ mod windowed_backfill {
             .await
             .unwrap();
         assert_eq!(count, 11, "the two undated posts must be kept, not skipped");
-        assert!(indexed(storage.as_ref(), "app.bsky.feed.post", "nodate"));
-        assert!(indexed(storage.as_ref(), "app.bsky.feed.post", "baddate"));
+        assert!(indexed(
+            storage.as_ref(),
+            DID,
+            "app.bsky.feed.post",
+            "nodate"
+        ));
+        assert!(indexed(
+            storage.as_ref(),
+            DID,
+            "app.bsky.feed.post",
+            "baddate"
+        ));
+    }
+
+    #[tokio::test]
+    async fn windowed_backfill_does_not_delete_history_older_than_the_window() {
+        // The bug this reproduces: `replace_repo_snapshot_inner` deleted every
+        // row of the did with time_us <= now before writing the snapshot, so a
+        // re-backfill with a 30-day window wiped 200-day posts that scrolling
+        // (or Jetstream) had already stored.
+        let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
+        let viewer = "did:plc:windowviewer";
+        let subject = format!("at://{viewer}/app.bsky.feed.post/vp1");
+        storage
+            .put_record(&seeded(
+                DID,
+                "app.bsky.feed.post",
+                "old-scroll",
+                200,
+                json!({"text": "stored by scrolling before"}),
+            ))
+            .unwrap();
+        storage
+            .put_record(&seeded(
+                DID,
+                "app.bsky.feed.like",
+                "old-like",
+                200,
+                json!({"subject": {"uri": subject}}),
+            ))
+            .unwrap();
+        storage
+            .put_record(&seeded(
+                DID,
+                "app.bsky.feed.post",
+                "recent-gone",
+                10,
+                json!({"text": "deleted at the source"}),
+            ))
+            .unwrap();
+        storage
+            .put_record(&seeded(
+                DID,
+                "app.bsky.feed.like",
+                "recent-like-gone",
+                10,
+                json!({"subject": {"uri": subject}}),
+            ))
+            .unwrap();
+
+        let backfiller = RepoBackfiller::new(
+            storage.clone(),
+            ScriptedFetcher,
+            ScriptedVerifier(vec![aged_record("app.bsky.feed.post", "p5", 5)]),
+            HostRateLimiter::new(std::time::Duration::ZERO),
+        );
+        let count = backfiller
+            .backfill(DID, "https://pds.example", "did:key:zDnaem-window-test-key")
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+
+        assert!(
+            indexed(storage.as_ref(), DID, "app.bsky.feed.post", "old-scroll"),
+            "a 200-day post stored by scrolling must survive a re-backfill whose snapshot stops at the window"
+        );
+        assert!(
+            indexed(storage.as_ref(), DID, "app.bsky.feed.like", "old-like"),
+            "an old like must survive for the same reason"
+        );
+        assert!(
+            !indexed(storage.as_ref(), DID, "app.bsky.feed.post", "recent-gone"),
+            "a post inside the window that is gone from the new snapshot must still be deleted (as today)"
+        );
+        assert!(
+            !indexed(
+                storage.as_ref(),
+                DID,
+                "app.bsky.feed.like",
+                "recent-like-gone"
+            ),
+            "an in-window like gone from the snapshot must still be deleted, with its notification event"
+        );
+        assert!(indexed(storage.as_ref(), DID, "app.bsky.feed.post", "p5"));
+        assert_eq!(
+            storage.notification_count(viewer).unwrap(),
+            1,
+            "the old like's notification event survives; the deleted in-window like's event does not"
+        );
     }
 }
 
