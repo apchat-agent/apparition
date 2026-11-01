@@ -881,3 +881,72 @@ fn timestamp_us_to_rfc3339(time_us: u64) -> String {
         })
         .unwrap_or_else(now_rfc3339)
 }
+
+#[cfg(test)]
+mod card_view_tests {
+    use super::*;
+    use crate::ingest::{IndexedRecord, MemoryStorage};
+
+    fn store_profile(storage: &MemoryStorage, did: &str, record: Value) {
+        storage
+            .put_record(&IndexedRecord {
+                did: did.into(),
+                collection: ACTOR_PROFILE.into(),
+                rkey: "self".into(),
+                uri: format!("at://{did}/{ACTOR_PROFILE}/self"),
+                cid: None,
+                time_us: 1,
+                record,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_card_keeps_the_profile_labels_so_moderation_still_applies() {
+        let storage = MemoryStorage::default();
+        let labels = json!([{"src":"did:plc:labeler","uri":"at://did:plc:labelled/app.bsky.actor.profile/self","val":"porn","cts":"2026-11-01T00:00:00Z"}]);
+        store_profile(
+            &storage,
+            "did:plc:labelled",
+            json!({"publicHandle":"labelled.test","labels":labels}),
+        );
+        let card = profile_card_view_from_storage(&storage, "did:plc:labelled").unwrap();
+        assert_eq!(
+            card["labels"], labels,
+            "a card must carry the profile labels"
+        );
+        let full = profile_view_from_storage(&storage, "did:plc:labelled").unwrap();
+        assert_eq!(full["labels"], labels, "the full view must carry them too");
+    }
+
+    #[test]
+    fn a_card_shows_a_public_avatar_only_from_the_bluesky_cdn() {
+        let storage = MemoryStorage::default();
+        let good = "https://cdn.bsky.app/img/avatar/plain/did:plc:good/bafkreigood@jpeg";
+        store_profile(&storage, "did:plc:good", json!({"publicAvatar": good}));
+        for (did, avatar) in [
+            ("did:plc:other-host", "https://tracker.example/pixel.jpg"),
+            (
+                "did:plc:http",
+                "http://cdn.bsky.app/img/avatar/plain/x/y@jpeg",
+            ),
+            (
+                "did:plc:userinfo",
+                "https://user:pw@cdn.bsky.app/img/avatar/plain/x/y@jpeg",
+            ),
+            (
+                "did:plc:lookalike",
+                "https://cdn.bsky.app.tracker.example/a.jpg",
+            ),
+        ] {
+            store_profile(&storage, did, json!({"publicAvatar": avatar}));
+            let card = profile_card_view_from_storage(&storage, did).unwrap();
+            assert!(
+                card.get("avatar").is_none(),
+                "{avatar} must not become a card avatar: {card}"
+            );
+        }
+        let card = profile_card_view_from_storage(&storage, "did:plc:good").unwrap();
+        assert_eq!(card["avatar"], json!(good));
+    }
+}
