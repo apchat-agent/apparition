@@ -5512,26 +5512,30 @@ impl Storage for SqliteStorage {
     ) -> Result<(), StorageError> {
         let viewer_did = viewer_did.to_owned();
         let profile_did = profile_did.to_owned();
-        self.writer.call(move |connection| {
-            let transaction = connection.transaction()?;
-            transaction.execute(
+        // A profile page GET arrived-from-search remembers the click; the row
+        // only feeds the NEXT search page's Recent list, so this render must
+        // not queue behind the writer. The queued batch transaction applies
+        // the three statements atomically, and a repeated click only reorders
+        // the row to the top (bounded by the writer queue + drop counter).
+        self.writer.fire(move |connection| {
+            connection.execute(
                 "DELETE FROM recent_profile_clicks WHERE viewer_did=?1 AND profile_did=?2",
                 params![viewer_did, profile_did],
             )?;
-            transaction.execute(
+            connection.execute(
                 "INSERT INTO recent_profile_clicks(viewer_did,profile_did) VALUES(?1,?2)",
                 params![viewer_did, profile_did],
             )?;
-            transaction.execute(
+            connection.execute(
                 "DELETE FROM recent_profile_clicks WHERE viewer_did=?1 AND seq NOT IN (
                      SELECT seq FROM recent_profile_clicks WHERE viewer_did=?1
                      ORDER BY seq DESC LIMIT 10
                  )",
                 [&viewer_did],
             )?;
-            transaction.commit()?;
-            Ok(())
-        })
+            Ok(None)
+        });
+        Ok(())
     }
 
     fn recent_profiles_for_viewer(&self, viewer_did: &str) -> Result<Vec<String>, StorageError> {
