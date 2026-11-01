@@ -15734,7 +15734,7 @@ fn render_web_post<S: Storage>(
             url::form_urlencoded::byte_serialize(record.uri.as_bytes()).collect::<String>()
         );
         format!(
-            "<a class=\"post-text-link\" href=\"{}\">{}</a>",
+            "<a class=\"post-thread-link\" href=\"{}\">{}</a>",
             html_escape(&thread_uri),
             text
         )
@@ -23518,6 +23518,39 @@ mod tests {
     }
 
     #[test]
+    fn whole_text_thread_link_is_not_styled_as_an_accent_link() {
+        let mut record = link_facet_fixture_record();
+        record.record["text"] = json!("plain words, no links");
+        record.record.as_object_mut().unwrap().remove("facets");
+        let storage = MemoryStorage::default();
+        storage.put_record(&record).unwrap();
+        let index = QuoteRenderIndex::default();
+
+        let rendered = render_web_post(
+            &storage,
+            &record,
+            WebPostRenderOptions {
+                viewer_did: "did:plc:viewer",
+                rights: FormRights::default(),
+                link_text_to_thread: true,
+                eager_avatar: false,
+                quote_index: &index,
+                page_interactions: &HashMap::new(),
+                render: &WebRenderContext::default(),
+            },
+        );
+
+        assert!(
+            rendered.contains("<a class=\"post-thread-link\" href=\"/app/thread?uri="),
+            "the timeline text still opens the thread: {rendered}"
+        );
+        assert!(
+            !rendered.contains("post-text-link"),
+            "the accent class is for link facets only; timeline text stays body-coloured: {rendered}"
+        );
+    }
+
+    #[test]
     fn link_facets_in_post_text_become_anchors_with_the_full_target_url_underneath() {
         let record = link_facet_fixture_record();
         let storage = MemoryStorage::default();
@@ -23551,7 +23584,7 @@ mod tests {
             "the full target URL sits in small print under the post text: {rendered}"
         );
         assert!(
-            !rendered.contains("<a class=\"post-text-link\" href=\"/app/thread"),
+            !rendered.contains("<a class=\"post-thread-link\""),
             "the whole-text thread link must not nest around an external anchor: {rendered}"
         );
     }
