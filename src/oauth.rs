@@ -10257,17 +10257,12 @@ where
     page_timing.timeline_fetch_index_ms = timeline_started.elapsed().as_millis() as u64;
     let has_more = records.len() > limit;
     let records = records.iter().take(limit).collect::<Vec<_>>();
-    // Queue one deduplicated, bounded "recent posts" job for the account being
-    // viewed (owner 2026-11-01: an unfollowed profile lookup should load their
-    // recent posts in a worker). The page renders what is local right now and
-    // never waits for the fetch or the write.
-    if let Err(error) = state.storage.enqueue_recent_posts_fetch(subject) {
-        tracing::warn!(
-            %error,
-            subject = %subject,
-            "could not queue a recent-posts fetch; serving the local page"
-        );
-    }
+    // Queue one deduplicated, bounded "recent posts" job unless this account's
+    // cache is fresh or its last fetch is inside the retry backoff (owner
+    // 2026-11-01: "should load their posts ... in a worker" / "And cache").
+    // The page renders what is local right now and never waits.
+    let _recent_posts_visit =
+        crate::recent_posts::on_profile_visit(state.storage.as_ref(), subject, records.len());
     let content_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
     let parent_started = std::time::Instant::now();
     let mut parent_stats = ParentHydrationStats::default();

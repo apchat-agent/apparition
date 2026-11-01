@@ -166,11 +166,36 @@ impl<F: OAuthFlow, S: Storage + 'static> RecentPostsWorker<F, S> {
     }
 
     async fn run_once_inner(&self) -> Result<usize, StorageError> {
-        let pending = self
+        // Scan deeper than the attempt budget so accounts still inside their
+        // retry backoff cannot starve the accounts queued behind them.
+        let candidates = self
             .storage
-            .pending_recent_posts_fetches(RECENT_POSTS_WORKER_BATCH)?;
+            .pending_recent_posts_fetches(RECENT_POSTS_WORKER_BATCH * 4)?;
+        let now_ms = now_wall_ms();
+        let ttl_ms = RECENT_POSTS_TTL.as_millis() as i64;
+        let mut attempted = 0_usize;
         let mut completed = 0;
-        for did in pending {
+        for did in candidates {
+            if attempted >= RECENT_POSTS_WORKER_BATCH {
+                break;
+            }
+            let status = self.storage.recent_posts_status(&did)?;
+            if status.is_some_and(|status| {
+                status.fetched_at_ms > 0 && now_ms.saturating_sub(status.fetched_at_ms) < ttl_ms
+            }) {
+                // A page queued this account although its cache is fresh
+                // (or a second page did while the first was in flight); the
+                // job has nothing left to do.
+                self.storage.complete_recent_posts_fetch(&did)?;
+                completed += 1;
+                continue;
+            }
+            if status.is_some_and(|status| status.next_retry_at_ms > now_ms) {
+                // Failed recently: retry only after the backoff, and keep the
+                // queue slot so pages do not queue a second job for it.
+                continue;
+            }
+            attempted += 1;
             match self.flow.fetch_recent_posts(&did).await {
                 Ok(records) => {
                     let expected_prefix = format!("at://{did}/app.bsky.feed.post/");
@@ -194,12 +219,15 @@ impl<F: OAuthFlow, S: Storage + 'static> RecentPostsWorker<F, S> {
                         self.storage.put_record(record)?;
                         stored += 1;
                     }
+                    self.storage.record_recent_posts_fetched(&did, now_ms)?;
                     tracing::debug!(
                         did = %did,
                         stored,
                         skipped,
                         "stored a recent-posts page for one account"
                     );
+                    self.storage.complete_recent_posts_fetch(&did)?;
+                    completed += 1;
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -207,10 +235,12 @@ impl<F: OAuthFlow, S: Storage + 'static> RecentPostsWorker<F, S> {
                         error = %error,
                         "the recent-posts fetch failed"
                     );
+                    self.storage.record_recent_posts_failure(
+                        &did,
+                        now_ms + RECENT_POSTS_RETRY_BACKOFF.as_millis() as i64,
+                    )?;
                 }
             }
-            self.storage.complete_recent_posts_fetch(&did)?;
-            completed += 1;
         }
         Ok(completed)
     }
