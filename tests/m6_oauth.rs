@@ -530,7 +530,7 @@ impl OAuthFlow for FakeOAuthFlow {
         _: &'a str,
         uri: &'a str,
         _: Option<&'a str>,
-        _: &'a dyn Storage,
+        _: Arc<dyn Storage>,
     ) -> Pin<Box<dyn Future<Output = Result<FeedTimeline, String>> + Send + 'a>> {
         let uri = uri.to_owned();
         let delay_ms = self.feed_timeline_delay_ms;

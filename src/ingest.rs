@@ -218,6 +218,8 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
     #[error("SQLite writer stopped before replying")]
     WriterStopped,
+    #[error("blocking storage task failed: {0}")]
+    BlockingTask(String),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

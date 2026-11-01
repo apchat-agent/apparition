@@ -777,7 +777,7 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
     pub async fn hydrate_skeleton(
         &self,
         skeleton: FeedSkeletonPage,
-        storage: &dyn Storage,
+        storage: Arc<dyn Storage>,
     ) -> Result<HydratedFeedPage, String> {
         const PAGE_BUDGET: Duration = Duration::from_secs(8);
         let count = skeleton.feed.len();
@@ -788,17 +788,36 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
             .iter()
             .map(|item| item.post_uri.clone())
             .collect::<Vec<_>>();
-        let local = storage
-            .records_by_uri("app.bsky.feed.post", &uris)
-            .unwrap_or_default();
+        let local_storage = Arc::clone(&storage);
+        let local_uris = uris.clone();
+        let local = tokio::task::spawn_blocking(move || {
+            local_storage.records_by_uri("app.bsky.feed.post", &local_uris)
+        })
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "blocking feed record lookup task failed");
+            error.to_string()
+        })?
+        .map_err(|error| {
+            tracing::warn!(%error, "feed local record lookup failed");
+            error.to_string()
+        })?;
         let missing = uris
             .iter()
             .filter(|uri| !local.contains_key(*uri))
             .cloned()
             .collect::<Vec<_>>();
-        let fetched = tokio::time::timeout_at(deadline, self.fetch_posts(&missing))
-            .await
-            .unwrap_or_default();
+        let fetched = match tokio::time::timeout_at(deadline, self.fetch_posts(&missing)).await {
+            Ok(fetched) => fetched,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    requested_posts = missing.len(),
+                    "public feed post lookup timed out"
+                );
+                HashMap::new()
+            }
+        };
 
         let mut authors = Vec::new();
         let mut feed = Vec::with_capacity(count);
@@ -833,7 +852,19 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
                 reposted_by,
             });
         }
-        persist_public_profiles(storage, authors).map_err(|error| error.to_string())?;
+        let profile_storage = Arc::clone(&storage);
+        tokio::task::spawn_blocking(move || {
+            persist_public_profiles(profile_storage.as_ref(), authors)
+        })
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "blocking feed profile persistence task failed");
+            error.to_string()
+        })?
+        .map_err(|error| {
+            tracing::warn!(%error, "feed public profile persistence failed");
+            error.to_string()
+        })?;
         Ok(HydratedFeedPage {
             dropped_count: count.saturating_sub(feed.len()),
             feed,
@@ -893,7 +924,14 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
                     }
                     unanswered.extend(batch.into_iter().filter(|uri| !fetched.contains_key(uri)));
                 }
-                Err(_) => unanswered.extend(batch),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        requested_posts = batch.len(),
+                        "public appview post batch failed"
+                    );
+                    unanswered.extend(batch);
+                }
             }
         }
 
@@ -1619,7 +1657,7 @@ mod tests {
             Duration::from_secs(30),
         ));
         let client = client(identity);
-        let storage = MemoryStorage::default();
+        let storage = Arc::new(MemoryStorage::default());
         let indexed_first = indexed_post("did:plc:indexed", "first", "first indexed post");
         let indexed_last = indexed_post("did:plc:indexed", "last", "last indexed post");
         storage.put_record(&indexed_first).unwrap();
@@ -1649,7 +1687,10 @@ mod tests {
             cursor: Some("next-cursor".into()),
         };
 
-        let page = client.hydrate_skeleton(skeleton, &storage).await.unwrap();
+        let page = client
+            .hydrate_skeleton(skeleton, storage.clone())
+            .await
+            .unwrap();
         let uris = page
             .feed
             .iter()
@@ -1703,8 +1744,11 @@ mod tests {
             cursor: None,
         };
 
-        let storage = MemoryStorage::default();
-        let page = client.hydrate_skeleton(skeleton, &storage).await.unwrap();
+        let storage = Arc::new(MemoryStorage::default());
+        let page = client
+            .hydrate_skeleton(skeleton, storage.clone())
+            .await
+            .unwrap();
 
         assert_eq!(page.feed.len(), 51);
         let mut call_sizes = state.appview_calls.lock().unwrap().clone();
@@ -1744,7 +1788,7 @@ mod tests {
                     }],
                     cursor: None,
                 },
-                &MemoryStorage::default(),
+                Arc::new(MemoryStorage::default()),
             )
             .await
             .unwrap();
@@ -1776,7 +1820,7 @@ mod tests {
                         }],
                         cursor: None,
                     },
-                    &MemoryStorage::default(),
+                    Arc::new(MemoryStorage::default()),
                 )
                 .await
                 .unwrap();
@@ -1818,7 +1862,7 @@ mod tests {
                         }],
                         cursor: None,
                     },
-                    &MemoryStorage::default(),
+                    Arc::new(MemoryStorage::default()),
                 )
                 .with_subscriber(subscriber)
                 .await
