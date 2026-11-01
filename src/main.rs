@@ -227,6 +227,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 connections_cut,
                 "shutdown deadline reached; forcing process exit"
             );
+            // Returning would drop the storage, whose writer Drop joins a thread
+            // that only stops once every sender is gone, while the tasks that
+            // missed the deadline still hold senders until the runtime drops
+            // AFTER main's locals: a deadlock (live 2026-11-01, twice: the old
+            // pid ran on until kill -9 at 3 min). SQLite rolls back the open
+            // transaction; the WAL keeps every committed one.
+            std::process::exit(1);
         }
     }
     Ok(())
