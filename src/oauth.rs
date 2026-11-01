@@ -21377,6 +21377,10 @@ mod tests {
         profiles_response: Option<Value>,
         search_posts_calls: usize,
         search_posts_requests: Vec<(String, Option<String>)>,
+        // (query, atproto-proxy header) per getPosts call: Some(header) means the call came
+        // through the viewer's PDS proxy, None means it came anonymous to the public AppView.
+        get_posts_requests: Vec<(String, Option<String>)>,
+        get_posts_fail_proxied: bool,
     }
 
     #[derive(Clone, Default)]
@@ -21473,6 +21477,7 @@ mod tests {
         let preferences_state = state.clone();
         let profiles_state = state.clone();
         let search_posts_state = state.clone();
+        let get_posts_state = state.clone();
         let app = Router::new()
             .route(
                 "/.well-known/oauth-authorization-server",
@@ -21619,6 +21624,73 @@ mod tests {
                             }],
                             "cursor": "signed-next"
                         }))
+                    }
+                }),
+            )
+            .route(
+                "/xrpc/app.bsky.feed.getPosts",
+                get(move |uri: Uri, headers: HeaderMap| {
+                    let state = get_posts_state.clone();
+                    async move {
+                        let query = uri.query().unwrap_or_default().to_owned();
+                        let proxy = headers
+                            .get("atproto-proxy")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned);
+                        let fail = {
+                            let mut state = state.lock().unwrap();
+                            state.get_posts_requests.push((query, proxy.clone()));
+                            state.get_posts_fail_proxied && proxy.is_some()
+                        };
+                        if fail {
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(json!({"error":"Unavailable"})),
+                            )
+                                .into_response();
+                        }
+                        let uris = url::form_urlencoded::parse(
+                            uri.query().unwrap_or_default().as_bytes(),
+                        )
+                        .into_owned()
+                        .filter(|(name, _)| name == "uris")
+                        .map(|(_, value)| value)
+                        .collect::<Vec<_>>();
+                        let posts = uris
+                            .iter()
+                            .map(|uri| {
+                                let author = uri
+                                    .strip_prefix("at://")
+                                    .and_then(|rest| rest.split('/').next())
+                                    .unwrap_or_default();
+                                json!({
+                                    "uri": uri,
+                                    // atrium parses post-view cids with a real CID validator; a
+                                    // fake view must carry a lexicon-valid cid like the real one.
+                                    "cid": "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+                                    "author": {
+                                        "did": author,
+                                        "handle": format!(
+                                            "{}.test",
+                                            author.strip_prefix("did:plc:").unwrap_or("author")
+                                        ),
+                                    },
+                                    "record": {
+                                        "$type": "app.bsky.feed.post",
+                                        "text": format!(
+                                            "public {}",
+                                            uri.rsplit('/').next().unwrap_or_default()
+                                        ),
+                                        "createdAt": "2026-10-31T12:00:00.000Z"
+                                    },
+                                    "indexedAt": "2026-10-31T12:00:01.000Z",
+                                    "replyCount": 0,
+                                    "repostCount": 0,
+                                    "likeCount": 0
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        Json(json!({"posts": posts})).into_response()
                     }
                 }),
             )
@@ -21772,7 +21844,9 @@ mod tests {
             .await
             .unwrap();
         let public_appview_base = format!("{pds}/xrpc/");
-        let flow = AtriumOAuthFlow::new_with_public_appview_base(
+        let feed_identity = Arc::clone(&identity_resolver);
+        let feed_store = store.clone();
+        let mut flow = AtriumOAuthFlow::new_with_public_appview_base(
             &public,
             identity_resolver,
             store,
@@ -21784,6 +21858,16 @@ mod tests {
         // Setup only: this fake server serves every xrpc route these tests use,
         // so the labelled getProfiles must land here too; expectations unchanged.
         .with_labelled_appview_base(public_appview_base.clone());
+        // Setup only: the feed hydration path must land on this fake too, never on
+        // the production public AppView base the flow constructor keeps for it.
+        flow.feed_client = Arc::new(
+            FeedClient::new_with_store(
+                feed_identity,
+                SafeHttpClient::new().with_http_test_hosts(["127.0.0.1".to_owned()]),
+                feed_store,
+            )
+            .with_public_appview_base(public_appview_base),
+        );
         (flow, state, server)
     }
 
@@ -21879,6 +21963,207 @@ mod tests {
             .expect("skipping is not a failure");
         assert!(answer.is_none(), "old sign-ins get no signed search");
         assert_eq!(state.lock().unwrap().search_posts_calls, 0);
+        server.abort();
+    }
+
+    async fn grant_get_posts_scope(flow: &AtriumOAuthFlow<FeedTestIdentity>) {
+        let viewer_did: Did = FEED_VIEWER_DID.parse().unwrap();
+        let mut stored = flow
+            .store
+            .get(&viewer_did)
+            .await
+            .unwrap()
+            .expect("the test session is stored");
+        stored.token_set.scope =
+            Some("atproto rpc:app.bsky.feed.getPosts?aud=*".to_owned());
+        flow.store.set(viewer_did.clone(), stored).await.unwrap();
+    }
+
+    fn get_posts_calls(
+        state: &Arc<Mutex<FeedTestState>>,
+    ) -> (Vec<(String, Option<String>)>, Vec<(String, Option<String>)>) {
+        let requests = state.lock().unwrap().get_posts_requests.clone();
+        let (proxied, anonymous): (Vec<_>, Vec<_>) =
+            requests.into_iter().partition(|(_, proxy)| proxy.is_some());
+        (proxied, anonymous)
+    }
+
+    fn feed_hydration_uris(page: &crate::feeds::FeedTimeline) -> Vec<String> {
+        page.timeline
+            .feed
+            .iter()
+            .map(|post| post.record.uri.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn feed_hydration_for_a_signed_in_viewer_hydrates_through_the_pds_proxy() {
+        let (flow, state, server) = feed_test_flow(false).await;
+        grant_get_posts_scope(&flow).await;
+        let storage = Arc::new(MemoryStorage::default());
+
+        let page = flow
+            .feed_timeline(FEED_VIEWER_DID, FEED_URI, None, storage)
+            .await
+            .unwrap();
+
+        assert_eq!(feed_hydration_uris(&page), REAL_POST_URIS.to_vec());
+        let texts = page
+            .timeline
+            .feed
+            .iter()
+            .map(|post| post.record.record["text"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            ["public real-one", "public real-two", "public real-three"],
+            "the proxied route must deliver the same posts in the same order"
+        );
+        let (proxied, anonymous) = get_posts_calls(&state);
+        assert_eq!(
+            proxied.len(),
+            1,
+            "one batched getPosts goes through the viewer's PDS"
+        );
+        assert_eq!(anonymous.len(), 0, "the public fake must see zero getPosts");
+        assert!(
+            proxied[0]
+                .1
+                .as_deref()
+                .is_some_and(|proxy| proxy.contains("did:web:api.bsky.app#bsky_appview")),
+            "the proxied call must carry the AppView proxy header: {:?}",
+            proxied[0].1
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn feed_hydration_without_the_get_posts_scope_keeps_using_the_public_appview() {
+        let (flow, state, server) = feed_test_flow(false).await;
+        // feed_test_flow stores its session with the bare `atproto` scope: a sign-in made
+        // before the getPosts scope existed must keep the anonymous route.
+        let storage = Arc::new(MemoryStorage::default());
+
+        let page = flow
+            .feed_timeline(FEED_VIEWER_DID, FEED_URI, None, storage)
+            .await
+            .unwrap();
+
+        assert_eq!(feed_hydration_uris(&page), REAL_POST_URIS.to_vec());
+        let (proxied, anonymous) = get_posts_calls(&state);
+        assert_eq!(proxied.len(), 0, "no scope, no proxied call");
+        assert_eq!(anonymous.len(), 1, "one public batch as today");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_failed_proxied_get_posts_falls_back_to_the_public_appview_keeping_posts_and_order()
+    {
+        let (flow, state, server) = feed_test_flow(false).await;
+        grant_get_posts_scope(&flow).await;
+        state.lock().unwrap().get_posts_fail_proxied = true;
+        let logs = FeedTestLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(logs.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let storage = Arc::new(MemoryStorage::default());
+
+        let page = flow
+            .feed_timeline(FEED_VIEWER_DID, FEED_URI, None, storage)
+            .await
+            .unwrap();
+        drop(_guard);
+
+        assert_eq!(feed_hydration_uris(&page), REAL_POST_URIS.to_vec());
+        let texts = page
+            .timeline
+            .feed
+            .iter()
+            .map(|post| post.record.record["text"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            ["public real-one", "public real-two", "public real-three"],
+            "a failed proxied batch must not lose or reorder posts"
+        );
+        let (proxied, anonymous) = get_posts_calls(&state);
+        assert!(!proxied.is_empty(), "the PDS fake was tried first");
+        assert_eq!(anonymous.len(), 1, "the public fake answered the fallback");
+        let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        let warns = text
+            .lines()
+            .filter(|line| line.contains("WARN") && line.contains("get posts"))
+            .count();
+        assert_eq!(
+            warns, 1,
+            "one WARN line per proxied batch that fell back: {text}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn anonymous_feed_hydration_never_uses_the_pds_proxy() {
+        let (flow, state, server) = feed_test_flow(false).await;
+        let storage = Arc::new(MemoryStorage::default());
+
+        let page = flow.feed_timeline("", FEED_URI, None, storage).await.unwrap();
+
+        assert_eq!(
+            feed_hydration_uris(&page),
+            vec![PLACEHOLDER_URI.to_owned()]
+        );
+        let (proxied, anonymous) = get_posts_calls(&state);
+        assert_eq!(proxied.len(), 0, "an anonymous page has no session to proxy with");
+        assert_eq!(anonymous.len(), 1, "the public fake serves the anonymous page");
+        server.abort();
+    }
+
+    #[test]
+    fn the_sign_in_scope_requests_the_public_get_posts_rpc() {
+        assert!(
+            REQUESTED_SCOPE
+                .split_whitespace()
+                .any(|scope| scope == "rpc:app.bsky.feed.getPosts?aud=*"),
+            "feed hydration through the viewer's session needs the getPosts rpc scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_page_timing_list_labels_the_proxied_get_posts_call_with_its_own_kind() {
+        let (flow, state, server) = feed_test_flow(false).await;
+        grant_get_posts_scope(&flow).await;
+        let storage = Arc::new(MemoryStorage::default());
+        let accounting = crate::net::RequestOutboundAccounting::default();
+
+        let page = crate::net::with_request_outbound_accounting(
+            accounting.clone(),
+            flow.feed_timeline(FEED_VIEWER_DID, FEED_URI, None, storage),
+        )
+        .await
+        .unwrap();
+        assert_eq!(feed_hydration_uris(&page), REAL_POST_URIS.to_vec());
+        let (proxied, anonymous) = get_posts_calls(&state);
+        assert_eq!(proxied.len(), 1);
+        assert_eq!(anonymous.len(), 0);
+
+        let calls = accounting.snapshot().calls;
+        let get_posts: Vec<_> = calls
+            .iter()
+            .filter(|call| call.path == "/xrpc/app.bsky.feed.getPosts")
+            .collect();
+        assert_eq!(
+            get_posts.len(),
+            1,
+            "the hydration call must be listed: {calls:?}"
+        );
+        assert_eq!(
+            get_posts[0].kind, "pds_proxy",
+            "the proxied call must show up as its own timing kind: {calls:?}"
+        );
         server.abort();
     }
 

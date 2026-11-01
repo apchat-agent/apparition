@@ -517,7 +517,7 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
     }
 
     #[cfg(test)]
-    fn with_public_appview_base(mut self, base: impl Into<String>) -> Self {
+    pub(crate) fn with_public_appview_base(mut self, base: impl Into<String>) -> Self {
         self.public_appview_base = base.into();
         self
     }
