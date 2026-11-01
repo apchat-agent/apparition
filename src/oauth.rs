@@ -21908,6 +21908,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thread_ancestor_pages_without_a_page_chain_read_only_parents_and_roots() {
+        // Same shape as the test above, but with thread ancestors enabled (a home timeline):
+        // the extra local levels run only when the page itself holds a parent->reply link, so
+        // the "Middle" posts between parent and root must never be read.
+        let storage = Arc::new(MemoryStorage::default());
+        let mut replies = Vec::new();
+        for index in 0..50_u64 {
+            let did = format!("did:plc:no-chain-{index}");
+            let root = test_web_post(&did, "root", 1, "Root", None);
+            let middle = test_web_post(&did, "middle", 2, "Middle", Some(&root.uri));
+            let mut parent = test_web_post(&did, "parent", 3, "Rendered parent", Some(&middle.uri));
+            parent.record["reply"]["root"]["uri"] = json!(root.uri);
+            let mut reply = test_web_post(&did, "reply", 4, "Reply", Some(&parent.uri));
+            reply.record["reply"]["root"]["uri"] = json!(root.uri);
+            storage.put_record(&root).unwrap();
+            storage.put_record(&middle).unwrap();
+            storage.put_record(&parent).unwrap();
+            replies.push(reply);
+        }
+        let page_records = replies.iter().collect::<Vec<_>>();
+
+        let mut stats = ParentHydrationStats::default();
+        let parents = hydrate_page_parents(
+            &DisabledOAuthFlow,
+            "",
+            storage.clone(),
+            &page_records,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            true,
+            &mut stats,
+        )
+        .await
+        .unwrap();
+        let (_, batch_lookups) = storage.record_uri_lookup_counts();
+
+        assert_eq!(batch_lookups, 1, "parents and roots share one local read");
+        assert_eq!(stats.rounds, 1);
+        assert!(
+            parents
+                .values()
+                .flatten()
+                .all(|record| record.record["text"] != "Middle"),
+            "no ancestor level beyond the rendered parent may be read without a page chain"
+        );
+    }
+
+    #[tokio::test]
     async fn parent_hydration_keeps_timeline_notification_and_profile_html_identical() {
         let storage = Arc::new(MemoryStorage::default());
         let ancestor = test_web_post(
