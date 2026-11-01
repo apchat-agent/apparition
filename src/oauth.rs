@@ -23984,6 +23984,443 @@ mod tests {
         assert_eq!(failed, 1, "the failed fetch counted once");
     }
 
+    /// A fake account PDS for the older-on-scroll tests: it serves pages of
+    /// 25 from a fixed newest-first post list, one page per `fetch_older_posts`
+    /// call, resuming from the rkey/PDS cursor it was handed. Unknown or
+    /// missing cursors restart from the newest page (like the fake here, the
+    /// first real older page starts from the oldest rkey we hold).
+    #[derive(Clone)]
+    struct OlderScrollFlow {
+        calls: Arc<Mutex<Vec<Option<String>>>>,
+        pds_posts: Arc<Vec<IndexedRecord>>,
+        failure: Option<String>,
+    }
+
+    impl OlderScrollFlow {
+        fn new(pds_posts: Vec<IndexedRecord>) -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                pds_posts: Arc::new(pds_posts),
+                failure: None,
+            }
+        }
+
+        fn failing(message: &str) -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                pds_posts: Arc::new(Vec::new()),
+                failure: Some(message.to_owned()),
+            }
+        }
+
+        fn cursors(&self) -> Vec<Option<String>> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl OAuthFlow for OlderScrollFlow {
+        fn authorize<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: Vec<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async { Err("test flow does not authorize".to_owned()) })
+        }
+
+        fn callback<'a>(
+            &'a self,
+            _: OAuthCallback,
+        ) -> Pin<Box<dyn Future<Output = Result<OAuthAccount, String>> + Send + 'a>> {
+            Box::pin(async { Err("test flow does not callback".to_owned()) })
+        }
+
+        fn logout<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn fetch_older_posts<'a>(
+            &'a self,
+            _: &'a str,
+            cursor: Option<&'a str>,
+        ) -> Pin<Box<dyn Future<Output = Result<crate::recent_posts::OlderPostsPage, String>> + Send + 'a>>
+        {
+            let calls = Arc::clone(&self.calls);
+            let posts = Arc::clone(&self.pds_posts);
+            let failure = self.failure.clone();
+            let cursor = cursor.map(str::to_owned);
+            Box::pin(async move {
+                calls.lock().unwrap().push(cursor.clone());
+                if let Some(message) = failure {
+                    return Err(message);
+                }
+                let start = match cursor.as_deref() {
+                    Some(cursor) => posts
+                        .iter()
+                        .position(|post| post.rkey == cursor)
+                        .map_or(0, |index| index + 1),
+                    None => 0,
+                };
+                let page = posts
+                    .iter()
+                    .skip(start)
+                    .take(crate::recent_posts::RECENT_POSTS_FETCH_LIMIT)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let done = start + page.len() >= posts.len();
+                let next_cursor = (!done)
+                    .then(|| page.last().map(|post| post.rkey.clone()))
+                    .flatten();
+                Ok(crate::recent_posts::OlderPostsPage {
+                    records: page,
+                    cursor: next_cursor,
+                })
+            })
+        }
+    }
+
+    fn older_link_href(html: &str) -> Option<String> {
+        let marker = "<a class=\"pagination-link\" rel=\"next\" href=\"";
+        let start = html.find(marker)? + marker.len();
+        let end = start + html[start..].find('"')?;
+        Some(html[start..end].replace("&amp;", "&"))
+    }
+
+    fn rendered_scroll_rkeys(html: &str) -> Vec<(usize, String)> {
+        let mut found = Vec::new();
+        for index in 0..90 {
+            for (prefix, marker) in [
+                ("a", format!("scroll local {index}")),
+                ("r", format!("scroll pds {index:02}")),
+            ] {
+                if let Some(position) = html.find(&marker) {
+                    found.push((position, format!("{prefix}{}", if prefix == "a" { index.to_string() } else { format!("{index:02}") })));
+                }
+            }
+        }
+        found.sort();
+        found.into_iter().map(|(_, rkey)| rkey).collect()
+    }
+
+    fn scroll_posts(did: &str, rkey: &str, time_us: u64, text: &str) -> IndexedRecord {
+        test_web_post(did, rkey, time_us, text, None)
+    }
+
+    #[tokio::test]
+    async fn scrolling_older_pages_the_author_pds_newest_first_with_no_duplicates_or_gaps() {
+        let storage = Arc::new(MemoryStorage::default());
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let viewer = "did:plc:older-scroll-viewer";
+        let subject = "did:plc:older-scroll-author";
+        let base_us = 1_900_000_000_000_000_u64;
+        for index in 0..10 {
+            storage
+                .put_record(&scroll_posts(
+                    subject,
+                    &format!("a{index}"),
+                    base_us - index as u64 * 1_000_000_000,
+                    &format!("scroll local {index}"),
+                ))
+                .unwrap();
+        }
+        let pds_posts = (0..80)
+            .map(|index| {
+                scroll_posts(
+                    subject,
+                    &format!("r{index:02}"),
+                    base_us - (10 + index) as u64 * 1_000_000_000,
+                    &format!("scroll pds {index:02}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let flow = OlderScrollFlow::new(pds_posts);
+        let token = recent_posts_session(&storage, &public, viewer);
+        let app = public.router_with_flow(flow.clone(), storage.clone());
+        let cookie = format!("{SESSION_COOKIE}={token}");
+
+        let mut rendered = Vec::new();
+        let mut uri = format!("/profile?did={subject}&limit=3");
+        let mut pages = 0_usize;
+        for _ in 0..45 {
+            let calls_before = flow.cursors().len();
+            let (status, html) = recent_posts_get(&app, uri.clone(), &cookie).await;
+            assert_eq!(status, StatusCode::OK, "page {pages} renders");
+            pages += 1;
+            let calls_after = flow.cursors().len();
+            assert!(
+                calls_after - calls_before <= 1,
+                "one page request must make at most one PDS fetch"
+            );
+            for rkey in rendered_scroll_rkeys(&html) {
+                rendered.push(rkey);
+            }
+            match older_link_href(&html) {
+                Some(href) => uri = href,
+                None => break,
+            }
+        }
+        let expected = (0..10)
+            .map(|index| format!("a{index}"))
+            .chain((0..80).map(|index| format!("r{index:02}")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rendered, expected,
+            "scrolling must walk every post newest-to-oldest with no duplicates and no gaps"
+        );
+        assert_eq!(
+            flow.cursors(),
+            vec![
+                Some("a9".to_owned()),
+                Some("r24".to_owned()),
+                Some("r49".to_owned()),
+                Some("r74".to_owned()),
+            ],
+            "the first older fetch starts at the oldest rkey held locally, later ones continue from the PDS cursor"
+        );
+        assert_eq!(
+            storage.author_posts(subject, None, 200, true).unwrap().len(),
+            90,
+            "every scrolled page was stored through the normal writer"
+        );
+        let state = storage
+            .older_posts_state(subject)
+            .unwrap()
+            .expect("the older-posts state exists");
+        assert!(
+            state.exhausted,
+            "a PDS page without a cursor marks the account's history complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_author_pds_still_renders_the_local_posts_and_logs_the_real_error() {
+        let storage = Arc::new(MemoryStorage::default());
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let viewer = "did:plc:older-fail-viewer";
+        let subject = "did:plc:older-fail-author";
+        let base_us = 1_900_000_000_000_000_u64;
+        for index in 0..6 {
+            storage
+                .put_record(&scroll_posts(
+                    subject,
+                    &format!("a{index}"),
+                    base_us - index as u64 * 1_000_000_000,
+                    &format!("scroll local {index}"),
+                ))
+                .unwrap();
+        }
+        let flow = OlderScrollFlow::failing("author PDS older posts request failed: connect error (fake)");
+        let token = recent_posts_session(&storage, &public, viewer);
+        let app = public.router_with_flow(flow.clone(), storage.clone());
+        let cookie = format!("{SESSION_COOKIE}={token}");
+        let (_status, html) =
+            recent_posts_get(&app, format!("/profile?did={subject}&limit=3"), &cookie).await;
+        let older = older_link_href(&html).expect("the first page has an Older link");
+
+        let logs = FeedTestLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(logs.clone())
+            .finish();
+        let (status, html) = async { recent_posts_get(&app, older, &cookie).await }
+            .with_subscriber(subscriber)
+            .await;
+        let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(status, StatusCode::OK, "a PDS failure must not break the page");
+        assert!(
+            html.contains("scroll local 3") && html.contains("scroll local 5"),
+            "the page still shows the local posts it has: {output}"
+        );
+        assert!(
+            output.contains("author PDS older posts request failed: connect error (fake)"),
+            "the real underlying error is logged, not just 'request failed': {output}"
+        );
+        assert_eq!(flow.cursors().len(), 1, "one fetch attempt was made");
+        assert!(
+            storage.author_posts(subject, None, 50, true).unwrap().len() == 4,
+            "a failed fetch stores nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_account_gets_no_further_pds_calls() {
+        let storage = Arc::new(MemoryStorage::default());
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let viewer = "did:plc:older-exhausted-viewer";
+        let subject = "did:plc:older-exhausted-author";
+        let base_us = 1_900_000_000_000_000_u64;
+        storage
+            .put_record(&scroll_posts(
+                subject,
+                "a0",
+                base_us,
+                "scroll local 0",
+            ))
+            .unwrap();
+        // A two-post fake PDS: one page, no cursor, history complete.
+        let pds_posts = (0..2)
+            .map(|index| {
+                scroll_posts(
+                    subject,
+                    &format!("r{index:02}"),
+                    base_us - (1 + index) as u64 * 1_000_000_000,
+                    &format!("scroll pds {index:02}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let flow = OlderScrollFlow::new(pds_posts);
+        let token = recent_posts_session(&storage, &public, viewer);
+        let app = public.router_with_flow(flow.clone(), storage.clone());
+        let cookie = format!("{SESSION_COOKIE}={token}");
+        // Request the Older position directly: one fetch fills the page and
+        // the PDS has no cursor, so the account becomes exhausted.
+        let first_cursor = RecordCursor {
+            time_us: base_us + 1_000_000_000,
+            uri: String::new(),
+        }
+        .encode();
+        let (status, _html) = recent_posts_get(
+            &app,
+            format!("/profile?did={subject}&limit=3&cursor={first_cursor}"),
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            flow.cursors().len(),
+            1,
+            "one fetch filled the page; the PDS had no cursor"
+        );
+        let state = storage
+            .older_posts_state(subject)
+            .unwrap()
+            .expect("the older-posts state exists");
+        assert!(state.exhausted);
+        let calls_before = flow.cursors().len();
+        let manual_cursor = RecordCursor {
+            time_us: base_us - 3_000_000_000,
+            uri: format!("at://{subject}/app.bsky.feed.post/r01"),
+        }
+        .encode();
+        let (status, _html) = recent_posts_get(
+            &app,
+            format!("/profile?did={subject}&limit=3&cursor={manual_cursor}"),
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            flow.cursors().len(),
+            calls_before,
+            "an account we hold complete history for must not be fetched again"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_web_page_phases_line_carries_the_older_posts_fetch() {
+        let storage = Arc::new(MemoryStorage::default());
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let viewer = "did:plc:older-phases-viewer";
+        let subject = "did:plc:older-phases-author";
+        let base_us = 1_900_000_000_000_000_u64;
+        storage
+            .put_record(&scroll_posts(subject, "a0", base_us, "scroll local 0"))
+            .unwrap();
+        let pds_posts = (0..30)
+            .map(|index| {
+                scroll_posts(
+                    subject,
+                    &format!("r{index:02}"),
+                    base_us - (1 + index) as u64 * 1_000_000_000,
+                    &format!("scroll pds {index:02}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let flow = OlderScrollFlow::new(pds_posts);
+        let token = recent_posts_session(&storage, &public, viewer);
+        let app = public.router_with_flow(flow.clone(), storage.clone());
+        let cookie = format!("{SESSION_COOKIE}={token}");
+        let first_cursor = RecordCursor {
+            time_us: base_us + 1_000_000_000,
+            uri: String::new(),
+        }
+        .encode();
+        let logs = FeedTestLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(logs.clone())
+            .finish();
+        let older = format!("/profile?did={subject}&limit=3&cursor={first_cursor}");
+        async { recent_posts_get(&app, older, &cookie).await }
+            .with_subscriber(subscriber)
+            .await;
+        let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        let phase = |name: &str| -> Option<String> {
+            output
+                .lines()
+                .filter(|line| line.contains("web page phases"))
+                .filter_map(|line| {
+                    line.split_whitespace().find_map(|field| {
+                        field
+                            .strip_prefix(&format!("{name}="))
+                            .map(|value| value.trim_matches(|c| c == '"' || c == ',').to_owned())
+                    })
+                })
+                .next_back()
+        };
+        assert_eq!(
+            phase("profile_older_posts").as_deref(),
+            Some("ok"),
+            "the phases line names the older-posts fetch state: {output}"
+        );
+        assert_eq!(
+            phase("profile_older_posts_fetched").as_deref(),
+            Some("25"),
+            "the phases line counts the records the PDS page brought back"
+        );
+        assert!(
+            phase("profile_older_posts_ms").is_some(),
+            "the phases line carries the fetch duration in ms like profile_recent_posts's page does"
+        );
+    }
+
+    #[test]
+    fn the_older_posts_page_url_carries_the_saved_cursor_and_asks_for_25_newest_first() {
+        let url = crate::recent_posts::older_posts_url(
+            "https://pds.example",
+            "did:plc:olderscroll",
+            Some("ba44tczzcgc2e"),
+        )
+        .unwrap();
+        let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
+        assert_eq!(url.path(), "/xrpc/com.atproto.repo.listRecords");
+        assert!(pairs.contains(&("repo".into(), "did:plc:olderscroll".into())));
+        assert!(pairs.contains(&("collection".into(), "app.bsky.feed.post".into())));
+        assert!(pairs.contains(&("limit".into(), "25".into())));
+        assert!(pairs.contains(&("cursor".into(), "ba44tczzcgc2e".into())));
+        assert!(
+            pairs.iter().all(|(key, _)| key != "reverse"),
+            "an older-posts page must stay newest-first: {url}"
+        );
+        let first = crate::recent_posts::older_posts_url(
+            "https://pds.example",
+            "did:plc:olderscroll",
+            None,
+        )
+        .unwrap();
+        assert!(
+            first.query_pairs().into_owned().iter().all(|(key, _)| key != "cursor"),
+            "the first older page carries no PDS cursor: {first}"
+        );
+    }
+
     #[tokio::test]
     async fn a_sparse_profile_shows_a_loading_note_while_its_job_runs_and_loses_it_once_done() {
         let storage = Arc::new(MemoryStorage::default());
