@@ -730,9 +730,24 @@ pub(crate) fn profile_view_from_storage<S: Storage>(
     storage: &S,
     did: &str,
 ) -> Result<Value, StorageError> {
+    let mut view = profile_card_view_from_storage(storage, did)?;
+    let (follows, followers, posts) = storage.profile_counts(did)?;
+    view["followersCount"] = json!(followers);
+    view["followsCount"] = json!(follows);
+    view["postsCount"] = json!(posts);
+    Ok(view)
+}
+
+/// The identity a post card shows: the same handle rules, display fields,
+/// avatars and labels as the full profile view, minus the follower/follows/
+/// post counts. Cards never display those numbers, and fetching them means a
+/// three-subquery COUNT per lookup, so rendering uses this view.
+pub(crate) fn profile_card_view_from_storage<S: Storage>(
+    storage: &S,
+    did: &str,
+) -> Result<Value, StorageError> {
     let profile = storage.get_record(did, ACTOR_PROFILE, "self")?;
     let record = profile.as_ref().map(|profile| &profile.record);
-    let (follows, followers, posts) = storage.profile_counts(did)?;
     let public_handle = record
         .and_then(|record| record.get("publicHandle"))
         .and_then(Value::as_str)
@@ -750,9 +765,6 @@ pub(crate) fn profile_view_from_storage<S: Storage>(
     let mut view = json!({
         "did":did,
         "handle":handle,
-        "followersCount":followers,
-        "followsCount":follows,
-        "postsCount":posts,
         "labels":[],
         "verification":{"verifications":[],"verifiedStatus":"none","trustedVerifierStatus":"none"}
     });

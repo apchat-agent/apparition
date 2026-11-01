@@ -1,6 +1,6 @@
 use crate::identity::{HttpIdentityBackend, IdentityResolver};
 use crate::{
-    api::profile_view_from_storage,
+    api::{profile_card_view_from_storage, profile_view_from_storage},
     feeds::{
         FeedClient, FeedSkeletonPage, FeedTimeline, FeedTimelineTiming, ResolvedFeed,
         SavedFeedPreference, parse_saved_feed_preferences, persist_public_profiles,
@@ -5549,9 +5549,9 @@ struct PageShellOptions<'a> {
 }
 
 /// The viewer's profile for the shared shell, built the way the thread page always did it:
-/// `profile_view_from_storage` with a handle/did fallback so the menu never disappears.
+/// `profile_card_view_from_storage` with a handle/did fallback so the menu never disappears.
 fn viewer_profile_view<S: Storage>(storage: &S, did: &str) -> Value {
-    profile_view_from_storage(storage, did).unwrap_or_else(|_| json!({"did":did,"handle":did}))
+    profile_card_view_from_storage(storage, did).unwrap_or_else(|_| json!({"did":did,"handle":did}))
 }
 
 fn page_shell_with_options(
@@ -6296,15 +6296,16 @@ impl WebRenderContext {
         );
     }
 
-    /// The author (or parent) identity behind a card: the same handle rules as
-    /// the full profile view, and (until the light card lookup lands) the same
-    /// `profile_counts` query too. Timed and counted here so the phases line
-    /// can say how much of `render_ms` the identity lookups cost.
+    /// The author (or parent) identity behind a card: the same handle rules
+    /// and display fields as the full profile view, but the card view without
+    /// follower/follows/post counts — cards show none of those numbers and the
+    /// COUNT query was costing a statement per card. Timed and counted here
+    /// so the phases line can say how much of `render_ms` the identity
+    /// lookups cost.
     fn author_identity<S: Storage>(&self, storage: &S, did: &str) -> Value {
         self.profile_lookups.fetch_add(1, Ordering::Relaxed);
-        self.profile_count_queries.fetch_add(1, Ordering::Relaxed);
         self.timed(&self.profiles_us, || {
-            profile_view_from_storage(storage, did).unwrap_or_else(|error| {
+            profile_card_view_from_storage(storage, did).unwrap_or_else(|error| {
                 tracing::warn!(%error, did, "could not load a profile identity; showing the did");
                 json!({"did":did,"handle":did})
             })
@@ -6312,14 +6313,11 @@ impl WebRenderContext {
     }
 
     /// The viewer's own identity for the composer avatar, reply bar or shell
-    /// menu. It runs the same `profile_view_from_storage` (its `profile_counts`
-    /// included) until the light card lookup lands, but it is timed under the
-    /// shell: the brief counts identity lookups for post/parent authors, not
-    /// for the viewer's own card.
+    /// menu. Nothing there displays counts, so it takes the card view too;
+    /// timed under the shell, not under the card author/parent lookups.
     fn viewer_identity<S: Storage>(&self, storage: &S, did: &str) -> Value {
-        self.profile_count_queries.fetch_add(1, Ordering::Relaxed);
         self.timed(&self.shell_us, || {
-            profile_view_from_storage(storage, did).unwrap_or_else(|error| {
+            profile_card_view_from_storage(storage, did).unwrap_or_else(|error| {
                 tracing::warn!(%error, did, "could not load the viewer's profile; showing the did");
                 json!({"did":did,"handle":did})
             })
@@ -8739,7 +8737,7 @@ fn render_recent_profiles<S: Storage>(
         recent
             .iter()
             .map(|did| {
-                let profile = profile_view_from_storage(storage, did)?;
+                let profile = profile_card_view_from_storage(storage, did)?;
                 let actor = SearchActor {
                     did: did.clone(),
                     handle: profile
@@ -10114,8 +10112,7 @@ fn render_web_notification_group<'a, S: Storage, G: NotificationGroupView<'a>>(
         .author_dids
         .iter()
         .map(|did| {
-            let profile = profile_view_from_storage(storage, did)
-                .unwrap_or_else(|_| json!({"did":did,"handle":did}));
+            let profile = render.author_identity(storage, did);
             let fill = author_fill(&profile, did);
             avatar_markup_with_priority_and_attrs(
                 &profile,
@@ -11199,7 +11196,7 @@ where
             "profile actions are unavailable on your own profile",
         );
     }
-    let handle = match profile_view_from_storage(state.storage.as_ref(), subject_did) {
+    let handle = match profile_card_view_from_storage(state.storage.as_ref(), subject_did) {
         Ok(profile) => profile_handle(&profile, subject_did),
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
@@ -11956,7 +11953,7 @@ where
             verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref());
         let video_access =
             verified_cookie_video_access(&state.public, &headers, state.storage.as_ref());
-        let profile = profile_view_from_storage(state.storage.as_ref(), &viewer_did)
+        let profile = profile_card_view_from_storage(state.storage.as_ref(), &viewer_did)
             .unwrap_or_else(|_| json!({"did":viewer_did,"handle":viewer_did}));
         render_composer(ComposerSpec {
             form_attributes: "",
@@ -12096,7 +12093,7 @@ where
     }
     let mut profiles = serde_json::Map::new();
     for did in dids {
-        let Ok(profile) = profile_view_from_storage(state.storage.as_ref(), &did) else {
+        let Ok(profile) = profile_card_view_from_storage(state.storage.as_ref(), &did) else {
             continue;
         };
         let handle = profile_handle(&profile, &did);
