@@ -510,7 +510,13 @@ mod tests {
         assert_eq!(url.path(), "/xrpc/com.atproto.repo.listRecords");
         assert!(pairs.contains(&("repo".into(), "did:plc:recent".into())));
         assert!(pairs.contains(&("collection".into(), "app.bsky.feed.post".into())));
-        assert!(pairs.contains(&("limit".into(), RECENT_POSTS_FETCH_LIMIT.to_string())));
+        // Literal 25 on purpose (owner 2026-11-01, lane av75q step 4): one
+        // page of 25 per PDS call, recent and older-on-scroll alike. Not the
+        // constant — the literal is what fails if the page size drifts.
+        assert!(
+            pairs.contains(&("limit".into(), "25".into())),
+            "the owner asked for a page of 25 newest posts per fetch: {url}"
+        );
         // listRecords is newest-first unless asked otherwise; any `reverse`
         // flips it to the account's oldest posts (the 2026-11-01 bug).
         assert!(
