@@ -1424,3 +1424,75 @@ fn jetstream_timeouts_default_to_sixty_seconds_and_are_configurable() {
     assert_eq!(from_env.jetstream_idle_timeout_secs, 12);
     assert_eq!(from_env.jetstream_event_timeout_secs, 4);
 }
+
+#[test]
+fn notification_window_queries_use_the_subject_indexes() {
+    let path = std::path::PathBuf::from(format!(
+        "target/av72q-query-plan-{}.sqlite3",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let storage = SqliteStorage::open(&path).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    let plan = |sql: &str, params: usize| -> String {
+        let mut statement = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let values = vec![rusqlite::types::Value::Null; params];
+        statement
+            .query_map(rusqlite::params_from_iter(values.iter()), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<String>, _>>()
+            .unwrap()
+            .join("\n")
+    };
+    let scan = plan(
+        "SELECT source_did, source_collection, source_rkey, source_uri, reason, reason_subject, time_us
+         FROM notification_events
+         WHERE subject_did=?1 AND (?2 IS NULL OR time_us < ?2 OR
+             (time_us=?2 AND (source_uri < ?3 OR (source_uri=?3 AND reason < ?4))))
+           AND NOT (reason=?5 AND reason_subject IS ?6 AND time_us >= ?7)
+         ORDER BY time_us DESC, source_uri DESC, reason LIMIT ?8",
+        8,
+    );
+    assert!(
+        scan.contains("USING INDEX notification_events_subject_time"),
+        "window scan plan: {scan}"
+    );
+    assert!(
+        !scan.contains("SCAN notification_events"),
+        "window scan must not table-scan: {scan}"
+    );
+    assert!(
+        !scan.contains("TEMP B-TREE"),
+        "window scan must avoid a temp b-tree for ordering: {scan}"
+    );
+    let count = plan(
+        "SELECT COUNT(*) FROM notification_events
+         WHERE subject_did=?1 AND reason=?2 AND reason_subject IS ?3
+           AND time_us BETWEEN ?4 AND ?5",
+        5,
+    );
+    assert!(
+        count.contains("COVERING INDEX notification_events_subject_key_time"),
+        "key count plan: {count}"
+    );
+    let key_events = plan(
+        "SELECT source_did, source_collection, source_rkey, source_uri, reason, reason_subject, time_us
+         FROM notification_events
+         WHERE subject_did=?1 AND reason=?2 AND reason_subject IS ?3 AND (
+             ?4 IS NULL OR time_us < ?5 OR
+             (time_us=?5 AND (source_uri < ?6 OR (source_uri=?6 AND reason < ?7))))
+           AND (?8 IS NULL OR time_us >= ?8) AND (?10 IS NULL OR time_us <= ?10)
+         ORDER BY time_us DESC, source_uri DESC, reason LIMIT ?9",
+        10,
+    );
+    assert!(
+        key_events.contains("INDEX notification_events_subject_key_time"),
+        "key events plan: {key_events}"
+    );
+    drop(storage);
+    let _ = std::fs::remove_file(&path);
+}

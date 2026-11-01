@@ -6,7 +6,8 @@ use crate::{
         SavedFeedPreference, parse_saved_feed_preferences, persist_public_profiles,
     },
     ingest::{
-        IndexedNotification, IndexedRecord, MemoryStorage, NotificationCursor, ProfileIndexEntry,
+        IndexedNotification, IndexedRecord, MemoryStorage, NotificationCursor,
+        NotificationEventRow, NotificationGroupSkip, NotificationKeyWindow, ProfileIndexEntry,
         RecordCursor, Storage, StorageError,
     },
     link_card::{LinkCard, LinkCardFetcher, LinkThumbnail},
@@ -9086,6 +9087,7 @@ where
     response
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 struct WebNotificationGroup {
     reason: String,
@@ -9096,6 +9098,7 @@ struct WebNotificationGroup {
 const NOTIFICATION_GROUP_WINDOW_US: u64 = 48 * 60 * 60 * 1_000_000;
 const NOTIFICATION_GROUP_LEAD_AUTHORS: usize = 5;
 
+#[cfg(test)]
 fn group_web_notifications(
     notifications: &[IndexedNotification],
     last_seen_us: u64,
@@ -9167,6 +9170,7 @@ fn group_web_notifications(
     groups
 }
 
+#[cfg(test)]
 fn notification_group_page<'a>(
     groups: &'a [WebNotificationGroup],
     before: Option<&NotificationCursor>,
@@ -9208,8 +9212,6 @@ struct NotificationWindowGroup {
     reason: String,
     reason_subject: Option<String>,
     head: IndexedNotification,
-    #[allow(dead_code)]
-    source_collection: String,
     author_dids: Vec<String>,
     size: usize,
 }
@@ -9249,6 +9251,7 @@ trait NotificationGroupView<'a> {
     fn notification_group_view(&'a self) -> WebNotificationGroupView<'a>;
 }
 
+#[cfg(test)]
 impl<'a> NotificationGroupView<'a> for WebNotificationGroup {
     fn notification_group_view(&'a self) -> WebNotificationGroupView<'a> {
         WebNotificationGroupView {
@@ -9281,13 +9284,24 @@ impl NotificationGroupView<'_> for NotificationWindowGroup {
     }
 }
 
+const NOTIFICATION_WINDOW_BATCH: usize = 64;
+
 /// Build one page of notification groups without reading every notification the
-/// viewer ever got. The full-scan reference (`notifications_for` ->
-/// `group_web_notifications` -> `notification_group_page`) stays available for
-/// tests; `reference_notification_page` is exactly what the page used to do.
+/// viewer ever got. Events are read newest-first in batches, carrying only the
+/// columns grouping needs; a group is complete the moment its newest event is
+/// seen because its size is COUNTed over the (reason, reason_subject, time)
+/// window instead of being read row by row, and only the newest event and the
+/// first five author dids are materialized. The scan stops once `limit + 1`
+/// groups exist (which proves `has_more`) or the events run out.
 ///
-/// Red state (lane av72q): this still loads all events, which is the bug the
-/// oracle and the bounded-read tests pin down.
+/// Cursor edge: an event below the cursor belongs to a group whose newest event
+/// may sit at or after the cursor (already rendered on an earlier page). Before
+/// a key (reason + reason_subject, on one side of `last_seen`) opens a group
+/// below the cursor, `notification_hidden_floor` walks that key's group heads
+/// down to the cursor and returns the floor of the last group shown on an
+/// earlier page; events at or above that floor are skipped. The 500-seed oracle
+/// against `reference_notification_page` is the proof this matches the full
+/// scan exactly.
 fn notification_window_page<S: Storage>(
     storage: &S,
     viewer_did: &str,
@@ -9295,41 +9309,244 @@ fn notification_window_page<S: Storage>(
     limit: usize,
     last_seen_us: u64,
 ) -> Result<NotificationWindowPage, StorageError> {
-    let notices = storage.notifications_for(viewer_did, None, usize::MAX)?;
-    let groups = group_web_notifications(&notices, last_seen_us);
-    let (visible, has_more) = notification_group_page(&groups, before, limit);
-    let groups = visible
-        .iter()
-        .map(|group| NotificationWindowGroup {
-            reason: group.reason.clone(),
-            reason_subject: group.reason_subject.clone(),
-            head: group
-                .events
-                .first()
-                .expect("a group always holds its newest event")
-                .clone(),
-            source_collection: group
-                .events
-                .first()
-                .expect("a group always holds its newest event")
-                .record
-                .collection
-                .clone(),
-            author_dids: group
-                .events
+    notification_window_page_with_edge(storage, viewer_did, before, limit, last_seen_us, true)
+}
+
+fn notification_window_page_with_edge<S: Storage>(
+    storage: &S,
+    viewer_did: &str,
+    before: Option<&NotificationCursor>,
+    limit: usize,
+    last_seen_us: u64,
+    honor_cursor_edge: bool,
+) -> Result<NotificationWindowPage, StorageError> {
+    struct PendingGroup {
+        head: NotificationEventRow,
+        author_dids: Vec<String>,
+        size: usize,
+    }
+    let mut pending: Vec<PendingGroup> = Vec::new();
+    let mut skip: Vec<NotificationGroupSkip> = Vec::new();
+    let mut open_floors = HashMap::<(String, Option<String>, bool), u64>::new();
+    let mut scan_after = before.cloned();
+    let mut events_read = 0u64;
+    let mut has_more = false;
+    'scan: loop {
+        let batch = storage.notification_events_window(
+            viewer_did,
+            scan_after.as_ref(),
+            &skip,
+            NOTIFICATION_WINDOW_BATCH,
+        )?;
+        events_read += batch.len() as u64;
+        let exhausted = batch.len() < NOTIFICATION_WINDOW_BATCH;
+        for event in batch {
+            scan_after = Some(event.cursor());
+            let unread = event.time_us > last_seen_us;
+            let groupable = match event.reason.as_str() {
+                "like" | "repost" => event.reason_subject.is_some(),
+                "follow" => true,
+                _ => false,
+            };
+            if !groupable {
+                let author_dids = vec![event.source_did.clone()];
+                pending.push(PendingGroup {
+                    head: event,
+                    author_dids,
+                    size: 1,
+                });
+                if pending.len() > limit {
+                    has_more = true;
+                    break 'scan;
+                }
+                continue;
+            }
+            let key = (event.reason.clone(), event.reason_subject.clone(), unread);
+            let side_floor = if unread {
+                last_seen_us.saturating_add(1)
+            } else {
+                0
+            };
+            if let Some(&floor) = open_floors.get(&key) {
+                if event.time_us >= floor {
+                    continue;
+                }
+            } else if honor_cursor_edge && let Some(cursor) = before {
+                let hidden_floor = notification_hidden_floor(
+                    storage,
+                    viewer_did,
+                    &event,
+                    side_floor,
+                    if unread { None } else { Some(last_seen_us) },
+                    cursor,
+                    &mut events_read,
+                )?;
+                if let Some(floor) = hidden_floor
+                    && event.time_us >= floor
+                {
+                    skip.push((key.0.clone(), key.1.clone(), floor));
+                    open_floors.insert(key, floor);
+                    continue;
+                }
+            }
+            let floor = event
+                .time_us
+                .saturating_sub(NOTIFICATION_GROUP_WINDOW_US)
+                .max(side_floor);
+            let size = storage.notification_key_event_count(
+                viewer_did,
+                &event.reason,
+                event.reason_subject.as_deref(),
+                floor,
+                event.time_us,
+            )?;
+            let leads = storage.notification_key_events(
+                viewer_did,
+                &event.reason,
+                event.reason_subject.as_deref(),
+                Some(&NotificationCursor {
+                    time_us: event.time_us.saturating_add(1),
+                    uri: String::new(),
+                    reason: String::new(),
+                }),
+                &NotificationKeyWindow {
+                    from_us: Some(floor),
+                    to_us: None,
+                },
+                NOTIFICATION_GROUP_LEAD_AUTHORS,
+            )?;
+            events_read += leads.len() as u64;
+            let author_dids = leads
                 .iter()
-                .take(NOTIFICATION_GROUP_LEAD_AUTHORS)
-                .map(|event| event.record.did.clone())
-                .collect(),
-            size: group.events.len(),
-        })
-        .collect();
+                .map(|lead| lead.source_did.clone())
+                .collect::<Vec<_>>();
+            open_floors.insert(key, floor);
+            skip.push((event.reason.clone(), event.reason_subject.clone(), floor));
+            pending.push(PendingGroup {
+                head: event,
+                author_dids,
+                size,
+            });
+            if pending.len() > limit {
+                has_more = true;
+                break 'scan;
+            }
+        }
+        if exhausted {
+            break 'scan;
+        }
+    }
+    if has_more {
+        pending.truncate(limit);
+    }
+    let mut groups = Vec::with_capacity(pending.len());
+    let mut records_loaded = 0u64;
+    for group in pending {
+        let head = group.head;
+        match storage.record_by_uri(&head.source_collection, &head.source_uri) {
+            Ok(Some(record)) => {
+                records_loaded += 1;
+                groups.push(NotificationWindowGroup {
+                    reason: head.reason.clone(),
+                    reason_subject: head.reason_subject.clone(),
+                    head: IndexedNotification {
+                        record,
+                        reason: head.reason,
+                        reason_subject: head.reason_subject,
+                    },
+                    author_dids: group.author_dids,
+                    size: group.size,
+                });
+            }
+            Ok(None) => tracing::warn!(
+                viewer = %viewer_did,
+                uri = %head.source_uri,
+                collection = %head.source_collection,
+                "notification event has no record to render; the group is left off the page"
+            ),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    viewer = %viewer_did,
+                    uri = %head.source_uri,
+                    "loading a notification record for the page failed"
+                );
+                return Err(error);
+            }
+        }
+    }
     Ok(NotificationWindowPage {
         groups,
         has_more,
-        events_read: notices.len() as u64,
-        records_loaded: visible.len() as u64,
+        events_read,
+        records_loaded,
     })
+}
+
+/// The floor of the newest group of this key (on this side of `last_seen_us`)
+/// whose newest event sits at or after the cursor: events below the cursor but
+/// at or above the returned floor are members of a group an earlier page
+/// already showed. Found by walking the key's group heads downward — each step
+/// is one indexed probe for the key's first event below the current head's
+/// window — so a cursor buried deep in a dense key costs one probe per group
+/// the key has above the cursor, not one per event.
+fn notification_hidden_floor<S: Storage>(
+    storage: &S,
+    viewer_did: &str,
+    event: &NotificationEventRow,
+    side_floor: u64,
+    side_ceiling: Option<u64>,
+    cursor: &NotificationCursor,
+    events_read: &mut u64,
+) -> Result<Option<u64>, StorageError> {
+    let probe =
+        |before: Option<NotificationCursor>| -> Result<Vec<NotificationEventRow>, StorageError> {
+            storage.notification_key_events(
+                viewer_did,
+                &event.reason,
+                event.reason_subject.as_deref(),
+                before.as_ref(),
+                &NotificationKeyWindow {
+                    from_us: Some(side_floor),
+                    to_us: side_ceiling,
+                },
+                1,
+            )
+        };
+    let rows = probe(None)?;
+    *events_read += rows.len() as u64;
+    let Some(newest) = rows.into_iter().next() else {
+        return Ok(None);
+    };
+    if newest.sorts_before(cursor) {
+        return Ok(None);
+    }
+    let mut newest_head = newest;
+    loop {
+        let next_floor = newest_head
+            .time_us
+            .saturating_sub(NOTIFICATION_GROUP_WINDOW_US)
+            .max(side_floor);
+        let rows = probe(Some(NotificationCursor {
+            time_us: next_floor,
+            uri: String::new(),
+            reason: String::new(),
+        }))?;
+        *events_read += rows.len() as u64;
+        let Some(next) = rows.into_iter().next() else {
+            break;
+        };
+        if next.sorts_before(cursor) {
+            break;
+        }
+        newest_head = next;
+    }
+    Ok(Some(
+        newest_head
+            .time_us
+            .saturating_sub(NOTIFICATION_GROUP_WINDOW_US)
+            .max(side_floor),
+    ))
 }
 
 #[cfg(test)]
@@ -18355,6 +18572,7 @@ mod tests {
         all: &[IndexedNotification],
         last_seen_us: u64,
         limit: usize,
+        honor_cursor_edge: bool,
     ) -> Option<String> {
         let mut cursor: Option<NotificationCursor> = None;
         let mut seen = HashMap::<(String, String), usize>::new();
@@ -18368,12 +18586,13 @@ mod tests {
             }
             let (reference, reference_has_more) =
                 reference_notification_page(all, last_seen_us, cursor.as_ref(), limit);
-            let bounded = match notification_window_page(
+            let bounded = match notification_window_page_with_edge(
                 storage,
                 "did:plc:oracle-viewer",
                 cursor.as_ref(),
                 limit,
                 last_seen_us,
+                honor_cursor_edge,
             ) {
                 Ok(page) => page,
                 Err(error) => return Some(format!("bounded read failed: {error}")),
@@ -18532,7 +18751,7 @@ mod tests {
             let all = storage
                 .notifications_for("did:plc:oracle-viewer", None, usize::MAX)
                 .unwrap();
-            if let Some(mismatch) = oracle_walk(&storage, &all, last_seen_us, limit) {
+            if let Some(mismatch) = oracle_walk(&storage, &all, last_seen_us, limit, true) {
                 panic!("seed {seed}: {mismatch}");
             }
         }
@@ -18566,7 +18785,7 @@ mod tests {
             let all = storage
                 .notifications_for("did:plc:oracle-viewer", None, usize::MAX)
                 .unwrap();
-            let mismatch = oracle_walk(&storage, &all, last_seen_us, limit);
+            let mismatch = oracle_walk(&storage, &all, last_seen_us, limit, true);
             drop(storage);
             let _ = std::fs::remove_file(&path);
             let _ = std::fs::remove_file(format!("{}-wal", path.display()));
@@ -18575,6 +18794,35 @@ mod tests {
                 panic!("sqlite seed {seed}: {mismatch}");
             }
         }
+    }
+
+    #[test]
+    fn the_oracle_detects_a_variant_that_ignores_the_cursor_edge() {
+        for seed in 0..500u64 {
+            let (records, last_seen_us, limit) = oracle_case(seed);
+            let storage = MemoryStorage::default();
+            records.iter().for_each(|record| {
+                storage.put_record(record).unwrap();
+            });
+            let all = storage
+                .notifications_for("did:plc:oracle-viewer", None, usize::MAX)
+                .unwrap();
+            assert!(
+                oracle_walk(&storage, &all, last_seen_us, limit, true).is_none(),
+                "seed {seed}: the honest variant must match the full scan"
+            );
+            if let Some(mismatch) = oracle_walk(&storage, &all, last_seen_us, limit, false) {
+                eprintln!(
+                    "broken variant (ignore the cursor edge) fails on seed {seed}: {mismatch}"
+                );
+                assert!(
+                    seed < 500,
+                    "the oracle seeds must catch the variant that ignores the cursor edge"
+                );
+                return;
+            }
+        }
+        panic!("no seed caught the variant that ignores the cursor edge");
     }
 
     #[test]
@@ -18671,6 +18919,12 @@ mod tests {
         assert_eq!(storage.notification_count(VIEWER).unwrap(), 20_000);
 
         let page = notification_window_page(&storage, VIEWER, None, 50, 0).unwrap();
+        eprintln!(
+            "20k page 1: groups={} events_read={} records_loaded={}",
+            page.groups.len(),
+            page.events_read,
+            page.records_loaded
+        );
         drop(storage);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));

@@ -219,11 +219,19 @@ pub struct NotificationEventRow {
 }
 
 impl NotificationEventRow {
-    fn sorts_before(&self, cursor: &NotificationCursor) -> bool {
+    pub fn sorts_before(&self, cursor: &NotificationCursor) -> bool {
         self.time_us < cursor.time_us
             || (self.time_us == cursor.time_us
                 && (self.source_uri < cursor.uri
                     || (self.source_uri == cursor.uri && self.reason < cursor.reason)))
+    }
+
+    pub fn cursor(&self) -> NotificationCursor {
+        NotificationCursor {
+            time_us: self.time_us,
+            uri: self.source_uri.clone(),
+            reason: self.reason.clone(),
+        }
     }
 }
 
@@ -231,6 +239,13 @@ impl NotificationEventRow {
 /// already been accounted for by an open (or resolved) notification group; the
 /// windowed read skips them.
 pub type NotificationGroupSkip = (String, Option<String>, u64);
+
+/// Inclusive time bounds for a single key's event lookups.
+#[derive(Debug, Clone, Copy)]
+pub struct NotificationKeyWindow {
+    pub from_us: Option<u64>,
+    pub to_us: Option<u64>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordCursor {
@@ -646,15 +661,15 @@ pub trait Storage: Send + Sync {
         to_us: u64,
     ) -> Result<usize, StorageError>;
     /// One key's events newest-first, strictly after `before` in (time, uri,
-    /// reason) order and at or after `from_us`: the leading-author probe (limit
-    /// 5) and the cursor-edge group-chain probe (limit 1).
+    /// reason) order and inside `window`: the leading-author probe (limit 5)
+    /// and the cursor-edge group-chain probe (limit 1).
     fn notification_key_events(
         &self,
         did: &str,
         reason: &str,
         reason_subject: Option<&str>,
         before: Option<&NotificationCursor>,
-        from_us: Option<u64>,
+        window: &NotificationKeyWindow,
         limit: usize,
     ) -> Result<Vec<NotificationEventRow>, StorageError>;
     fn notification_count(&self, did: &str) -> Result<usize, StorageError>;
@@ -1658,7 +1673,7 @@ impl Storage for MemoryStorage {
         reason: &str,
         reason_subject: Option<&str>,
         before: Option<&NotificationCursor>,
-        from_us: Option<u64>,
+        window: &NotificationKeyWindow,
         limit: usize,
     ) -> Result<Vec<NotificationEventRow>, StorageError> {
         let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
@@ -1667,7 +1682,8 @@ impl Storage for MemoryStorage {
                 row.reason == reason
                     && row.reason_subject.as_deref() == reason_subject
                     && before.is_none_or(|cursor| row.sorts_before(cursor))
-                    && from_us.is_none_or(|floor| row.time_us >= floor)
+                    && window.from_us.is_none_or(|floor| row.time_us >= floor)
+                    && window.to_us.is_none_or(|ceiling| row.time_us <= ceiling)
             })
             .collect::<Vec<_>>();
         rows.sort_by(notification_event_order);
@@ -5391,7 +5407,7 @@ impl Storage for SqliteStorage {
         reason: &str,
         reason_subject: Option<&str>,
         before: Option<&NotificationCursor>,
-        from_us: Option<u64>,
+        window: &NotificationKeyWindow,
         limit: usize,
     ) -> Result<Vec<NotificationEventRow>, StorageError> {
         self.read_conn()?.prepare_cached(
@@ -5400,7 +5416,7 @@ impl Storage for SqliteStorage {
              WHERE subject_did=?1 AND reason=?2 AND reason_subject IS ?3 AND (
                  ?4 IS NULL OR time_us < ?5 OR
                  (time_us=?5 AND (source_uri < ?6 OR (source_uri=?6 AND reason < ?7)))
-             ) AND (?8 IS NULL OR time_us >= ?8)
+             ) AND (?8 IS NULL OR time_us >= ?8) AND (?10 IS NULL OR time_us <= ?10)
              ORDER BY time_us DESC, source_uri DESC, reason LIMIT ?9",
         )?
         .query_map(
@@ -5414,8 +5430,13 @@ impl Storage for SqliteStorage {
                     .unwrap_or(0),
                 before.map(|cursor| cursor.uri.as_str()).unwrap_or(""),
                 before.map(|cursor| cursor.reason.as_str()).unwrap_or(""),
-                from_us.map(|floor| floor.min(i64::MAX as u64) as i64),
+                window
+                    .from_us
+                    .map(|floor| floor.min(i64::MAX as u64) as i64),
                 i64::try_from(limit).unwrap_or(i64::MAX),
+                window
+                    .to_us
+                    .map(|ceiling| ceiling.min(i64::MAX as u64) as i64),
             ],
             |row| {
                 Ok(NotificationEventRow {
