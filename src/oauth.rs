@@ -24315,6 +24315,68 @@ mod tests {
         );
     }
 
+    // Reviewer reproducer (claude-helper, 2026-11-01): the scroll test above pages with limit=3,
+    // below the 25 posts one PDS fetch brings, so it never sees a page that a fetch cannot fill.
+    // With the real page size (no limit parameter = 50) the Older link must still lead through
+    // the whole PDS history: 10 posts held locally (fewer than one page), 80 more on the PDS.
+    #[tokio::test]
+    async fn scrolling_at_the_default_page_size_still_reaches_every_pds_post() {
+        let storage = Arc::new(MemoryStorage::default());
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let viewer = "did:plc:older-scroll-default-viewer";
+        let subject = "did:plc:older-scroll-default-author";
+        let base_us = 1_900_000_000_000_000_u64;
+        for index in 0..10 {
+            storage
+                .put_record(&scroll_posts(
+                    subject,
+                    &format!("a{index}"),
+                    base_us - index as u64 * 1_000_000_000,
+                    &format!("scroll local {index}"),
+                ))
+                .unwrap();
+        }
+        let pds_posts = (0..80)
+            .map(|index| {
+                scroll_posts(
+                    subject,
+                    &format!("r{index:02}"),
+                    base_us - (10 + index) as u64 * 1_000_000_000,
+                    &format!("scroll pds {index:02}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let flow = OlderScrollFlow::new(pds_posts);
+        let token = recent_posts_session(&storage, &public, viewer);
+        let app = public.router_with_flow(flow.clone(), storage.clone());
+        let cookie = format!("{SESSION_COOKIE}={token}");
+
+        let mut rendered = Vec::new();
+        let mut uri = format!("/profile?did={subject}");
+        for pages in 1_usize..=20 {
+            let calls_before = flow.cursors().len();
+            let (status, html) = recent_posts_get(&app, uri.clone(), &cookie).await;
+            assert_eq!(status, StatusCode::OK, "page {pages} renders");
+            assert!(
+                flow.cursors().len() - calls_before <= 1,
+                "one page request must make at most one PDS fetch"
+            );
+            rendered.extend(rendered_scroll_rkeys(&html));
+            match older_link_href(&html) {
+                Some(href) => uri = href,
+                None => break,
+            }
+        }
+        let expected = (0..10)
+            .map(|index| format!("a{index}"))
+            .chain((0..80).map(|index| format!("r{index:02}")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rendered, expected,
+            "at the default page size the Older link must keep leading to the PDS until its history ends"
+        );
+    }
+
     #[tokio::test]
     async fn a_failing_author_pds_still_renders_the_local_posts_and_logs_the_real_error() {
         let storage = Arc::new(MemoryStorage::default());
