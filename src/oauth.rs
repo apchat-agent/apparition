@@ -27419,8 +27419,18 @@ mod tests {
         }
     }
 
+    /// The rotating-auth tests share process-wide seams (the expire pause) and measure token
+    /// endpoint latency windows; one test's storm is another's flake, so they take turns.
+    fn rotating_auth_serial() -> &'static tokio::sync::Mutex<()> {
+        static SERIAL: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        SERIAL.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    const FAR_PAST: &str = "2000-01-01T00:00:00Z";
+
     #[tokio::test]
     async fn concurrent_page_load_refreshes_the_refresh_token_only_once() {
+        let _serial = rotating_auth_serial().lock().await;
         let _storm = ExpireStormPause::after_first(Duration::from_millis(250));
         let harness = rotating_auth_harness(&[(REFRESH_STORM_DID, "storm")]).await;
         seed_rotating_session(&harness, REFRESH_STORM_DID, "storm", FAR_FUTURE).await;
@@ -27481,6 +27491,187 @@ mod tests {
         assert!(dead.is_none(), "no request may mark the session dead: {dead:?}");
         let stored = harness.store.get(&did).await.unwrap();
         assert!(stored.is_some(), "the account session must survive the storm");
+        harness.task.abort();
+    }
+
+    /// Edge case (a): a refresh token the server rejects on its FIRST use is a real
+    /// revocation, not our own replay. It must still end in "sign in again".
+    #[tokio::test]
+    async fn a_refresh_token_rejected_on_its_first_use_still_sends_the_user_to_sign_in_again() {
+        let _serial = rotating_auth_serial().lock().await;
+        let harness = rotating_auth_harness(&[(REFRESH_STORM_DID, "revoked")]).await;
+        seed_rotating_session(&harness, REFRESH_STORM_DID, "revoked", FAR_FUTURE).await;
+        harness.server.lock().unwrap().reject_grants = Some((
+            400,
+            "Refresh token revoked by the account owner".to_owned(),
+        ));
+        let did: Did = REFRESH_STORM_DID.parse().unwrap();
+
+        let (outcome, dead) = storm_page_load(harness.flow.clone(), did.clone()).await;
+        assert!(
+            outcome.is_err(),
+            "a refresh the server rejects on its first use must not look like a success"
+        );
+        assert_eq!(
+            dead.as_deref(),
+            Some(REFRESH_STORM_DID),
+            "a real revocation must still mark the session dead: {outcome:?}"
+        );
+        {
+            let state = harness.server.lock().unwrap();
+            assert_eq!(
+                state.grants, 1,
+                "the server must see exactly one honest grant, seen: {:?}",
+                state.grant_refresh_tokens
+            );
+            assert_eq!(state.replays, 0, "the first presentation was rejected, not replayed");
+        }
+        assert!(
+            harness.store.get(&did).await.unwrap().is_none(),
+            "the dead session must be deleted"
+        );
+
+        // The next request finds no stored session: sign in again, not a generic failure.
+        let (next_outcome, next_dead) = storm_page_load(harness.flow.clone(), did).await;
+        assert!(next_outcome.is_err());
+        assert_eq!(
+            next_dead.as_deref(),
+            Some(REFRESH_STORM_DID),
+            "a missing session must be reported as dead: {next_outcome:?}"
+        );
+        harness.task.abort();
+    }
+
+    /// Edge case (b): the single-flight lock is per DID. User B must not queue behind user
+    /// A's slow (350 ms) refresh grant.
+    #[tokio::test]
+    async fn two_users_refreshing_at_the_same_time_do_not_block_each_other() {
+        const SLOW_DID: &str = "did:plc:refreshstormslow";
+        const FAST_DID: &str = "did:plc:refreshstormfast";
+        let _serial = rotating_auth_serial().lock().await;
+        let harness = rotating_auth_harness(&[(SLOW_DID, "slow"), (FAST_DID, "fast")]).await;
+        seed_rotating_session(&harness, SLOW_DID, "slow", FAR_FUTURE).await;
+        seed_rotating_session(&harness, FAST_DID, "fast", FAR_FUTURE).await;
+        let slow_did: Did = SLOW_DID.parse().unwrap();
+        let fast_did: Did = FAST_DID.parse().unwrap();
+
+        let slow = tokio::spawn(storm_page_load(harness.flow.clone(), slow_did));
+        // Let the slow user's recovery reach the token endpoint (its grant takes 350 ms)
+        // while holding the per-DID refresh lock, then start the fast user.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let fast_at = tokio::time::Instant::now();
+        let (fast_outcome, fast_dead) = tokio::time::timeout(
+            Duration::from_millis(250),
+            storm_page_load(harness.flow.clone(), fast_did),
+        )
+        .await
+        .expect("the fast user must not queue behind the slow user's refresh");
+        assert!(fast_outcome.is_ok(), "the fast user must recover: {fast_outcome:?}");
+        assert!(fast_dead.is_none(), "the fast user must not be marked dead");
+        assert!(
+            fast_at.elapsed() < Duration::from_millis(300),
+            "the fast user's refresh took {:?} while the slow user's grant was in flight",
+            fast_at.elapsed()
+        );
+
+        let (slow_outcome, slow_dead) = slow.await.unwrap();
+        assert!(slow_outcome.is_ok(), "the slow user must recover too: {slow_outcome:?}");
+        assert!(slow_dead.is_none(), "the slow user must not be marked dead");
+        {
+            let state = harness.server.lock().unwrap();
+            assert_eq!(
+                state.grants, 2,
+                "exactly one grant per user, seen: {:?}",
+                state.grant_refresh_tokens
+            );
+            assert_eq!(state.replays, 0);
+            assert!(!state.family_revoked);
+        }
+        harness.task.abort();
+    }
+
+    /// Edge case (c1): the cached-session TTL path. When the in-memory session expires and
+    /// several page loads arrive at once, the restore coalescing and the refresh lock must
+    /// still yield exactly one refresh grant.
+    #[tokio::test]
+    async fn the_cached_session_ttl_path_makes_only_one_refresh_under_concurrency() {
+        let _serial = rotating_auth_serial().lock().await;
+        let harness = rotating_auth_harness(&[(REFRESH_STORM_DID, "storm")]).await;
+        seed_rotating_session(&harness, REFRESH_STORM_DID, "storm", FAR_FUTURE).await;
+        let did: Did = REFRESH_STORM_DID.parse().unwrap();
+
+        // Prime the session cache, then expire its entry the way the TTL does: the entry is
+        // still in the map when the next page load arrives, only its deadline has passed.
+        harness.flow.restored_session(&did).await.unwrap();
+        {
+            let mut cache = harness.flow.session_cache.lock().await;
+            match cache.get_mut(&did.to_string()) {
+                Some((expires, _)) => *expires = tokio::time::Instant::now(),
+                None => panic!("the session cache must hold the restored session"),
+            }
+        }
+
+        let load = tokio::time::timeout(
+            Duration::from_secs(10),
+            futures_util::future::join_all(
+                (0..4).map(|_| storm_page_load(harness.flow.clone(), did.clone())),
+            ),
+        )
+        .await
+        .expect("the concurrent page load finishes");
+        for (outcome, dead) in &load {
+            assert!(outcome.is_ok(), "every request must succeed: {outcome:?}");
+            assert!(dead.is_none(), "no request may mark the session dead: {dead:?}");
+        }
+        {
+            let state = harness.server.lock().unwrap();
+            assert_eq!(
+                state.grants, 1,
+                "the TTL path must refresh exactly once, seen: {:?}",
+                state.grant_refresh_tokens
+            );
+            assert_eq!(state.replays, 0);
+            assert!(!state.family_revoked);
+        }
+        assert!(
+            harness.store.writer.metrics.refresh_reuses.load(Ordering::Relaxed) >= 1,
+            "waiters that reused another request's refresh must be counted"
+        );
+        harness.task.abort();
+    }
+
+    /// Edge case (c2): the time-expired path. The OAuth client's own registry refreshes a
+    /// token that expired by clock alone, before the PDS ever answers. Concurrent requests
+    /// must share that refresh too.
+    #[tokio::test]
+    async fn the_time_expired_token_path_makes_only_one_refresh_under_concurrency() {
+        let _serial = rotating_auth_serial().lock().await;
+        let harness = rotating_auth_harness(&[(REFRESH_STORM_DID, "storm")]).await;
+        seed_rotating_session(&harness, REFRESH_STORM_DID, "storm", FAR_PAST).await;
+        let did: Did = REFRESH_STORM_DID.parse().unwrap();
+
+        let load = tokio::time::timeout(
+            Duration::from_secs(10),
+            futures_util::future::join_all(
+                (0..4).map(|_| storm_page_load(harness.flow.clone(), did.clone())),
+            ),
+        )
+        .await
+        .expect("the concurrent page load finishes");
+        for (outcome, dead) in &load {
+            assert!(outcome.is_ok(), "every request must succeed: {outcome:?}");
+            assert!(dead.is_none(), "no request may mark the session dead: {dead:?}");
+        }
+        {
+            let state = harness.server.lock().unwrap();
+            assert_eq!(
+                state.grants, 1,
+                "the time-expired path must refresh exactly once, seen: {:?}",
+                state.grant_refresh_tokens
+            );
+            assert_eq!(state.replays, 0);
+            assert!(!state.family_revoked);
+        }
         harness.task.abort();
     }
 }
