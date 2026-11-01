@@ -23577,6 +23577,743 @@ mod tests {
             "the visit served from the fresh cache reports the fresh state"
         );
     }
+
+    use crate::ingest::{
+        BatchApplyTiming, JetstreamStorageUpdate, NotificationSubscription, PostInteractionSummary,
+        SkippedCursorWindow,
+    };
+
+    const ANSWER_VIEWER: &str = "did:plc:answer-viewer";
+
+    #[derive(Clone, Default)]
+    struct AnswerFlowState {
+        like_calls: usize,
+        unlike_calls: usize,
+        repost_calls: usize,
+        unlike_uris: Vec<String>,
+    }
+
+    /// A PDS that always accepts the write; counts how often each route actually reached it.
+    #[derive(Clone, Default)]
+    struct AnswerFlow {
+        state: Arc<Mutex<AnswerFlowState>>,
+    }
+
+    impl AnswerFlow {
+        fn created(did: &str, collection: &str, rkey: &str, cid: &str, subject: &Value) -> PdsCreatedRecord {
+            PdsCreatedRecord {
+                uri: format!("at://{did}/{collection}/{rkey}"),
+                cid: cid.to_owned(),
+                record: json!({"$type":collection,"subject":subject}),
+                time_us: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_micros() as u64,
+            }
+        }
+    }
+
+    impl OAuthFlow for AnswerFlow {
+        fn authorize<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: Vec<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async { Err("answer test flow does not authorize".to_owned()) })
+        }
+
+        fn callback<'a>(
+            &'a self,
+            _: OAuthCallback,
+        ) -> Pin<Box<dyn Future<Output = Result<OAuthAccount, String>> + Send + 'a>> {
+            Box::pin(async { Err("answer test flow does not callback".to_owned()) })
+        }
+
+        fn logout<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn like<'a>(
+            &'a self,
+            did: &'a str,
+            uri: &'a str,
+            cid: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+            let state = self.state.clone();
+            let subject = json!({"uri": uri, "cid": cid});
+            let did = did.to_owned();
+            Box::pin(async move {
+                state.lock().unwrap().like_calls += 1;
+                Ok(AnswerFlow::created(
+                    &did,
+                    "app.bsky.feed.like",
+                    "answer-like-r1",
+                    "answer-like-cid",
+                    &subject,
+                ))
+            })
+        }
+
+        fn delete_like<'a>(
+            &'a self,
+            _: &'a str,
+            like_uri: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            let state = self.state.clone();
+            let like_uri = like_uri.to_owned();
+            Box::pin(async move {
+                let mut state = state.lock().unwrap();
+                state.unlike_calls += 1;
+                state.unlike_uris.push(like_uri);
+                Ok(())
+            })
+        }
+
+        fn repost<'a>(
+            &'a self,
+            did: &'a str,
+            uri: &'a str,
+            cid: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+            let state = self.state.clone();
+            let subject = json!({"uri": uri, "cid": cid});
+            let did = did.to_owned();
+            Box::pin(async move {
+                state.lock().unwrap().repost_calls += 1;
+                Ok(AnswerFlow::created(
+                    &did,
+                    "app.bsky.feed.repost",
+                    "answer-repost-r1",
+                    "answer-repost-cid",
+                    &subject,
+                ))
+            })
+        }
+    }
+
+    /// A storage whose `put_record` answers "database is locked" for the first N attempts
+    /// (`usize::MAX` = always) so the writer-behind case can be reproduced without SQLite.
+    struct FlakyPutStorage {
+        inner: MemoryStorage,
+        lock_failures: AtomicUsize,
+    }
+
+    impl FlakyPutStorage {
+        fn lock_failure(error: &str) -> StorageError {
+            StorageError::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                Some(error.to_owned()),
+            ))
+        }
+    }
+
+    impl Storage for FlakyPutStorage {
+        fn put_record(&self, record: &IndexedRecord) -> Result<(), StorageError> {
+            if self.lock_failures.load(Ordering::SeqCst) > 0 {
+                self.lock_failures.fetch_sub(1, Ordering::SeqCst);
+                return Err(Self::lock_failure("database is locked"));
+            }
+            self.inner.put_record(record)
+        }
+
+        fn delete_record(
+            &self,
+            did: &str,
+            collection: &str,
+            rkey: &str,
+        ) -> Result<(), StorageError> {
+            self.inner.delete_record(did, collection, rkey)
+        }
+
+        fn apply_jetstream_batch(
+            &self,
+            updates: &[JetstreamStorageUpdate],
+        ) -> Result<BatchApplyTiming, StorageError> {
+            self.inner.apply_jetstream_batch(updates)
+        }
+
+        fn record_skipped_window(&self, from: u64, to: u64) -> Result<(), StorageError> {
+            self.inner.record_skipped_window(from, to)
+        }
+
+        fn skipped_windows(&self) -> Result<Vec<SkippedCursorWindow>, StorageError> {
+            self.inner.skipped_windows()
+        }
+
+        fn replace_repo_snapshot(
+            &self,
+            did: &str,
+            records: &[IndexedRecord],
+            following: &[String],
+        ) -> Result<(), StorageError> {
+            self.inner.replace_repo_snapshot(did, records, following)
+        }
+
+        fn get_record(
+            &self,
+            did: &str,
+            collection: &str,
+            rkey: &str,
+        ) -> Result<Option<IndexedRecord>, StorageError> {
+            self.inner.get_record(did, collection, rkey)
+        }
+
+        fn record_by_uri(
+            &self,
+            collection: &str,
+            uri: &str,
+        ) -> Result<Option<IndexedRecord>, StorageError> {
+            self.inner.record_by_uri(collection, uri)
+        }
+
+        fn records_by_uri(
+            &self,
+            collection: &str,
+            uris: &[String],
+        ) -> Result<HashMap<String, IndexedRecord>, StorageError> {
+            self.inner.records_by_uri(collection, uris)
+        }
+
+        fn replies_to(
+            &self,
+            parent_uri: &str,
+            limit: usize,
+        ) -> Result<Vec<IndexedRecord>, StorageError> {
+            self.inner.replies_to(parent_uri, limit)
+        }
+
+        fn records_for_subject(
+            &self,
+            collection: &str,
+            subject_uri: &str,
+            limit: usize,
+        ) -> Result<Vec<IndexedRecord>, StorageError> {
+            self.inner.records_for_subject(collection, subject_uri, limit)
+        }
+
+        fn records_for_actor_collection(
+            &self,
+            did: &str,
+            collection: &str,
+            limit: usize,
+        ) -> Result<Vec<IndexedRecord>, StorageError> {
+            self.inner.records_for_actor_collection(did, collection, limit)
+        }
+
+        fn follows_for_actor(
+            &self,
+            did: &str,
+            limit: usize,
+        ) -> Result<Vec<IndexedRecord>, StorageError> {
+            self.inner.follows_for_actor(did, limit)
+        }
+
+        fn followers_for_did(
+            &self,
+            did: &str,
+            limit: usize,
+        ) -> Result<Vec<IndexedRecord>, StorageError> {
+            self.inner.followers_for_did(did, limit)
+        }
+
+        fn profile_counts(&self, did: &str) -> Result<(usize, usize, usize), StorageError> {
+            self.inner.profile_counts(did)
+        }
+
+        fn remember_recent_profile(
+            &self,
+            viewer_did: &str,
+            profile_did: &str,
+        ) -> Result<(), StorageError> {
+            self.inner.remember_recent_profile(viewer_did, profile_did)
+        }
+
+        fn recent_profiles_for_viewer(&self, viewer_did: &str) -> Result<Vec<String>, StorageError> {
+            self.inner.recent_profiles_for_viewer(viewer_did)
+        }
+
+        fn clear_recent_profiles_for_viewer(
+            &self,
+            viewer_did: &str,
+        ) -> Result<(), StorageError> {
+            self.inner.clear_recent_profiles_for_viewer(viewer_did)
+        }
+
+        fn set_last_active_feed_tab(&self, viewer_did: &str, tab: &str) -> Result<(), StorageError> {
+            self.inner.set_last_active_feed_tab(viewer_did, tab)
+        }
+
+        fn last_active_feed_tab(
+            &self,
+            viewer_did: &str,
+        ) -> Result<Option<String>, StorageError> {
+            self.inner.last_active_feed_tab(viewer_did)
+        }
+
+        fn profile_index_snapshot(&self) -> Result<HashMap<String, ProfileIndexEntry>, StorageError> {
+            self.inner.profile_index_snapshot()
+        }
+
+        fn set_profile_index_entry(
+            &self,
+            did: &str,
+            entry: ProfileIndexEntry,
+        ) -> Result<(), StorageError> {
+            self.inner.set_profile_index_entry(did, entry)
+        }
+
+        fn enqueue_profile_fetches(&self, dids: &[String]) -> Result<(), StorageError> {
+            self.inner.enqueue_profile_fetches(dids)
+        }
+
+        fn pending_profile_fetches(&self, limit: usize) -> Result<Vec<String>, StorageError> {
+            self.inner.pending_profile_fetches(limit)
+        }
+
+        fn complete_profile_fetch(&self, did: &str) -> Result<(), StorageError> {
+            self.inner.complete_profile_fetch(did)
+        }
+
+        fn notifications_for(
+            &self,
+            did: &str,
+            before: Option<&NotificationCursor>,
+            limit: usize,
+        ) -> Result<Vec<IndexedNotification>, StorageError> {
+            self.inner.notifications_for(did, before, limit)
+        }
+
+        fn notification_count(&self, did: &str) -> Result<usize, StorageError> {
+            self.inner.notification_count(did)
+        }
+
+        fn notification_last_seen(&self, did: &str) -> Result<u64, StorageError> {
+            self.inner.notification_last_seen(did)
+        }
+
+        fn mark_notifications_seen(&self, did: &str, time_us: u64) -> Result<(), StorageError> {
+            self.inner.mark_notifications_seen(did, time_us)
+        }
+
+        fn unread_notification_count(&self, did: &str) -> Result<usize, StorageError> {
+            self.inner.unread_notification_count(did)
+        }
+
+        fn subscribe_notification_counts(&self, did: &str) -> NotificationSubscription {
+            self.inner.subscribe_notification_counts(did)
+        }
+
+        fn author_posts(
+            &self,
+            did: &str,
+            cursor: Option<&RecordCursor>,
+            limit: usize,
+            include_replies: bool,
+        ) -> Result<Vec<IndexedRecord>, StorageError> {
+            self.inner.author_posts(did, cursor, limit, include_replies)
+        }
+
+        fn timeline_posts(
+            &self,
+            actor: &str,
+            cursor: Option<&RecordCursor>,
+            limit: usize,
+        ) -> Result<Vec<IndexedRecord>, StorageError> {
+            self.inner.timeline_posts(actor, cursor, limit)
+        }
+
+        fn post_interaction_summary(
+            &self,
+            uri: &str,
+            viewer_did: Option<&str>,
+        ) -> Result<PostInteractionSummary, StorageError> {
+            self.inner.post_interaction_summary(uri, viewer_did)
+        }
+
+        fn records(&self) -> Result<Vec<IndexedRecord>, StorageError> {
+            self.inner.records()
+        }
+
+        fn cursor(&self) -> Result<Option<u64>, StorageError> {
+            self.inner.cursor()
+        }
+
+        fn set_cursor(&self, cursor: u64) -> Result<(), StorageError> {
+            self.inner.set_cursor(cursor)
+        }
+
+        fn register_user(&self, did: &str) -> Result<(), StorageError> {
+            self.inner.register_user(did)
+        }
+
+        fn unregister_user(&self, did: &str) -> Result<(), StorageError> {
+            self.inner.unregister_user(did)
+        }
+
+        fn is_registered(&self, did: &str) -> Result<bool, StorageError> {
+            self.inner.is_registered(did)
+        }
+
+        fn rotate_web_session(&self, did: &str, session_id: &str) -> Result<u64, StorageError> {
+            self.inner.rotate_web_session(did, session_id)
+        }
+
+        fn web_session_generation(
+            &self,
+            did: &str,
+            session_id: &str,
+        ) -> Result<Option<u64>, StorageError> {
+            self.inner.web_session_generation(did, session_id)
+        }
+
+        fn delete_web_session(&self, did: &str, session_id: &str) -> Result<(), StorageError> {
+            self.inner.delete_web_session(did, session_id)
+        }
+
+        fn set_follow(&self, actor: &str, subject: &str, following: bool) -> Result<(), StorageError> {
+            self.inner.set_follow(actor, subject, following)
+        }
+
+        fn is_following(&self, actor: &str, subject: &str) -> Result<bool, StorageError> {
+            self.inner.is_following(actor, subject)
+        }
+
+        fn has_follow_record(&self, actor: &str, subject: &str) -> Result<bool, StorageError> {
+            self.inner.has_follow_record(actor, subject)
+        }
+
+        fn tracked_follow_count(&self, did: &str) -> Result<u32, StorageError> {
+            self.inner.tracked_follow_count(did)
+        }
+
+        fn is_followed_by_registered(&self, did: &str) -> Result<bool, StorageError> {
+            self.inner.is_followed_by_registered(did)
+        }
+
+        fn enqueue_backfill(&self, did: &str) -> Result<(), StorageError> {
+            self.inner.enqueue_backfill(did)
+        }
+
+        fn enqueue_backfill_for(&self, owner_did: &str, did: &str) -> Result<(), StorageError> {
+            self.inner.enqueue_backfill_for(owner_did, did)
+        }
+
+        fn pending_backfills(&self) -> Result<Vec<String>, StorageError> {
+            self.inner.pending_backfills()
+        }
+
+        fn complete_backfill(&self, did: &str) -> Result<(), StorageError> {
+            self.inner.complete_backfill(did)
+        }
+
+        fn record_backfill_failure(&self, did: &str) -> Result<Duration, StorageError> {
+            self.inner.record_backfill_failure(did)
+        }
+
+        fn backfill_progress(&self, owner_did: &str) -> Result<(usize, usize), StorageError> {
+            self.inner.backfill_progress(owner_did)
+        }
+
+        fn backfill_failure_count(&self, owner_did: &str) -> Result<usize, StorageError> {
+            self.inner.backfill_failure_count(owner_did)
+        }
+
+        fn set_verified_handle(&self, did: &str, handle: &str) -> Result<(), StorageError> {
+            self.inner.set_verified_handle(did, handle)
+        }
+
+        fn clear_verified_handle(&self, did: &str) -> Result<(), StorageError> {
+            self.inner.clear_verified_handle(did)
+        }
+
+        fn verified_handle(&self, did: &str) -> Result<Option<String>, StorageError> {
+            self.inner.verified_handle(did)
+        }
+
+        fn handle_is_invalid(&self, did: &str) -> Result<bool, StorageError> {
+            self.inner.handle_is_invalid(did)
+        }
+
+        fn did_by_verified_handle(&self, handle: &str) -> Result<Option<String>, StorageError> {
+            self.inner.did_by_verified_handle(handle)
+        }
+
+        fn is_tracked_did(&self, did: &str) -> Result<bool, StorageError> {
+            self.inner.is_tracked_did(did)
+        }
+
+        fn registered_followers(&self, did: &str) -> Result<Vec<String>, StorageError> {
+            self.inner.registered_followers(did)
+        }
+
+        fn is_displayed_did(&self, did: &str) -> Result<bool, StorageError> {
+            self.inner.is_displayed_did(did)
+        }
+
+        fn stale_handle_dids(&self, ttl: Duration, limit: usize) -> Result<Vec<String>, StorageError> {
+            self.inner.stale_handle_dids(ttl, limit)
+        }
+
+        fn queue_handle_refresh(&self, did: &str) -> Result<(), StorageError> {
+            self.inner.queue_handle_refresh(did)
+        }
+
+        fn queue_handle_refresh_ordered(&self, dids: &[String]) -> Result<(), StorageError> {
+            self.inner.queue_handle_refresh_ordered(dids)
+        }
+
+        fn pending_handle_refreshes(
+            &self,
+            limit: usize,
+        ) -> Result<Vec<String>, StorageError> {
+            self.inner.pending_handle_refreshes(limit)
+        }
+
+        fn complete_handle_refresh(&self, did: &str) -> Result<(), StorageError> {
+            self.inner.complete_handle_refresh(did)
+        }
+
+        fn bytes_on_disk(&self) -> u64 {
+            self.inner.bytes_on_disk()
+        }
+    }
+
+    fn answer_session_cookie<S: Storage>(public: &OAuthPublic, storage: &S, viewer: &str) -> String {
+        let generation = storage
+            .rotate_web_session(viewer, "answer-session")
+            .unwrap();
+        let token = public.issue_session_cookie(
+            viewer,
+            "answer-session",
+            generation,
+            SessionPermissions {
+                write: true,
+                feed: true,
+                blob: true,
+                video: true,
+                follow: true,
+                block: true,
+                mute: true,
+                list: true,
+                preferences: true,
+                like: true,
+                repost: true,
+                post: true,
+            },
+        );
+        format!("{SESSION_COOKIE}={token}")
+    }
+
+    async fn post_like(
+        app: &Router,
+        cookie: &str,
+        body: String,
+        fetch: bool,
+    ) -> axum::response::Response {
+        let mut builder = axum::http::Request::builder()
+            .method("POST")
+            .uri("/like")
+            .header("origin", "https://appview.example")
+            .header("sec-fetch-site", "same-origin")
+            .header("cookie", cookie)
+            .header("content-type", "application/x-www-form-urlencoded");
+        if fetch {
+            builder = builder.header("x-appview-fetch", "1");
+        }
+        app.clone()
+            .oneshot(builder.body(Body::from(body)).unwrap())
+            .await
+            .unwrap()
+    }
+
+    fn like_form_body(uri: &str) -> String {
+        format!("uri={}&cid=cid-post", form_encoded(uri))
+    }
+
+    async fn json_response(response: axum::response::Response) -> Value {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn wait_until(mut check: impl FnMut() -> bool, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if check() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn captured_logs(logs: &FeedTestLogs) -> String {
+        String::from_utf8(logs.0.lock().unwrap().clone()).unwrap_or_default()
+    }
+
+    async fn wait_for_log(logs: &FeedTestLogs, needle: &str, timeout: Duration) -> String {
+        let found = wait_until(|| captured_logs(logs).contains(needle), timeout).await;
+        let output = captured_logs(logs);
+        assert!(found, "no line containing {needle:?} in the logs: {output}");
+        output
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_like_answers_from_the_pds_while_the_writer_is_held() {
+        // Live 2026-11-01 06:47Z: the owner's likes answered in 13699/10190/3665 ms while the
+        // PDS call was 293-297 ms: the response awaited the writer queue and one like even
+        // answered "could not index PDS record: SQLite error: database is locked" after the
+        // like WAS created. Once the PDS says OK the user must get their answer.
+        let path = held_writer_page_path("like-answer");
+        remove_held_writer_database(&path);
+        let storage = Arc::new(crate::ingest::SqliteStorage::open(&path).unwrap());
+        let post = test_web_post("did:plc:answered-author", "answered", 7, "answer me fast", None);
+        storage.put_record(&post).unwrap();
+        let flow = AnswerFlow::default();
+        let flow_state = flow.state.clone();
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        let app = public.router_with_flow(flow, storage.clone());
+        let cookie = answer_session_cookie(&public, storage.as_ref(), ANSWER_VIEWER);
+
+        let gate = storage.hold_writer(Duration::from_secs(3));
+        gate.recv_timeout(Duration::from_secs(1))
+            .expect("the writer picked up the hold");
+
+        let started = Instant::now();
+        let response = post_like(&app, &cookie, like_form_body(&post.uri), true).await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_response(response).await;
+        assert_eq!(body, json!({"liked": true, "likeCount": 1}));
+        assert!(
+            elapsed_ms < 500,
+            "the like waited {elapsed_ms} ms behind the held writer instead of answering on PDS OK"
+        );
+        assert_eq!(flow_state.lock().unwrap().like_calls, 1);
+
+        storage.writer_barrier().unwrap();
+        let like_uri = format!("at://{ANSWER_VIEWER}/app.bsky.feed.like/answer-like-r1");
+        assert!(
+            wait_until(
+                || storage
+                    .record_by_uri("app.bsky.feed.like", &like_uri)
+                    .unwrap()
+                    .is_some(),
+                Duration::from_secs(5)
+            )
+            .await,
+            "the like must be indexed once the writer frees up"
+        );
+        drop(storage);
+        remove_held_writer_database(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_like_says_liked_when_the_index_write_always_fails() {
+        // The 13699 ms like of 2026-11-01 06:47Z answered an error although the PDS created
+        // the like: a local index failure must never be shown as a failed like. The failure
+        // belongs in the log with its real cause, counted.
+        let storage = Arc::new(FlakyPutStorage {
+            inner: MemoryStorage::default(),
+            lock_failures: AtomicUsize::new(usize::MAX),
+        });
+        let post = test_web_post("did:plc:failing-author", "failing", 7, "post behind a broken index", None);
+        storage.inner.put_record(&post).unwrap();
+        let flow = AnswerFlow::default();
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        let app = public.router_with_flow(flow, storage.clone());
+        let cookie = answer_session_cookie(&public, storage.as_ref(), ANSWER_VIEWER);
+
+        let logs = FeedTestLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(logs.clone())
+            .finish();
+        let capture = tracing::subscriber::set_default(subscriber);
+        let response = post_like(&app, &cookie, like_form_body(&post.uri), true).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a failed index write must not fail the like"
+        );
+        let body = json_response(response).await;
+        assert_eq!(body, json!({"liked": true, "likeCount": 1}));
+        let output = wait_for_log(&logs, "web index write failed", Duration::from_secs(20)).await;
+        drop(capture);
+        let failed_line = output
+            .lines()
+            .find(|line| line.contains("web index write failed"))
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            failed_line.contains("database is locked"),
+            "the final failure must carry the real cause: {failed_line}"
+        );
+        assert!(
+            failed_line.contains("failed_index_writes="),
+            "the final failure must be counted: {failed_line}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_like_is_indexed_after_the_writer_lock_clears() {
+        // A writer that answers "database is locked" twice and then succeeds: the user saw
+        // success, the retries are logged, and the index row lands.
+        let storage = Arc::new(FlakyPutStorage {
+            inner: MemoryStorage::default(),
+            lock_failures: AtomicUsize::new(2),
+        });
+        let post = test_web_post("did:plc:locked-author", "locked", 7, "post behind a busy writer", None);
+        storage.inner.put_record(&post).unwrap();
+        let flow = AnswerFlow::default();
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        let app = public.router_with_flow(flow, storage.clone());
+        let cookie = answer_session_cookie(&public, storage.as_ref(), ANSWER_VIEWER);
+
+        let logs = FeedTestLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(logs.clone())
+            .finish();
+        let capture = tracing::subscriber::set_default(subscriber);
+        let response = post_like(&app, &cookie, like_form_body(&post.uri), true).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_response(response).await;
+        assert_eq!(body, json!({"liked": true, "likeCount": 1}));
+
+        let like_uri = format!("at://{ANSWER_VIEWER}/app.bsky.feed.like/answer-like-r1");
+        assert!(
+            wait_until(
+                || storage
+                    .inner
+                    .record_by_uri("app.bsky.feed.like", &like_uri)
+                    .unwrap()
+                    .is_some(),
+                Duration::from_secs(5)
+            )
+            .await,
+            "the like must be indexed after the lock clears"
+        );
+        let output = wait_for_log(&logs, "attempt=2", Duration::from_secs(1)).await;
+        drop(capture);
+        let retries: Vec<&str> = output
+            .lines()
+            .filter(|line| line.contains("web index write") && line.contains("database is locked"))
+            .collect();
+        assert!(
+            retries.len() >= 2,
+            "both lock failures must be logged as retries: {output}"
+        );
+    }
 }
 
 #[cfg(not(unix))]
