@@ -86,7 +86,7 @@ use std::{
     sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     thread::JoinHandle,
 };
@@ -5866,6 +5866,21 @@ async fn with_web_page_phase_detail<F: Future>(detail: WebPagePhaseDetail, futur
 
 tokio::task_local! {
     static WEB_WRITE_FAILURE: Arc<Mutex<Option<String>>>;
+    static WEB_INDEX_WRITE: Arc<AtomicU8>;
+}
+
+const INDEX_WRITE_UNSET: u8 = 0;
+const INDEX_WRITE_QUEUED: u8 = 1;
+const INDEX_WRITE_DONE: u8 = 2;
+const INDEX_WRITE_FAILED: u8 = 3;
+
+fn index_write_label(value: u8) -> &'static str {
+    match value {
+        INDEX_WRITE_QUEUED => "queued",
+        INDEX_WRITE_DONE => "done",
+        INDEX_WRITE_FAILED => "failed",
+        _ => "sync",
+    }
 }
 
 async fn with_web_write_failure<F: Future>(
@@ -5873,6 +5888,18 @@ async fn with_web_write_failure<F: Future>(
     future: F,
 ) -> F::Output {
     WEB_WRITE_FAILURE.scope(slot, future).await
+}
+
+async fn with_web_index_write<F: Future>(slot: Arc<AtomicU8>, future: F) -> F::Output {
+    WEB_INDEX_WRITE.scope(slot, future).await
+}
+
+/// The `index_write` slot of the request being served, or a detached one when a
+/// handler runs outside the timing middleware (tests calling handlers directly).
+fn index_write_outcome_slot() -> Arc<AtomicU8> {
+    WEB_INDEX_WRITE
+        .try_with(Clone::clone)
+        .unwrap_or_else(|_| Arc::new(AtomicU8::new(INDEX_WRITE_UNSET)))
 }
 
 /// Keep the first failed write's real error text so the `web write` minute line can carry it.
@@ -6007,6 +6034,7 @@ async fn account_web_outbound_calls<F: OAuthFlow, S: Storage + 'static>(
     let page_phases = WebPagePhaseDetail::default();
     let write_failure = Arc::new(Mutex::new(None::<String>));
     let dead_session = Arc::new(Mutex::new(None::<String>));
+    let index_write = Arc::new(AtomicU8::new(INDEX_WRITE_UNSET));
     let response = with_request_outbound_accounting(
         accounting.clone(),
         with_web_page_phase_detail(
@@ -6015,7 +6043,10 @@ async fn account_web_outbound_calls<F: OAuthFlow, S: Storage + 'static>(
                 timing_id.clone(),
                 with_web_write_failure(
                     write_failure.clone(),
-                    OAUTH_SESSION_DEAD_DID.scope(dead_session, next.run(request)),
+                    with_web_index_write(
+                        index_write.clone(),
+                        OAUTH_SESSION_DEAD_DID.scope(dead_session, next.run(request)),
+                    ),
                 ),
             ),
         ),
@@ -6059,6 +6090,7 @@ async fn account_web_outbound_calls<F: OAuthFlow, S: Storage + 'static>(
         tracing::info!(
             route,
             total_ms = started.elapsed().as_millis() as u64,
+            index_write = index_write_label(index_write.load(Ordering::Relaxed)),
             outbound_call_count = calls.total_calls,
             outbound_call_ms = calls.total_ms,
             dpop_nonce_retries = calls.dpop_nonce_retries,
@@ -13736,30 +13768,38 @@ where
     }
 }
 
+fn record_index_rkey(did: &str, collection: &str, uri: &str) -> Result<String, String> {
+    let prefix = format!("at://{did}/{collection}/");
+    uri.strip_prefix(&prefix)
+        .filter(|rkey| !rkey.is_empty() && !rkey.contains('/'))
+        .map(str::to_owned)
+        .ok_or_else(|| format!("PDS record URI {uri} is outside the expected at://{did}/{collection}/ prefix"))
+}
+
+fn indexed_created_record(
+    did: &str,
+    collection: &str,
+    created: &PdsCreatedRecord,
+) -> Result<IndexedRecord, String> {
+    let rkey = record_index_rkey(did, collection, &created.uri)?;
+    Ok(IndexedRecord {
+        did: did.to_owned(),
+        collection: collection.to_owned(),
+        rkey,
+        uri: created.uri.clone(),
+        cid: Some(created.cid.clone()),
+        time_us: created.time_us,
+        record: created.record.clone(),
+    })
+}
+
 async fn persist_created_record<S: Storage + 'static>(
     storage: Arc<S>,
     did: &str,
     collection: &str,
     created: PdsCreatedRecord,
 ) -> Result<(), String> {
-    let prefix = format!("at://{did}/{collection}/");
-    let rkey = created
-        .uri
-        .strip_prefix(&prefix)
-        .filter(|rkey| !rkey.is_empty() && !rkey.contains('/'))
-        .ok_or_else(|| {
-            "PDS createRecord returned a URI outside the expected repo/collection".to_owned()
-        })?
-        .to_owned();
-    let record = IndexedRecord {
-        did: did.to_owned(),
-        collection: collection.to_owned(),
-        rkey,
-        uri: created.uri,
-        cid: Some(created.cid),
-        time_us: created.time_us,
-        record: created.record,
-    };
+    let record = indexed_created_record(did, collection, &created)?;
     tokio::task::spawn_blocking(move || storage.put_record(&record))
         .await
         .map_err(|error| format!("index write task failed: {error}"))?
@@ -13772,18 +13812,167 @@ async fn remove_deleted_record<S: Storage + 'static>(
     collection: &str,
     uri: &str,
 ) -> Result<(), String> {
-    let prefix = format!("at://{did}/{collection}/");
-    let rkey = uri
-        .strip_prefix(&prefix)
-        .filter(|rkey| !rkey.is_empty() && !rkey.contains('/'))
-        .ok_or_else(|| "PDS deleteRecord URI is outside the expected repo/collection".to_owned())?
-        .to_owned();
+    let rkey = record_index_rkey(did, collection, uri)?;
     let did = did.to_owned();
     let collection = collection.to_owned();
     tokio::task::spawn_blocking(move || storage.delete_record(&did, &collection, &rkey))
         .await
         .map_err(|error| format!("index delete task failed: {error}"))?
         .map_err(|error| format!("could not remove deleted PDS record: {error}"))
+}
+
+/// One local index write handed to the writer after the PDS already accepted the
+/// record: the response is on its way, so this must never surface to the user.
+#[derive(Clone)]
+enum IndexWrite {
+    Put(Box<IndexedRecord>),
+    Delete {
+        did: String,
+        collection: String,
+        rkey: String,
+    },
+}
+
+impl IndexWrite {
+    fn apply<S: Storage + ?Sized>(&self, storage: &S) -> Result<(), StorageError> {
+        match self {
+            Self::Put(record) => storage.put_record(record),
+            Self::Delete {
+                did,
+                collection,
+                rkey,
+            } => storage.delete_record(did, collection, rkey),
+        }
+    }
+
+    fn target(&self) -> String {
+        match self {
+            Self::Put(record) => record.uri.clone(),
+            Self::Delete {
+                did,
+                collection,
+                rkey,
+            } => format!("at://{did}/{collection}/{rkey}"),
+        }
+    }
+}
+
+/// Every local index write the web writes handed off that never landed. Kept
+/// next to the counters a running service already exposes (SQLite writer
+/// minute metrics); each final failure also warns with its real cause.
+static FAILED_INDEX_WRITES: AtomicU64 = AtomicU64::new(0);
+
+/// The single SQLite writer is often seconds behind (live 2026-11-01: transaction
+/// max ~5 s, sometimes 20 s; the write connection answers `SQLITE_BUSY` while
+/// another writer transaction runs). A handed-off write retries on lock/busy
+/// with bounded backoff; any other error fails fast and is logged whole.
+const INDEX_WRITE_ATTEMPTS: usize = 8;
+const INDEX_WRITE_FIRST_BACKOFF: Duration = Duration::from_millis(100);
+const INDEX_WRITE_MAX_BACKOFF: Duration = Duration::from_secs(1);
+
+fn sqlite_lock_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("database is locked")
+        || lower.contains("database is busy")
+        || lower.contains("database table is locked")
+}
+
+fn count_failed_index_write(route: &str, target: &str, attempts: usize, error: &str) -> u64 {
+    let total = FAILED_INDEX_WRITES.fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::warn!(
+        route,
+        uri = %target,
+        attempts,
+        error,
+        failed_index_writes = total,
+        "web index write failed"
+    );
+    total
+}
+
+/// Runs one `put_record`/`delete_record` after the response has gone out, with a
+/// bounded retry on a lock/busy error. `outcome` carries queued/done/failed for
+/// the `web write` line and for tests; the final failure is warned with the
+/// real error text and counted, never shown to the user.
+fn hand_off_index_write<S: Storage + 'static>(
+    storage: Arc<S>,
+    write: IndexWrite,
+    route: &'static str,
+    outcome: Arc<AtomicU8>,
+) {
+    outcome.store(INDEX_WRITE_QUEUED, Ordering::Relaxed);
+    tokio::spawn(async move {
+        let mut backoff = INDEX_WRITE_FIRST_BACKOFF;
+        for attempt in 1..=INDEX_WRITE_ATTEMPTS {
+            let attempt_write = write.clone();
+            let attempt_storage = storage.clone();
+            let result = tokio::task::spawn_blocking(move || attempt_write.apply(attempt_storage.as_ref()))
+                .await
+                .map_err(|error| format!("index write task failed: {error}"));
+            match result {
+                Ok(Ok(())) => {
+                    outcome.store(INDEX_WRITE_DONE, Ordering::Relaxed);
+                    tracing::info!(
+                        route,
+                        uri = %write.target(),
+                        attempts = attempt,
+                        index_write = "done",
+                        "web index write"
+                    );
+                    return;
+                }
+                Ok(Err(error))
+                    if attempt < INDEX_WRITE_ATTEMPTS && sqlite_lock_error(&error.to_string()) =>
+                {
+                    tracing::warn!(
+                        route,
+                        uri = %write.target(),
+                        attempt,
+                        backoff_ms = backoff.as_millis() as u64,
+                        error = %error,
+                        "web index write retry after SQLite lock"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(INDEX_WRITE_MAX_BACKOFF);
+                }
+                Ok(Err(error)) => {
+                    outcome.store(INDEX_WRITE_FAILED, Ordering::Relaxed);
+                    count_failed_index_write(
+                        route,
+                        &write.target(),
+                        attempt,
+                        &error.to_string(),
+                    );
+                    return;
+                }
+                Err(error) => {
+                    outcome.store(INDEX_WRITE_FAILED, Ordering::Relaxed);
+                    count_failed_index_write(route, &write.target(), attempt, &error);
+                    return;
+                }
+            }
+        }
+        outcome.store(INDEX_WRITE_FAILED, Ordering::Relaxed);
+        count_failed_index_write(
+            route,
+            &write.target(),
+            INDEX_WRITE_ATTEMPTS,
+            "index write still waiting on the SQLite writer after the last attempt",
+        );
+    });
+}
+
+/// A local index hand-off that could not even be queued (a PDS URI outside the
+/// expected repo/collection): the user already got their answer on PDS OK, so
+/// the real error goes to the log and the failure counter, never to the browser.
+fn report_index_hand_off_failure(
+    route: &'static str,
+    target: &str,
+    error: &str,
+    outcome: &Arc<AtomicU8>,
+) {
+    outcome.store(INDEX_WRITE_FAILED, Ordering::Relaxed);
+    count_failed_index_write(route, target, 0, error);
 }
 
 async fn write_like<F, S>(
@@ -13810,10 +13999,14 @@ where
     if !uri.starts_with("at://") || cid.is_empty() {
         return oauth_error(StatusCode::BAD_REQUEST, "uri and cid are invalid");
     }
+    // The count the response reports is the page's count read BEFORE the write,
+    // adjusted by this action: the index row lands in the background, so the
+    // summary can no longer see it when the response goes out.
     if form.get("intent").is_some_and(|intent| intent == "delete") {
         let summary = match state.storage.post_interaction_summary(uri, Some(&did)) {
             Ok(summary) => summary,
             Err(error) => {
+                tracing::warn!(error = %error, "could not read the post summary for the unlike");
                 return web_write_response(
                     &state.public,
                     &headers,
@@ -13832,31 +14025,31 @@ where
             );
         };
         return match state.flow.delete_like(&did, &like_uri).await {
-            Ok(()) => match remove_deleted_record(
-                state.storage.clone(),
-                &did,
-                "app.bsky.feed.like",
-                &like_uri,
-            )
-            .await
-            {
-                Ok(()) => like_response(
+            Ok(()) => {
+                let outcome = index_write_outcome_slot();
+                match record_index_rkey(&did, "app.bsky.feed.like", &like_uri) {
+                    Ok(rkey) => hand_off_index_write(
+                        state.storage.clone(),
+                        IndexWrite::Delete {
+                            did: did.clone(),
+                            collection: "app.bsky.feed.like".to_owned(),
+                            rkey,
+                        },
+                        "like",
+                        outcome,
+                    ),
+                    Err(error) => {
+                        report_index_hand_off_failure("like", &like_uri, &error, &outcome)
+                    }
+                }
+                like_state_response(
                     &headers,
                     &state.public.public_url,
-                    state.storage.as_ref(),
-                    &did,
                     uri,
-                ),
-                Err(error) => web_write_response(
-                    &state.public,
-                    &headers,
-                    "like",
-                    "like",
-                    &did,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &error,
-                ),
-            },
+                    false,
+                    summary.like_count.saturating_sub(1) as u64,
+                )
+            }
             Err(error) => web_write_response(
                 &state.public,
                 &headers,
@@ -13868,28 +14061,31 @@ where
             ),
         };
     }
+    let summary = state
+        .storage
+        .post_interaction_summary(uri, Some(&did))
+        .unwrap_or_default();
     match state.flow.like(&did, uri, cid).await {
         Ok(created) => {
-            match persist_created_record(state.storage.clone(), &did, "app.bsky.feed.like", created)
-                .await
-            {
-                Ok(()) => like_response(
-                    &headers,
-                    &state.public.public_url,
-                    state.storage.as_ref(),
-                    &did,
-                    uri,
-                ),
-                Err(error) => web_write_response(
-                    &state.public,
-                    &headers,
+            let outcome = index_write_outcome_slot();
+            match indexed_created_record(&did, "app.bsky.feed.like", &created) {
+                Ok(record) => hand_off_index_write(
+                    state.storage.clone(),
+                    IndexWrite::Put(Box::new(record)),
                     "like",
-                    "like",
-                    &did,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &error,
+                    outcome,
                 ),
+                Err(error) => {
+                    report_index_hand_off_failure("like", &created.uri, &error, &outcome)
+                }
             }
+            like_state_response(
+                &headers,
+                &state.public.public_url,
+                uri,
+                true,
+                (summary.like_count + 1) as u64,
+            )
         }
         Err(error) => web_write_response(
             &state.public,
@@ -13927,26 +14123,34 @@ where
     if !uri.starts_with("at://") || cid.is_empty() {
         return oauth_error(StatusCode::BAD_REQUEST, "uri and cid are invalid");
     }
+    // Same answer-on-PDS-OK shape as the like: the count is the page's count read
+    // before the write, adjusted here, because the index row lands in the background.
+    let summary = state
+        .storage
+        .post_interaction_summary(uri, Some(&did))
+        .unwrap_or_default();
     match state.flow.repost(&did, uri, cid).await {
-        Ok(created) => match persist_created_record(
-            state.storage.clone(),
-            &did,
-            "app.bsky.feed.repost",
-            created,
-        )
-        .await
-        {
-            Ok(()) => return_to_post(&headers, &state.public.public_url, uri),
-            Err(error) => web_write_response(
-                &state.public,
+        Ok(created) => {
+            let outcome = index_write_outcome_slot();
+            match indexed_created_record(&did, "app.bsky.feed.repost", &created) {
+                Ok(record) => hand_off_index_write(
+                    state.storage.clone(),
+                    IndexWrite::Put(Box::new(record)),
+                    "repost",
+                    outcome,
+                ),
+                Err(error) => {
+                    report_index_hand_off_failure("repost", &created.uri, &error, &outcome)
+                }
+            }
+            repost_state_response(
                 &headers,
-                "repost",
-                "repost",
-                &did,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &error,
-            ),
-        },
+                &state.public.public_url,
+                uri,
+                true,
+                (summary.repost_count + 1) as u64,
+            )
+        }
         Err(error) => web_write_response(
             &state.public,
             &headers,
@@ -14140,23 +14344,42 @@ fn verified_cookie_session<S: Storage>(
 }
 
 /// The like script asks with `x-appview-fetch: 1` and gets the new state as JSON instead of a page.
-fn like_response<S: Storage>(
+/// The state is the one the handler computed from the pre-write page read: the index row lands
+/// in the background, so reading it back here would race with the writer.
+fn like_state_response(
     headers: &HeaderMap,
     public_url: &str,
-    storage: &S,
-    did: &str,
     uri: &str,
+    liked: bool,
+    like_count: u64,
 ) -> Response {
     if headers
         .get("x-appview-fetch")
         .is_some_and(|value| value.as_bytes() == b"1")
     {
-        let summary = storage
-            .post_interaction_summary(uri, Some(did))
-            .unwrap_or_default();
         return Json(json!({
-            "liked": summary.viewer_like.is_some(),
-            "likeCount": summary.like_count,
+            "liked": liked,
+            "likeCount": like_count,
+        }))
+        .into_response();
+    }
+    return_to_post(headers, public_url, uri)
+}
+
+fn repost_state_response(
+    headers: &HeaderMap,
+    public_url: &str,
+    uri: &str,
+    reposted: bool,
+    repost_count: u64,
+) -> Response {
+    if headers
+        .get("x-appview-fetch")
+        .is_some_and(|value| value.as_bytes() == b"1")
+    {
+        return Json(json!({
+            "reposted": reposted,
+            "repostCount": repost_count,
         }))
         .into_response();
     }

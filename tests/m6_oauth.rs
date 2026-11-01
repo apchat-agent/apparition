@@ -35,6 +35,44 @@ const EXPECTED_LIKE_ONLY_SCOPE: &str = "atproto rpc:app.bsky.actor.getPreference
 const EXPECTED_ALL_BOXES_SCOPE: &str = "atproto rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* rpc:app.bsky.graph.getMutes?aud=* rpc:app.bsky.feed.searchPosts?aud=* repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete repo:app.bsky.feed.post?action=create blob:image/* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.actor.putPreferences?aud=did:web:api.bsky.app%23bsky_appview";
 const EXPECTED_OAUTH_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.graph.getMutes?aud=* rpc:app.bsky.feed.searchPosts?aud=* rpc:app.bsky.actor.putPreferences?aud=did:web:api.bsky.app%23bsky_appview";
 
+/// Web writes answer on PDS OK and index in the background: a test that reads the
+/// index back must wait for the handed-off write to land instead of asserting at
+/// once (the writer barrier only covers what is already queued).
+async fn wait_until(mut check: impl FnMut() -> bool, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if check() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn wait_for_indexed<S: Storage>(
+    storage: &S,
+    collection: &str,
+    uri: &str,
+    present: bool,
+) {
+    let found = wait_until(
+        || storage
+            .record_by_uri(collection, uri)
+            .unwrap()
+            .is_some()
+            == present,
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        found,
+        "{uri} should {}be indexed in {collection}",
+        if present { "" } else { "not " }
+    );
+}
+
 #[derive(Clone)]
 struct ProfileHydrationTiming(Arc<Mutex<Option<u64>>>);
 
@@ -3818,7 +3856,8 @@ async fn logged_in_write_forms_use_the_account_oauth_flow() {
     let public = OAuthPublic::new("https://appview.example").unwrap();
     let flow = FakeOAuthFlow::default();
     let actions = flow.actions.clone();
-    let app = public.router_with_flow(flow, Arc::new(MemoryStorage::default()));
+    let storage = Arc::new(MemoryStorage::default());
+    let app = public.router_with_flow(flow, storage.clone());
     let login_cookie = prelogin_cookie(&app).await;
     let callback = app
         .clone()
@@ -3886,6 +3925,16 @@ async fn logged_in_write_forms_use_the_account_oauth_flow() {
         ]
     );
 
+    // The like answered on PDS OK; its index row lands in the background. Let it
+    // land before the toggle below reads the index for its state.
+    wait_for_indexed(
+        storage.as_ref(),
+        "app.bsky.feed.like",
+        "at://did:plc:alice/app.bsky.feed.like/pds-like-r1",
+        true,
+    )
+    .await;
+
     // The like script (static/app.js) sends x-appview-fetch: 1 and gets the new state as JSON, so a like toggles
     // in place: unlike the post liked above, then like it again.
     for (body, liked, count) in [
@@ -3925,6 +3974,13 @@ async fn logged_in_write_forms_use_the_account_oauth_flow() {
             serde_json::json!({"liked": liked, "likeCount": count}),
             "{body}"
         );
+        wait_for_indexed(
+            storage.as_ref(),
+            "app.bsky.feed.like",
+            "at://did:plc:alice/app.bsky.feed.like/pds-like-r1",
+            liked,
+        )
+        .await;
     }
 }
 
@@ -3981,6 +4037,16 @@ async fn successful_pds_writes_are_indexed_and_jetstream_replays_are_idempotent(
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SEE_OTHER, "{path}");
+    }
+    for (collection, uri) in [
+        ("app.bsky.feed.post", "at://did:plc:alice/app.bsky.feed.post/pds-post-r1"),
+        ("app.bsky.feed.like", "at://did:plc:alice/app.bsky.feed.like/pds-like-r1"),
+        (
+            "app.bsky.feed.repost",
+            "at://did:plc:alice/app.bsky.feed.repost/pds-repost-r1",
+        ),
+    ] {
+        wait_for_indexed(storage.as_ref(), collection, uri, true).await;
     }
 
     let records = storage.records().unwrap();
@@ -4049,12 +4115,7 @@ async fn successful_pds_writes_are_indexed_and_jetstream_replays_are_idempotent(
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
-    assert!(
-        storage
-            .record_by_uri("app.bsky.feed.like", &own_like.uri)
-            .unwrap()
-            .is_none()
-    );
+    wait_for_indexed(storage.as_ref(), "app.bsky.feed.like", &own_like.uri, false).await;
     assert_eq!(storage.notification_count("did:plc:alice").unwrap(), 1);
 }
 
