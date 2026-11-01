@@ -2256,3 +2256,96 @@ Deno.test("the timing console button opens the page waterfall only after being t
     failing.restore();
   }
 });
+
+Deno.test("the timing console shows count phases without an ms suffix", async () => {
+  // Live footer 2026-11-01: "parent_rounds 3 ms" — the waterfall renders every
+  // phase field with an ms suffix, but parent_rounds/parent_rows/
+  // parent_local_pending (and the other count fields the server reports) are
+  // counts, not durations.
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  const start = source.indexOf("function installTimingConsole");
+  assert(start >= 0, "app.js must define installTimingConsole");
+  const call = source.indexOf("installTimingConsole();", start);
+  assert(call > start, "app.js must install the timing console on load");
+  const installTimingConsole = new Function(`${source.slice(start, call)}; return installTimingConsole;`)();
+
+  class Element {
+    constructor(tag) {
+      this.tagName = tag;
+      this.className = "";
+      this.textContent = "";
+      this.hidden = false;
+      this.attributes = new Map();
+      this.children = [];
+      this.listeners = new Map();
+    }
+    setAttribute(name, value) { this.attributes.set(name, String(value)); }
+    getAttribute(name) { return this.attributes.get(name) ?? null; }
+    append(...nodes) { this.children.push(...nodes); }
+    replaceChildren(...nodes) { this.children = [...nodes]; }
+    addEventListener(name, listener) { this.listeners.set(name, listener); }
+  }
+  const findAllByClass = (node, className) => {
+    const found = [];
+    if (node.className === className) found.push(node);
+    for (const child of node.children) found.push(...findAllByClass(child, className));
+    return found;
+  };
+  const pageRecord = {
+    id: "cnt1", viewer: "did:plc:owner", method: "GET", path: "/app", status: 200,
+    started_at_ms: 1780000000000, total_ms: 120, page: "app",
+    phases: {
+      render_ms: 20,
+      parent_rounds: 3,
+      parent_rows: 12,
+      parent_local_pending: 1,
+      list_blocked_posts: 2,
+      relationship_requests: 4,
+      ancestors_live: 5,
+    },
+    calls: [],
+    calls_overflow: 0,
+  };
+  const body = new Element("body");
+  body.setAttribute("data-timing-id", "cnt1");
+  const documentMock = {
+    body,
+    createElement: (tag) => new Element(tag),
+    querySelector: (selector) => (selector === 'form[action="/logout"]' ? new Element("form") : null),
+  };
+  const windowMock = { performance: { getEntriesByType: () => [] } };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ records: [pageRecord] }) });
+  try {
+    installTimingConsole(documentMock, windowMock, new Map());
+    const button = findAllByClass(body, "timing-console-button")[0];
+    button.listeners.get("click")();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const panel = findAllByClass(body, "timing-console-panel")[0];
+    const rows = findAllByClass(panel, "timing-console-phase");
+    const texts = rows.map((row) => row.textContent);
+    assert(texts.includes("render_ms 20 ms"), `durations keep the ms suffix: ${JSON.stringify(texts)}`);
+    for (const count of [
+      "parent_rounds 3",
+      "parent_rows 12",
+      "parent_local_pending 1",
+      "list_blocked_posts 2",
+      "relationship_requests 4",
+      "ancestors_live 5",
+    ]) {
+      assert(texts.includes(count), `the count phase must render without a unit: ${JSON.stringify(texts)}`);
+    }
+    assert(
+      !texts.some((text) => /(parent_rounds|parent_rows|parent_local_pending|list_blocked_posts|relationship_requests|ancestors_live) \d+ ms/.test(text)),
+      `no count may carry an ms suffix: ${JSON.stringify(texts)}`,
+    );
+    const countRow = rows.find((row) => row.textContent === "parent_rows 12");
+    assert(countRow && countRow.children.length === 0,
+      "a count row carries no duration bar; bars belong to durations only");
+    const durationRow = rows.find((row) => row.textContent === "render_ms 20 ms");
+    assert(durationRow && durationRow.children.length === 1,
+      "the duration row keeps its bar");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
