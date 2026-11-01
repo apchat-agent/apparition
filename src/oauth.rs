@@ -24753,6 +24753,7 @@ mod tests {
             .with_writer(logs.clone())
             .finish();
         let capture = tracing::subscriber::set_default(subscriber);
+        let failed_before = FAILED_INDEX_WRITES.load(Ordering::Relaxed);
         let response = post_like(&app, &cookie, like_form_body(&post.uri), true).await;
         assert_eq!(
             response.status(),
@@ -24775,6 +24776,10 @@ mod tests {
         assert!(
             failed_line.contains("failed_index_writes="),
             "the final failure must be counted: {failed_line}"
+        );
+        assert!(
+            FAILED_INDEX_WRITES.load(Ordering::Relaxed) > failed_before,
+            "the process-wide failed index write counter must grow"
         );
     }
 
@@ -24918,6 +24923,115 @@ mod tests {
         );
         drop(storage);
         remove_held_writer_database(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unlike_while_the_like_write_is_retrying_leaves_no_index_row() {
+        // The like's index write is backing off on "database is locked" when the unlike's
+        // delete lands: the retrying put must not come back afterwards and re-add the row
+        // the user just removed.
+        let storage = Arc::new(FlakyPutStorage {
+            inner: MemoryStorage::default(),
+            lock_failures: AtomicUsize::new(3),
+        });
+        let post = test_web_post(
+            "did:plc:retry-author",
+            "retrying",
+            7,
+            "liked while the writer was locked",
+            None,
+        );
+        storage.inner.put_record(&post).unwrap();
+        storage.lock_failures.store(3, Ordering::SeqCst);
+        let flow = AnswerFlow::default();
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        let app = public.router_with_flow(flow, storage.clone());
+        let cookie = answer_session_cookie(&public, storage.as_ref(), ANSWER_VIEWER);
+
+        let like = post_like(&app, &cookie, like_form_body(&post.uri), true).await;
+        assert_eq!(like.status(), StatusCode::OK);
+        drop(json_response(like).await);
+        let unlike = post_like(
+            &app,
+            &cookie,
+            format!("{}&intent=delete", like_form_body(&post.uri)),
+            true,
+        )
+        .await;
+        assert_eq!(unlike.status(), StatusCode::OK);
+        // Past the whole retry window for 3 lock failures (100 + 200 + 400 ms of
+        // backoff) with room for the attempt that would land; a cancelled put stops
+        // early and never uses them up, so wait on the clock, not on the counter.
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        assert!(
+            storage
+                .inner
+                .records_for_actor_collection(ANSWER_VIEWER, "app.bsky.feed.like", 10)
+                .unwrap()
+                .is_empty(),
+            "a put retrying behind the lock must not re-add a like the user removed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_landed_like_skips_the_pds_on_a_repeat_click_and_unlike_counts_down() {
+        let storage = Arc::new(FlakyPutStorage {
+            inner: MemoryStorage::default(),
+            lock_failures: AtomicUsize::new(0),
+        });
+        let post = test_web_post(
+            "did:plc:landed-author",
+            "landed",
+            7,
+            "liked once, clicked again",
+            None,
+        );
+        storage.inner.put_record(&post).unwrap();
+        let flow = AnswerFlow::default();
+        let flow_state = flow.state.clone();
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        let app = public.router_with_flow(flow, storage.clone());
+        let cookie = answer_session_cookie(&public, storage.as_ref(), ANSWER_VIEWER);
+
+        let like = post_like(&app, &cookie, like_form_body(&post.uri), true).await;
+        assert_eq!(
+            json_response(like).await,
+            json!({"liked": true, "likeCount": 1})
+        );
+        assert!(
+            wait_until(
+                || storage
+                    .inner
+                    .records_for_actor_collection(ANSWER_VIEWER, "app.bsky.feed.like", 10)
+                    .is_ok_and(|records| records.len() == 1),
+                Duration::from_secs(5)
+            )
+            .await,
+            "the like row landed"
+        );
+        // A stale page still shows the like button: the index already holds this like.
+        let again = post_like(&app, &cookie, like_form_body(&post.uri), true).await;
+        assert_eq!(
+            json_response(again).await,
+            json!({"liked": true, "likeCount": 1})
+        );
+        assert_eq!(
+            flow_state.lock().unwrap().like_calls,
+            1,
+            "a like the index already holds must not reach the PDS again"
+        );
+        let unlike = post_like(
+            &app,
+            &cookie,
+            format!("{}&intent=delete", like_form_body(&post.uri)),
+            true,
+        )
+        .await;
+        assert_eq!(
+            json_response(unlike).await,
+            json!({"liked": false, "likeCount": 0}),
+            "the unlike answers the indexed count minus this like"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
