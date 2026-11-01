@@ -10409,6 +10409,16 @@ where
     } else {
         posts
     };
+    // Step 4: while the recent-posts job is queued or running and the page has
+    // few/no posts, say so; the next load shows the fetched posts. No new
+    // client-side code: the note rides the same page the fetch lands behind.
+    let posts = if recent_posts_visit.show_loading_note {
+        format!(
+            "<li class=\"recent-posts-loading\">Loading recent posts…</li>{posts}"
+        )
+    } else {
+        posts
+    };
     let older = if has_more {
         records
             .last()
