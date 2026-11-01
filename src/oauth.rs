@@ -25813,16 +25813,20 @@ mod tests {
                 );
                 assert!(metric(line, timer) >= 0, "{line}");
             }
-            for counter in ["render_profile_lookups", "render_profile_count_queries"] {
-                assert!(
-                    line.contains(&format!("{counter}=")),
-                    "the phases line must carry the render counter {counter}: {line}"
-                );
-                assert!(
-                    metric(line, counter) > 0,
-                    "a page of 30 posts must report nonzero {counter}: {line}"
-                );
-            }
+            assert!(
+                line.contains("render_profile_lookups=")
+                    && line.contains("render_profile_count_queries="),
+                "the phases line must carry both render counters: {line}"
+            );
+            assert!(
+                metric(line, "render_profile_lookups") > 0,
+                "a page of 30 posts must report nonzero identity lookups: {line}"
+            );
+            assert_eq!(
+                metric(line, "render_profile_count_queries"),
+                0,
+                "no card render may run a profile COUNT query: {line}"
+            );
             assert!(
                 !line.contains("render_profile_lookups_ms")
                     && !line.contains("render_profile_count_queries_ms"),
@@ -25837,12 +25841,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rendering_the_seed_page_asks_the_database_for_one_profile_counts_statement_per_identity()
-     {
-        // Before-numbers for the report: the same 30-post page (10 distinct
-        // authors, 3 reply parent cards with 2 parent authors) plus the
-        // viewer's own shell lookup. Every identity lookup runs its own
-        // profile_counts SELECT today.
+    async fn rendering_the_seed_page_runs_no_profile_counts_statements() {
+        // The before-numbers lived here at commit 030a3c4: one profile_counts
+        // statement per identity lookup (home/feed 34 = 30 post cards + 3
+        // parent cards + viewer; thread 3; profile 5). After the card lookup
+        // stopped asking for counts, a render must not run any. The profile
+        // page still asks once, for its own subject outside the render
+        // window, because the page header shows the counts.
         let path = render_phase_page_path("statements");
         remove_render_phase_database(&path);
         let storage = Arc::new(crate::ingest::SqliteStorage::open(&path).unwrap());
@@ -25884,11 +25889,7 @@ mod tests {
             counts.push(trace.count_containing(crate::ingest::StatementTrace::PROFILE_COUNTS_SQL));
         }
         eprintln!("profile_counts statements per page: {counts:?}");
-        // home/feed: 30 post cards + 3 reply parent cards + the viewer shell
-        // lookup. thread: focus author + ancestor author + viewer. profile:
-        // the subject's own full view (outside the render window) + its 3
-        // posts + the viewer. One statement per identity lookup, no sharing.
-        assert_eq!(counts, vec![34, 34, 3, 5], "pages: {paths:?}");
+        assert_eq!(counts, vec![0, 0, 0, 1], "pages: {paths:?}");
         drop(app);
         let storage = Arc::into_inner(storage).expect("the router was the last storage handle");
         storage.writer_barrier().unwrap();
