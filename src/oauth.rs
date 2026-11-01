@@ -1885,6 +1885,25 @@ fn take_dead_oauth_session() -> Option<String> {
         .unwrap_or(None)
 }
 
+/// Test seam for `expire_stored_session` (see there): while armed, every recovery expiry
+/// after the first reads the stored session, waits, and only then writes it back. That is
+/// the interleaving the production log shows when several page-load requests recover from
+/// `invalid_token` at once: one request's refresh commit lands between another request's
+/// expiry read and its write-back, so the write-back resurrects the rotated refresh token.
+/// Armed only by `concurrent_page_load_refreshes_the_refresh_token_only_once`.
+#[cfg(test)]
+static OAUTH_EXPIRE_STORM_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static OAUTH_EXPIRE_STORM_EXPIRATIONS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+async fn oauth_expire_storm_pause() {
+    let pause_ms = OAUTH_EXPIRE_STORM_PAUSE_MS.load(Ordering::Relaxed);
+    if pause_ms > 0 && OAUTH_EXPIRE_STORM_EXPIRATIONS.fetch_add(1, Ordering::Relaxed) > 0 {
+        tokio::time::sleep(Duration::from_millis(pause_ms)).await;
+    }
+}
+
 /// The user's Bluesky sign-in is dead: clear this app's cookie, send them to sign in again,
 /// and tell fetch callers with 401 SessionExpired instead of a redirect they cannot read.
 fn session_expired_response(public: &OAuthPublic, headers: &HeaderMap) -> Response {
@@ -2003,6 +2022,8 @@ impl SharedOAuthSession {
         let Ok(Some(mut session)) = self.store.get(&did).await else {
             return false;
         };
+        #[cfg(test)]
+        oauth_expire_storm_pause().await;
         session.token_set.expires_at = None;
         self.store.set(did, session).await.is_ok()
     }
@@ -26940,6 +26961,427 @@ mod tests {
         let from_full_views = render_page(true);
         assert!(from_card_view.contains("reply-parent-card"));
         assert_eq!(from_card_view, from_full_views);
+    }
+
+    const REFRESH_STORM_DID: &str = "did:plc:refreshstormone";
+    const FAR_FUTURE: &str = "2999-12-31T23:59:59Z";
+
+    /// A fake authorization server and PDS that behaves like Bluesky's: refresh tokens
+    /// rotate on every exchange, and a token presented a second time is a replay that
+    /// revokes the whole token family (every access token and refresh token of the sign-in).
+    #[derive(Default)]
+    struct RotatingAuthServer {
+        /// Account name (carried in the fake token strings) to newest issued token number;
+        /// only the newest access token passes the fake PDS gate.
+        current: HashMap<String, u64>,
+        seen_refresh_tokens: HashSet<String>,
+        grants: usize,
+        grant_refresh_tokens: Vec<String>,
+        replays: usize,
+        family_revoked: bool,
+        token_latency: Duration,
+        slow_latency: Duration,
+        reject_grants: Option<(u16, String)>,
+        subject_by_account: HashMap<String, String>,
+    }
+
+    impl RotatingAuthServer {
+        fn access_token_valid(&self, token: &str) -> bool {
+            let Some(stem) = token.strip_prefix("access-") else {
+                return false;
+            };
+            let Some((account, sequence)) = stem.rsplit_once('-') else {
+                return false;
+            };
+            sequence.parse::<u64>().is_ok_and(|sequence| {
+                self.current.get(account).is_some_and(|issued| *issued == sequence)
+            })
+        }
+    }
+
+    struct RotatingAuthHarness {
+        origin: String,
+        flow: AtriumOAuthFlow<FeedTestIdentity>,
+        store: SqliteOAuthStore,
+        server: Arc<Mutex<RotatingAuthServer>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    fn preferences_xrpc_request() -> XrpcRequest<Value, Value> {
+        XrpcRequest {
+            method: http::Method::GET,
+            nsid: "app.bsky.actor.getPreferences".to_owned(),
+            parameters: Some(json!({})),
+            input: None,
+            encoding: None,
+        }
+    }
+
+    /// One signed request through the real recovery path: restore, send, and observe whether
+    /// anything marked the session dead for this request.
+    async fn storm_page_load(
+        flow: AtriumOAuthFlow<FeedTestIdentity>,
+        did: Did,
+    ) -> (Result<(), String>, Option<String>) {
+        OAUTH_SESSION_DEAD_DID
+            .scope(Arc::new(Mutex::new(None)), async move {
+                let outcome = async {
+                    let session = flow.restored_session(&did).await?;
+                    session
+                        .send_xrpc::<Value, Value, Value, Value>(&preferences_xrpc_request())
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| format!("{error:?}"))
+                }
+                .await;
+                (outcome, take_dead_oauth_session())
+            })
+            .await
+    }
+
+    async fn rotating_auth_harness(accounts: &[(&str, &str)]) -> RotatingAuthHarness {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let origin = format!("http://127.0.0.1:{}", address.port());
+        let server = Arc::new(Mutex::new(RotatingAuthServer {
+            token_latency: Duration::from_millis(80),
+            slow_latency: Duration::from_millis(350),
+            subject_by_account: accounts
+                .iter()
+                .map(|(did, account)| ((*account).to_owned(), (*did).to_owned()))
+                .collect(),
+            ..RotatingAuthServer::default()
+        }));
+        let oauth_metadata = json!({
+            "issuer": origin,
+            "authorization_endpoint": format!("{origin}/authorize"),
+            "token_endpoint": format!("{origin}/token"),
+            "revocation_endpoint": format!("{origin}/revoke"),
+            "scopes_supported": ["atproto"],
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "token_endpoint_auth_methods_supported": ["none", "private_key_jwt"],
+            "token_endpoint_auth_signing_alg_values_supported": ["ES256"],
+            "dpop_signing_alg_values_supported": ["ES256"],
+            "authorization_response_iss_parameter_supported": true,
+        });
+        let protected_resource = json!({
+            "resource": origin,
+            "authorization_servers": [origin],
+            "scopes_supported": ["atproto"],
+        });
+        let metadata_app = {
+            let metadata = oauth_metadata.clone();
+            get(move || {
+                let metadata = metadata.clone();
+                async move { Json(metadata) }
+            })
+        };
+        let resource_app = {
+            let metadata = protected_resource.clone();
+            get(move || {
+                let metadata = metadata.clone();
+                async move { Json(metadata) }
+            })
+        };
+        let token_state = server.clone();
+        let preferences_state = server.clone();
+        let did_origin = origin.clone();
+        let app = Router::new()
+            .route("/.well-known/oauth-authorization-server", metadata_app)
+            .route("/.well-known/oauth-protected-resource", resource_app)
+            .route(
+                "/token",
+                post(move |body: Bytes| {
+                    let state = token_state.clone();
+                    async move { rotating_token_request(state, body).await }
+                }),
+            )
+            .route(
+                "/xrpc/app.bsky.actor.getPreferences",
+                get(move |headers: HeaderMap| {
+                    let state = preferences_state.clone();
+                    async move { rotating_preferences_request(state, headers).await }
+                }),
+            )
+            .route("/{did}", get(move |AxumPath(did): AxumPath<String>| {
+                let origin = did_origin.clone();
+                async move {
+                    if !did.starts_with("did:") {
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
+                    Json(json!({
+                        "id": did,
+                        "alsoKnownAs": [],
+                        "verificationMethod": [],
+                        "service": [{
+                            "id": "#atproto_pds",
+                            "type": "AtprotoPersonalDataServer",
+                            "serviceEndpoint": origin,
+                        }],
+                    }))
+                    .into_response()
+                }
+            }));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let store = SqliteOAuthStore::open(":memory:").unwrap();
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let identity_resolver = Arc::new(IdentityResolver::new(
+            FeedTestIdentity(HashMap::new()),
+            Duration::from_secs(30),
+        ));
+        let flow = AtriumOAuthFlow::new_with_public_appview_base(
+            &public,
+            identity_resolver,
+            store.clone(),
+            &origin,
+            SafeHttpClient::new().with_http_test_hosts(["127.0.0.1".to_owned()]),
+            &format!("{origin}/xrpc/"),
+        )
+        .unwrap();
+        RotatingAuthHarness {
+            origin,
+            flow,
+            store,
+            server,
+            task,
+        }
+    }
+
+    async fn rotating_token_request(
+        state: Arc<Mutex<RotatingAuthServer>>,
+        body: Bytes,
+    ) -> axum::response::Response {
+        let parameters: HashMap<String, String> = url::form_urlencoded::parse(&body)
+            .into_owned()
+            .collect();
+        if parameters.get("grant_type").map(String::as_str) != Some("refresh_token") {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "unsupported_grant_type"})),
+            )
+                .into_response();
+        }
+        let refresh_token = parameters
+            .get("refresh_token")
+            .cloned()
+            .unwrap_or_default();
+        let account = refresh_token
+            .strip_prefix("refresh-")
+            .and_then(|stem| stem.rsplit_once('-'))
+            .map(|(account, _)| account.to_owned());
+        let Some(account) = account else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "invalid_grant", "error_description": "unknown refresh token"})),
+            )
+                .into_response();
+        };
+        let latency = {
+            let state = state.lock().unwrap();
+            if refresh_token.starts_with("refresh-slow") {
+                state.slow_latency
+            } else {
+                state.token_latency
+            }
+        };
+        tokio::time::sleep(latency).await;
+        let mut state = state.lock().unwrap();
+        state.grants += 1;
+        state.grant_refresh_tokens.push(refresh_token.clone());
+        if let Some((status, description)) = state.reject_grants.clone() {
+            return (
+                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST),
+                Json(json!({"error": "invalid_grant", "error_description": description})),
+            )
+                .into_response();
+        }
+        if state.family_revoked {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "invalid_grant",
+                    "error_description": "Invalid refresh token: the token family has been revoked",
+                })),
+            )
+                .into_response();
+        }
+        if !state.seen_refresh_tokens.insert(refresh_token.clone()) {
+            // Rotating refresh tokens mean a token presented twice is a replay; the real
+            // authorization server kills the whole token family in response.
+            state.replays += 1;
+            state.family_revoked = true;
+            state.current.clear();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "invalid_grant",
+                    "error_description": "Refresh token replay detected: the token family has been revoked",
+                })),
+            )
+                .into_response();
+        }
+        let Some(subject) = state.subject_by_account.get(&account).cloned() else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "invalid_grant", "error_description": "unknown subject"})),
+            )
+                .into_response();
+        };
+        let issued = state.current.entry(account.clone()).or_insert(0);
+        *issued += 1;
+        (
+            StatusCode::OK,
+            Json(json!({
+                "access_token": format!("access-{account}-{issued}"),
+                "refresh_token": format!("refresh-{account}-{issued}"),
+                "token_type": "DPoP",
+                "expires_in": 3600,
+                "scope": "atproto",
+                "sub": subject,
+            })),
+        )
+            .into_response()
+    }
+
+    async fn rotating_preferences_request(
+        state: Arc<Mutex<RotatingAuthServer>>,
+        headers: HeaderMap,
+    ) -> axum::response::Response {
+        let authorization = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let token = authorization.trim_start_matches("DPoP ").trim().to_owned();
+        let valid = state.lock().unwrap().access_token_valid(&token);
+        if valid {
+            (StatusCode::OK, Json(json!({"preferences": []}))).into_response()
+        } else {
+            (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, "DPoP error=\"invalid_token\"")],
+                Json(json!({"error": "invalid_token"})),
+            )
+                .into_response()
+        }
+    }
+
+    async fn seed_rotating_session(
+        harness: &RotatingAuthHarness,
+        did: &str,
+        account: &str,
+        expires_at: &str,
+    ) {
+        let subject = did.to_owned();
+        let did: Did = did.parse().unwrap();
+        harness
+            .store
+            .set(
+                did,
+                Session {
+                    dpop_key: create_key().key,
+                    token_set: serde_json::from_value(json!({
+                        "iss": harness.origin,
+                        "sub": subject,
+                        "aud": harness.origin,
+                        "scope": "atproto",
+                        "refresh_token": format!("refresh-{account}-0"),
+                        "access_token": format!("access-{account}-initial"),
+                        "token_type": "DPoP",
+                        "expires_at": expires_at,
+                    }))
+                    .unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Arms `expire_stored_session` so every recovery expiry after the first pauses between
+    /// its read and its write-back, deterministically reproducing the production interleaving.
+    struct ExpireStormPause;
+
+    impl ExpireStormPause {
+        fn after_first(pause: Duration) -> Self {
+            OAUTH_EXPIRE_STORM_EXPIRATIONS.store(0, Ordering::Relaxed);
+            OAUTH_EXPIRE_STORM_PAUSE_MS.store(pause.as_millis() as u64, Ordering::Relaxed);
+            Self
+        }
+    }
+
+    impl Drop for ExpireStormPause {
+        fn drop(&mut self) {
+            OAUTH_EXPIRE_STORM_PAUSE_MS.store(0, Ordering::Relaxed);
+            OAUTH_EXPIRE_STORM_EXPIRATIONS.store(0, Ordering::Relaxed);
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_page_load_refreshes_the_refresh_token_only_once() {
+        let _storm = ExpireStormPause::after_first(Duration::from_millis(250));
+        let harness = rotating_auth_harness(&[(REFRESH_STORM_DID, "storm")]).await;
+        seed_rotating_session(&harness, REFRESH_STORM_DID, "storm", FAR_FUTURE).await;
+        let did: Did = REFRESH_STORM_DID.parse().unwrap();
+
+        // One page load: four signed requests run the recovery path at the same time.
+        let first_load = tokio::time::timeout(
+            Duration::from_secs(10),
+            futures_util::future::join_all(
+                (0..4).map(|_| storm_page_load(harness.flow.clone(), did.clone())),
+            ),
+        )
+        .await
+        .expect("the concurrent page load finishes");
+        for (outcome, dead) in &first_load {
+            if let Err(error) = outcome {
+                let state = harness.server.lock().unwrap();
+                panic!(
+                    "every request in the storm must succeed: {error}; grants={:?} replays={} family_revoked={}",
+                    state.grant_refresh_tokens,
+                    state.replays,
+                    state.family_revoked
+                );
+            }
+            assert!(dead.is_none(), "no storm request may mark the session dead");
+        }
+        {
+            let state = harness.server.lock().unwrap();
+            assert_eq!(
+                state.grants, 1,
+                "the storm ran {} refresh grants, seen: {:?}",
+                state.grants, state.grant_refresh_tokens
+            );
+        }
+
+        // The next page load (an hour later in production, when the stale access token stops
+        // working): the fake PDS now rejects every access token it ever handed out, so the
+        // requests must recover with a refresh of the CURRENT token chain.
+        harness.server.lock().unwrap().current.clear();
+        let (outcome, dead) = storm_page_load(harness.flow.clone(), did.clone()).await;
+        {
+            let state = harness.server.lock().unwrap();
+            assert!(
+                !state.family_revoked,
+                "the fake authorization server revoked the token family because a refresh \
+                 token was presented twice: grants={:?} replays={}",
+                state.grant_refresh_tokens,
+                state.replays
+            );
+            assert_eq!(
+                state.grants, 2,
+                "the page load after the storm must add exactly one refresh grant, seen: {:?}",
+                state.grant_refresh_tokens
+            );
+        }
+        outcome
+            .expect("the page load after the storm must recover, not send the user to sign in again");
+        assert!(dead.is_none(), "no request may mark the session dead: {dead:?}");
+        let stored = harness.store.get(&did).await.unwrap();
+        assert!(stored.is_some(), "the account session must survive the storm");
+        harness.task.abort();
     }
 }
 
