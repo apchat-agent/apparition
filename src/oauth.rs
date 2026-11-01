@@ -6092,7 +6092,6 @@ async fn account_web_outbound_calls<F: OAuthFlow, S: Storage + 'static>(
         tracing::info!(
             route,
             total_ms = started.elapsed().as_millis() as u64,
-            index_write = index_write_label(index_write.load(Ordering::Relaxed)),
             outbound_call_count = calls.total_calls,
             outbound_call_ms = calls.total_ms,
             dpop_nonce_retries = calls.dpop_nonce_retries,
