@@ -22127,6 +22127,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_recent_posts_fetch_stores_only_the_subjects_own_posts() {
+        let storage = Arc::new(MemoryStorage::default());
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let viewer = "did:plc:recent-posts-forgery-viewer";
+        let subject = "did:plc:recent-posts-forgery";
+        let victim = "did:plc:recent-posts-forgery-victim";
+        // The subject's PDS is not trusted to speak for anyone else: a record
+        // claiming another account must not land in the index as theirs.
+        let mut forged_under_subject_uri = test_web_post(
+            victim,
+            "forged-2",
+            1_800_000_000_000_002,
+            "a forged post under the subject's uri",
+            None,
+        );
+        forged_under_subject_uri.uri = format!("at://{subject}/app.bsky.feed.post/forged-2");
+        let fetched = vec![
+            test_web_post(
+                subject,
+                "own",
+                1_800_000_000_000_000,
+                "the subject's own post",
+                None,
+            ),
+            test_web_post(
+                victim,
+                "forged",
+                1_800_000_000_000_001,
+                "a post forged for the victim",
+                None,
+            ),
+            forged_under_subject_uri,
+        ];
+        let flow = RecentPostsTestFlow::new([(subject.to_owned(), fetched)]);
+        let token = recent_posts_session(&storage, &public, viewer);
+        let app = public.router_with_flow(flow.clone(), storage.clone());
+        let cookie = format!("{SESSION_COOKIE}={token}");
+        let worker = RecentPostsWorker::new(flow.clone(), storage.clone(), Duration::from_secs(30));
+        recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
+        worker.run_once().await.unwrap();
+        assert_eq!(flow.call_count(), 1);
+        assert_eq!(
+            storage.author_posts(subject, None, 10, true).unwrap().len(),
+            1
+        );
+        assert!(
+            storage
+                .author_posts(victim, None, 10, true)
+                .unwrap()
+                .is_empty(),
+            "a record naming another account must be skipped, not indexed under that account"
+        );
+    }
+
+    #[tokio::test]
     async fn a_tracked_profile_queues_no_recent_posts_fetch() {
         let storage = Arc::new(MemoryStorage::default());
         let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
