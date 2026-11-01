@@ -237,6 +237,10 @@ const GONE_POST_CACHE_SECS: u64 = 10 * 60;
 const PUBLIC_PROFILE_REWRITE_AFTER: Duration = Duration::from_secs(6 * 60 * 60);
 const PUBLIC_POST_BATCH_SIZE: usize = 25;
 const PUBLIC_POST_BATCH_CONCURRENCY: usize = 4;
+/// How long one proxied getPosts batch may take before the anonymous public AppView answers it
+/// instead. The viewer's PDS is an extra hop in front of the AppView: a PDS that hangs rather than
+/// fails would otherwise hold the batch to the 8 s page budget and the page would lose its posts.
+const PROXIED_POST_BATCH_TIMEOUT: Duration = Duration::from_millis(2_500);
 const MAX_PUBLIC_POST_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const FEED_GENERATOR_CACHE_PREFIX: &str = "feed-generator:";
 
@@ -1007,7 +1011,18 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
                 let mut pending = batch.clone();
                 let mut proxied = Vec::new();
                 if let Some(proxy) = &proxy {
-                    match proxy.fetch_post_views(&pending).await {
+                    let proxied_result = tokio::time::timeout(
+                        PROXIED_POST_BATCH_TIMEOUT,
+                        proxy.fetch_post_views(&pending),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(format!(
+                            "timed out after {} ms",
+                            PROXIED_POST_BATCH_TIMEOUT.as_millis()
+                        ))
+                    });
+                    match proxied_result {
                         Ok(Some(views)) => {
                             proxied = public_posts_from_views(&views, &pending);
                             let answered = proxied
