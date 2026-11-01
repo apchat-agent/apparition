@@ -6400,7 +6400,12 @@ fn hydrate_page_profiles<S: Storage>(
         }
         if let Some(profile) = profiles.remove(did) {
             if !profile_is_fresh {
-                storage.put_record(&crate::feeds::merged_public_profile(storage, &profile)?)?;
+                // A freshly fetched author profile is a cache warm: the page
+                // renders it through the pending-write overlay, so it must not
+                // queue behind the writer (live 2026-11-01: this wait was the
+                // ~13.3 s profile/quote/labels phases).
+                storage
+                    .queue_record_write(&crate::feeds::merged_public_profile(storage, &profile)?)?;
                 hydration.fetched_live += 1;
             }
         } else if !profile_is_fresh && !profile_is_negative_cached {
@@ -8512,7 +8517,7 @@ fn persist_search_actor_profiles(
                 profile.record = Value::Object(serde_json::Map::new());
             }
             profile.record["description"] = Value::String(description.to_owned());
-            storage.put_record(&profile)?;
+            storage.queue_record_write(&profile)?;
         }
     }
     Ok(())

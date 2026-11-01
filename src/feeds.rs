@@ -356,7 +356,10 @@ pub(crate) fn persist_public_profiles(
         let existing = storage.get_record(&profile.did, "app.bsky.actor.profile", "self")?;
         let merged = merge_public_profile(existing.clone(), &profile);
         if !public_profile_write_is_redundant(existing.as_ref(), &merged) {
-            storage.put_record(&merged)?;
+            // Author profiles persisted from a page are a cache warm for the
+            // NEXT page: the current one renders from the fetched copy (the
+            // storage backends that make this queue also keep it readable).
+            storage.queue_record_write(&merged)?;
         }
         if profile.handle.is_some()
             && storage.verified_handle(&profile.did)?.is_none()

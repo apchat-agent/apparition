@@ -374,6 +374,14 @@ pub trait Storage: Send + Sync {
     }
     fn record_backfill_wait(&self, _waited: Duration) {}
     fn put_record(&self, record: &IndexedRecord) -> Result<(), StorageError>;
+    /// Queues a cache-warm write without waiting for the writer. Page paths
+    /// use it for records they render from their own copy (freshly fetched
+    /// author profiles); storage backends that can keep the queued record
+    /// readable (read-your-writes) accept the write, everything else falls
+    /// back to the acknowledged `put_record`.
+    fn queue_record_write(&self, record: &IndexedRecord) -> Result<(), StorageError> {
+        self.put_record(record)
+    }
     fn apply_jetstream_batch(
         &self,
         updates: &[JetstreamStorageUpdate],
@@ -2518,8 +2526,11 @@ pub struct SqliteStorage {
     profile_index: Arc<RwLock<HashMap<String, ProfileIndexEntry>>>,
     notification_hub: NotificationHub,
     pending_counts_fills: Arc<RwLock<HashSet<String>>>,
+    pending_record_writes: Arc<RwLock<HashMap<PendingRecordKey, IndexedRecord>>>,
     _ephemeral_database: Option<EphemeralDatabase>,
 }
+
+type PendingRecordKey = (String, String, String);
 
 impl Drop for SqliteStorage {
     fn drop(&mut self) {
@@ -3152,6 +3163,7 @@ impl SqliteStorage {
             profile_index: Arc::new(RwLock::new(profile_index)),
             notification_hub: NotificationHub::default(),
             pending_counts_fills: Arc::new(RwLock::new(HashSet::new())),
+            pending_record_writes: Arc::new(RwLock::new(HashMap::new())),
             _ephemeral_database: ephemeral_database,
         })
     }
@@ -3469,6 +3481,13 @@ impl SqliteStorage {
     /// console to observe the fire-and-forget path.
     pub fn pending_post_counts_fills(&self) -> usize {
         self.pending_counts_fills
+            .read()
+            .map(|pending| pending.len())
+            .unwrap_or_default()
+    }
+
+    pub fn pending_queued_record_writes(&self) -> usize {
+        self.pending_record_writes
             .read()
             .map(|pending| pending.len())
             .unwrap_or_default()
@@ -3988,6 +4007,98 @@ impl Storage for SqliteStorage {
         Ok(())
     }
 
+    /// Queues a profile record without waiting for the writer. The record is
+    /// immediately readable through `get_record` from a pending overlay, and
+    /// the overlay entry is dropped when the write runs, so the page can
+    /// render freshly fetched authors while the writer is seconds behind. Only
+    /// profile cache warms take the async path: anything with notification
+    /// edges (or any other collection) goes through the acknowledged
+    /// `put_record`, and a full writer queue simply drops the warm. A key with
+    /// a pending task is never queued twice: the caller updates the pending
+    /// content in place and the queued task writes whatever the overlay holds
+    /// when it runs, so the overlay size is bounded by the writer queue.
+    fn queue_record_write(&self, record: &IndexedRecord) -> Result<(), StorageError> {
+        if record.collection != "app.bsky.actor.profile" || !notification_edges(record).is_empty() {
+            return self.put_record(record);
+        }
+        let key = (
+            record.did.clone(),
+            record.collection.clone(),
+            record.rkey.clone(),
+        );
+        let already_pending = {
+            let mut pending = self
+                .pending_record_writes
+                .write()
+                .map_err(|_| StorageError::Poisoned)?;
+            let already_pending = pending.contains_key(&key);
+            pending.insert(key.clone(), record.clone());
+            already_pending
+        };
+        if already_pending {
+            return Ok(());
+        }
+        let overlay = Arc::clone(&self.pending_record_writes);
+        let overlay_key = key.clone();
+        let index_did = record.did.clone();
+        let index_time_ms = profile_time_ms(record.time_us);
+        let enqueued = self.writer.fire(move |connection| {
+            let Some(pending_record) = overlay
+                .write()
+                .ok()
+                .and_then(|mut pending| pending.remove(&overlay_key))
+            else {
+                return Ok(None);
+            };
+            let record_json = serde_json::to_string(&pending_record.record)?;
+            connection.execute(
+                "INSERT INTO records (did, collection, rkey, uri, cid, time_us, record_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(did, collection, rkey) DO UPDATE SET
+                     uri=excluded.uri, cid=excluded.cid, time_us=excluded.time_us, record_json=excluded.record_json",
+                params![
+                    pending_record.did,
+                    pending_record.collection,
+                    pending_record.rkey,
+                    pending_record.uri,
+                    pending_record.cid,
+                    pending_record.time_us,
+                    record_json
+                ],
+            )?;
+            connection.execute(
+                "INSERT INTO profile_index_status(did,has_profile,fetched_at_ms)
+                 VALUES(?1,?2,?3)
+                 ON CONFLICT(did) DO UPDATE SET
+                     has_profile=excluded.has_profile,fetched_at_ms=excluded.fetched_at_ms",
+                params![index_did, true, index_time_ms],
+            )?;
+            Ok(None)
+        });
+        if !enqueued {
+            self.pending_record_writes
+                .write()
+                .map_err(|_| StorageError::Poisoned)?
+                .remove(&key);
+            tracing::debug!(
+                record_uri = %record.uri,
+                "queue full; dropped a fire-and-forget profile cache write"
+            );
+            return Ok(());
+        }
+        self.profile_index
+            .write()
+            .map_err(|_| StorageError::Poisoned)?
+            .insert(
+                record.did.clone(),
+                ProfileIndexEntry {
+                    has_profile: true,
+                    fetched_at_ms: index_time_ms,
+                },
+            );
+        Ok(())
+    }
+
     fn apply_jetstream_batch(
         &self,
         updates: &[JetstreamStorageUpdate],
@@ -4316,6 +4427,12 @@ impl Storage for SqliteStorage {
         collection: &str,
         rkey: &str,
     ) -> Result<Option<IndexedRecord>, StorageError> {
+        if let Ok(pending) = self.pending_record_writes.read()
+            && let Some(record) =
+                pending.get(&(did.to_owned(), collection.to_owned(), rkey.to_owned()))
+        {
+            return Ok(Some(record.clone()));
+        }
         self.read_conn()?
             .query_row(
                 "SELECT did, collection, rkey, uri, cid, time_us, record_json
@@ -5241,13 +5358,17 @@ impl Storage for SqliteStorage {
     fn delete_web_session(&self, did: &str, session_id: &str) -> Result<(), StorageError> {
         let did = did.to_owned();
         let session_id = session_id.to_owned();
-        self.writer.call(move |connection| {
+        // The caller has already cleared the session cookie, so the page must
+        // not wait on the writer for the row to disappear; the delete lands as
+        // soon as the writer drains.
+        self.writer.fire(move |connection| {
             connection.execute(
                 "DELETE FROM web_sessions WHERE did=?1 AND session_id=?2",
                 params![did, session_id],
             )?;
-            Ok(())
-        })
+            Ok(None)
+        });
+        Ok(())
     }
 
     fn did_by_verified_handle(&self, handle: &str) -> Result<Option<String>, StorageError> {
@@ -5438,14 +5559,17 @@ impl Storage for SqliteStorage {
     fn set_last_active_feed_tab(&self, viewer_did: &str, tab: &str) -> Result<(), StorageError> {
         let key = format!("last-active-feed-tab:{viewer_did}");
         let tab = tab.to_owned();
-        self.writer.call(move |connection| {
+        // A navigation click must not wait on the writer to remember the tab;
+        // the state read falls back to the last tab that landed.
+        self.writer.fire(move |connection| {
             connection.execute(
                 "INSERT INTO appview_state(key,value) VALUES(?1,?2)
                  ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 params![key, tab],
             )?;
-            Ok(())
-        })
+            Ok(None)
+        });
+        Ok(())
     }
 
     fn last_active_feed_tab(&self, viewer_did: &str) -> Result<Option<String>, StorageError> {
@@ -6819,6 +6943,87 @@ mod sqlite_writer_tests {
     }
 
     #[test]
+    fn queued_profile_writes_are_readable_deduped_and_bounded() {
+        let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
+        let profile = |did: &str, name: &str, time_us: u64| IndexedRecord {
+            did: did.to_owned(),
+            collection: "app.bsky.actor.profile".to_owned(),
+            rkey: "self".to_owned(),
+            uri: format!("at://{did}/app.bsky.actor.profile/self"),
+            cid: None,
+            time_us,
+            record: serde_json::json!({"displayName": name}),
+        };
+        let stored_name = |storage: &SqliteStorage, did: &str| {
+            storage
+                .get_record(did, "app.bsky.actor.profile", "self")
+                .unwrap()
+                .and_then(|record| {
+                    record
+                        .record
+                        .get("displayName")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+        };
+        let writer_storage = Arc::clone(&storage);
+        let (started_tx, started_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            writer_storage
+                .writer
+                .call(move |connection| {
+                    started_tx.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(250));
+                    let _ = connection;
+                    Ok(())
+                })
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+
+        storage
+            .queue_record_write(&profile("did:plc:warm", "First", 1))
+            .unwrap();
+        assert_eq!(
+            stored_name(&storage, "did:plc:warm").as_deref(),
+            Some("First"),
+            "a queued profile must be readable before the writer applies it"
+        );
+        storage
+            .queue_record_write(&profile("did:plc:warm", "Second", 2))
+            .unwrap();
+        assert_eq!(
+            storage.pending_queued_record_writes(),
+            1,
+            "a second warm for the same record must update the pending content, not queue twice"
+        );
+        assert_eq!(
+            stored_name(&storage, "did:plc:warm").as_deref(),
+            Some("Second"),
+            "the pending overlay must hold the latest content"
+        );
+
+        for index in 0..(2 * SQLITE_WRITER_QUEUE) {
+            storage
+                .queue_record_write(&profile(&format!("did:plc:many-{index}"), "bounded", 3))
+                .unwrap();
+        }
+        assert!(
+            storage.pending_queued_record_writes() <= SQLITE_WRITER_QUEUE,
+            "pending profile writes exceeded the writer queue bound"
+        );
+
+        holder.join().unwrap();
+        storage.writer_barrier().unwrap();
+        assert_eq!(storage.pending_queued_record_writes(), 0);
+        assert_eq!(
+            stored_name(&storage, "did:plc:warm").as_deref(),
+            Some("Second"),
+            "the queued task must write the latest pending content, not the first"
+        );
+    }
+
+    #[test]
     fn shutdown_flushes_queued_request_writes() {
         let path = test_path("shutdown-flush");
         let storage = SqliteStorage::open(&path).unwrap();
@@ -7094,6 +7299,8 @@ mod remembered_feed_tab_storage_tests {
             sqlite
                 .set_last_active_feed_tab("did:plc:one", "following")
                 .unwrap();
+            // The tab write is fire-and-forget; let the writer catch up first.
+            sqlite.writer_barrier().unwrap();
             assert_eq!(
                 sqlite.last_active_feed_tab("did:plc:one").unwrap(),
                 Some("following".to_owned())
