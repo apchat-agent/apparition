@@ -10932,11 +10932,25 @@ where
     // one call, newest first, continuing from the saved cursor or this page's
     // oldest rkey. Newly stored posts are re-read so they render in THIS page;
     // a failed call logs its real cause and the page still shows local posts.
+    // True once this request has actually knocked on the author PDS's door
+    // (lane av75q round 2): a page whose fetch failed keeps its Older link so
+    // the retry is possible even when the page itself has no post to anchor on.
+    // The fetch itself stays exactly as step 3 gated it: never on page 1.
+    let mut older_fetch_attempted = false;
     if cursor.is_some() && !has_more {
-        let oldest_local_rkey = records.last().and_then(|last| {
-            let prefix = format!("at://{subject}/app.bsky.feed.post/");
-            last.uri.strip_prefix(prefix.as_str()).map(str::to_owned)
-        });
+        let post_prefix = format!("at://{subject}/app.bsky.feed.post/");
+        let oldest_local_rkey = records
+            .last()
+            .and_then(|last| last.uri.strip_prefix(post_prefix.as_str()))
+            .or_else(|| {
+                // A page this request could not fill from the index at all
+                // (the 25-per-fetch walk meeting a 50-post page): the request
+                // cursor's own uri is this account's oldest rendered rkey.
+                cursor
+                    .as_ref()
+                    .and_then(|cursor| cursor.uri.strip_prefix(post_prefix.as_str()))
+            })
+            .map(str::to_owned);
         let older_started = std::time::Instant::now();
         match crate::recent_posts::older_posts_while_scrolling(
             &state.flow,
@@ -10948,10 +10962,12 @@ where
         {
             crate::recent_posts::OlderFetch::Skipped => {}
             crate::recent_posts::OlderFetch::Failed => {
+                older_fetch_attempted = true;
                 page_timing.profile_older_posts = "failed";
                 page_timing.profile_older_posts_ms = older_started.elapsed().as_millis() as u64;
             }
             crate::recent_posts::OlderFetch::Fetched { stored } => {
+                older_fetch_attempted = true;
                 page_timing.profile_older_posts = "ok";
                 page_timing.profile_older_posts_fetched = stored as u64;
                 page_timing.profile_older_posts_ms = older_started.elapsed().as_millis() as u64;
@@ -11132,15 +11148,37 @@ where
     } else {
         posts
     };
-    let older = if has_more {
+    // The Older link leads on whenever the local store has more OR the
+    // account's older-posts history is not exhausted (lane av75q round 2):
+    // a 25-per-fetch PDS page cannot fill a 50-post page, so `has_more` alone
+    // hid the link and the PDS walk never started. The walk ends only when the
+    // PDS returns a page without a cursor or a window-disabled backfill
+    // marked the history complete; an unreadable state keeps the link (and
+    // logs why). The link needs an anchor: the page's last post, or — when a
+    // fetch was attempted and the page came out empty — the request's own
+    // cursor, so a failed fetch can be retried. No anchor, no link.
+    let history_open = has_more
+        || match state.storage.older_posts_state(subject) {
+            Ok(state) => !state.is_some_and(|state| state.exhausted),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    subject = %subject,
+                    "could not read the older-posts state; keeping the Older link on the page"
+                );
+                true
+            }
+        };
+    let older = if history_open {
         records
             .last()
-            .map(|last| {
-                let cursor = RecordCursor {
-                    time_us: last.time_us,
-                    uri: last.uri.clone(),
-                }
-                .encode();
+            .map(|last| RecordCursor {
+                time_us: last.time_us,
+                uri: last.uri.clone(),
+            })
+            .or_else(|| older_fetch_attempted.then(|| cursor.clone()).flatten())
+            .map(|anchor| {
+                let cursor = anchor.encode();
                 let encoded_did =
                     url::form_urlencoded::byte_serialize(subject.as_bytes()).collect::<String>();
                 let encoded_cursor =
@@ -24432,6 +24470,120 @@ mod tests {
             storage.author_posts(subject, None, 50, true).unwrap().len(),
             6,
             "a failed fetch stores nothing: the account still holds exactly its 6 local posts"
+        );
+    }
+
+    // Lane av75q round 2, edge 1: once the walk is over — the PDS answered a
+    // page without a cursor — the last page of a complete history shows no
+    // Older link at all.
+    #[tokio::test]
+    async fn an_exhausted_account_at_page_end_shows_no_older_link() {
+        let storage = Arc::new(MemoryStorage::default());
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let viewer = "did:plc:older-exhausted-link-viewer";
+        let subject = "did:plc:older-exhausted-link-author";
+        let base_us = 1_900_000_000_000_000_u64;
+        storage
+            .put_record(&scroll_posts(subject, "a0", base_us, "scroll local 0"))
+            .unwrap();
+        // A two-post fake PDS: one page, no cursor, history complete.
+        let pds_posts = (0..2)
+            .map(|index| {
+                scroll_posts(
+                    subject,
+                    &format!("r{index:02}"),
+                    base_us - (1 + index) as u64 * 1_000_000_000,
+                    &format!("scroll pds {index:02}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let flow = OlderScrollFlow::new(pds_posts);
+        let token = recent_posts_session(&storage, &public, viewer);
+        let app = public.router_with_flow(flow.clone(), storage.clone());
+        let cookie = format!("{SESSION_COOKIE}={token}");
+        let (status, html) =
+            recent_posts_get(&app, format!("/profile?did={subject}&limit=3"), &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        let older = older_link_href(&html).expect("page 1 offers the Older link");
+        let (status, html) = recent_posts_get(&app, older, &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            html.contains("scroll pds 00") && html.contains("scroll pds 01"),
+            "the last page shows the PDS's final posts"
+        );
+        assert!(
+            older_link_href(&html).is_none(),
+            "an exhausted account at the end of its history shows no Older link"
+        );
+        let state = storage
+            .older_posts_state(subject)
+            .unwrap()
+            .expect("the older-posts state exists");
+        assert!(state.exhausted);
+    }
+
+    // Lane av75q round 2, edge 2: a failed fetch must not end the walk. The
+    // page keeps an Older link so the next scroll retries, and the account's
+    // history stays unexhausted.
+    #[tokio::test]
+    async fn a_failed_older_fetch_keeps_the_link_and_leaves_the_history_open() {
+        let storage = Arc::new(MemoryStorage::default());
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let viewer = "did:plc:older-fail-link-viewer";
+        let subject = "did:plc:older-fail-link-author";
+        let base_us = 1_900_000_000_000_000_u64;
+        for index in 0..3 {
+            storage
+                .put_record(&scroll_posts(
+                    subject,
+                    &format!("a{index}"),
+                    base_us - index as u64 * 1_000_000_000,
+                    &format!("scroll local {index}"),
+                ))
+                .unwrap();
+        }
+        let flow =
+            OlderScrollFlow::failing("author PDS older posts request failed: connect error (fake)");
+        let token = recent_posts_session(&storage, &public, viewer);
+        let app = public.router_with_flow(flow.clone(), storage.clone());
+        let cookie = format!("{SESSION_COOKIE}={token}");
+        let (_status, html) =
+            recent_posts_get(&app, format!("/profile?did={subject}&limit=3"), &cookie).await;
+        let older = older_link_href(&html).expect("the first page has an Older link");
+        let (status, html) = recent_posts_get(&app, older, &cookie).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a failed fetch must not break the page"
+        );
+        assert!(
+            older_link_href(&html).is_some(),
+            "the page where the fetch failed keeps the Older link so the next scroll can retry"
+        );
+        let state = storage.older_posts_state(subject).unwrap();
+        assert!(
+            !state.is_some_and(|state| state.exhausted),
+            "a failed fetch does not mark the history exhausted"
+        );
+        assert_eq!(flow.cursors().len(), 1, "one fetch was attempted");
+        // The retried page has no posts of its own left to anchor on; the
+        // link must still be there and its request must reach the PDS again.
+        let retry = older_link_href(&html).expect("the Older link survives the failure");
+        let (status, html) = recent_posts_get(&app, retry, &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            flow.cursors().len(),
+            2,
+            "the next scroll after a failure tries the author PDS again"
+        );
+        assert!(
+            older_link_href(&html).is_some(),
+            "even a page the failed retry could not fill keeps the Older link"
+        );
+        let state = storage.older_posts_state(subject).unwrap();
+        assert!(
+            !state.is_some_and(|state| state.exhausted),
+            "the history is still open after the retried failure"
         );
     }
 
