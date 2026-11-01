@@ -1,8 +1,8 @@
 use appview_rs::{
     backfill::{AtriumRepoVerifier, HostRateLimiter, HttpRepoSource, RepoBackfiller, RepoVerifier},
     identity::{DidDocument, DidService, VerificationMethod},
-    ingest::{MemoryStorage, Storage},
-};
+        ingest::{IndexedRecord, MemoryStorage, SqliteStorage, Storage},
+    };
 use atrium_api::types::string::Did;
 use atrium_crypto::keypair::{Did as _, P256Keypair};
 use atrium_repo::{
@@ -713,10 +713,10 @@ async fn backfill_worker_backs_off_after_a_failed_repository_fetch() {
 mod windowed_backfill {
     use appview_rs::{
         backfill::{
-            BackfillError, HostRateLimiter, RepoBackfiller, RepoFetcher, RepoRecord, RepoVerifier,
+            BackfillError, HostRateLimiter, RepoBackfiller, RepoFetcher, RepoVerifier, RepoRecord,
             VerifiedRepo,
         },
-        ingest::{MemoryStorage, Storage},
+        ingest::{IndexedRecord, MemoryStorage, SqliteStorage, Storage},
     };
     use serde_json::json;
     use std::{
@@ -808,8 +808,120 @@ mod windowed_backfill {
         }
     }
 
-    fn indexed(storage: &MemoryStorage, collection: &str, rkey: &str) -> bool {
+    fn indexed<S: Storage>(storage: &S, collection: &str, rkey: &str) -> bool {
         storage.get_record(DID, collection, rkey).unwrap().is_some()
+    }
+
+    fn now_us() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as u64
+    }
+
+    fn seeded(
+        collection: &str,
+        rkey: &str,
+        age_days: i64,
+        extra: serde_json::Value,
+    ) -> IndexedRecord {
+        let time_us = now_us() - age_days as u64 * 86_400_000_000;
+        let mut record = json!({
+            "$type": collection,
+            "createdAt": aged_created_at(age_days),
+        });
+        if let (Some(target), Some(source)) = (extra.as_object(), record.as_object_mut()) {
+            for (key, value) in target {
+                source.insert(key.clone(), value.clone());
+            }
+        }
+        IndexedRecord {
+            did: DID.to_owned(),
+            collection: collection.to_owned(),
+            rkey: rkey.to_owned(),
+            uri: format!("at://{DID}/{collection}/{rkey}"),
+            cid: Some(format!("cid-{rkey}")),
+            time_us,
+            record,
+        }
+    }
+
+    #[tokio::test]
+    async fn windowed_backfill_does_not_delete_history_older_than_the_window() {
+        // The bug this reproduces: `replace_repo_snapshot_inner` deletes every
+        // row of the did with time_us <= now before writing the snapshot, so a
+        // re-backfill with a 30-day window wipes 200-day posts that scrolling
+        // (or Jetstream) had already stored.
+        let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
+        let viewer = "did:plc:windowviewer";
+        let subject = format!("at://{viewer}/app.bsky.feed.post/vp1");
+        storage
+            .put_record(&seeded(
+                "app.bsky.feed.post",
+                "old-scroll",
+                200,
+                json!({"text": "stored by scrolling before"}),
+            ))
+            .unwrap();
+        storage
+            .put_record(&seeded(
+                "app.bsky.feed.like",
+                "old-like",
+                200,
+                json!({"subject": {"uri": subject}}),
+            ))
+            .unwrap();
+        storage
+            .put_record(&seeded(
+                "app.bsky.feed.post",
+                "recent-gone",
+                10,
+                json!({"text": "deleted at the source"}),
+            ))
+            .unwrap();
+        storage
+            .put_record(&seeded(
+                "app.bsky.feed.like",
+                "recent-like-gone",
+                10,
+                json!({"subject": {"uri": subject}}),
+            ))
+            .unwrap();
+
+        let backfiller = RepoBackfiller::new(
+            storage.clone(),
+            ScriptedFetcher,
+            ScriptedVerifier(vec![aged_record("app.bsky.feed.post", "p5", 5)]),
+            HostRateLimiter::new(std::time::Duration::ZERO),
+        );
+        let count = backfiller
+            .backfill(DID, "https://pds.example", "did:key:zDnaem-window-test-key")
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+
+        assert!(
+            indexed(storage.as_ref(), "app.bsky.feed.post", "old-scroll"),
+            "a 200-day post stored by scrolling must survive a re-backfill whose snapshot stops at the window"
+        );
+        assert!(
+            indexed(storage.as_ref(), "app.bsky.feed.like", "old-like"),
+            "an old like must survive for the same reason"
+        );
+        assert!(
+            !indexed(storage.as_ref(), "app.bsky.feed.post", "recent-gone"),
+            "a post inside the window that is gone from the new snapshot must still be deleted (as today)"
+        );
+        assert!(
+            !indexed(storage.as_ref(), "app.bsky.feed.like", "recent-like-gone"),
+            "an in-window like gone from the snapshot must still be deleted, with its notification event"
+        );
+        assert!(indexed(storage.as_ref(), "app.bsky.feed.post", "p5"));
+        assert_eq!(
+            storage.notification_count(viewer).unwrap(),
+            1,
+            "the old like's notification event survives; the deleted in-window like's event does not"
+        );
     }
 
     #[tokio::test]
@@ -842,7 +954,7 @@ mod windowed_backfill {
                 ("app.bsky.feed.repost", "r"),
             ] {
                 assert!(
-                    indexed(&storage, collection, &format!("{prefix}{days}")),
+                    indexed(storage.as_ref(), collection, &format!("{prefix}{days}")),
                     "a {days}-day-old {collection} must be indexed inside the window"
                 );
             }
@@ -854,14 +966,14 @@ mod windowed_backfill {
                 ("app.bsky.feed.repost", "r"),
             ] {
                 assert!(
-                    !indexed(&storage, collection, &format!("{prefix}{days}")),
+                    !indexed(storage.as_ref(), collection, &format!("{prefix}{days}")),
                     "a {days}-day-old {collection} must not be indexed outside the window"
                 );
             }
         }
-        assert!(indexed(&storage, "app.bsky.graph.follow", "f400"));
-        assert!(indexed(&storage, "app.bsky.graph.block", "b400"));
-        assert!(indexed(&storage, "app.bsky.actor.profile", "self"));
+        assert!(indexed(storage.as_ref(), "app.bsky.graph.follow", "f400"));
+        assert!(indexed(storage.as_ref(), "app.bsky.graph.block", "b400"));
+        assert!(indexed(storage.as_ref(), "app.bsky.actor.profile", "self"));
 
         let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
         let completed = output
@@ -890,7 +1002,7 @@ mod windowed_backfill {
                 ("app.bsky.feed.repost", "r"),
             ] {
                 assert!(
-                    indexed(&storage, collection, &format!("{prefix}{days}")),
+                    indexed(storage.as_ref(), collection, &format!("{prefix}{days}")),
                     "with no window a {days}-day-old {collection} must be indexed"
                 );
             }
@@ -924,8 +1036,8 @@ mod windowed_backfill {
             .await
             .unwrap();
         assert_eq!(count, 11, "the two undated posts must be kept, not skipped");
-        assert!(indexed(&storage, "app.bsky.feed.post", "nodate"));
-        assert!(indexed(&storage, "app.bsky.feed.post", "baddate"));
+        assert!(indexed(storage.as_ref(), "app.bsky.feed.post", "nodate"));
+        assert!(indexed(storage.as_ref(), "app.bsky.feed.post", "baddate"));
     }
 }
 
