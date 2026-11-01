@@ -27094,7 +27094,9 @@ mod tests {
                 return false;
             };
             sequence.parse::<u64>().is_ok_and(|sequence| {
-                self.current.get(account).is_some_and(|issued| *issued == sequence)
+                self.current
+                    .get(account)
+                    .is_some_and(|issued| *issued == sequence)
             })
         }
     }
@@ -27204,25 +27206,28 @@ mod tests {
                     async move { rotating_preferences_request(state, headers).await }
                 }),
             )
-            .route("/{did}", get(move |AxumPath(did): AxumPath<String>| {
-                let origin = did_origin.clone();
-                async move {
-                    if !did.starts_with("did:") {
-                        return StatusCode::NOT_FOUND.into_response();
+            .route(
+                "/{did}",
+                get(move |AxumPath(did): AxumPath<String>| {
+                    let origin = did_origin.clone();
+                    async move {
+                        if !did.starts_with("did:") {
+                            return StatusCode::NOT_FOUND.into_response();
+                        }
+                        Json(json!({
+                            "id": did,
+                            "alsoKnownAs": [],
+                            "verificationMethod": [],
+                            "service": [{
+                                "id": "#atproto_pds",
+                                "type": "AtprotoPersonalDataServer",
+                                "serviceEndpoint": origin,
+                            }],
+                        }))
+                        .into_response()
                     }
-                    Json(json!({
-                        "id": did,
-                        "alsoKnownAs": [],
-                        "verificationMethod": [],
-                        "service": [{
-                            "id": "#atproto_pds",
-                            "type": "AtprotoPersonalDataServer",
-                            "serviceEndpoint": origin,
-                        }],
-                    }))
-                    .into_response()
-                }
-            }));
+                }),
+            );
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -27254,9 +27259,8 @@ mod tests {
         state: Arc<Mutex<RotatingAuthServer>>,
         body: Bytes,
     ) -> axum::response::Response {
-        let parameters: HashMap<String, String> = url::form_urlencoded::parse(&body)
-            .into_owned()
-            .collect();
+        let parameters: HashMap<String, String> =
+            url::form_urlencoded::parse(&body).into_owned().collect();
         if parameters.get("grant_type").map(String::as_str) != Some("refresh_token") {
             return (
                 StatusCode::BAD_REQUEST,
@@ -27264,10 +27268,7 @@ mod tests {
             )
                 .into_response();
         }
-        let refresh_token = parameters
-            .get("refresh_token")
-            .cloned()
-            .unwrap_or_default();
+        let refresh_token = parameters.get("refresh_token").cloned().unwrap_or_default();
         let account = refresh_token
             .strip_prefix("refresh-")
             .and_then(|stem| stem.rsplit_once('-'))
@@ -27275,7 +27276,9 @@ mod tests {
         let Some(account) = account else {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "invalid_grant", "error_description": "unknown refresh token"})),
+                Json(
+                    json!({"error": "invalid_grant", "error_description": "unknown refresh token"}),
+                ),
             )
                 .into_response();
         };
@@ -27450,9 +27453,7 @@ mod tests {
                 let state = harness.server.lock().unwrap();
                 panic!(
                     "every request in the storm must succeed: {error}; grants={:?} replays={} family_revoked={}",
-                    state.grant_refresh_tokens,
-                    state.replays,
-                    state.family_revoked
+                    state.grant_refresh_tokens, state.replays, state.family_revoked
                 );
             }
             assert!(dead.is_none(), "no storm request may mark the session dead");
@@ -27477,8 +27478,7 @@ mod tests {
                 !state.family_revoked,
                 "the fake authorization server revoked the token family because a refresh \
                  token was presented twice: grants={:?} replays={}",
-                state.grant_refresh_tokens,
-                state.replays
+                state.grant_refresh_tokens, state.replays
             );
             assert_eq!(
                 state.grants, 2,
@@ -27486,11 +27486,18 @@ mod tests {
                 state.grant_refresh_tokens
             );
         }
-        outcome
-            .expect("the page load after the storm must recover, not send the user to sign in again");
-        assert!(dead.is_none(), "no request may mark the session dead: {dead:?}");
+        outcome.expect(
+            "the page load after the storm must recover, not send the user to sign in again",
+        );
+        assert!(
+            dead.is_none(),
+            "no request may mark the session dead: {dead:?}"
+        );
         let stored = harness.store.get(&did).await.unwrap();
-        assert!(stored.is_some(), "the account session must survive the storm");
+        assert!(
+            stored.is_some(),
+            "the account session must survive the storm"
+        );
         harness.task.abort();
     }
 
@@ -27501,10 +27508,8 @@ mod tests {
         let _serial = rotating_auth_serial().lock().await;
         let harness = rotating_auth_harness(&[(REFRESH_STORM_DID, "revoked")]).await;
         seed_rotating_session(&harness, REFRESH_STORM_DID, "revoked", FAR_FUTURE).await;
-        harness.server.lock().unwrap().reject_grants = Some((
-            400,
-            "Refresh token revoked by the account owner".to_owned(),
-        ));
+        harness.server.lock().unwrap().reject_grants =
+            Some((400, "Refresh token revoked by the account owner".to_owned()));
         let did: Did = REFRESH_STORM_DID.parse().unwrap();
 
         let (outcome, dead) = storm_page_load(harness.flow.clone(), did.clone()).await;
@@ -27524,7 +27529,10 @@ mod tests {
                 "the server must see exactly one honest grant, seen: {:?}",
                 state.grant_refresh_tokens
             );
-            assert_eq!(state.replays, 0, "the first presentation was rejected, not replayed");
+            assert_eq!(
+                state.replays, 0,
+                "the first presentation was rejected, not replayed"
+            );
         }
         assert!(
             harness.store.get(&did).await.unwrap().is_none(),
@@ -27566,7 +27574,10 @@ mod tests {
         )
         .await
         .expect("the fast user must not queue behind the slow user's refresh");
-        assert!(fast_outcome.is_ok(), "the fast user must recover: {fast_outcome:?}");
+        assert!(
+            fast_outcome.is_ok(),
+            "the fast user must recover: {fast_outcome:?}"
+        );
         assert!(fast_dead.is_none(), "the fast user must not be marked dead");
         assert!(
             fast_at.elapsed() < Duration::from_millis(300),
@@ -27575,7 +27586,10 @@ mod tests {
         );
 
         let (slow_outcome, slow_dead) = slow.await.unwrap();
-        assert!(slow_outcome.is_ok(), "the slow user must recover too: {slow_outcome:?}");
+        assert!(
+            slow_outcome.is_ok(),
+            "the slow user must recover too: {slow_outcome:?}"
+        );
         assert!(slow_dead.is_none(), "the slow user must not be marked dead");
         {
             let state = harness.server.lock().unwrap();
@@ -27621,7 +27635,10 @@ mod tests {
         .expect("the concurrent page load finishes");
         for (outcome, dead) in &load {
             assert!(outcome.is_ok(), "every request must succeed: {outcome:?}");
-            assert!(dead.is_none(), "no request may mark the session dead: {dead:?}");
+            assert!(
+                dead.is_none(),
+                "no request may mark the session dead: {dead:?}"
+            );
         }
         {
             let state = harness.server.lock().unwrap();
@@ -27634,7 +27651,13 @@ mod tests {
             assert!(!state.family_revoked);
         }
         assert!(
-            harness.store.writer.metrics.refresh_reuses.load(Ordering::Relaxed) >= 1,
+            harness
+                .store
+                .writer
+                .metrics
+                .refresh_reuses
+                .load(Ordering::Relaxed)
+                >= 1,
             "waiters that reused another request's refresh must be counted"
         );
         harness.task.abort();
@@ -27660,7 +27683,10 @@ mod tests {
         .expect("the concurrent page load finishes");
         for (outcome, dead) in &load {
             assert!(outcome.is_ok(), "every request must succeed: {outcome:?}");
-            assert!(dead.is_none(), "no request may mark the session dead: {dead:?}");
+            assert!(
+                dead.is_none(),
+                "no request may mark the session dead: {dead:?}"
+            );
         }
         {
             let state = harness.server.lock().unwrap();
