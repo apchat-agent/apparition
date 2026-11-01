@@ -9094,6 +9094,7 @@ struct WebNotificationGroup {
 }
 
 const NOTIFICATION_GROUP_WINDOW_US: u64 = 48 * 60 * 60 * 1_000_000;
+const NOTIFICATION_GROUP_LEAD_AUTHORS: usize = 5;
 
 fn group_web_notifications(
     notifications: &[IndexedNotification],
@@ -9188,6 +9189,7 @@ fn notification_group_page<'a>(
     (matching.into_iter().take(limit).collect(), has_more)
 }
 
+#[cfg(test)]
 fn notification_group_cursor(group: &WebNotificationGroup) -> NotificationCursor {
     let newest = &group.events[0];
     NotificationCursor {
@@ -9195,6 +9197,151 @@ fn notification_group_cursor(group: &WebNotificationGroup) -> NotificationCursor
         uri: newest.record.uri.clone(),
         reason: newest.reason.clone(),
     }
+}
+
+/// One group as the bounded page read returns it: the newest event carries the
+/// full record (loaded only because the page renders it), the rest of the group
+/// is reduced to a count and at most five leading author dids (the page renders
+/// avatars for the first five and "and N others" for the rest).
+#[derive(Clone, Debug)]
+struct NotificationWindowGroup {
+    reason: String,
+    reason_subject: Option<String>,
+    head: IndexedNotification,
+    #[allow(dead_code)]
+    source_collection: String,
+    author_dids: Vec<String>,
+    size: usize,
+}
+
+impl NotificationWindowGroup {
+    fn cursor(&self) -> NotificationCursor {
+        NotificationCursor {
+            time_us: self.head.record.time_us,
+            uri: self.head.record.uri.clone(),
+            reason: self.head.reason.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct NotificationWindowPage {
+    groups: Vec<NotificationWindowGroup>,
+    has_more: bool,
+    #[allow(dead_code)]
+    events_read: u64,
+    #[allow(dead_code)]
+    records_loaded: u64,
+}
+
+/// Everything a group row renders from, independent of how the group was built:
+/// the full-scan `WebNotificationGroup` and the bounded
+/// `NotificationWindowGroup` both expose it, so the renderer stays shared.
+struct WebNotificationGroupView<'a> {
+    reason: &'a str,
+    reason_subject: Option<&'a str>,
+    head: &'a IndexedNotification,
+    author_dids: Vec<String>,
+    size: usize,
+}
+
+trait NotificationGroupView<'a> {
+    fn notification_group_view(&'a self) -> WebNotificationGroupView<'a>;
+}
+
+impl<'a> NotificationGroupView<'a> for WebNotificationGroup {
+    fn notification_group_view(&'a self) -> WebNotificationGroupView<'a> {
+        WebNotificationGroupView {
+            reason: &self.reason,
+            reason_subject: self.reason_subject.as_deref(),
+            head: self
+                .events
+                .first()
+                .expect("a group always holds its newest event"),
+            author_dids: self
+                .events
+                .iter()
+                .take(NOTIFICATION_GROUP_LEAD_AUTHORS)
+                .map(|event| event.record.did.clone())
+                .collect(),
+            size: self.events.len(),
+        }
+    }
+}
+
+impl NotificationGroupView<'_> for NotificationWindowGroup {
+    fn notification_group_view(&self) -> WebNotificationGroupView<'_> {
+        WebNotificationGroupView {
+            reason: &self.reason,
+            reason_subject: self.reason_subject.as_deref(),
+            head: &self.head,
+            author_dids: self.author_dids.clone(),
+            size: self.size,
+        }
+    }
+}
+
+/// Build one page of notification groups without reading every notification the
+/// viewer ever got. The full-scan reference (`notifications_for` ->
+/// `group_web_notifications` -> `notification_group_page`) stays available for
+/// tests; `reference_notification_page` is exactly what the page used to do.
+///
+/// Red state (lane av72q): this still loads all events, which is the bug the
+/// oracle and the bounded-read tests pin down.
+fn notification_window_page<S: Storage>(
+    storage: &S,
+    viewer_did: &str,
+    before: Option<&NotificationCursor>,
+    limit: usize,
+    last_seen_us: u64,
+) -> Result<NotificationWindowPage, StorageError> {
+    let notices = storage.notifications_for(viewer_did, None, usize::MAX)?;
+    let groups = group_web_notifications(&notices, last_seen_us);
+    let (visible, has_more) = notification_group_page(&groups, before, limit);
+    let groups = visible
+        .iter()
+        .map(|group| NotificationWindowGroup {
+            reason: group.reason.clone(),
+            reason_subject: group.reason_subject.clone(),
+            head: group
+                .events
+                .first()
+                .expect("a group always holds its newest event")
+                .clone(),
+            source_collection: group
+                .events
+                .first()
+                .expect("a group always holds its newest event")
+                .record
+                .collection
+                .clone(),
+            author_dids: group
+                .events
+                .iter()
+                .take(NOTIFICATION_GROUP_LEAD_AUTHORS)
+                .map(|event| event.record.did.clone())
+                .collect(),
+            size: group.events.len(),
+        })
+        .collect();
+    Ok(NotificationWindowPage {
+        groups,
+        has_more,
+        events_read: notices.len() as u64,
+        records_loaded: visible.len() as u64,
+    })
+}
+
+#[cfg(test)]
+fn reference_notification_page(
+    notifications: &[IndexedNotification],
+    last_seen_us: u64,
+    before: Option<&NotificationCursor>,
+    limit: usize,
+) -> (Vec<WebNotificationGroup>, bool) {
+    let groups = group_web_notifications(notifications, last_seen_us);
+    let (visible, has_more) = notification_group_page(&groups, before, limit);
+    (visible.into_iter().cloned().collect(), has_more)
 }
 
 fn unread_count_event(count: usize) -> Event {
@@ -9412,28 +9559,32 @@ where
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
     let timeline_started = std::time::Instant::now();
-    let notices = match state.storage.notifications_for(&did, None, usize::MAX) {
-        Ok(notices) => notices,
-        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    let notification_page = match notification_window_page(
+        state.storage.as_ref(),
+        &did,
+        before.as_ref(),
+        limit,
+        last_seen_us,
+    ) {
+        Ok(page) => page,
+        Err(error) => {
+            tracing::warn!(%error, viewer = %did, "notification page read failed");
+            return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+        }
     };
     page_timing.timeline_fetch_index_ms = timeline_started.elapsed().as_millis() as u64;
-    let groups = group_web_notifications(&notices, last_seen_us);
-    let (visible, has_more) = notification_group_page(&groups, before.as_ref(), limit);
-    let notification_records = visible
+    let has_more = notification_page.has_more;
+    let notification_records = notification_page
+        .groups
         .iter()
-        .map(|group| &group.events[0].record)
+        .map(|group| &group.head.record)
         .collect::<Vec<_>>();
-    let mut leading_authors = visible
+    let mut leading_authors = notification_page
+        .groups
         .iter()
-        .flat_map(|group| {
-            group
-                .events
-                .iter()
-                .take(5)
-                .map(|event| event.record.did.clone())
-        })
+        .flat_map(|group| group.author_dids.iter().cloned())
         .collect::<Vec<_>>();
-    for group in &visible {
+    for group in &notification_page.groups {
         if let Some(uri) = group.reason_subject.as_deref()
             && let Ok(Some(post)) = state.storage.record_by_uri("app.bsky.feed.post", uri)
         {
@@ -9484,7 +9635,8 @@ where
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
     let render_started = std::time::Instant::now();
-    let items = visible
+    let items = notification_page
+        .groups
         .iter()
         .map(|group| {
             render_web_notification_group(state.storage.as_ref(), group, &quote_index, &parents)
@@ -9496,8 +9648,8 @@ where
         items
     };
     let older = if has_more {
-        visible.last().map(|group| {
-                let cursor = notification_group_cursor(group).encode();
+        notification_page.groups.last().map(|group| {
+                let cursor = group.cursor().encode();
                 let cursor =
                     url::form_urlencoded::byte_serialize(cursor.as_bytes()).collect::<String>();
                 format!(
@@ -9532,17 +9684,18 @@ where
     response
 }
 
-fn render_web_notification_group<S: Storage>(
+fn render_web_notification_group<'a, S: Storage, G: NotificationGroupView<'a>>(
     storage: &S,
-    group: &WebNotificationGroup,
+    group: &'a G,
     quote_index: &QuoteRenderIndex,
     parents: &PageParentIndex,
 ) -> String {
-    if !matches!(group.reason.as_str(), "like" | "repost" | "follow") {
-        return render_web_notification(storage, &group.events[0], quote_index, parents);
+    let view = group.notification_group_view();
+    if !matches!(view.reason, "like" | "repost" | "follow") {
+        return render_web_notification(storage, view.head, quote_index, parents);
     }
 
-    let newest = &group.events[0];
+    let newest = view.head;
     let author = profile_view_from_storage(storage, &newest.record.did)
         .unwrap_or_else(|_| json!({"did":newest.record.did,"handle":newest.record.did}));
     let handle = profile_handle(&author, &newest.record.did);
@@ -9555,14 +9708,13 @@ fn render_web_notification_group<S: Storage>(
         "/profile?did={}",
         url::form_urlencoded::byte_serialize(newest.record.did.as_bytes()).collect::<String>()
     );
-    let avatars = group
-        .events
+    let avatars = view
+        .author_dids
         .iter()
-        .take(5)
-        .map(|event| {
-            let profile = profile_view_from_storage(storage, &event.record.did)
-                .unwrap_or_else(|_| json!({"did":event.record.did,"handle":event.record.did}));
-            let fill = author_fill(&profile, &event.record.did);
+        .map(|did| {
+            let profile = profile_view_from_storage(storage, did)
+                .unwrap_or_else(|_| json!({"did":did,"handle":did}));
+            let fill = author_fill(&profile, did);
             avatar_markup_with_priority_and_attrs(
                 &profile,
                 "notification-avatar",
@@ -9571,13 +9723,13 @@ fn render_web_notification_group<S: Storage>(
             )
         })
         .collect::<String>();
-    let count = group.events.len().saturating_sub(1);
+    let count = view.size.saturating_sub(1);
     let others = if count == 0 {
         String::new()
     } else {
         format!(" and {count} other{}", if count == 1 { "" } else { "s" })
     };
-    let (icon, action) = match group.reason.as_str() {
+    let (icon, action) = match view.reason {
         "like" => ("like", "liked your post"),
         "repost" => ("repost", "reposted your post"),
         _ => ("follow", "started following you"),
@@ -9587,16 +9739,14 @@ fn render_web_notification_group<S: Storage>(
         &format!("class=\"icon notification-type-icon notification-{icon}-icon\""),
     );
     let age = notification_age(newest.record.time_us);
-    let snippet = if matches!(group.reason.as_str(), "like" | "repost") {
-        group
-            .reason_subject
-            .as_deref()
+    let snippet = if matches!(view.reason, "like" | "repost") {
+        view.reason_subject
             .and_then(|uri| storage.record_by_uri("app.bsky.feed.post", uri).ok().flatten())
             .and_then(|post| {
                 let text = post.record.get("text").and_then(Value::as_str)?;
                 let text = text.chars().take(300).collect::<String>();
                 let target = url::form_urlencoded::byte_serialize(
-                    group.reason_subject.as_deref()?.as_bytes(),
+                    view.reason_subject?.as_bytes(),
                 )
                 .collect::<String>();
                 Some(format!(
@@ -18054,6 +18204,492 @@ mod tests {
             .flat_map(|group| group.events.iter().map(|event| event.record.uri.clone()))
             .collect::<HashSet<_>>();
         assert_eq!(all_uris.len(), 4);
+    }
+
+    fn oracle_case(seed: u64) -> (Vec<IndexedRecord>, u64, usize) {
+        use rand::rngs::StdRng;
+        use rand::{Rng, RngCore, SeedableRng};
+        const HOUR_US: u64 = 3_600_000_000;
+        const ORACLE_VIEWER: &str = "did:plc:oracle-viewer";
+        let mut rng = StdRng::seed_from_u64(seed);
+        let subject_count = 1 + (rng.next_u32() % 3) as usize;
+        let subjects = (0..subject_count)
+            .map(|index| format!("at://{ORACLE_VIEWER}/app.bsky.feed.post/post-{index}"))
+            .collect::<Vec<_>>();
+        let author_count = 2 + (rng.next_u32() % 7) as usize;
+        let authors = (0..author_count)
+            .map(|index| format!("did:plc:oracle-author-{index}"))
+            .collect::<Vec<_>>();
+        let grid_us = (1 + (rng.next_u32() % 3) as u64) * HOUR_US / 20;
+        let mut records = Vec::new();
+        let mut rkey = 0u64;
+        let push = |records: &mut Vec<IndexedRecord>,
+                    rkey: &mut u64,
+                    did: &str,
+                    collection: &str,
+                    time_us: u64,
+                    record: Value| {
+            records.push(IndexedRecord {
+                did: did.to_owned(),
+                collection: collection.to_owned(),
+                rkey: format!("k{rkey}"),
+                uri: format!("at://{did}/{collection}/k{rkey}"),
+                cid: None,
+                time_us,
+                record,
+            });
+            *rkey += 1;
+        };
+        for subject in 0..subject_count {
+            push(
+                &mut records,
+                &mut rkey,
+                ORACLE_VIEWER,
+                "app.bsky.feed.post",
+                1,
+                json!({"text": format!("own post {subject}")}),
+            );
+        }
+        let timed_push = |records: &mut Vec<IndexedRecord>,
+                          rkey: &mut u64,
+                          authors: &[String],
+                          rng: &mut StdRng,
+                          base: u64,
+                          span_steps: u64,
+                          collection: &str,
+                          subject: Option<&String>,
+                          grid_us: u64| {
+            let author = &authors[rng.gen_range(0..authors.len())];
+            let time_us = base + rng.gen_range(0..=span_steps) * grid_us;
+            let record = match collection {
+                "app.bsky.feed.like" | "app.bsky.feed.repost" => {
+                    json!({"subject": {"uri": subject}})
+                }
+                "app.bsky.graph.follow" => json!({"subject": ORACLE_VIEWER}),
+                _ => {
+                    json!({"text": "reply body", "reply": {"parent": {"uri": subject}, "root": {"uri": subject}}})
+                }
+            };
+            push(records, rkey, author, collection, time_us, record);
+        };
+        for subject in &subjects {
+            let base = rng.gen_range(0..400) * HOUR_US;
+            let burst_steps = rng.gen_range(2..=90);
+            let burst_len = rng.gen_range(0..=14);
+            for _ in 0..burst_len {
+                timed_push(
+                    &mut records,
+                    &mut rkey,
+                    &authors,
+                    &mut rng,
+                    base,
+                    burst_steps,
+                    "app.bsky.feed.like",
+                    Some(subject),
+                    grid_us,
+                );
+            }
+            let repost_len = rng.gen_range(0..=5);
+            for _ in 0..repost_len {
+                timed_push(
+                    &mut records,
+                    &mut rkey,
+                    &authors,
+                    &mut rng,
+                    base,
+                    burst_steps,
+                    "app.bsky.feed.repost",
+                    Some(subject),
+                    grid_us,
+                );
+            }
+            let reply_len = rng.gen_range(0..=4);
+            for _ in 0..reply_len {
+                let reply_base = rng.gen_range(0..400);
+                timed_push(
+                    &mut records,
+                    &mut rkey,
+                    &authors,
+                    &mut rng,
+                    reply_base,
+                    380,
+                    "app.bsky.feed.post",
+                    Some(subject),
+                    grid_us,
+                );
+            }
+        }
+        let follow_len = rng.gen_range(0..=10);
+        for _ in 0..follow_len {
+            let follow_base = rng.gen_range(0..400);
+            timed_push(
+                &mut records,
+                &mut rkey,
+                &authors,
+                &mut rng,
+                follow_base,
+                380,
+                "app.bsky.graph.follow",
+                None,
+                grid_us,
+            );
+        }
+        let last_seen_candidates = [
+            0u64,
+            rng.gen_range(0..400) * HOUR_US,
+            rng.gen_range(0..400) * HOUR_US,
+            records
+                .iter()
+                .map(|record| record.time_us)
+                .max()
+                .unwrap_or(0)
+                + 1,
+        ];
+        let last_seen_us = last_seen_candidates[rng.gen_range(0..4) as usize];
+        let limit = 1 + (rng.next_u32() % 3) as usize;
+        (records, last_seen_us, limit)
+    }
+
+    fn oracle_walk<S: Storage>(
+        storage: &S,
+        all: &[IndexedNotification],
+        last_seen_us: u64,
+        limit: usize,
+    ) -> Option<String> {
+        let mut cursor: Option<NotificationCursor> = None;
+        let mut seen = HashMap::<(String, String), usize>::new();
+        let mut page = 0usize;
+        loop {
+            page += 1;
+            if page > all.len() + 2 {
+                return Some(format!(
+                    "walk ran past every event without ending at page {page}"
+                ));
+            }
+            let (reference, reference_has_more) =
+                reference_notification_page(all, last_seen_us, cursor.as_ref(), limit);
+            let bounded = match notification_window_page(
+                storage,
+                "did:plc:oracle-viewer",
+                cursor.as_ref(),
+                limit,
+                last_seen_us,
+            ) {
+                Ok(page) => page,
+                Err(error) => return Some(format!("bounded read failed: {error}")),
+            };
+            if bounded.has_more != reference_has_more {
+                return Some(format!(
+                    "page {page}: has_more {} != reference {reference_has_more}",
+                    bounded.has_more
+                ));
+            }
+            if bounded.groups.len() != reference.len() {
+                return Some(format!(
+                    "page {page}: {} groups != reference {}",
+                    bounded.groups.len(),
+                    reference.len()
+                ));
+            }
+            for (index, (group, reference_group)) in
+                bounded.groups.iter().zip(&reference).enumerate()
+            {
+                let label = format!("page {page} group {index}");
+                if group.reason != reference_group.reason
+                    || group.reason_subject != reference_group.reason_subject
+                {
+                    return Some(format!(
+                        "{label}: key {:?}/{:?} != reference {:?}/{:?}",
+                        group.reason,
+                        group.reason_subject,
+                        reference_group.reason,
+                        reference_group.reason_subject
+                    ));
+                }
+                let newest = reference_group
+                    .events
+                    .first()
+                    .expect("a group always holds its newest event");
+                if group.head != *newest {
+                    return Some(format!(
+                        "{label}: newest {:?} != reference {newest:?}",
+                        group.head
+                    ));
+                }
+                if group.size != reference_group.events.len() {
+                    return Some(format!(
+                        "{label}: size {} != reference {}",
+                        group.size,
+                        reference_group.events.len()
+                    ));
+                }
+                let expected_authors = reference_group
+                    .events
+                    .iter()
+                    .take(5)
+                    .map(|event| event.record.did.clone())
+                    .collect::<Vec<_>>();
+                if group.author_dids != expected_authors {
+                    return Some(format!(
+                        "{label}: leading authors {:?} != reference {expected_authors:?}",
+                        group.author_dids
+                    ));
+                }
+                let head_time = group.head.record.time_us;
+                let groupable = match group.reason.as_str() {
+                    "like" | "repost" => group.reason_subject.is_some(),
+                    "follow" => true,
+                    _ => false,
+                };
+                let window = if groupable {
+                    let unread = head_time > last_seen_us;
+                    let floor = head_time
+                        .saturating_sub(NOTIFICATION_GROUP_WINDOW_US)
+                        .max(if unread { last_seen_us + 1 } else { 0 });
+                    all.iter()
+                        .filter(|notice| {
+                            notice.reason == group.reason
+                                && notice.reason_subject == group.reason_subject
+                                && notice.record.time_us >= floor
+                                && notice.record.time_us <= head_time
+                                && (notice.record.time_us > last_seen_us) == unread
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    all.iter()
+                        .filter(|notice| {
+                            notice.record.uri == group.head.record.uri
+                                && notice.reason == group.head.reason
+                        })
+                        .collect::<Vec<_>>()
+                };
+                if window.len() != group.size {
+                    return Some(format!(
+                        "{label}: window holds {} events but the page claims size {}",
+                        window.len(),
+                        group.size
+                    ));
+                }
+                let window_authors = window
+                    .iter()
+                    .take(5)
+                    .map(|notice| notice.record.did.clone())
+                    .collect::<Vec<_>>();
+                if window_authors != group.author_dids {
+                    return Some(format!(
+                        "{label}: window authors {window_authors:?} != page {:?}",
+                        group.author_dids
+                    ));
+                }
+                for notice in window {
+                    if let Some(previous) =
+                        seen.insert((notice.record.uri.clone(), notice.reason.clone()), page)
+                    {
+                        return Some(format!(
+                            "{label}: event {} ({}) was already shown on page {previous}",
+                            notice.record.uri, notice.reason
+                        ));
+                    }
+                }
+            }
+            if !bounded.has_more {
+                break;
+            }
+            let bounded_cursor = bounded
+                .groups
+                .last()
+                .expect("a page with more groups has one")
+                .cursor();
+            let reference_cursor = notification_group_cursor(
+                reference.last().expect("a page with more groups has one"),
+            );
+            if bounded_cursor != reference_cursor {
+                return Some(format!(
+                    "page {page}: next cursor {:?} != reference {reference_cursor:?}",
+                    bounded_cursor
+                ));
+            }
+            cursor = Some(bounded_cursor);
+        }
+        if seen.len() != all.len() {
+            return Some(format!(
+                "the walk showed {} of {} events",
+                seen.len(),
+                all.len()
+            ));
+        }
+        None
+    }
+
+    #[test]
+    fn the_bounded_notification_page_matches_the_full_scan_on_memory() {
+        for seed in 0..500u64 {
+            let (records, last_seen_us, limit) = oracle_case(seed);
+            let storage = MemoryStorage::default();
+            records.iter().for_each(|record| {
+                storage.put_record(record).unwrap();
+            });
+            let all = storage
+                .notifications_for("did:plc:oracle-viewer", None, usize::MAX)
+                .unwrap();
+            if let Some(mismatch) = oracle_walk(&storage, &all, last_seen_us, limit) {
+                panic!("seed {seed}: {mismatch}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_bounded_notification_page_matches_the_full_scan_on_sqlite() {
+        for seed in 0..500u64 {
+            let (records, last_seen_us, limit) = oracle_case(seed);
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join(format!(
+                    "av72q-oracle-{}-{seed}.sqlite3",
+                    std::process::id()
+                ));
+            let _ = std::fs::remove_file(&path);
+            let storage = crate::ingest::SqliteStorage::open(&path).unwrap();
+            let updates = records
+                .iter()
+                .map(|record| crate::ingest::JetstreamStorageUpdate {
+                    time_us: record.time_us,
+                    upsert: Some(record.clone()),
+                    delete: None,
+                    follows: Vec::new(),
+                    backfill_for: Vec::new(),
+                    handle_refresh: None,
+                })
+                .collect::<Vec<_>>();
+            storage.apply_jetstream_batch(&updates).unwrap();
+            storage.writer_barrier().unwrap();
+            let all = storage
+                .notifications_for("did:plc:oracle-viewer", None, usize::MAX)
+                .unwrap();
+            let mismatch = oracle_walk(&storage, &all, last_seen_us, limit);
+            drop(storage);
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+            let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+            if let Some(mismatch) = mismatch {
+                panic!("sqlite seed {seed}: {mismatch}");
+            }
+        }
+    }
+
+    #[test]
+    fn page_one_of_20_000_notifications_reads_a_bounded_number_of_events() {
+        const HOUR_US: u64 = 3_600_000_000;
+        const VIEWER: &str = "did:plc:bound-viewer";
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("av72q-20k-{}.sqlite3", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let storage = crate::ingest::SqliteStorage::open(&path).unwrap();
+        let subject = format!("at://{VIEWER}/app.bsky.feed.post/burst");
+        let mut records = vec![IndexedRecord {
+            did: VIEWER.to_owned(),
+            collection: "app.bsky.feed.post".to_owned(),
+            rkey: "burst".to_owned(),
+            uri: subject.clone(),
+            cid: None,
+            time_us: 1,
+            record: json!({"text": "the burst post"}),
+        }];
+        let like = |records: &mut Vec<IndexedRecord>,
+                    author: &str,
+                    index: usize,
+                    collection: &str,
+                    time_us: u64| {
+            records.push(IndexedRecord {
+                did: format!("did:plc:{author}"),
+                collection: collection.to_owned(),
+                rkey: format!("n{index}"),
+                uri: format!("at://did:plc:{author}/{collection}/n{index}"),
+                cid: None,
+                time_us,
+                record: if collection == "app.bsky.graph.follow" {
+                    json!({"subject": VIEWER})
+                } else if collection == "app.bsky.feed.post" {
+                    json!({"text": "reply body", "reply": {"parent": {"uri": subject}, "root": {"uri": subject}}})
+                } else {
+                    json!({"subject": {"uri": subject}})
+                },
+            });
+        };
+        let burst_start = 90 * 24 * HOUR_US;
+        for index in 0..10_000 {
+            like(
+                &mut records,
+                &format!("liker-{}", index % 500),
+                index,
+                "app.bsky.feed.like",
+                burst_start + (index as u64) * (46 * HOUR_US / 10_000),
+            );
+        }
+        for index in 10_000..15_000 {
+            like(
+                &mut records,
+                &format!("spreader-{}", index % 900),
+                index,
+                "app.bsky.feed.like",
+                burst_start + (index as u64 - 10_000) * (60 * HOUR_US),
+            );
+        }
+        for index in 15_000..18_000 {
+            like(
+                &mut records,
+                &format!("follower-{}", index % 2_000),
+                index,
+                "app.bsky.graph.follow",
+                burst_start + (index as u64 - 15_000) * (47 * HOUR_US),
+            );
+        }
+        for index in 18_000..20_000 {
+            like(
+                &mut records,
+                &format!("replier-{}", index % 900),
+                index,
+                "app.bsky.feed.post",
+                burst_start + (index as u64 - 18_000) * (70 * 24 * HOUR_US / 2_000),
+            );
+        }
+        assert_eq!(records.len(), 20_001);
+        let updates = records
+            .iter()
+            .map(|record| crate::ingest::JetstreamStorageUpdate {
+                time_us: record.time_us,
+                upsert: Some(record.clone()),
+                delete: None,
+                follows: Vec::new(),
+                backfill_for: Vec::new(),
+                handle_refresh: None,
+            })
+            .collect::<Vec<_>>();
+        storage.apply_jetstream_batch(&updates).unwrap();
+        storage.writer_barrier().unwrap();
+        assert_eq!(storage.notification_count(VIEWER).unwrap(), 20_000);
+
+        let page = notification_window_page(&storage, VIEWER, None, 50, 0).unwrap();
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+        assert!(
+            page.groups.len() <= 50,
+            "the page holds at most the limit of groups: {}",
+            page.groups.len()
+        );
+        assert!(
+            page.events_read < 1_000,
+            "page 1 of 20 000 notifications materialized {} event rows",
+            page.events_read
+        );
+        assert_eq!(
+            page.records_loaded,
+            page.groups.len() as u64,
+            "full records must be loaded only for the rendered rows"
+        );
     }
 
     #[test]

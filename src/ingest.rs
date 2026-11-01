@@ -203,6 +203,35 @@ pub struct IndexedNotification {
     pub reason_subject: Option<String>,
 }
 
+/// One notification event as the grouping pass reads it: the `notification_events`
+/// columns only, with no join to `records` and no `record_json`. Lane av72q reads
+/// these newest-first in batches to build one page of groups without loading every
+/// notification the viewer ever got.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotificationEventRow {
+    pub source_did: String,
+    pub source_collection: String,
+    pub source_rkey: String,
+    pub source_uri: String,
+    pub reason: String,
+    pub reason_subject: Option<String>,
+    pub time_us: u64,
+}
+
+impl NotificationEventRow {
+    fn sorts_before(&self, cursor: &NotificationCursor) -> bool {
+        self.time_us < cursor.time_us
+            || (self.time_us == cursor.time_us
+                && (self.source_uri < cursor.uri
+                    || (self.source_uri == cursor.uri && self.reason < cursor.reason)))
+    }
+}
+
+/// A `reason` + `reason_subject` pair whose events at or after `floor_us` have
+/// already been accounted for by an open (or resolved) notification group; the
+/// windowed read skips them.
+pub type NotificationGroupSkip = (String, Option<String>, u64);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordCursor {
     pub time_us: u64,
@@ -398,6 +427,37 @@ fn record_matches_cursor(record: &IndexedRecord, cursor: Option<&RecordCursor>) 
     })
 }
 
+fn notification_event_order(
+    left: &NotificationEventRow,
+    right: &NotificationEventRow,
+) -> std::cmp::Ordering {
+    right
+        .time_us
+        .cmp(&left.time_us)
+        .then_with(|| right.source_uri.cmp(&left.source_uri))
+        .then_with(|| right.reason.cmp(&left.reason))
+}
+
+fn memory_notification_rows<'records>(
+    records: &'records HashMap<(String, String, String), IndexedRecord>,
+    did: &str,
+) -> impl Iterator<Item = NotificationEventRow> + 'records {
+    let did = did.to_owned();
+    records
+        .values()
+        .flat_map(notification_edges)
+        .filter(move |(_, subject_did, _, _)| *subject_did == did)
+        .map(|(record, _, reason, reason_subject)| NotificationEventRow {
+            source_did: record.did,
+            source_collection: record.collection,
+            source_rkey: record.rkey,
+            source_uri: record.uri,
+            reason,
+            reason_subject,
+            time_us: record.time_us,
+        })
+}
+
 fn notification_matches_cursor(
     record: &IndexedRecord,
     reason: &str,
@@ -563,6 +623,40 @@ pub trait Storage: Send + Sync {
         before: Option<&NotificationCursor>,
         limit: usize,
     ) -> Result<Vec<IndexedNotification>, StorageError>;
+    /// Newest-first batch of the viewer's notification events, strictly after
+    /// `before` in (time, uri, reason) order, skipping events already claimed by
+    /// an open group (`skip`: reason, reason_subject, floor time inclusive).
+    /// Never joins `records` and never reads `record_json`.
+    fn notification_events_window(
+        &self,
+        did: &str,
+        before: Option<&NotificationCursor>,
+        skip: &[NotificationGroupSkip],
+        limit: usize,
+    ) -> Result<Vec<NotificationEventRow>, StorageError>;
+    /// How many of the viewer's events for one (reason, reason_subject) key fall
+    /// in the inclusive time range. A group's size is only ever rendered as a
+    /// count, so the page COUNTs it instead of reading the rows.
+    fn notification_key_event_count(
+        &self,
+        did: &str,
+        reason: &str,
+        reason_subject: Option<&str>,
+        from_us: u64,
+        to_us: u64,
+    ) -> Result<usize, StorageError>;
+    /// One key's events newest-first, strictly after `before` in (time, uri,
+    /// reason) order and at or after `from_us`: the leading-author probe (limit
+    /// 5) and the cursor-edge group-chain probe (limit 1).
+    fn notification_key_events(
+        &self,
+        did: &str,
+        reason: &str,
+        reason_subject: Option<&str>,
+        before: Option<&NotificationCursor>,
+        from_us: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<NotificationEventRow>, StorageError>;
     fn notification_count(&self, did: &str) -> Result<usize, StorageError>;
     fn notification_last_seen(&self, did: &str) -> Result<u64, StorageError>;
     fn mark_notifications_seen(&self, did: &str, time_us: u64) -> Result<(), StorageError>;
@@ -1516,6 +1610,69 @@ impl Storage for MemoryStorage {
         });
         notifications.truncate(limit.max(1));
         Ok(notifications)
+    }
+
+    fn notification_events_window(
+        &self,
+        did: &str,
+        before: Option<&NotificationCursor>,
+        skip: &[NotificationGroupSkip],
+        limit: usize,
+    ) -> Result<Vec<NotificationEventRow>, StorageError> {
+        let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut rows = memory_notification_rows(&inner.records, did)
+            .filter(|row| before.is_none_or(|cursor| row.sorts_before(cursor)))
+            .filter(|row| {
+                !skip.iter().any(|(reason, subject, floor)| {
+                    &row.reason == reason && row.reason_subject == *subject && row.time_us >= *floor
+                })
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(notification_event_order);
+        rows.truncate(limit);
+        Ok(rows)
+    }
+
+    fn notification_key_event_count(
+        &self,
+        did: &str,
+        reason: &str,
+        reason_subject: Option<&str>,
+        from_us: u64,
+        to_us: u64,
+    ) -> Result<usize, StorageError> {
+        let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        Ok(memory_notification_rows(&inner.records, did)
+            .filter(|row| {
+                row.reason == reason
+                    && row.reason_subject.as_deref() == reason_subject
+                    && row.time_us >= from_us
+                    && row.time_us <= to_us
+            })
+            .count())
+    }
+
+    fn notification_key_events(
+        &self,
+        did: &str,
+        reason: &str,
+        reason_subject: Option<&str>,
+        before: Option<&NotificationCursor>,
+        from_us: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<NotificationEventRow>, StorageError> {
+        let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut rows = memory_notification_rows(&inner.records, did)
+            .filter(|row| {
+                row.reason == reason
+                    && row.reason_subject.as_deref() == reason_subject
+                    && before.is_none_or(|cursor| row.sorts_before(cursor))
+                    && from_us.is_none_or(|floor| row.time_us >= floor)
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(notification_event_order);
+        rows.truncate(limit);
+        Ok(rows)
     }
 
     fn notification_count(&self, did: &str) -> Result<usize, StorageError> {
@@ -3235,6 +3392,8 @@ impl SqliteStorage {
              );
              CREATE INDEX IF NOT EXISTS notification_events_subject_time
                  ON notification_events(subject_did, time_us DESC, source_uri DESC, reason);
+             CREATE INDEX IF NOT EXISTS notification_events_subject_key_time
+                 ON notification_events(subject_did, reason, reason_subject, time_us DESC, source_uri DESC);
              CREATE TABLE IF NOT EXISTS notification_last_seen (
                  viewer_did TEXT PRIMARY KEY,
                  time_us INTEGER NOT NULL
@@ -5123,6 +5282,155 @@ impl Storage for SqliteStorage {
             )?
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    fn notification_events_window(
+        &self,
+        did: &str,
+        before: Option<&NotificationCursor>,
+        skip: &[NotificationGroupSkip],
+        limit: usize,
+    ) -> Result<Vec<NotificationEventRow>, StorageError> {
+        let mut sql = String::from(
+            "SELECT source_did, source_collection, source_rkey, source_uri, reason, reason_subject, time_us
+             FROM notification_events
+             WHERE subject_did=?1 AND (
+                 ?2 IS NULL OR time_us < ?2 OR
+                 (time_us=?2 AND (source_uri < ?3 OR (source_uri=?3 AND reason < ?4)))
+             )",
+        );
+        let mut values = vec![
+            rusqlite::types::Value::Text(did.to_owned()),
+            before
+                .map(|cursor| {
+                    rusqlite::types::Value::Integer(cursor.time_us.min(i64::MAX as u64) as i64)
+                })
+                .unwrap_or(rusqlite::types::Value::Null),
+            rusqlite::types::Value::Text(
+                before
+                    .map(|cursor| cursor.uri.as_str())
+                    .unwrap_or("")
+                    .to_owned(),
+            ),
+            rusqlite::types::Value::Text(
+                before
+                    .map(|cursor| cursor.reason.as_str())
+                    .unwrap_or("")
+                    .to_owned(),
+            ),
+        ];
+        for (index, (reason, subject, floor)) in skip.iter().enumerate() {
+            let reason_slot = 5 + index * 3;
+            sql.push_str(&format!(
+                " AND NOT (reason=?{reason_slot} AND reason_subject IS ?{} AND time_us >= ?{})",
+                reason_slot + 1,
+                reason_slot + 2
+            ));
+            values.push(rusqlite::types::Value::Text(reason.clone()));
+            values.push(
+                subject
+                    .as_ref()
+                    .map(|subject| rusqlite::types::Value::Text(subject.clone()))
+                    .unwrap_or(rusqlite::types::Value::Null),
+            );
+            values.push(rusqlite::types::Value::Integer(
+                (*floor).min(i64::MAX as u64) as i64,
+            ));
+        }
+        let limit_slot = 5 + skip.len() * 3;
+        sql.push_str(&format!(
+            " ORDER BY time_us DESC, source_uri DESC, reason LIMIT ?{limit_slot}"
+        ));
+        values.push(rusqlite::types::Value::Integer(
+            i64::try_from(limit).unwrap_or(i64::MAX),
+        ));
+        let connection = self.read_conn()?;
+        let mut statement = connection.prepare(&sql)?;
+        statement
+            .query_map(rusqlite::params_from_iter(values.iter()), |row| {
+                Ok(NotificationEventRow {
+                    source_did: row.get(0)?,
+                    source_collection: row.get(1)?,
+                    source_rkey: row.get(2)?,
+                    source_uri: row.get(3)?,
+                    reason: row.get(4)?,
+                    reason_subject: row.get(5)?,
+                    time_us: row.get::<_, i64>(6)?.max(0) as u64,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    fn notification_key_event_count(
+        &self,
+        did: &str,
+        reason: &str,
+        reason_subject: Option<&str>,
+        from_us: u64,
+        to_us: u64,
+    ) -> Result<usize, StorageError> {
+        Ok(self.read_conn()?.query_row(
+            "SELECT COUNT(*) FROM notification_events
+             WHERE subject_did=?1 AND reason=?2 AND reason_subject IS ?3
+               AND time_us BETWEEN ?4 AND ?5",
+            params![
+                did,
+                reason,
+                reason_subject,
+                from_us.min(i64::MAX as u64) as i64,
+                to_us.min(i64::MAX as u64) as i64,
+            ],
+            |row| row.get::<_, i64>(0),
+        )? as usize)
+    }
+
+    fn notification_key_events(
+        &self,
+        did: &str,
+        reason: &str,
+        reason_subject: Option<&str>,
+        before: Option<&NotificationCursor>,
+        from_us: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<NotificationEventRow>, StorageError> {
+        self.read_conn()?.prepare_cached(
+            "SELECT source_did, source_collection, source_rkey, source_uri, reason, reason_subject, time_us
+             FROM notification_events
+             WHERE subject_did=?1 AND reason=?2 AND reason_subject IS ?3 AND (
+                 ?4 IS NULL OR time_us < ?5 OR
+                 (time_us=?5 AND (source_uri < ?6 OR (source_uri=?6 AND reason < ?7)))
+             ) AND (?8 IS NULL OR time_us >= ?8)
+             ORDER BY time_us DESC, source_uri DESC, reason LIMIT ?9",
+        )?
+        .query_map(
+            params![
+                did,
+                reason,
+                reason_subject,
+                before.map(|cursor| cursor.time_us.min(i64::MAX as u64) as i64),
+                before
+                    .map(|cursor| cursor.time_us.min(i64::MAX as u64) as i64)
+                    .unwrap_or(0),
+                before.map(|cursor| cursor.uri.as_str()).unwrap_or(""),
+                before.map(|cursor| cursor.reason.as_str()).unwrap_or(""),
+                from_us.map(|floor| floor.min(i64::MAX as u64) as i64),
+                i64::try_from(limit).unwrap_or(i64::MAX),
+            ],
+            |row| {
+                Ok(NotificationEventRow {
+                    source_did: row.get(0)?,
+                    source_collection: row.get(1)?,
+                    source_rkey: row.get(2)?,
+                    source_uri: row.get(3)?,
+                    reason: row.get(4)?,
+                    reason_subject: row.get(5)?,
+                    time_us: row.get::<_, i64>(6)?.max(0) as u64,
+                })
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
     }
 
     fn notification_count(&self, did: &str) -> Result<usize, StorageError> {
