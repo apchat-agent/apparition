@@ -1278,6 +1278,91 @@ Deno.test("case33: a pending quote replaces its loading placeholder with the fet
   }
 });
 
+Deno.test("a deferred parent swaps once and preserves the loaded parent card", async () => {
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  const start = source.indexOf("function fillDeferredParents(");
+  const end = source.indexOf("\nfillDeferredParents();", start);
+  assert(start >= 0 && end > start, "app.js should install deferred parent fills");
+  const fillDeferredParents = new Function(`${source.slice(start, end)}; return fillDeferredParents;`)();
+  const card = {
+    matches() { return false; },
+    querySelectorAll() { return []; },
+  };
+  const placeholder = {
+    dataset: {},
+    matches(selector) { return selector === "[data-parent-fragment]"; },
+    querySelectorAll() { return []; },
+    getAttribute(name) {
+      return ({
+        "data-parent-fragment": "/parent-fragment?uri=at%3A%2F%2Fdid%3Aplc%3Aauthor%2Fapp.bsky.feed.post%2Fparent",
+      })[name] ?? null;
+    },
+    replaceWith(node) { this.replacedWith = node; },
+  };
+  let requests = 0;
+  const originalFetch = globalThis.fetch;
+  const originalDocument = globalThis.document;
+  const originalDOMParser = globalThis.DOMParser;
+  const originalFillDeferredQuotes = globalThis.fillDeferredQuotes;
+  globalThis.fillDeferredQuotes = () => {};
+  globalThis.document = { createElement() { return {}; } };
+  globalThis.DOMParser = class {
+    parseFromString(html) {
+      assert(html.includes("reply-parent-card"));
+      return { querySelector(selector) { return selector === ".reply-parent-card" ? card : null; } };
+    }
+  };
+  globalThis.fetch = async () => {
+    requests += 1;
+    return { ok: true, text: async () => "<a class=\"reply-parent-card\">Loaded parent</a>" };
+  };
+  try {
+    fillDeferredParents(placeholder);
+    fillDeferredParents(placeholder);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEquals(requests, 1, "one placeholder should make one fragment request");
+    assertEquals(placeholder.replacedWith, card);
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.document = originalDocument;
+    globalThis.DOMParser = originalDOMParser;
+    if (originalFillDeferredQuotes === undefined) delete globalThis.fillDeferredQuotes;
+    else globalThis.fillDeferredQuotes = originalFillDeferredQuotes;
+  }
+});
+
+Deno.test("a failed deferred parent keeps its thread link", async () => {
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  const start = source.indexOf("function fillDeferredParents(");
+  const end = source.indexOf("\nfillDeferredParents();", start);
+  const fillDeferredParents = new Function(`${source.slice(start, end)}; return fillDeferredParents;`)();
+  const fallback = {};
+  const placeholder = {
+    dataset: {},
+    matches() { return true; },
+    querySelectorAll() { return []; },
+    querySelector() { return { getAttribute() { return "/app/thread?uri=at%3A%2F%2Fdid%3Aplc%3Aauthor%2Fapp.bsky.feed.post%2Fparent"; } }; },
+    getAttribute(name) {
+      return ({ "data-parent-fragment": "/parent-fragment?uri=at%3A%2F%2Fdid%3Aplc%3Aauthor%2Fapp.bsky.feed.post%2Fparent" })[name] ?? null;
+    },
+    replaceWith(node) { this.replacedWith = node; },
+  };
+  const originalFetch = globalThis.fetch;
+  const originalDocument = globalThis.document;
+  globalThis.document = { createElement() { return fallback; } };
+  globalThis.fetch = async () => ({ ok: false, status: 502 });
+  try {
+    fillDeferredParents(placeholder);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assertEquals(placeholder.replacedWith, fallback);
+    assertEquals(fallback.href, "/app/thread?uri=at%3A%2F%2Fdid%3Aplc%3Aauthor%2Fapp.bsky.feed.post%2Fparent");
+    assertEquals(fallback.textContent, "Post unavailable · Open thread");
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.document = originalDocument;
+  }
+});
+
 Deno.test("infinite scroll errors wait for an explicit retry and do not storm requests", async () => {
   const pages = {};
   const harness = await createInfiniteScrollHarness({

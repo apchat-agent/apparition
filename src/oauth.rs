@@ -85,7 +85,7 @@ use std::{
     pin::Pin,
     sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     thread::JoinHandle,
@@ -94,7 +94,7 @@ use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
     io::AsyncWriteExt,
-    sync::{OnceCell, oneshot},
+    sync::{OnceCell, Semaphore, oneshot},
 };
 use tracing::instrument::WithSubscriber;
 
@@ -108,7 +108,6 @@ const MAX_RENDERED_REMOTE_CHARS: usize = 4096;
 const PROFILE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const PROFILE_NEGATIVE_TTL: Duration = Duration::from_secs(60 * 60);
 const PAGE_PROFILE_BUDGET: Duration = Duration::from_millis(1500);
-const PARENT_PUBLIC_LOOKUP_HEAD_START: Duration = Duration::from_millis(50);
 /// How long a spawned block-list refresh may run. The page waits only PAGE_PROFILE_BUDGET for it,
 /// but the refresh itself must be allowed to finish: a 742-member list is ~8 getList pages (~4 s),
 /// and cutting it at the page budget meant it never filled the cache (2026-10-30).
@@ -615,6 +614,8 @@ pub type PublicPostsPage = (
 );
 /// One boxed `OAuthFlow::fetch_public_posts` future.
 pub type PublicPostsFetch<'a> = Pin<Box<dyn Future<Output = PublicPostsPage> + Send + 'a>>;
+/// One boxed page-only post fetch and its actual proxied getPosts request count.
+pub type PagePostsFetch<'a> = Pin<Box<dyn Future<Output = (PublicPostsPage, u64)> + Send + 'a>>;
 
 pub trait OAuthFlow: Clone + Send + Sync + 'static {
     /// `scopes` is the scope list chosen for this sign-in: atproto + the read-only list + the
@@ -727,6 +728,12 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<IndexedRecord, String>> + Send + 'a>> {
         Box::pin(async { Err("post fetch is not available".to_owned()) })
     }
+    fn fetch_post_for_fragment<'a>(
+        &'a self,
+        uri: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<IndexedRecord>, String>> + Send + 'a>> {
+        Box::pin(async move { self.fetch_post(uri).await.map(Some) })
+    }
     /// Batch-hydrate posts for a page, through the viewer's proxied session when the flow
     /// supports it (`viewer_did` empty = anonymous). Returns the posts and where each route
     /// served them.
@@ -757,6 +764,16 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
             };
             (posts, routes)
         })
+    }
+    /// The page's single inline hydration request. Implementations with a
+    /// proxy can override this to avoid the public/PDS fallbacks used by
+    /// `fetch_public_posts`; deferred posts use that broader path later.
+    fn fetch_page_posts_once<'a>(
+        &'a self,
+        _viewer_did: &'a str,
+        _uris: &'a [String],
+    ) -> PagePostsFetch<'a> {
+        Box::pin(async { ((HashMap::new(), crate::feeds::PostRouteStats::default()), 0) })
     }
     fn supports_public_post_batching(&self) -> bool {
         false
@@ -1384,6 +1401,7 @@ impl OAuthPublic {
             .route("/app/feed", get(feed_timeline_page::<F, S>))
             .route("/app/thread", get(thread_page::<F, S>))
             .route("/quote-fragment", get(quote_fragment::<F, S>))
+            .route("/parent-fragment", get(parent_fragment::<F, S>))
             .route("/profile-fragment", get(profile_fragment::<F, S>))
             .route("/notifications", get(notifications_page::<F, S>))
             .route("/timing/recent", get(timing_recent::<F, S>))
@@ -5026,6 +5044,18 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
         Box::pin(async move { self.feed_client.fetch_post(uri).await })
     }
 
+    fn fetch_post_for_fragment<'a>(
+        &'a self,
+        uri: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<IndexedRecord>, String>> + Send + 'a>> {
+        Box::pin(async move {
+            match self.feed_client.fetch_post_optional(uri).await {
+                Err(error) if parent_fetch_error_is_not_found(&error) => Ok(None),
+                result => result,
+            }
+        })
+    }
+
     fn fetch_public_posts<'a>(
         &'a self,
         viewer_did: &'a str,
@@ -5034,6 +5064,22 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
         let uris = uris.to_vec();
         let proxy = self.posts_proxy(viewer_did);
         Box::pin(async move { self.feed_client.fetch_posts(Some(proxy), &uris).await })
+    }
+
+    fn fetch_page_posts_once<'a>(
+        &'a self,
+        viewer_did: &'a str,
+        uris: &'a [String],
+    ) -> PagePostsFetch<'a> {
+        let uris = uris.to_vec();
+        let proxy = self.posts_proxy(viewer_did);
+        Box::pin(async move {
+            let (posts, routes, requests) = self
+                .feed_client
+                .fetch_page_posts_once(Some(proxy), &uris)
+                .await;
+            ((posts, routes), requests)
+        })
     }
 
     fn supports_public_post_batching(&self) -> bool {
@@ -6094,6 +6140,8 @@ struct ParentHydrationStats {
     rounds: u64,
     public_ms: u64,
     local_pending: bool,
+    deferred: u64,
+    requests: u64,
     /// Which route served the parent posts the index did not have.
     routes: crate::feeds::PostRouteStats,
 }
@@ -6105,10 +6153,58 @@ struct ThreadAncestorStats {
     timed_out: usize,
 }
 
-#[derive(Clone, Copy)]
-enum AncestorSource {
-    Index,
-    Live,
+enum ThreadAncestorDisplay {
+    Found(IndexedRecord),
+    Deferred(String),
+}
+
+fn thread_ancestor_display(
+    record: &IndexedRecord,
+    parents: &PageParentIndex,
+    parent_height: usize,
+) -> Vec<ThreadAncestorDisplay> {
+    let mut displayed = Vec::new();
+    let mut visited = HashSet::from([record.uri.clone()]);
+    let mut uri = record
+        .record
+        .pointer("/reply/parent/uri")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    for _ in 0..parent_height {
+        let Some(current_uri) = uri else { break };
+        if !post_uri_did(&current_uri).is_some() || !visited.insert(current_uri.clone()) {
+            break;
+        }
+        match parents.get(&current_uri) {
+            Some(Some(parent)) => {
+                uri = parent
+                    .record
+                    .pointer("/reply/parent/uri")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                displayed.push(ThreadAncestorDisplay::Found(parent.clone()));
+            }
+            Some(None) => {
+                displayed.push(ThreadAncestorDisplay::Deferred(current_uri));
+                break;
+            }
+            None => break,
+        }
+    }
+    displayed.reverse();
+    if let Some(root_uri) = record
+        .record
+        .pointer("/reply/root/uri")
+        .and_then(Value::as_str)
+        .filter(|uri| post_uri_did(uri).is_some())
+        && !displayed.iter().any(|ancestor| {
+            matches!(ancestor, ThreadAncestorDisplay::Found(found) if found.uri == root_uri)
+        })
+        && let Some(Some(root)) = parents.get(root_uri)
+    {
+        displayed.insert(0, ThreadAncestorDisplay::Found(root.clone()));
+    }
+    displayed
 }
 
 /// Response header carrying the request's timing console id.
@@ -6464,6 +6560,8 @@ struct WebPageTiming {
     parent_posts_public: u64,
     /// Parent/reply posts the authors' PDSes served.
     parent_posts_pds: u64,
+    parent_deferred: u64,
+    page_post_requests: u64,
     content_hydration_ms: u64,
     profile_hydration_ms: u64,
     quote_hydration_ms: u64,
@@ -6523,6 +6621,8 @@ impl WebPageTiming {
             parent_posts_proxy: 0,
             parent_posts_public: 0,
             parent_posts_pds: 0,
+            parent_deferred: 0,
+            page_post_requests: 0,
             content_hydration_ms: 0,
             profile_hydration_ms: 0,
             quote_hydration_ms: 0,
@@ -6560,6 +6660,8 @@ impl WebPageTiming {
         self.parent_posts_proxy = stats.routes.proxy;
         self.parent_posts_public = stats.routes.public;
         self.parent_posts_pds = stats.routes.pds;
+        self.parent_deferred = stats.deferred;
+        self.page_post_requests = stats.requests;
     }
 }
 
@@ -6749,6 +6851,8 @@ impl Drop for WebPageTiming {
             parent_posts_proxy = self.parent_posts_proxy,
             parent_posts_public = self.parent_posts_public,
             parent_posts_pds = self.parent_posts_pds,
+            parent_deferred = self.parent_deferred,
+            page_post_requests = self.page_post_requests,
             content_hydration_ms = self.content_hydration_ms,
             profile_hydration_ms = self.profile_hydration_ms,
             quote_hydration_ms = self.quote_hydration_ms,
@@ -6808,6 +6912,8 @@ impl Drop for WebPageTiming {
                 ("parent_posts_proxy", self.parent_posts_proxy),
                 ("parent_posts_public", self.parent_posts_public),
                 ("parent_posts_pds", self.parent_posts_pds),
+                ("parent_deferred", self.parent_deferred),
+                ("page_post_requests", self.page_post_requests),
                 ("content_hydration_ms", self.content_hydration_ms),
                 ("profile_hydration_ms", self.profile_hydration_ms),
                 ("quote_hydration_ms", self.quote_hydration_ms),
@@ -7064,26 +7170,43 @@ fn hydrate_page_profiles<S: Storage>(
     Ok(hydration)
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 async fn hydrate_page_content<F: OAuthFlow, S: Storage + 'static>(
     flow: &F,
     viewer_did: &str,
     storage: Arc<S>,
     page_records: &[&IndexedRecord],
     quote_records: &[&IndexedRecord],
+    prefetched_posts: &PageParentIndex,
     leading_authors: impl IntoIterator<Item = String>,
     deadline: tokio::time::Instant,
 ) -> Result<PageContentHydration, StorageError> {
-    let mut refs = Vec::new();
-    let mut seen_refs = HashSet::new();
-    for record in quote_records {
-        if let Some(embed) = record.record.get("embed")
-            && let Some(reference) = quoted_record_ref(embed)
-            && seen_refs.insert(reference.uri.clone())
-        {
-            refs.push(reference);
-        }
-    }
+    let authors = page_content_authors(page_records, leading_authors);
+    let account_data_hydration = fetch_page_account_data(
+        flow,
+        viewer_did.to_owned(),
+        page_account_actor_dids(&authors),
+        deadline,
+    );
+    hydrate_page_content_with_account_future(
+        flow,
+        viewer_did,
+        storage,
+        page_records,
+        quote_records,
+        prefetched_posts,
+        authors,
+        account_data_hydration,
+        deadline,
+    )
+    .await
+}
 
+fn page_content_authors(
+    page_records: &[&IndexedRecord],
+    leading_authors: impl IntoIterator<Item = String>,
+) -> Vec<String> {
     let mut authors = leading_authors.into_iter().collect::<Vec<_>>();
     for (record, quote_ref) in page_records.iter().zip(
         page_records
@@ -7098,53 +7221,127 @@ async fn hydrate_page_content<F: OAuthFlow, S: Storage + 'static>(
             authors.push(did.to_owned());
         }
     }
+    authors
+}
 
-    let label_actor_dids = {
-        let mut actors = authors.clone();
-        actors.sort();
-        actors.dedup();
-        actors.truncate(100);
-        actors
-    };
+fn page_account_actor_dids(authors: &[String]) -> Vec<String> {
+    let mut actors = authors.to_vec();
+    actors.sort();
+    actors.dedup();
+    actors.truncate(100);
+    actors
+}
+
+async fn fetch_page_account_data<F: OAuthFlow>(
+    flow: &F,
+    viewer_did: String,
+    label_actor_dids: Vec<String>,
+    deadline: tokio::time::Instant,
+) -> (PageAccountData, u64) {
     let account_flow = flow.clone();
-    let viewer_did = viewer_did.to_owned();
-    let quote_viewer_did = viewer_did.clone();
     let label_actor_count = label_actor_dids.len();
-    let account_data_hydration = async move {
-        let started = std::time::Instant::now();
-        let data = match tokio::time::timeout_at(
-            deadline,
-            account_flow.page_account_data_for_page(&viewer_did, label_actor_dids),
-        )
-        .await
-        {
-            Ok(Ok(data)) => data,
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "page account profiles and labels could not be fetched");
-                PageAccountData::default()
-            }
-            Err(_) => {
-                tracing::warn!(
-                    viewer = %viewer_did,
-                    actors = label_actor_count,
-                    "account labels timed out before the page deadline"
-                );
-                PageAccountData::default()
-            }
-        };
-        (data, started.elapsed().as_millis() as u64)
+    let started = std::time::Instant::now();
+    let data = match tokio::time::timeout_at(
+        deadline,
+        account_flow.page_account_data_for_page(&viewer_did, label_actor_dids),
+    )
+    .await
+    {
+        Ok(Ok(data)) => data,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "page account profiles and labels could not be fetched");
+            PageAccountData::default()
+        }
+        Err(_) => {
+            tracing::warn!(
+                viewer = %viewer_did,
+                actors = label_actor_count,
+                "account labels timed out before the page deadline"
+            );
+            PageAccountData::default()
+        }
     };
+    (data, started.elapsed().as_millis() as u64)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn hydrate_page_content_with_account_future<F, S, A>(
+    flow: &F,
+    viewer_did: &str,
+    storage: Arc<S>,
+    page_records: &[&IndexedRecord],
+    quote_records: &[&IndexedRecord],
+    prefetched_posts: &PageParentIndex,
+    authors: Vec<String>,
+    account_data_hydration: A,
+    deadline: tokio::time::Instant,
+) -> Result<PageContentHydration, StorageError>
+where
+    F: OAuthFlow,
+    S: Storage + 'static,
+    A: Future<Output = (PageAccountData, u64)> + Send,
+{
+    let mut refs = Vec::new();
+    let mut seen_refs = HashSet::new();
+    for record in page_records {
+        if let Some(embed) = record.record.get("embed")
+            && let Some(reference) = quoted_record_ref(embed)
+            && seen_refs.insert(reference.uri.clone())
+        {
+            refs.push(reference);
+        }
+    }
+    let page_record_uris = page_records
+        .iter()
+        .map(|record| record.uri.as_str())
+        .collect::<HashSet<_>>();
+    let mut nested_deferred_refs = Vec::new();
+    for record in quote_records
+        .iter()
+        .filter(|record| !page_record_uris.contains(record.uri.as_str()))
+    {
+        if let Some(embed) = record.record.get("embed")
+            && let Some(reference) = quoted_record_ref(embed)
+            && !reference.unavailable
+            && at_uri_collection(&reference.uri) == Some("app.bsky.feed.post")
+            && post_uri_did(&reference.uri).is_some()
+            && seen_refs.insert(reference.uri.clone())
+        {
+            nested_deferred_refs.push(reference);
+        }
+    }
+
+    let quote_viewer_did = viewer_did.to_owned();
     let quote_storage = storage.clone();
+    let prefetched_posts = prefetched_posts.clone();
     let quote_hydration = async {
         let started = std::time::Instant::now();
-        let quotes = hydrate_page_quotes(
+        let mut quotes = hydrate_page_quotes(
             flow,
             &quote_viewer_did,
             quote_storage.as_ref(),
-            refs,
+            &prefetched_posts,
+            refs.clone(),
             deadline,
         )
         .await;
+        if let Ok(index) = &mut quotes {
+            for reference in refs {
+                if !reference.unavailable
+                    && let Some(Some(record)) = prefetched_posts.get(&reference.uri)
+                {
+                    index.insert(reference.uri, QuoteRenderState::Found(record.clone()));
+                }
+            }
+            for reference in nested_deferred_refs {
+                if !prefetched_posts
+                    .get(&reference.uri)
+                    .is_some_and(Option::is_some)
+                {
+                    index.insert(reference.uri, QuoteRenderState::Pending);
+                }
+            }
+        }
         (quotes, started.elapsed().as_millis() as u64)
     };
     let (quote_hydration, (account_data, account_labels_ms)) =
@@ -7189,6 +7386,33 @@ fn page_records_with_parents<'a>(
     result
 }
 
+const MAX_PENDING_PAGE_POSTS: usize = 5_000;
+const MAX_LOCAL_PAGE_ANCESTORS: usize = 500;
+const MAX_DEFERRED_PAGE_POST_WORKERS: usize = 4;
+static DEFERRED_PAGE_POSTS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static DEFERRED_PAGE_POST_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn deferred_page_post_registry() -> &'static Mutex<HashSet<String>> {
+    DEFERRED_PAGE_POSTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn deferred_page_post_semaphore() -> Arc<Semaphore> {
+    Arc::clone(
+        DEFERRED_PAGE_POST_SEMAPHORE
+            .get_or_init(|| Arc::new(Semaphore::new(MAX_DEFERRED_PAGE_POST_WORKERS))),
+    )
+}
+
+fn deferred_page_post_is_pending(uri: &str) -> bool {
+    match deferred_page_post_registry().lock() {
+        Ok(pending) => pending.contains(uri),
+        Err(error) => {
+            tracing::error!(%error, "deferred page post registry lock failed");
+            false
+        }
+    }
+}
+
 async fn hydrate_page_parents<F: OAuthFlow, S: Storage + 'static>(
     flow: &F,
     viewer_did: &str,
@@ -7203,91 +7427,153 @@ async fn hydrate_page_parents<F: OAuthFlow, S: Storage + 'static>(
         .iter()
         .map(|record| record.uri.as_str())
         .collect::<HashSet<_>>();
-    let has_page_thread_chain = include_thread_ancestors
-        && page_records.iter().any(|record| {
-            record
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    let mut direct_uris = Vec::new();
+
+    // Preserve the owner's priority order. Do not sort: getPosts request order
+    // is direct parents, then thread roots, then quotes from the visible page.
+    for record in page_records {
+        if let Some(uri) = record
+            .record
+            .pointer("/reply/parent/uri")
+            .and_then(Value::as_str)
+            .filter(|uri| post_uri_did(uri).is_some())
+        {
+            direct_uris.push(uri.to_owned());
+            if seen.insert(uri.to_owned()) {
+                candidates.push(uri.to_owned());
+            }
+        }
+    }
+    if include_thread_ancestors {
+        for record in page_records {
+            if let Some(uri) = record
                 .record
-                .pointer("/reply/parent/uri")
-                .and_then(Value::as_str)
-                .is_some_and(|uri| page_uris.contains(uri))
-        });
-    let mut parent_uris = page_records
-        .iter()
-        .filter_map(|record| {
-            record
-                .record
-                .pointer("/reply/parent/uri")
+                .pointer("/reply/root/uri")
                 .and_then(Value::as_str)
                 .filter(|uri| post_uri_did(uri).is_some())
-                .map(str::to_owned)
-        })
-        .collect::<Vec<_>>();
-    parent_uris.sort_unstable();
-    parent_uris.dedup();
-
-    let mut first_round_uris = parent_uris
-        .iter()
-        .filter(|uri| !parents.contains_key(*uri))
-        .cloned()
-        .collect::<Vec<_>>();
-    if has_page_thread_chain {
-        first_round_uris.extend(
-            page_records
-                .iter()
-                .filter_map(|record| {
-                    record
-                        .record
-                        .pointer("/reply/root/uri")
-                        .and_then(Value::as_str)
-                        .filter(|uri| post_uri_did(uri).is_some())
-                        .map(str::to_owned)
-                })
-                .filter(|uri| !parents.contains_key(uri)),
-        );
+                && seen.insert(uri.to_owned())
+            {
+                candidates.push(uri.to_owned());
+            }
+        }
     }
-    if flow.supports_public_post_batching() {
-        first_round_uris.extend(page_records.iter().filter_map(|record| {
-            record
-                .record
-                .get("embed")
-                .and_then(quoted_record_ref)
-                .filter(|reference| !reference.unavailable)
-                .filter(|reference| at_uri_collection(&reference.uri) == Some("app.bsky.feed.post"))
-                .map(|reference| reference.uri)
-        }));
-    }
-    first_round_uris.sort_unstable();
-    first_round_uris.dedup();
     for record in page_records {
-        if first_round_uris.binary_search(&record.uri).is_ok() {
+        if let Some(reference) = record.record.get("embed").and_then(quoted_record_ref)
+            && !reference.unavailable
+            && at_uri_collection(&reference.uri) == Some("app.bsky.feed.post")
+            && post_uri_did(&reference.uri).is_some()
+            && seen.insert(reference.uri.clone())
+        {
+            candidates.push(reference.uri);
+        }
+    }
+    for uri in &candidates {
+        parents.insert(uri.clone(), None);
+    }
+    for record in page_records {
+        if candidates.iter().any(|uri| uri == &record.uri) {
             parents.insert(record.uri.clone(), Some((*record).clone()));
         }
     }
-    first_round_uris.retain(|uri| !parents.contains_key(uri));
 
-    for depth in 0..=2 {
-        let uris = if depth == 0 {
-            &first_round_uris
-        } else {
-            &parent_uris
-        };
-        if uris.is_empty() || tokio::time::Instant::now() >= deadline {
-            break;
+    let local_candidates = candidates
+        .iter()
+        .filter(|uri| !page_uris.contains(uri.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut fetched_inline = Vec::new();
+    if !local_candidates.is_empty() {
+        stats.rounds = stats.rounds.saturating_add(1);
+        match page_local_parent_records(Arc::clone(&storage), &local_candidates, deadline).await? {
+            Some((elapsed, records)) => {
+                stats.local_ms = stats.local_ms.saturating_add(elapsed);
+                stats.rows = stats.rows.saturating_add(records.len() as u64);
+                for (uri, record) in records {
+                    if record.uri == uri && record.collection == "app.bsky.feed.post" {
+                        parents.insert(uri, Some(record));
+                    }
+                }
+            }
+            None => stats.local_pending = true,
         }
-        hydrate_parent_uri_batch(
-            flow,
-            viewer_did,
-            Arc::clone(&storage),
-            uris,
-            &mut parents,
+    }
+
+    let missing = candidates
+        .iter()
+        .filter(|uri| parents.get(*uri).is_some_and(Option::is_none))
+        .cloned()
+        .collect::<Vec<_>>();
+    let available_missing = missing
+        .iter()
+        .filter(|uri| !deferred_page_post_is_pending(uri))
+        .cloned()
+        .collect::<Vec<_>>();
+    let request_uris = available_missing
+        .iter()
+        .take(25)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut deferred = missing
+        .iter()
+        .filter(|uri| !request_uris.contains(uri))
+        .cloned()
+        .collect::<HashSet<_>>();
+    if !request_uris.is_empty() && flow.supports_public_post_batching() {
+        let started = std::time::Instant::now();
+        match tokio::time::timeout_at(
             deadline,
-            stats,
+            flow.fetch_page_posts_once(viewer_did, &request_uris),
         )
-        .await?;
-        if depth == 2 || !has_page_thread_chain {
-            break;
+        .await
+        {
+            Ok(((fetched, routes), requests)) => {
+                stats.requests = stats.requests.saturating_add(requests);
+                stats.public_ms = stats
+                    .public_ms
+                    .saturating_add(started.elapsed().as_millis() as u64);
+                stats.routes.absorb(&routes);
+                for uri in &request_uris {
+                    if let Some(post) = fetched.get(uri)
+                        && post.record.uri == *uri
+                        && post.record.collection == "app.bsky.feed.post"
+                    {
+                        parents.insert(uri.clone(), Some(post.record.clone()));
+                        fetched_inline.push(post.clone());
+                    } else {
+                        deferred.insert(uri.clone());
+                    }
+                }
+            }
+            Err(_) => {
+                stats.requests = stats.requests.saturating_add(1);
+                let error = format!(
+                    "page getPosts call timed out before the page deadline ({} ms budget)",
+                    PAGE_PROFILE_BUDGET.as_millis()
+                );
+                tracing::warn!(%error, requested_posts = request_uris.len(), "page post hydration failed; posts deferred");
+                stats.public_ms = stats
+                    .public_ms
+                    .saturating_add(started.elapsed().as_millis() as u64);
+                deferred.extend(request_uris.iter().cloned());
+            }
         }
-        parent_uris = parent_uris
+    } else {
+        deferred.extend(request_uris.iter().cloned());
+    }
+
+    // Continue down ancestry only when each next level is already local. Missing
+    // levels become placeholders and are filled by the background worker.
+    let mut frontier = direct_uris
+        .iter()
+        .filter_map(|uri| parents.get(uri).and_then(Option::as_ref))
+        .map(|record| record.uri.clone())
+        .collect::<Vec<_>>();
+    let mut visited = candidates.iter().cloned().collect::<HashSet<_>>();
+    let mut local_ancestor_count = 0usize;
+    while !frontier.is_empty() && local_ancestor_count < MAX_LOCAL_PAGE_ANCESTORS {
+        let next = frontier
             .iter()
             .filter_map(|uri| parents.get(uri).and_then(Option::as_ref))
             .filter_map(|record| {
@@ -7296,241 +7582,298 @@ async fn hydrate_page_parents<F: OAuthFlow, S: Storage + 'static>(
                     .pointer("/reply/parent/uri")
                     .and_then(Value::as_str)
                     .filter(|uri| post_uri_did(uri).is_some())
-                    .filter(|uri| !parents.contains_key(*uri))
                     .map(str::to_owned)
             })
-            .collect();
-        parent_uris.sort_unstable();
-        parent_uris.dedup();
+            .filter(|uri| visited.insert(uri.clone()))
+            .collect::<Vec<_>>();
+        if next.is_empty() {
+            break;
+        }
+        for uri in &next {
+            parents.insert(uri.clone(), None);
+        }
+        stats.rounds = stats.rounds.saturating_add(1);
+        match page_local_parent_records(Arc::clone(&storage), &next, deadline).await? {
+            Some((elapsed, records)) => {
+                stats.local_ms = stats.local_ms.saturating_add(elapsed);
+                stats.rows = stats.rows.saturating_add(records.len() as u64);
+                let mut next_frontier = Vec::new();
+                for uri in &next {
+                    if let Some(record) = records.get(uri)
+                        && record.uri == *uri
+                        && record.collection == "app.bsky.feed.post"
+                    {
+                        parents.insert(uri.clone(), Some(record.clone()));
+                        next_frontier.push(uri.clone());
+                        local_ancestor_count += 1;
+                    } else {
+                        deferred.insert(uri.clone());
+                    }
+                }
+                frontier = next_frontier;
+            }
+            None => {
+                stats.local_pending = true;
+                deferred.extend(next);
+                break;
+            }
+        }
+    }
+    if local_ancestor_count >= MAX_LOCAL_PAGE_ANCESTORS {
+        for uri in frontier {
+            let parent_uri = parents
+                .get(&uri)
+                .and_then(Option::as_ref)
+                .and_then(|record| record.record.pointer("/reply/parent/uri"))
+                .and_then(Value::as_str)
+                .filter(|uri| post_uri_did(uri).is_some())
+                .map(str::to_owned);
+            if let Some(parent_uri) = parent_uri
+                && !parents.get(&parent_uri).is_some_and(Option::is_some)
+            {
+                parents.entry(parent_uri.clone()).or_insert(None);
+                deferred.insert(parent_uri);
+            }
+        }
+    }
+
+    for record in &fetched_inline {
+        if let Some(parent_uri) = record
+            .record
+            .record
+            .pointer("/reply/parent/uri")
+            .and_then(Value::as_str)
+            .filter(|uri| post_uri_did(uri).is_some())
+            && !parents.get(parent_uri).is_some_and(Option::is_some)
+        {
+            parents.entry(parent_uri.to_owned()).or_insert(None);
+            deferred.insert(parent_uri.to_owned());
+        }
+    }
+    stats.deferred = deferred.len() as u64;
+    let public_profiles = fetched_inline
+        .into_iter()
+        .filter_map(|post| post.author)
+        .collect::<Vec<_>>();
+    if !public_profiles.is_empty() {
+        let profile_storage = Arc::clone(&storage);
+        tokio::spawn(async move {
+            match tokio::task::spawn_blocking(move || {
+                persist_public_profiles(profile_storage.as_ref(), public_profiles)
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "public parent profile persistence failed")
+                }
+                Err(error) => {
+                    tracing::error!(%error, "blocking parent profile persistence task failed")
+                }
+            }
+        });
+    }
+    if !deferred.is_empty() {
+        let queued = start_deferred_page_posts(
+            flow.clone(),
+            Arc::clone(&storage),
+            viewer_did.to_owned(),
+            deferred.into_iter().collect(),
+        );
+        if queued > 0 {
+            tracing::debug!(
+                queued,
+                capacity = MAX_PENDING_PAGE_POSTS,
+                "queued deferred page posts"
+            );
+        }
     }
     Ok(parents)
 }
 
-async fn hydrate_parent_uri_batch<F: OAuthFlow, S: Storage + 'static>(
-    flow: &F,
-    viewer_did: &str,
+async fn page_local_parent_records<S: Storage + 'static>(
     storage: Arc<S>,
-    parent_uris: &[String],
-    parents: &mut PageParentIndex,
+    uris: &[String],
     deadline: tokio::time::Instant,
-    stats: &mut ParentHydrationStats,
-) -> Result<(), StorageError> {
-    for uri in parent_uris {
-        parents.entry(uri.clone()).or_insert(None);
-    }
-    stats.rounds = stats.rounds.saturating_add(1);
-    let local_uris = parent_uris.to_vec();
-    let local_storage = Arc::clone(&storage);
-    let local_started = std::time::Instant::now();
-    let local_worker = tokio::task::spawn_blocking(move || {
+) -> Result<Option<(u64, HashMap<String, IndexedRecord>)>, StorageError> {
+    let local_uris = uris.to_vec();
+    let worker = tokio::task::spawn_blocking(move || {
         let started = std::time::Instant::now();
-        let result = local_storage.records_by_uri("app.bsky.feed.post", &local_uris);
-        if let Err(error) = &result {
+        storage
+            .records_by_uri("app.bsky.feed.post", &local_uris)
+            .map(|records| (started.elapsed().as_millis() as u64, records))
+    });
+    match tokio::time::timeout_at(deadline, worker).await {
+        Ok(Ok(Ok((elapsed, records)))) => Ok(Some((elapsed, records))),
+        Ok(Ok(Err(error))) => {
             tracing::warn!(%error, "local parent record lookup failed");
+            Err(error)
         }
-        result.map(|records| (started.elapsed(), records))
-    });
-    let mut local = tokio::spawn(async move {
-        match local_worker.await {
-            Ok(result) => result,
-            Err(error) => {
-                tracing::error!(%error, "blocking parent lookup task failed");
-                Err(StorageError::BlockingTask(error.to_string()))
-            }
+        Ok(Err(error)) => {
+            tracing::error!(%error, "blocking parent lookup task failed");
+            Err(StorageError::BlockingTask(error.to_string()))
         }
-    });
+        Err(_) => Ok(None),
+    }
+}
 
-    let (start_public_fetch, public_start_signal) = tokio::sync::oneshot::channel();
-    let mut start_public_fetch = Some(start_public_fetch);
-    let public_started_at = Arc::new(Mutex::new(None));
-    let public_started_for_fetch = Arc::clone(&public_started_at);
-    let public_fetch = async move {
-        tokio::select! {
-            _ = tokio::time::sleep(PARENT_PUBLIC_LOOKUP_HEAD_START) => {},
-            _ = public_start_signal => {},
+fn start_deferred_page_posts<F: OAuthFlow, S: Storage + 'static>(
+    flow: F,
+    storage: Arc<S>,
+    viewer_did: String,
+    requested: Vec<String>,
+) -> usize {
+    let requested_count = requested.len();
+    let registry = deferred_page_post_registry();
+    let accepted = match registry.lock() {
+        Ok(mut pending) => {
+            let (accepted, capacity_reached) =
+                reserve_deferred_page_posts(&mut pending, requested, MAX_PENDING_PAGE_POSTS);
+            if capacity_reached {
+                tracing::warn!(
+                    requested = requested_count,
+                    pending = pending.len(),
+                    capacity = MAX_PENDING_PAGE_POSTS,
+                    "deferred page post queue is at capacity"
+                );
+            }
+            accepted
         }
-        let started = std::time::Instant::now();
-        if let Ok(mut public_started_at) = public_started_for_fetch.lock() {
-            *public_started_at = Some(started);
+        Err(error) => {
+            tracing::error!(%error, "deferred page post registry lock failed");
+            return 0;
         }
-        let (fetched, routes) = fetch_parent_posts(flow, viewer_did, parent_uris).await;
-        (started.elapsed(), fetched, routes)
     };
-    tokio::pin!(public_fetch);
-    tokio::select! {
-        result = &mut local => {
-            let (elapsed, records) = result.map_err(|error| {
-                tracing::error!(%error, "parent lookup supervisor task failed");
-                StorageError::BlockingTask(error.to_string())
-            })??;
-            stats.local_ms = stats.local_ms.saturating_add(elapsed.as_millis() as u64);
-            stats.local_pending = false;
-            stats.rows = stats.rows.saturating_add(records.len() as u64);
-            for (uri, record) in records {
-                parents.insert(uri, Some(record));
+    let accepted_count = accepted.len();
+    if accepted.is_empty() {
+        return 0;
+    }
+    tokio::spawn(async move {
+        let _worker = match deferred_page_post_semaphore().acquire_owned().await {
+            Ok(worker) => worker,
+            Err(error) => {
+                tracing::error!(%error, "deferred page post worker semaphore closed");
+                return;
             }
-            let missing = parent_uris
-                .iter()
-                .filter(|uri| parents.get(*uri).is_some_and(Option::is_none))
-                .cloned()
-                .collect::<Vec<_>>();
-            if missing.is_empty() || tokio::time::Instant::now() >= deadline {
-                stats.public_ms = stats
-                    .public_ms
-                    .saturating_add(parent_public_elapsed_ms(&public_started_at));
-                return Ok(());
+        };
+        let mut queue = std::collections::VecDeque::from(accepted);
+        while !queue.is_empty() {
+            let batch = queue.drain(..queue.len().min(25)).collect::<Vec<_>>();
+            let fetched_result = tokio::time::timeout(
+                Duration::from_secs(30),
+                flow.fetch_public_posts(&viewer_did, &batch),
+            )
+            .await;
+            let fetched = match fetched_result {
+                Ok((fetched, _)) => fetched,
+                Err(error) => {
+                    let error = format!("deferred post batch timed out after 30 s: {error}");
+                    tracing::warn!(%error, requested_posts = batch.len(), "deferred page post fetch failed");
+                    HashMap::new()
+                }
+            };
+            let mut discovered = HashSet::new();
+            let mut records_to_store = Vec::new();
+            let mut profiles_to_store = Vec::new();
+            for uri in &batch {
+                let Some(post) = fetched.get(uri) else {
+                    continue;
+                };
+                if post.record.uri != *uri || post.record.collection != "app.bsky.feed.post" {
+                    continue;
+                }
+                if let Some(parent) = post
+                    .record
+                    .record
+                    .pointer("/reply/parent/uri")
+                    .and_then(Value::as_str)
+                    .filter(|uri| post_uri_did(uri).is_some())
+                {
+                    discovered.insert(parent.to_owned());
+                }
+                if let Some(embed) = post.record.record.get("embed")
+                    && let Some(reference) = quoted_record_ref(embed)
+                    && !reference.unavailable
+                    && at_uri_collection(&reference.uri) == Some("app.bsky.feed.post")
+                    && post_uri_did(&reference.uri).is_some()
+                {
+                    discovered.insert(reference.uri);
+                }
+                records_to_store.push(post.record.clone());
+                if let Some(author) = &post.author {
+                    profiles_to_store.push(author.clone());
+                }
             }
-            if let Some(start) = start_public_fetch.take() {
-                let _ = start.send(());
+            if !records_to_store.is_empty() || !profiles_to_store.is_empty() {
+                let storage = Arc::clone(&storage);
+                let write_result = tokio::task::spawn_blocking(move || {
+                    for record in records_to_store {
+                        if let Err(error) = storage.put_record(&record) {
+                            tracing::warn!(%error, uri = %record.uri, "deferred page post persistence failed");
+                        }
+                    }
+                    if let Err(error) = persist_public_profiles(storage.as_ref(), profiles_to_store) {
+                        tracing::warn!(%error, "deferred page author profile persistence failed");
+                    }
+                })
+                .await;
+                if let Err(error) = write_result {
+                    tracing::error!(%error, "deferred page post persistence task failed");
+                }
             }
-            let fetched = tokio::time::timeout_at(deadline, &mut public_fetch).await;
-            if let Ok((elapsed, fetched, routes)) = fetched {
-                stats.public_ms = stats.public_ms.saturating_add(elapsed.as_millis() as u64);
-                stats.routes.absorb(&routes);
-                persist_fetched_parent_posts(Arc::clone(&storage), &missing, fetched, parents).await?;
-            } else {
-                stats.public_ms = stats
-                    .public_ms
-                    .saturating_add(parent_public_elapsed_ms(&public_started_at));
-            }
-        }
-        fetched = tokio::time::timeout_at(deadline, &mut public_fetch) => {
-            let local_elapsed_at_public = local_started.elapsed().as_millis() as u64;
-            stats.local_pending = true;
-            if let Ok((elapsed, fetched, routes)) = fetched {
-                stats.public_ms = stats.public_ms.saturating_add(elapsed.as_millis() as u64);
-                stats.routes.absorb(&routes);
-                persist_fetched_parent_posts(Arc::clone(&storage), parent_uris, fetched, parents).await?;
-            } else {
-                stats.public_ms = stats
-                    .public_ms
-                    .saturating_add(parent_public_elapsed_ms(&public_started_at));
-            }
-            let unresolved = parent_uris
-                .iter()
-                .filter(|uri| parents.get(*uri).is_some_and(Option::is_none))
-                .cloned()
-                .collect::<Vec<_>>();
-            if unresolved.is_empty() || tokio::time::Instant::now() >= deadline {
-                stats.local_ms = stats.local_ms.saturating_add(local_elapsed_at_public);
-                stats.local_pending = true;
-                return Ok(());
-            }
-            match tokio::time::timeout_at(deadline, &mut local).await {
-                Ok(Ok(Ok((elapsed, records)))) => {
-                    stats.local_ms = stats.local_ms.saturating_add(elapsed.as_millis() as u64);
-                    stats.local_pending = false;
-                    stats.rows = stats.rows.saturating_add(records.len() as u64);
-                    for (uri, record) in records {
-                        if parents.get(&uri).is_some_and(Option::is_none) {
-                            parents.insert(uri, Some(record));
+            let batch_set = batch.iter().cloned().collect::<HashSet<_>>();
+            let registry = deferred_page_post_registry();
+            match registry.lock() {
+                Ok(mut pending) => {
+                    for uri in &batch {
+                        pending.remove(uri);
+                    }
+                    for uri in discovered
+                        .into_iter()
+                        .filter(|uri| !batch_set.contains(uri))
+                    {
+                        if pending.len() >= MAX_PENDING_PAGE_POSTS {
+                            tracing::warn!(
+                                uri,
+                                pending = pending.len(),
+                                capacity = MAX_PENDING_PAGE_POSTS,
+                                "deferred page post queue is at capacity"
+                            );
+                            continue;
+                        }
+                        if pending.insert(uri.clone()) {
+                            queue.push_back(uri);
                         }
                     }
                 }
-                Ok(Ok(Err(error))) => return Err(error),
-                Ok(Err(error)) => {
-                    tracing::error!(%error, "parent lookup supervisor task failed");
-                    return Err(StorageError::BlockingTask(error.to_string()));
-                }
-                Err(_) => {
-                    stats.local_ms = stats.local_ms.saturating_add(local_elapsed_at_public);
-                    stats.local_pending = true;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-async fn fetch_parent_posts<F: OAuthFlow>(
-    flow: &F,
-    viewer_did: &str,
-    uris: &[String],
-) -> PublicPostsPage {
-    if flow.supports_public_post_batching() {
-        return flow.fetch_public_posts(viewer_did, uris).await;
-    }
-    let flow = flow.clone();
-    let posts = stream::iter(uris.iter().cloned().map(|uri| {
-        let flow = flow.clone();
-        async move {
-            match flow.fetch_post(&uri).await {
-                Ok(record) if record.uri == uri && record.collection == "app.bsky.feed.post" => {
-                    Some((
-                        uri,
-                        crate::feeds::FetchedPublicPost {
-                            record,
-                            author: None,
-                        },
-                    ))
-                }
-                Ok(_) => None,
                 Err(error) => {
-                    tracing::warn!(post_uri = %uri, %error, "public parent post lookup failed");
-                    None
+                    tracing::error!(%error, "deferred page post registry lock failed");
                 }
-            }
-        }
-    }))
-    .buffer_unordered(PAGE_QUOTE_CONCURRENCY)
-    .filter_map(|post| async move { post })
-    .collect::<HashMap<_, _>>()
-    .await;
-    let routes = crate::feeds::PostRouteStats {
-        public: posts.len() as u64,
-        ..Default::default()
-    };
-    (posts, routes)
-}
-
-fn parent_public_elapsed_ms(started_at: &Arc<Mutex<Option<std::time::Instant>>>) -> u64 {
-    started_at
-        .lock()
-        .ok()
-        .and_then(|started_at| *started_at)
-        .map(|started_at| started_at.elapsed().as_millis() as u64)
-        .unwrap_or_default()
-}
-
-async fn persist_fetched_parent_posts<S: Storage + 'static>(
-    storage: Arc<S>,
-    requested: &[String],
-    fetched: HashMap<String, crate::feeds::FetchedPublicPost>,
-    parents: &mut PageParentIndex,
-) -> Result<(), StorageError> {
-    let mut public_profiles = Vec::new();
-    for uri in requested {
-        let Some(post) = fetched.get(uri) else {
-            continue;
-        };
-        if post.record.uri == *uri && post.record.collection == "app.bsky.feed.post" {
-            parents.insert(uri.clone(), Some(post.record.clone()));
-            if let Some(author) = &post.author {
-                public_profiles.push(author.clone());
-            }
-        }
-    }
-    if public_profiles.is_empty() {
-        return Ok(());
-    }
-    // The page already has the parents; the author profiles only warm the index for later
-    // pages. Writing them goes through the shared SQLite writer, which can be seconds behind,
-    // so the page must not wait for it (live 2026-11-01: 12.2 s of parent hydration).
-    let profile_storage = Arc::clone(&storage);
-    tokio::spawn(async move {
-        match tokio::task::spawn_blocking(move || {
-            crate::feeds::persist_public_profiles(profile_storage.as_ref(), public_profiles)
-        })
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::warn!(%error, "public parent profile persistence failed"),
-            Err(error) => {
-                tracing::error!(%error, "blocking parent profile persistence task failed")
             }
         }
     });
-    Ok(())
+    accepted_count
+}
+
+fn reserve_deferred_page_posts(
+    pending: &mut HashSet<String>,
+    requested: Vec<String>,
+    capacity: usize,
+) -> (Vec<String>, bool) {
+    let mut accepted = Vec::new();
+    let mut capacity_reached = false;
+    for uri in requested {
+        if pending.contains(&uri) {
+            continue;
+        }
+        if pending.len() >= capacity {
+            capacity_reached = true;
+            continue;
+        }
+        pending.insert(uri.clone());
+        accepted.push(uri);
+    }
+    (accepted, capacity_reached)
 }
 
 fn queue_missing_parent_authors<S: Storage>(
@@ -7596,25 +7939,26 @@ fn at_uri_collection(uri: &str) -> Option<&str> {
 }
 
 async fn hydrate_page_quotes<F: OAuthFlow, S: Storage>(
-    flow: &F,
-    viewer_did: &str,
+    _flow: &F,
+    _viewer_did: &str,
     storage: &S,
+    prefetched_posts: &PageParentIndex,
     refs: Vec<QuotedRecordRef>,
-    deadline: tokio::time::Instant,
+    _deadline: tokio::time::Instant,
 ) -> Result<QuoteRenderIndex, StorageError> {
     let mut result = QuoteRenderIndex::default();
-    let mut missing_posts = Vec::new();
     for reference in refs {
         let state = if reference.unavailable {
             QuoteRenderState::Unavailable
         } else if let Some(collection) = at_uri_collection(&reference.uri) {
             if collection == "app.bsky.feed.post" {
-                match storage.record_by_uri(collection, &reference.uri)? {
-                    Some(record) => QuoteRenderState::Found(record),
-                    None => {
-                        missing_posts.push(reference.uri.clone());
-                        QuoteRenderState::Pending
-                    }
+                match prefetched_posts.get(&reference.uri) {
+                    Some(Some(record)) => QuoteRenderState::Found(record.clone()),
+                    Some(None) => QuoteRenderState::Pending,
+                    None => match storage.record_by_uri(collection, &reference.uri)? {
+                        Some(record) => QuoteRenderState::Found(record),
+                        None => QuoteRenderState::Pending,
+                    },
                 }
             } else {
                 QuoteRenderState::Other(storage.record_by_uri(collection, &reference.uri)?)
@@ -7623,71 +7967,6 @@ async fn hydrate_page_quotes<F: OAuthFlow, S: Storage>(
             QuoteRenderState::NotFound
         };
         result.insert(reference.uri, state);
-    }
-
-    if !flow.supports_public_post_batching() {
-        let flow = flow.clone();
-        let mut fetches = stream::iter(missing_posts.into_iter().map(|uri| {
-            let flow = flow.clone();
-            async move {
-                let fetched = flow.fetch_post(&uri).await;
-                (uri, fetched)
-            }
-        }))
-        .buffer_unordered(PAGE_QUOTE_CONCURRENCY);
-        let fetch_result = tokio::time::timeout_at(deadline, async {
-            while let Some((uri, fetched)) = fetches.next().await {
-                let state = match fetched {
-                    Ok(record)
-                        if record.uri == uri && record.collection == "app.bsky.feed.post" =>
-                    {
-                        QuoteRenderState::Found(record)
-                    }
-                    Ok(_) | Err(_) => QuoteRenderState::NotFound,
-                };
-                result.insert(uri, state);
-            }
-        })
-        .await;
-        if fetch_result.is_err() {
-            tracing::debug!(
-                pending = result
-                    .values()
-                    .filter(|state| matches!(state, QuoteRenderState::Pending))
-                    .count(),
-                "quoted post hydration reached page budget"
-            );
-        }
-    } else if let Ok((fetched, _routes)) = tokio::time::timeout_at(
-        deadline,
-        flow.fetch_public_posts(viewer_did, &missing_posts),
-    )
-    .await
-    {
-        let mut public_profiles = Vec::new();
-        for uri in missing_posts {
-            let state = match fetched.get(&uri) {
-                Some(post)
-                    if post.record.uri == uri && post.record.collection == "app.bsky.feed.post" =>
-                {
-                    if let Some(author) = &post.author {
-                        public_profiles.push(author.clone());
-                    }
-                    QuoteRenderState::Found(post.record.clone())
-                }
-                _ => QuoteRenderState::NotFound,
-            };
-            result.insert(uri, state);
-        }
-        crate::feeds::persist_public_profiles(storage, public_profiles)?;
-    } else {
-        tracing::debug!(
-            pending = result
-                .values()
-                .filter(|state| matches!(state, QuoteRenderState::Pending))
-                .count(),
-            "quoted post hydration reached page budget"
-        );
     }
     Ok(result)
 }
@@ -8654,9 +8933,16 @@ where
         .count() as u64;
     let timeline = page_records.iter().collect::<Vec<_>>();
     let content_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
+    let content_authors = page_content_authors(&timeline, std::iter::empty());
+    let account_data_hydration = fetch_page_account_data(
+        &state.flow,
+        did.clone(),
+        page_account_actor_dids(&content_authors),
+        content_deadline,
+    );
     let parent_started = std::time::Instant::now();
     let mut parent_stats = ParentHydrationStats::default();
-    let parent_result = hydrate_page_parents(
+    let parent_hydration = hydrate_page_parents(
         &state.flow,
         &did,
         state.storage.clone(),
@@ -8664,8 +8950,9 @@ where
         content_deadline,
         true,
         &mut parent_stats,
-    )
-    .await;
+    );
+    let (parent_result, account_data_hydration) =
+        tokio::join!(parent_hydration, account_data_hydration);
     page_timing.parent_hydration_ms = parent_started.elapsed().as_millis() as u64;
     page_timing.record_parent_hydration(parent_stats);
     let parents = match parent_result {
@@ -8674,13 +8961,15 @@ where
     };
     let quote_records = page_records_with_parents(&timeline, &parents);
     let content_started = std::time::Instant::now();
-    let content_result = hydrate_page_content(
+    let content_result = hydrate_page_content_with_account_future(
         &state.flow,
         &did,
         state.storage.clone(),
         &timeline,
         &quote_records,
-        std::iter::empty(),
+        &parents,
+        content_authors,
+        std::future::ready(account_data_hydration),
         content_deadline,
     )
     .await;
@@ -9021,8 +9310,15 @@ where
         .filter(|record| !hidden_actors.contains(&record.did))
         .collect::<Vec<_>>();
     let content_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
+    let content_authors = page_content_authors(&visible, std::iter::empty());
+    let account_data_hydration = fetch_page_account_data(
+        &state.flow,
+        did.clone(),
+        page_account_actor_dids(&content_authors),
+        content_deadline,
+    );
     let mut parent_stats = ParentHydrationStats::default();
-    let parents = match hydrate_page_parents(
+    let parent_hydration = hydrate_page_parents(
         &state.flow,
         &did,
         state.storage.clone(),
@@ -9030,22 +9326,25 @@ where
         content_deadline,
         true,
         &mut parent_stats,
-    )
-    .await
-    {
+    );
+    let (parent_result, account_data_hydration) =
+        tokio::join!(parent_hydration, account_data_hydration);
+    let parents = match parent_result {
         Ok(parents) => parents,
         Err(error) => {
             return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
         }
     };
     let quote_records = page_records_with_parents(&visible, &parents);
-    let hydration = match hydrate_page_content(
+    let hydration = match hydrate_page_content_with_account_future(
         &state.flow,
         &did,
         state.storage.clone(),
         &visible,
         &quote_records,
-        std::iter::empty(),
+        &parents,
+        content_authors,
+        std::future::ready(account_data_hydration),
         content_deadline,
     )
     .await
@@ -9503,9 +9802,16 @@ where
         .filter(|record| list_blocks.contains_key(&record.did))
         .count() as u64;
     let content_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
+    let content_authors = page_content_authors(&feed_records, std::iter::empty());
+    let account_data_hydration = fetch_page_account_data(
+        &state.flow,
+        did.clone(),
+        page_account_actor_dids(&content_authors),
+        content_deadline,
+    );
     let parent_started = std::time::Instant::now();
     let mut parent_stats = ParentHydrationStats::default();
-    let parent_result = hydrate_page_parents(
+    let parent_hydration = hydrate_page_parents(
         &state.flow,
         &did,
         state.storage.clone(),
@@ -9513,8 +9819,9 @@ where
         content_deadline,
         true,
         &mut parent_stats,
-    )
-    .await;
+    );
+    let (parent_result, account_data_hydration) =
+        tokio::join!(parent_hydration, account_data_hydration);
     page_timing.parent_hydration_ms = parent_started.elapsed().as_millis() as u64;
     page_timing.record_parent_hydration(parent_stats);
     let parents = match parent_result {
@@ -9523,13 +9830,15 @@ where
     };
     let quote_records = page_records_with_parents(&feed_records, &parents);
     let content_started = std::time::Instant::now();
-    let content_result = hydrate_page_content(
+    let content_result = hydrate_page_content_with_account_future(
         &state.flow,
         &did,
         state.storage.clone(),
         &feed_records,
         &quote_records,
-        std::iter::empty(),
+        &parents,
+        content_authors,
+        std::future::ready(account_data_hydration),
         content_deadline,
     )
     .await;
@@ -10378,9 +10687,16 @@ where
         }
     }
     let content_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
+    let content_authors = page_content_authors(&notification_records, leading_authors);
+    let account_data_hydration = fetch_page_account_data(
+        &state.flow,
+        did.clone(),
+        page_account_actor_dids(&content_authors),
+        content_deadline,
+    );
     let parent_started = std::time::Instant::now();
     let mut parent_stats = ParentHydrationStats::default();
-    let parent_result = hydrate_page_parents(
+    let parent_hydration = hydrate_page_parents(
         &state.flow,
         &did,
         state.storage.clone(),
@@ -10388,8 +10704,9 @@ where
         content_deadline,
         false,
         &mut parent_stats,
-    )
-    .await;
+    );
+    let (parent_result, account_data_hydration) =
+        tokio::join!(parent_hydration, account_data_hydration);
     page_timing.parent_hydration_ms = parent_started.elapsed().as_millis() as u64;
     page_timing.record_parent_hydration(parent_stats);
     let parents = match parent_result {
@@ -10398,13 +10715,15 @@ where
     };
     let quote_records = page_records_with_parents(&notification_records, &parents);
     let content_started = std::time::Instant::now();
-    let content_result = hydrate_page_content(
+    let content_result = hydrate_page_content_with_account_future(
         &state.flow,
         &did,
         state.storage.clone(),
         &notification_records,
         &quote_records,
-        leading_authors,
+        &parents,
+        content_authors,
+        std::future::ready(account_data_hydration),
         content_deadline,
     )
     .await;
@@ -11292,9 +11611,19 @@ where
         }
     }
     let content_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
+    let content_authors = page_content_authors(
+        &records,
+        std::iter::once(subject.to_owned()).chain(records.iter().map(|record| record.did.clone())),
+    );
+    let account_data_hydration = fetch_page_account_data(
+        &state.flow,
+        did.clone(),
+        page_account_actor_dids(&content_authors),
+        content_deadline,
+    );
     let parent_started = std::time::Instant::now();
     let mut parent_stats = ParentHydrationStats::default();
-    let parent_result = hydrate_page_parents(
+    let parent_hydration = hydrate_page_parents(
         &state.flow,
         &did,
         state.storage.clone(),
@@ -11302,8 +11631,9 @@ where
         content_deadline,
         true,
         &mut parent_stats,
-    )
-    .await;
+    );
+    let (parent_result, account_data_hydration) =
+        tokio::join!(parent_hydration, account_data_hydration);
     page_timing.parent_hydration_ms = parent_started.elapsed().as_millis() as u64;
     page_timing.record_parent_hydration(parent_stats);
     let parents = match parent_result {
@@ -11312,13 +11642,15 @@ where
     };
     let quote_records = page_records_with_parents(&records, &parents);
     let content_started = std::time::Instant::now();
-    let content_result = hydrate_page_content(
+    let content_result = hydrate_page_content_with_account_future(
         &state.flow,
         &did,
         state.storage.clone(),
         &records,
         &quote_records,
-        std::iter::once(subject.to_owned()).chain(records.iter().map(|record| record.did.clone())),
+        &parents,
+        content_authors,
+        std::future::ready(account_data_hydration),
         content_deadline,
     )
     .await;
@@ -12249,14 +12581,43 @@ where
         .chain(std::iter::once(&record))
         .chain(thread_reply_records.iter())
         .collect::<Vec<_>>();
-    let content_started = std::time::Instant::now();
-    let content_result = hydrate_page_content(
+    let content_authors = page_content_authors(&page_records, std::iter::empty());
+    let account_data_hydration = fetch_page_account_data(
+        &state.flow,
+        viewer_did.clone(),
+        page_account_actor_dids(&content_authors),
+        page_deadline,
+    );
+    let parent_started = std::time::Instant::now();
+    let mut parent_stats = ParentHydrationStats::default();
+    let parent_hydration = hydrate_page_parents(
         &state.flow,
         &viewer_did,
         state.storage.clone(),
         &page_records,
+        page_deadline,
+        true,
+        &mut parent_stats,
+    );
+    let (parent_result, account_data_hydration) =
+        tokio::join!(parent_hydration, account_data_hydration);
+    let parents = match parent_result {
+        Ok(parents) => parents,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    page_timing.parent_hydration_ms = parent_started.elapsed().as_millis() as u64;
+    page_timing.record_parent_hydration(parent_stats);
+    let quote_records = page_records_with_parents(&page_records, &parents);
+    let content_started = std::time::Instant::now();
+    let content_result = hydrate_page_content_with_account_future(
+        &state.flow,
+        &viewer_did,
+        state.storage.clone(),
         &page_records,
-        std::iter::empty(),
+        &quote_records,
+        &parents,
+        content_authors,
+        std::future::ready(account_data_hydration),
         page_deadline,
     )
     .await;
@@ -12280,13 +12641,13 @@ where
     let page_interactions =
         load_page_interactions(&state.storage, &interaction_uris, Some(&viewer_did)).await;
     render.add_interactions(interactions_started.elapsed());
-    let ancestors_html = ancestors
+    let thread_ancestor_cards = thread_ancestor_display(&record, &parents, parent_height);
+    let ancestors_html = thread_ancestor_cards
         .iter()
         .enumerate()
         .map(|(index, ancestor)| {
-            format!(
-                "<li class=\"post-item\">{}</li>",
-                render_web_post(
+            let card = match ancestor {
+                ThreadAncestorDisplay::Found(ancestor) => render_web_post(
                     state.storage.as_ref(),
                     ancestor,
                     WebPostRenderOptions {
@@ -12298,8 +12659,10 @@ where
                         page_interactions: &page_interactions,
                         render: &render,
                     },
-                )
-            )
+                ),
+                ThreadAncestorDisplay::Deferred(uri) => render_deferred_parent(uri, true),
+            };
+            format!("<li class=\"post-item\">{card}</li>")
         })
         .collect::<String>();
     let mut reply_budget = 100;
@@ -12524,6 +12887,104 @@ where
     .into_response()
 }
 
+async fn parent_fragment<F, S>(
+    State(state): State<Arc<OAuthWebState<F, S>>>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response
+where
+    F: OAuthFlow,
+    S: Storage + 'static,
+{
+    let Some(viewer_did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref())
+    else {
+        return (StatusCode::UNAUTHORIZED, "sign in to load this parent post").into_response();
+    };
+    let Some(uri) = query.get("uri").filter(|uri| post_uri_did(uri).is_some()) else {
+        return oauth_error(StatusCode::BAD_REQUEST, "uri must identify a post");
+    };
+    let record = match state.storage.record_by_uri("app.bsky.feed.post", uri) {
+        Ok(Some(record)) => record,
+        Ok(None) => match tokio::time::timeout(
+            Duration::from_secs(10),
+            state.flow.fetch_post_for_fragment(uri),
+        )
+        .await
+        {
+            Ok(Ok(Some(record)))
+                if record.uri == *uri && record.collection == "app.bsky.feed.post" =>
+            {
+                record
+            }
+            Ok(Ok(Some(_))) => {
+                let error = "post fragment fetch returned a different record";
+                tracing::warn!(%error, uri, "parent post fragment fetch failed");
+                return (StatusCode::BAD_GATEWAY, "parent post could not be loaded")
+                    .into_response();
+            }
+            Ok(Ok(None)) => {
+                return (StatusCode::NOT_FOUND, "parent post not found").into_response();
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(%error, uri, "parent post fragment fetch failed");
+                if parent_fetch_error_is_not_found(&error) {
+                    return (StatusCode::NOT_FOUND, "parent post not found").into_response();
+                }
+                return (StatusCode::BAD_GATEWAY, "parent post could not be loaded")
+                    .into_response();
+            }
+            Err(error) => {
+                let error = format!("parent post fragment fetch timed out after 10 s: {error}");
+                tracing::warn!(%error, uri, "parent post fragment fetch failed");
+                return (StatusCode::BAD_GATEWAY, "parent post could not be loaded")
+                    .into_response();
+            }
+        },
+        Err(error) => {
+            tracing::warn!(%error, uri, "parent post fragment storage lookup failed");
+            return (StatusCode::BAD_GATEWAY, "parent post could not be loaded").into_response();
+        }
+    };
+    let render = WebRenderContext::default();
+    let card = if query.get("view").is_some_and(|view| view == "thread") {
+        let mut quote_index = QuoteRenderIndex::default();
+        if let Some(embed) = record.record.get("embed")
+            && let Some(reference) = quoted_record_ref(embed)
+            && !reference.unavailable
+            && at_uri_collection(&reference.uri) == Some("app.bsky.feed.post")
+        {
+            quote_index.insert(reference.uri, QuoteRenderState::Pending);
+        }
+        render_web_post(
+            state.storage.as_ref(),
+            &record,
+            WebPostRenderOptions {
+                viewer_did: &viewer_did,
+                rights: verified_cookie_form_rights(
+                    &state.public,
+                    &headers,
+                    state.storage.as_ref(),
+                ),
+                link_text_to_thread: true,
+                eager_avatar: false,
+                quote_index: &quote_index,
+                page_interactions: &PageInteractionIndex::new(),
+                render: &render,
+            },
+        )
+    } else {
+        render_reply_parent_card(&render, state.storage.as_ref(), &record)
+    };
+    Html(card).into_response()
+}
+
+fn parent_fetch_error_is_not_found(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("not found")
+        || error.contains("recordnotfound")
+        || error.contains("definitely gone")
+}
+
 async fn profile_fragment<F, S>(
     State(state): State<Arc<OAuthWebState<F, S>>>,
     headers: HeaderMap,
@@ -12639,11 +13100,11 @@ fn render_quote_preview<S: Storage>(storage: &S, quoted: &IndexedRecord) -> Stri
 }
 
 async fn thread_ancestors<F: OAuthFlow, S: Storage>(
-    flow: &F,
+    _flow: &F,
     storage: &S,
     record: &IndexedRecord,
     parent_height: usize,
-    deadline: tokio::time::Instant,
+    _deadline: tokio::time::Instant,
 ) -> Result<(Vec<IndexedRecord>, ThreadAncestorStats), String> {
     let mut stats = ThreadAncestorStats::default();
     let mut ancestors = Vec::new();
@@ -12670,104 +13131,36 @@ async fn thread_ancestors<F: OAuthFlow, S: Storage>(
     {
         initial_uris.push(root.clone());
     }
-    let mut records_by_uri = HashMap::new();
-    let mut source_by_uri = HashMap::new();
-    let mut missing = Vec::new();
-    for uri in initial_uris {
-        match storage
-            .record_by_uri("app.bsky.feed.post", &uri)
-            .map_err(|error| error.to_string())?
-        {
-            Some(local) => {
-                records_by_uri.insert(uri.clone(), local);
-                source_by_uri.insert(uri, AncestorSource::Index);
-            }
-            None => missing.push(uri),
-        }
-    }
-    let attempted_initial = missing.iter().cloned().collect::<HashSet<_>>();
-    let flow_for_initial = flow.clone();
-    let mut completed = HashSet::new();
-    let mut initial_fetches = stream::iter(missing.iter().cloned().map(move |uri| {
-        let flow = flow_for_initial.clone();
-        async move {
-            let fetched = flow.fetch_post(&uri).await;
-            (uri, fetched)
-        }
-    }))
-    .buffer_unordered(PAGE_QUOTE_CONCURRENCY);
-    let initial_result = tokio::time::timeout_at(deadline, async {
-        while let Some((uri, fetched)) = initial_fetches.next().await {
-            completed.insert(uri.clone());
-            if let Ok(parent) = fetched
-                && parent.uri == uri
-                && parent.collection == "app.bsky.feed.post"
-            {
-                records_by_uri.insert(uri.clone(), parent);
-                source_by_uri.insert(uri, AncestorSource::Live);
-            }
-        }
-    })
-    .await;
-    if initial_result.is_err() {
-        stats.timed_out += missing
-            .iter()
-            .filter(|uri| !completed.contains(*uri))
-            .count();
-    }
-
+    let mut records = storage
+        .records_by_uri("app.bsky.feed.post", &initial_uris)
+        .map_err(|error| error.to_string())?;
     for _ in 0..parent_height {
         let Some(uri) = parent_uri else { break };
-        if tokio::time::Instant::now() >= deadline {
-            break;
-        }
         if !visited.insert(uri.clone()) {
             break;
         }
-        let parent = match records_by_uri.remove(&uri) {
-            Some(parent) => {
-                match source_by_uri.remove(&uri) {
-                    Some(AncestorSource::Index) => stats.from_index += 1,
-                    Some(AncestorSource::Live) => stats.live += 1,
-                    None => {}
-                }
-                parent
-            }
-            None if attempted_initial.contains(&uri) => break,
+        let parent = match records.remove(&uri) {
+            Some(parent) => parent,
             None => match storage
-                .record_by_uri("app.bsky.feed.post", &uri)
+                .records_by_uri("app.bsky.feed.post", std::slice::from_ref(&uri))
                 .map_err(|error| error.to_string())?
+                .remove(&uri)
             {
-                Some(parent) => {
-                    stats.from_index += 1;
-                    parent
-                }
-                None => match tokio::time::timeout_at(deadline, flow.fetch_post(&uri)).await {
-                    Err(_) => {
-                        stats.timed_out += 1;
-                        break;
-                    }
-                    Ok(Ok(parent))
-                        if parent.uri == uri && parent.collection == "app.bsky.feed.post" =>
-                    {
-                        stats.live += 1;
-                        parent
-                    }
-                    Ok(Ok(_)) | Ok(Err(_)) => break,
-                },
+                Some(parent) => parent,
+                None => break,
             },
         };
-        let next_parent_uri = parent
+        let is_root = root_uri.as_deref() == Some(uri.as_str());
+        parent_uri = parent
             .record
             .pointer("/reply/parent/uri")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        let is_root = root_uri.as_deref() == Some(uri.as_str());
         ancestors.push(parent);
+        stats.from_index += 1;
         if is_root {
             break;
         }
-        parent_uri = next_parent_uri;
     }
     ancestors.reverse();
     Ok((ancestors, stats))
@@ -16143,8 +16536,14 @@ fn render_web_post<S: Storage>(
         })
         .unwrap_or_default();
     let anchor = post_anchor(&record.uri);
+    let reply_parent_uri = record
+        .record
+        .pointer("/reply/parent/uri")
+        .and_then(Value::as_str)
+        .map(html_escape)
+        .unwrap_or_default();
     format!(
-        "<article class=\"post-card\" id=\"{anchor}\" data-post-kind=\"post\" data-post-uri=\"{uri}\"><header class=\"post-header\">{author}{time}</header><p class=\"post-text\">{text}</p>{link_targets}{embed}<div class=\"post-actions\" aria-label=\"Post actions\">{actions}</div></article>"
+        "<article class=\"post-card\" id=\"{anchor}\" data-post-kind=\"post\" data-post-uri=\"{uri}\" data-reply-parent-uri=\"{reply_parent_uri}\"><header class=\"post-header\">{author}{time}</header><p class=\"post-text\">{text}</p>{link_targets}{embed}<div class=\"post-actions\" aria-label=\"Post actions\">{actions}</div></article>"
     )
 }
 
@@ -16211,6 +16610,26 @@ fn render_reply_parent_card<S: Storage>(
     )
 }
 
+fn render_deferred_parent(parent_uri: &str, thread_card: bool) -> String {
+    let thread_uri = format!("/app/thread?uri={}", form_encoded(parent_uri));
+    let mut fragment_uri = format!("/parent-fragment?uri={}", form_encoded(parent_uri));
+    let (class, view_attr) = if thread_card {
+        fragment_uri.push_str("&amp;view=thread");
+        (
+            "post-card deferred-parent-card",
+            " data-parent-view=\"thread\" data-parent-depth=\"0\"",
+        )
+    } else {
+        (
+            "reply-parent-card reply-parent-deferred",
+            " data-parent-depth=\"0\"",
+        )
+    };
+    format!(
+        "<div class=\"{class}\" data-parent-fragment=\"{fragment_uri}\"{view_attr}><span>Loading…</span><a href=\"{thread_uri}\">Open thread</a></div>"
+    )
+}
+
 fn render_reply_parent_fallback<S: Storage>(
     render: &WebRenderContext,
     storage: &S,
@@ -16252,7 +16671,33 @@ struct TimelinePostGrouping {
 
 struct TimelinePostGroup {
     page_members: Vec<usize>,
-    ancestors: Vec<IndexedRecord>,
+    ancestors: Vec<TimelineGroupAncestor>,
+}
+
+enum TimelineGroupAncestor {
+    Found(IndexedRecord),
+    Deferred(String),
+}
+
+enum TimelineGroupRenderMember<'a> {
+    Record(&'a IndexedRecord, Option<usize>),
+    Deferred(&'a str),
+}
+
+impl TimelineGroupRenderMember<'_> {
+    fn did(&self) -> Option<&str> {
+        match self {
+            Self::Record(record, _) => Some(record.did.as_str()),
+            Self::Deferred(uri) => post_uri_did(uri),
+        }
+    }
+
+    fn uri(&self) -> &str {
+        match self {
+            Self::Record(record, _) => record.uri.as_str(),
+            Self::Deferred(uri) => uri,
+        }
+    }
 }
 
 fn timeline_post_grouping(
@@ -16318,14 +16763,17 @@ fn timeline_post_grouping(
             match parents.get(uri) {
                 Some(Some(parent)) => {
                     oldest = oldest.min(parent.time_us);
-                    ancestors_near_to_far.push(parent.clone());
+                    ancestors_near_to_far.push(TimelineGroupAncestor::Found(parent.clone()));
                     parent_uri = parent
                         .record
                         .pointer("/reply/parent/uri")
                         .and_then(Value::as_str)
                         .filter(|uri| post_uri_did(uri).is_some());
                 }
-                Some(None) => break,
+                Some(None) => {
+                    ancestors_near_to_far.push(TimelineGroupAncestor::Deferred(uri.to_owned()));
+                    break;
+                }
                 None => {
                     complete_ancestry = false;
                     break;
@@ -16341,7 +16789,10 @@ fn timeline_post_grouping(
             .chain(
                 ancestors_near_to_far
                     .iter()
-                    .map(|ancestor| ancestor.time_us),
+                    .filter_map(|ancestor| match ancestor {
+                        TimelineGroupAncestor::Found(record) => Some(record.time_us),
+                        TimelineGroupAncestor::Deferred(_) => None,
+                    }),
             )
             .max()
             .unwrap_or_default();
@@ -16388,23 +16839,30 @@ fn render_timeline_post_items<S: Storage>(
             let mut members = group
                 .ancestors
                 .iter()
-                .map(|record| (record, None))
+                .map(|ancestor| match ancestor {
+                    TimelineGroupAncestor::Found(record) => {
+                        TimelineGroupRenderMember::Record(record, None)
+                    }
+                    TimelineGroupAncestor::Deferred(uri) => {
+                        TimelineGroupRenderMember::Deferred(uri)
+                    }
+                })
                 .collect::<Vec<_>>();
             members.extend(
-                group
-                    .page_members
-                    .iter()
-                    .map(|member| (records[*member], Some(*member))),
+                group.page_members.iter().map(|member| {
+                    TimelineGroupRenderMember::Record(records[*member], Some(*member))
+                }),
             );
             let attrs = timeline_list_block_attrs(
                 context.list_blocks,
-                members.iter().map(|(member, _)| member.did.as_str()),
+                members.iter().filter_map(TimelineGroupRenderMember::did),
             );
             html.push_str(&format!(
                 "<li class=\"post-item thread-group\"{attrs} aria-label=\"Reply thread\">"
             ));
-            let self_thread = members.first().is_some_and(|(first, _)| {
-                members.iter().all(|(member, _)| member.did == first.did)
+            let first_did = members.first().and_then(TimelineGroupRenderMember::did);
+            let self_thread = first_did.is_some_and(|first_did| {
+                members.iter().all(|member| member.did() == Some(first_did))
             });
             let visible = if self_thread && members.len() > 10 {
                 (0..members.len())
@@ -16425,27 +16883,35 @@ fn render_timeline_post_items<S: Storage>(
                         "<span class=\"reply-connector reply-connector-previous thread-group-connector\" aria-hidden=\"true\"></span>",
                     );
                 }
-                let (member, page_index) = members[*member_index];
-                if let Some(page_index) = page_index {
-                    html.push_str(preludes.get(page_index).map(String::as_str).unwrap_or(""));
+                match members[*member_index] {
+                    TimelineGroupRenderMember::Record(member, page_index) => {
+                        if let Some(page_index) = page_index {
+                            html.push_str(
+                                preludes.get(page_index).map(String::as_str).unwrap_or(""),
+                            );
+                        }
+                        html.push_str(&render_web_post(
+                            storage,
+                            member,
+                            WebPostRenderOptions {
+                                viewer_did: context.viewer_did,
+                                rights: context.rights,
+                                link_text_to_thread: true,
+                                eager_avatar: page_index.is_none_or(|page_index| page_index < 6),
+                                quote_index: context.quote_index,
+                                page_interactions: context.page_interactions,
+                                render: context.render,
+                            },
+                        ));
+                    }
+                    TimelineGroupRenderMember::Deferred(uri) => {
+                        html.push_str(&render_deferred_parent(uri, true));
+                    }
                 }
-                html.push_str(&render_web_post(
-                    storage,
-                    member,
-                    WebPostRenderOptions {
-                        viewer_did: context.viewer_did,
-                        rights: context.rights,
-                        link_text_to_thread: true,
-                        eager_avatar: page_index.is_none_or(|page_index| page_index < 6),
-                        quote_index: context.quote_index,
-                        page_interactions: context.page_interactions,
-                        render: context.render,
-                    },
-                ));
             }
             let skipped = members.len().saturating_sub(visible.len());
             if skipped > 0 {
-                let root_uri = &members[0].0.uri;
+                let root_uri = members[0].uri();
                 let thread_uri = format!("/app/thread?uri={}", form_encoded(root_uri));
                 let label = if self_thread {
                     format!("{skipped} more in this thread")
@@ -16524,7 +16990,13 @@ fn render_timeline_post_item<S: Storage>(
     let parent = options.parents.get(parent_uri).and_then(Option::as_ref);
     let parent_markup = parent
         .map(|parent| render_reply_parent_card(options.render, storage, parent))
-        .unwrap_or_else(|| render_reply_parent_fallback(options.render, storage, parent_uri));
+        .unwrap_or_else(|| {
+            if options.parents.get(parent_uri).is_some_and(Option::is_none) {
+                render_deferred_parent(parent_uri, false)
+            } else {
+                render_reply_parent_fallback(options.render, storage, parent_uri)
+            }
+        });
     format!(
         "<li class=\"post-item reply-with-parent\"{}>{}<div class=\"reply-parent-slot\">{parent_markup}<span class=\"reply-connector\" aria-hidden=\"true\"></span></div>{article}</li>",
         options.list_block_attrs, options.prelude
@@ -16547,7 +17019,13 @@ fn render_notification_parent<S: Storage>(
     let parent = parents.get(parent_uri).and_then(Option::as_ref);
     let markup = parent
         .map(|parent| render_reply_parent_card(render, storage, parent))
-        .unwrap_or_else(|| render_reply_parent_fallback(render, storage, parent_uri));
+        .unwrap_or_else(|| {
+            if parents.get(parent_uri).is_some_and(Option::is_none) {
+                render_deferred_parent(parent_uri, false)
+            } else {
+                render_reply_parent_fallback(render, storage, parent_uri)
+            }
+        });
     format!(
         "<div class=\"notification-reply-parent\">{markup}<span class=\"reply-connector\" aria-hidden=\"true\"></span></div>"
     )
@@ -18549,20 +19027,15 @@ mod tests {
 
         assert!(page.contains("class=\"post-item thread-group\""), "{page}");
         assert!(page.contains("Thread group ancestor"), "{page}");
-        assert!(page.contains("Hydrated ancestor quote body"), "{page}");
-        let mut fetched = flow.fetched.lock().unwrap().clone();
-        fetched.sort();
-        let mut expected = vec![root.uri.clone(), quote.uri.clone()];
-        expected.sort();
-        assert_eq!(
-            fetched, expected,
-            "one parent fetch and one batched quote fetch"
+        assert!(page.contains("data-quote-fragment"), "{page}");
+        assert!(!page.contains("Hydrated ancestor quote body"), "{page}");
+        let batches = flow.batches.lock().unwrap().clone();
+        assert!(batches.contains(&vec![root.uri.clone()]));
+        assert!(
+            batches
+                .iter()
+                .all(|batch| batch.len() == 1 && (batch[0] == root.uri || batch[0] == quote.uri))
         );
-        let mut batches = flow.batches.lock().unwrap().clone();
-        for batch in &mut batches {
-            batch.sort();
-        }
-        assert_eq!(batches, [[root.uri], [quote.uri]]);
     }
 
     #[tokio::test]
@@ -18661,6 +19134,94 @@ mod tests {
             fragment.contains("Fetched quote fragment body"),
             "{fragment}"
         );
+    }
+
+    #[tokio::test]
+    async fn parent_fragment_returns_the_inline_card_and_reports_not_found_and_fetch_errors() {
+        let storage = Arc::new(MemoryStorage::default());
+        let viewer = "did:plc:parent-fragment-viewer";
+        let parent = test_web_post(
+            "did:plc:parent-fragment-author",
+            "parent-fragment",
+            1,
+            "Parent fragment body",
+            None,
+        );
+        let flow = QuoteHydrationTestFlow::new([parent.clone()]);
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let session_id = "parent-fragment-session";
+        let generation = storage.rotate_web_session(viewer, session_id).unwrap();
+        let token = public.issue_session_cookie(
+            viewer,
+            session_id,
+            generation,
+            SessionPermissions {
+                write: false,
+                feed: false,
+                blob: false,
+                video: false,
+                follow: false,
+                block: false,
+                mute: false,
+                list: false,
+                preferences: false,
+                like: false,
+                repost: false,
+                post: false,
+            },
+        );
+        let expected =
+            render_reply_parent_card(&WebRenderContext::default(), storage.as_ref(), &parent);
+        let response = public
+            .router_with_flow(flow, storage.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!(
+                        "/parent-fragment?uri={}",
+                        form_encoded(&parent.uri)
+                    ))
+                    .header("cookie", format!("{SESSION_COOKIE}={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(String::from_utf8(body.to_vec()).unwrap(), expected);
+
+        let missing_uri = "at://did:plc:parent-fragment-author/app.bsky.feed.post/missing";
+        let not_found = public
+            .router_with_flow(QuoteHydrationTestFlow::new([]), storage.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!(
+                        "/parent-fragment?uri={}",
+                        form_encoded(missing_uri)
+                    ))
+                    .header("cookie", format!("{SESSION_COOKIE}={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+
+        let fetch_error = public
+            .router_with_flow(DisabledOAuthFlow, storage)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!(
+                        "/parent-fragment?uri={}",
+                        form_encoded(missing_uri)
+                    ))
+                    .header("cookie", format!("{SESSION_COOKIE}={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fetch_error.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
@@ -20767,7 +21328,8 @@ mod tests {
 
         let page = request_test_timeline(storage, viewer).await;
 
-        assert!(page.contains("Reply to <a"));
+        assert!(page.contains("data-parent-fragment"));
+        assert!(page.contains("Open thread"));
         assert!(page.contains("missing-parent"));
         assert!(page.contains("class=\"reply-connector\""));
     }
@@ -20832,7 +21394,328 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parent_hydration_batches_each_level_and_stops_after_two_extra_levels() {
+    async fn page_hydration_uses_one_priority_ordered_batch_of_25_and_defers_the_other_15() {
+        let storage = Arc::new(MemoryStorage::default());
+        let direct_uris = (0..14)
+            .map(|index| format!("at://did:plc:lane-direct-{index}/app.bsky.feed.post/direct"))
+            .collect::<Vec<_>>();
+        let root_uris = (0..13)
+            .map(|index| format!("at://did:plc:lane-root-{index}/app.bsky.feed.post/root"))
+            .collect::<Vec<_>>();
+        let quote_uris = (0..13)
+            .map(|index| format!("at://did:plc:lane-quote-{index}/app.bsky.feed.post/quote"))
+            .collect::<Vec<_>>();
+        let mut remote = Vec::new();
+        for (index, uri) in direct_uris.iter().enumerate() {
+            let parent = if index == 0 {
+                Some(root_uris[0].as_str())
+            } else {
+                None
+            };
+            let mut record = test_web_post(
+                post_uri_did(uri).unwrap(),
+                "direct",
+                index as u64 + 10,
+                "Fetched direct parent",
+                parent,
+            );
+            record.uri = uri.clone();
+            remote.push(record);
+        }
+        for index in 0..root_uris.len() {
+            let parent = match index {
+                0 => Some(root_uris[1].as_str()),
+                1 => Some(root_uris[2].as_str()),
+                _ => None,
+            };
+            let mut record = test_web_post(
+                post_uri_did(&root_uris[index]).unwrap(),
+                "root",
+                index as u64 + 100,
+                "Fetched thread root",
+                parent,
+            );
+            record.uri = root_uris[index].clone();
+            remote.push(record);
+        }
+        for uri in &quote_uris {
+            let mut record = test_web_post(
+                post_uri_did(uri).unwrap(),
+                "quote",
+                200,
+                "Fetched quoted post",
+                None,
+            );
+            record.uri = uri.clone();
+            remote.push(record);
+        }
+        let flow = CountedPagePostFlow::new(remote);
+        let mut page_records = Vec::new();
+        for index in 0..14 {
+            let mut page_post = test_web_post(
+                "did:plc:lane-page",
+                &format!("page-{index}"),
+                index as u64 + 500,
+                "Page reply",
+                Some(&direct_uris[index]),
+            );
+            page_post.record["reply"]["root"]["uri"] = json!(&root_uris[index.min(12)]);
+            if index < quote_uris.len() {
+                page_post.record["embed"] = quote_embed(&quote_uris[index]);
+            }
+            page_records.push(page_post);
+        }
+        let page_refs = page_records.iter().collect::<Vec<_>>();
+        let mut stats = ParentHydrationStats::default();
+        let parents = hydrate_page_parents(
+            &flow,
+            "did:plc:lane-viewer",
+            storage.clone(),
+            &page_refs,
+            tokio::time::Instant::now() + Duration::from_secs(3),
+            true,
+            &mut stats,
+        )
+        .await
+        .unwrap();
+
+        let mut expected = direct_uris.clone();
+        expected.extend(root_uris.iter().take(11).cloned());
+        assert_eq!(*flow.page_calls.lock().unwrap(), [expected]);
+        assert_eq!(stats.requests, 1);
+        assert_eq!(stats.deferred, 15);
+        assert_eq!(parents.values().filter(|post| post.is_none()).count(), 15);
+        assert!(parents.values().filter_map(Option::as_ref).count() == 25);
+
+        let hydration = hydrate_page_content(
+            &flow,
+            "did:plc:lane-viewer",
+            storage.clone(),
+            &page_refs,
+            &page_refs,
+            &parents,
+            std::iter::empty(),
+            tokio::time::Instant::now() + Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        let quote_placeholders = page_records
+            .iter()
+            .filter_map(|record| record.record.get("embed"))
+            .map(|embed| {
+                render_web_quote(
+                    &WebRenderContext::default(),
+                    storage.as_ref(),
+                    embed,
+                    &hydration.quote_index,
+                    0,
+                )
+            })
+            .filter(|html| html.contains("data-quote-fragment"))
+            .count();
+        assert_eq!(quote_placeholders, 13);
+        assert!(render_deferred_parent(&root_uris[11], false).contains("Open thread"));
+        assert!(render_deferred_parent(&root_uris[12], false).contains("data-parent-fragment"));
+
+        tokio::time::timeout(Duration::from_secs(2), flow.background_started.notified())
+            .await
+            .expect("the overflow should start one background fetch");
+        assert_eq!(flow.background_calls.lock().unwrap().len(), 1);
+        flow.release_background.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if quote_uris
+                    .iter()
+                    .chain(root_uris.iter().skip(11))
+                    .all(|uri| {
+                        storage
+                            .record_by_uri("app.bsky.feed.post", uri)
+                            .unwrap()
+                            .is_some()
+                    })
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("background posts should be written to the database");
+    }
+
+    #[tokio::test]
+    async fn omitted_page_post_is_deferred_and_a_pending_page_does_not_queue_it_twice() {
+        let storage = Arc::new(MemoryStorage::default());
+        let parent = test_web_post(
+            "did:plc:omitted-parent",
+            "parent",
+            1,
+            "Deferred parent",
+            None,
+        );
+        let reply = test_web_post(
+            "did:plc:omitted-reply",
+            "reply",
+            2,
+            "Reply stays linked without JavaScript",
+            Some(&parent.uri),
+        );
+        let flow =
+            CountedPagePostFlow::new([parent.clone()]).with_omitted_inline_uri(parent.uri.clone());
+        let page_records = [&reply];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut stats = ParentHydrationStats::default();
+        let parents = hydrate_page_parents(
+            &flow,
+            "did:plc:omitted-viewer",
+            storage.clone(),
+            &page_records,
+            deadline,
+            false,
+            &mut stats,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.requests, 1);
+        assert_eq!(stats.deferred, 1);
+        assert!(parents.get(&parent.uri).is_some_and(Option::is_none));
+        let html = render_timeline_post_items(
+            storage.as_ref(),
+            &page_records,
+            &[String::new()],
+            &parents,
+            &TimelineRenderContext {
+                viewer_did: "did:plc:omitted-viewer",
+                rights: FormRights::default(),
+                quote_index: &QuoteRenderIndex::default(),
+                page_interactions: &PageInteractionIndex::new(),
+                list_blocks: &HashMap::new(),
+                render: &WebRenderContext::default(),
+            },
+        );
+        assert!(html.contains("data-parent-fragment"), "{html}");
+        assert!(html.contains("Open thread"), "{html}");
+        assert!(
+            html.contains("Reply stays linked without JavaScript"),
+            "{html}"
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), flow.background_started.notified())
+            .await
+            .expect("the omitted post should be fetched by the background task");
+        let mut second_stats = ParentHydrationStats::default();
+        let second = hydrate_page_parents(
+            &flow,
+            "did:plc:omitted-viewer",
+            storage.clone(),
+            &page_records,
+            tokio::time::Instant::now() + Duration::from_secs(3),
+            false,
+            &mut second_stats,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second_stats.requests, 0);
+        assert_eq!(*flow.page_calls.lock().unwrap(), [vec![parent.uri.clone()]]);
+        assert_eq!(flow.background_calls.lock().unwrap().len(), 1);
+        assert!(second.get(&parent.uri).is_some_and(Option::is_none));
+        flow.release_background.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if storage
+                    .record_by_uri("app.bsky.feed.post", &parent.uri)
+                    .unwrap()
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the background result should be persisted");
+    }
+
+    #[tokio::test]
+    async fn a_missing_thread_ancestor_keeps_thread_group_connectors_around_its_placeholder() {
+        let storage = Arc::new(MemoryStorage::default());
+        let missing_uri = "at://did:plc:late-thread-root/app.bsky.feed.post/root";
+        let first = test_web_post(
+            "did:plc:thread-group-author",
+            "first",
+            1,
+            "First indexed reply",
+            Some(missing_uri),
+        );
+        let newest = test_web_post(
+            "did:plc:thread-group-author",
+            "newest",
+            2,
+            "Newest indexed reply",
+            Some(&first.uri),
+        );
+        storage.put_record(&first).unwrap();
+        storage.put_record(&newest).unwrap();
+        let page_records = [&first, &newest];
+        let parents = hydrate_page_parents(
+            &DisabledOAuthFlow,
+            "did:plc:thread-viewer",
+            storage.clone(),
+            &page_records,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            true,
+            &mut ParentHydrationStats::default(),
+        )
+        .await
+        .unwrap();
+        let html = render_timeline_post_items(
+            storage.as_ref(),
+            &page_records,
+            &[String::new(), String::new()],
+            &parents,
+            &TimelineRenderContext {
+                viewer_did: "did:plc:thread-viewer",
+                rights: FormRights::default(),
+                quote_index: &QuoteRenderIndex::default(),
+                page_interactions: &PageInteractionIndex::new(),
+                list_blocks: &HashMap::new(),
+                render: &WebRenderContext::default(),
+            },
+        );
+        assert!(html.contains("class=\"post-item thread-group\""), "{html}");
+        assert!(html.contains("data-parent-view=\"thread\""), "{html}");
+        assert!(html.contains("data-parent-fragment"), "{html}");
+        assert!(html.contains("Open thread"), "{html}");
+        assert_eq!(
+            html.matches("reply-connector-previous thread-group-connector")
+                .count(),
+            2,
+            "the deferred ancestor keeps both connectors in the grouped chain: {html}"
+        );
+    }
+
+    #[test]
+    fn deferred_page_post_queue_respects_its_5000_uri_bound() {
+        let requested = (0..MAX_PENDING_PAGE_POSTS + 5)
+            .map(|index| format!("at://did:plc:queue/app.bsky.feed.post/{index}"))
+            .collect::<Vec<_>>();
+        let mut pending = HashSet::new();
+        let (accepted, capacity_reached) =
+            reserve_deferred_page_posts(&mut pending, requested.clone(), MAX_PENDING_PAGE_POSTS);
+        assert_eq!(accepted.len(), MAX_PENDING_PAGE_POSTS);
+        assert_eq!(pending.len(), MAX_PENDING_PAGE_POSTS);
+        assert!(capacity_reached);
+        let (duplicates, capacity_reached) = reserve_deferred_page_posts(
+            &mut pending,
+            requested[..10].to_vec(),
+            MAX_PENDING_PAGE_POSTS,
+        );
+        assert!(duplicates.is_empty());
+        assert!(!capacity_reached);
+    }
+
+    #[tokio::test]
+    async fn parent_hydration_loads_local_ancestors_without_network_rounds() {
         let storage = Arc::new(MemoryStorage::default());
         let mut leaves = Vec::new();
         let mut fourth_level_uris = Vec::new();
@@ -20877,11 +21760,15 @@ mod tests {
             "parent hydration must not look up one URI at a time"
         );
         assert_eq!(
-            batch_lookups, 3,
-            "thread grouping loads its parent, two intermediate ancestors, and root in three batches"
+            batch_lookups, 4,
+            "the page loads direct parents and each available local ancestor level"
         );
-        assert_eq!(stats.rounds, 3);
-        assert_eq!(parents.len(), 125, "root plus three ancestors per thread");
+        assert_eq!(stats.rounds, 4);
+        assert_eq!(
+            parents.len(),
+            150,
+            "root plus every local ancestor per thread"
+        );
         assert!(
             (0..25).all(|index| parents.contains_key(&format!(
                 "at://did:plc:chain-{index}/app.bsky.feed.post/fifth"
@@ -20891,12 +21778,12 @@ mod tests {
         assert!(
             fourth_level_uris
                 .iter()
-                .all(|uri| !parents.contains_key(uri))
+                .all(|uri| parents.contains_key(uri))
         );
     }
 
     #[tokio::test]
-    async fn parent_hydration_reads_only_the_rendered_parent_when_the_page_has_no_thread_chain() {
+    async fn parent_hydration_walks_local_ancestors_even_without_a_page_thread_chain() {
         let storage = Arc::new(MemoryStorage::default());
         let mut replies = Vec::new();
         for index in 0..50_u64 {
@@ -20930,17 +21817,20 @@ mod tests {
 
         assert_eq!(single_lookups, 0);
         assert_eq!(
-            batch_lookups, 1,
-            "only the rendered parent should be queried"
+            batch_lookups, 3,
+            "the page reads the direct parent, middle, and root from local storage"
         );
-        assert_eq!(stats.rounds, 1);
-        assert_eq!(stats.rows, 50);
-        assert_eq!(parents.len(), 50);
-        assert!(parents.values().all(|parent| {
-            parent
-                .as_ref()
-                .is_some_and(|record| record.record["text"] == "Rendered parent")
-        }));
+        assert_eq!(stats.rounds, 3);
+        assert_eq!(stats.rows, 150);
+        assert_eq!(parents.len(), 150);
+        assert_eq!(
+            parents
+                .values()
+                .flatten()
+                .filter(|record| record.record["text"] == "Rendered parent")
+                .count(),
+            50
+        );
     }
 
     #[tokio::test]
@@ -21031,7 +21921,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parent_hydration_overlaps_slow_local_lookup_with_fast_public_appview() {
+    async fn parent_hydration_reads_local_records_before_the_single_proxy_batch() {
         let storage = Arc::new(MemoryStorage::default());
         storage.set_record_uri_batch_delay(Duration::from_millis(500));
         let parent = test_web_post("did:plc:overlap-parent", "parent", 1, "Public parent", None);
@@ -21063,24 +21953,14 @@ mod tests {
 
         assert!(parents.get(&parent.uri).is_some_and(Option::is_some));
         assert_eq!(stats.rounds, 1);
-        assert!(
-            stats.local_pending,
-            "the local query should continue off-worker"
-        );
+        assert!(!stats.local_pending, "the local batch must finish first");
+        assert_eq!(stats.requests, 1);
         assert!(
             stats.public_ms >= 25 && stats.public_ms < 200,
             "public_ms={}",
             stats.public_ms
         );
-        assert!(
-            elapsed <= Duration::from_millis(stats.public_ms + 80),
-            "parent hydration took {elapsed:?} after a {} ms public fetch",
-            stats.public_ms
-        );
-        assert!(
-            elapsed < Duration::from_millis(250),
-            "parent hydration waited {elapsed:?} for a 500 ms local store"
-        );
+        assert!(elapsed >= Duration::from_millis(500));
     }
 
     #[tokio::test]
@@ -21334,6 +22214,159 @@ mod tests {
                 };
                 (posts, routes)
             })
+        }
+
+        fn fetch_page_posts_once<'a>(
+            &'a self,
+            viewer_did: &'a str,
+            uris: &'a [String],
+        ) -> PagePostsFetch<'a> {
+            let requested = !uris.is_empty();
+            let fetched = self.fetch_public_posts(viewer_did, uris);
+            Box::pin(async move { (fetched.await, u64::from(requested)) })
+        }
+
+        fn supports_public_post_batching(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Clone)]
+    struct CountedPagePostFlow {
+        records: Arc<HashMap<String, IndexedRecord>>,
+        page_calls: Arc<Mutex<Vec<Vec<String>>>>,
+        background_calls: Arc<Mutex<Vec<Vec<String>>>>,
+        background_started: Arc<tokio::sync::Notify>,
+        release_background: Arc<tokio::sync::Notify>,
+        omitted_inline_uri: Option<String>,
+    }
+
+    impl CountedPagePostFlow {
+        fn new(records: impl IntoIterator<Item = IndexedRecord>) -> Self {
+            Self {
+                records: Arc::new(
+                    records
+                        .into_iter()
+                        .map(|record| (record.uri.clone(), record))
+                        .collect(),
+                ),
+                page_calls: Arc::new(Mutex::new(Vec::new())),
+                background_calls: Arc::new(Mutex::new(Vec::new())),
+                background_started: Arc::new(tokio::sync::Notify::new()),
+                release_background: Arc::new(tokio::sync::Notify::new()),
+                omitted_inline_uri: None,
+            }
+        }
+
+        fn with_omitted_inline_uri(mut self, uri: String) -> Self {
+            self.omitted_inline_uri = Some(uri);
+            self
+        }
+
+        fn posts_for(&self, uris: &[String], omit: Option<&str>) -> PublicPostsPage {
+            let posts = uris
+                .iter()
+                .filter(|uri| Some(uri.as_str()) != omit)
+                .filter_map(|uri| {
+                    self.records.get(uri).cloned().map(|record| {
+                        (
+                            uri.clone(),
+                            crate::feeds::FetchedPublicPost {
+                                record,
+                                author: None,
+                            },
+                        )
+                    })
+                })
+                .collect::<HashMap<_, _>>();
+            let routes = crate::feeds::PostRouteStats {
+                proxy: posts.len() as u64,
+                ..Default::default()
+            };
+            (posts, routes)
+        }
+    }
+
+    impl OAuthFlow for CountedPagePostFlow {
+        fn authorize<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: Vec<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async { Err("counted fixture does not authorize".to_owned()) })
+        }
+
+        fn callback<'a>(
+            &'a self,
+            _: OAuthCallback,
+        ) -> Pin<Box<dyn Future<Output = Result<OAuthAccount, String>> + Send + 'a>> {
+            Box::pin(async { Err("counted fixture does not callback".to_owned()) })
+        }
+
+        fn logout<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn fetch_post<'a>(
+            &'a self,
+            uri: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<IndexedRecord, String>> + Send + 'a>> {
+            let record = self
+                .records
+                .get(uri)
+                .cloned()
+                .ok_or_else(|| "counted fixture post was not found".to_owned());
+            Box::pin(async move { record })
+        }
+
+        fn fetch_public_posts<'a>(
+            &'a self,
+            _: &'a str,
+            uris: &'a [String],
+        ) -> PublicPostsFetch<'a> {
+            let uris = uris.to_vec();
+            let records = Arc::clone(&self.records);
+            let calls = Arc::clone(&self.background_calls);
+            let started = Arc::clone(&self.background_started);
+            let release = Arc::clone(&self.release_background);
+            Box::pin(async move {
+                calls.lock().unwrap().push(uris.clone());
+                started.notify_one();
+                release.notified().await;
+                let posts = uris
+                    .iter()
+                    .filter_map(|uri| {
+                        records.get(uri).cloned().map(|record| {
+                            (
+                                uri.clone(),
+                                crate::feeds::FetchedPublicPost {
+                                    record,
+                                    author: None,
+                                },
+                            )
+                        })
+                    })
+                    .collect::<HashMap<_, _>>();
+                let routes = crate::feeds::PostRouteStats {
+                    public: posts.len() as u64,
+                    ..Default::default()
+                };
+                (posts, routes)
+            })
+        }
+
+        fn fetch_page_posts_once<'a>(
+            &'a self,
+            _: &'a str,
+            uris: &'a [String],
+        ) -> PagePostsFetch<'a> {
+            self.page_calls.lock().unwrap().push(uris.to_vec());
+            let result = self.posts_for(uris, self.omitted_inline_uri.as_deref());
+            Box::pin(async move { (result, 1) })
         }
 
         fn supports_public_post_batching(&self) -> bool {
@@ -22722,6 +23755,7 @@ mod tests {
             storage.clone(),
             &page_records,
             &[],
+            &PageParentIndex::new(),
             [actor_did.to_owned()],
             tokio::time::Instant::now() + Duration::from_millis(60),
         )
@@ -22758,6 +23792,7 @@ mod tests {
             storage.clone(),
             &page_records,
             &[],
+            &PageParentIndex::new(),
             [actor_did.to_owned()],
             tokio::time::Instant::now() + Duration::from_secs(2),
         )
@@ -22858,6 +23893,7 @@ mod tests {
             storage.clone(),
             &page_records,
             &[],
+            &PageParentIndex::new(),
             [actor_did.to_owned()],
             tokio::time::Instant::now() + Duration::from_secs(2),
         )
@@ -22965,6 +24001,7 @@ mod tests {
             storage.clone(),
             &page_records,
             &quote_records,
+            &PageParentIndex::new(),
             std::iter::empty(),
             tokio::time::Instant::now() + Duration::from_secs(30),
         )
@@ -23121,6 +24158,16 @@ mod tests {
             })
         }
 
+        fn fetch_page_posts_once<'a>(
+            &'a self,
+            viewer_did: &'a str,
+            uris: &'a [String],
+        ) -> PagePostsFetch<'a> {
+            let requested = !uris.is_empty();
+            let fetched = self.fetch_public_posts(viewer_did, uris);
+            Box::pin(async move { (fetched.await, u64::from(requested)) })
+        }
+
         fn supports_public_post_batching(&self) -> bool {
             true
         }
@@ -23176,12 +24223,25 @@ mod tests {
             .expect("the writer picked up the hold");
 
         let started = Instant::now();
+        let mut parent_stats = ParentHydrationStats::default();
+        let prefetched = hydrate_page_parents(
+            &flow,
+            FEED_VIEWER_DID,
+            storage.clone(),
+            &page_records,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            false,
+            &mut parent_stats,
+        )
+        .await
+        .unwrap();
         let hydration = hydrate_page_content(
             &flow,
             FEED_VIEWER_DID,
             storage.clone(),
             &page_records,
             &page_records,
+            &prefetched,
             std::iter::empty(),
             tokio::time::Instant::now() + Duration::from_secs(30),
         )

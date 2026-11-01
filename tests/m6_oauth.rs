@@ -1,14 +1,15 @@
 use appview_rs::{
     config::Config,
     feeds::{
-        FEED_GONE_PREFIX, FeedTimeline, FeedTimelineTiming, HydratedFeedPage, HydratedFeedPost,
-        ResolvedFeed,
+        FEED_GONE_PREFIX, FeedTimeline, FeedTimelineTiming, FetchedPublicPost, HydratedFeedPage,
+        HydratedFeedPost, PostRouteStats, ResolvedFeed,
     },
     ingest::{IndexedRecord, Ingestor, MemoryStorage, ScopeMode, SqliteStorage, Storage},
     oauth::{
         AccountLabel, BlockListDetail, FetchedAuthorProfile, OAuthAccount, OAuthCallback,
-        OAuthFlow, OAuthPublic, PageAccountData, PdsCreatedRecord, PinnedFeedTabs, PostImage,
-        PostStrongRef, ProfileListChoice, ProfileRefreshWorker, SqliteOAuthStore, WebShutdown,
+        OAuthFlow, OAuthPublic, PageAccountData, PagePostsFetch, PdsCreatedRecord, PinnedFeedTabs,
+        PostImage, PostStrongRef, ProfileListChoice, ProfileRefreshWorker, SqliteOAuthStore,
+        WebShutdown,
     },
 };
 use appview_rs::{router, router_with_oauth_flow};
@@ -482,6 +483,53 @@ impl OAuthFlow for FakeOAuthFlow {
                 .cloned()
                 .ok_or_else(|| "fake PDS has no post for URI".to_owned())
         })
+    }
+
+    fn fetch_page_posts_once<'a>(&'a self, _: &'a str, uris: &'a [String]) -> PagePostsFetch<'a> {
+        let requests = self.post_requests.clone();
+        let live_posts = self.live_posts.clone();
+        let post_delays_ms = self.post_delays_ms.clone();
+        let uris = uris.to_vec();
+        Box::pin(async move {
+            requests.lock().unwrap().extend(uris.iter().cloned());
+            let fetched = futures_util::future::join_all(uris.iter().cloned().map(|uri| {
+                let live_posts = live_posts.clone();
+                let post_delays_ms = post_delays_ms.clone();
+                async move {
+                    let delay_ms = post_delays_ms
+                        .lock()
+                        .unwrap()
+                        .get(&uri)
+                        .copied()
+                        .unwrap_or_default();
+                    if delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    }
+                    live_posts.lock().unwrap().get(&uri).cloned().map(|record| {
+                        (
+                            uri,
+                            FetchedPublicPost {
+                                record,
+                                author: None,
+                            },
+                        )
+                    })
+                }
+            }))
+            .await
+            .into_iter()
+            .flatten()
+            .collect::<std::collections::HashMap<_, _>>();
+            let routes = PostRouteStats {
+                proxy: fetched.len() as u64,
+                ..Default::default()
+            };
+            ((fetched, routes), u64::from(!uris.is_empty()))
+        })
+    }
+
+    fn supports_public_post_batching(&self) -> bool {
+        true
     }
 
     fn fetch_author_profile<'a>(
@@ -4818,8 +4866,13 @@ async fn timeline_reply_context_uses_verified_parent_handle_when_post_is_missing
             .to_vec(),
     )
     .unwrap();
-    assert!(html.contains("Reply to <a"), "{html}");
-    assert!(html.contains("@friend.test"), "{html}");
+    // The missing parent is deferred under the one-call page policy, with its thread link
+    // available even when JavaScript is off.
+    assert!(
+        html.contains("data-parent-fragment=\"/parent-fragment?uri="),
+        "{html}"
+    );
+    assert!(html.contains("Open thread"), "{html}");
     assert!(html.contains("class=\"reply-connector\""), "{html}");
 }
 
@@ -6704,13 +6757,16 @@ async fn quote_failures_distinguish_missing_unavailable_and_budget_placeholder()
     )
     .unwrap();
 
-    assert!(html.contains("Post not found"), "{html}");
+    // Unknown and over-budget quote URIs remain linked placeholders until the fragment fetch.
+    assert!(!html.contains("Post not found"), "{html}");
     assert!(html.contains("Post unavailable"), "{html}");
     assert!(
         html.contains("data-quote-fragment=\"/quote-fragment?uri="),
         "{html}"
     );
     assert!(html.contains("Loading quoted post"), "{html}");
+    assert_eq!(html.matches("Loading quoted post").count(), 2, "{html}");
+    assert!(html.contains("Open thread"), "{html}");
     assert!(!html.contains(">Quoted post</a>"), "{html}");
     assert!(!html.contains(deleted_uri), "{html}");
     assert!(!html.contains(unavailable_uri), "{html}");
@@ -6942,7 +6998,13 @@ async fn thread_page_fetches_parent_and_root_concurrently() {
     )
     .unwrap();
     assert!(html.contains("Root"), "{html}");
-    assert!(html.contains("Middle"), "{html}");
+    // The direct parent and root share the page's only batch; the deeper ancestor is deferred.
+    assert!(
+        html.contains("data-parent-fragment=\"/parent-fragment?uri="),
+        "{html}"
+    );
+    assert!(html.contains("Open thread"), "{html}");
+    assert!(!html.contains("Middle"), "{html}");
     assert!(html.contains("Parent"), "{html}");
 }
 

@@ -1111,6 +1111,76 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
         (fetched, routes)
     }
 
+    /// Fetch one page hydration batch through the viewer proxy only. Unlike
+    /// `fetch_posts`, this does not retry through the public AppView or each
+    /// author's PDS: page rendering uses it once, then defers anything missing.
+    pub async fn fetch_page_posts_once(
+        &self,
+        proxy: Option<Arc<dyn ProxiedPostsFetcher>>,
+        uris: &[String],
+    ) -> (HashMap<String, FetchedPublicPost>, PostRouteStats, u64) {
+        let now = tokio::time::Instant::now();
+        let mut fetched = HashMap::new();
+        let mut missing = Vec::new();
+        let mut seen = HashSet::new();
+        {
+            let mut cache = self.live_post_cache.lock().await;
+            cache.retain(|_, (expires, _)| *expires > now);
+            for uri in uris {
+                if !seen.insert(uri.as_str()) {
+                    continue;
+                }
+                match cache.get(uri) {
+                    Some((_, LivePostCacheValue::Post(post))) => {
+                        fetched.insert(uri.clone(), post.as_ref().clone());
+                    }
+                    Some((_, LivePostCacheValue::Gone)) => {}
+                    None => missing.push(uri.clone()),
+                }
+            }
+        }
+
+        let Some(proxy) = proxy else {
+            return (fetched, PostRouteStats::default(), 0);
+        };
+        if missing.is_empty() {
+            return (fetched, PostRouteStats::default(), 0);
+        }
+        let proxied =
+            tokio::time::timeout(PROXIED_POST_BATCH_TIMEOUT, proxy.fetch_post_views(&missing))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(format!(
+                        "timed out after {} ms",
+                        PROXIED_POST_BATCH_TIMEOUT.as_millis()
+                    ))
+                });
+        let views = match proxied {
+            Ok(Some(views)) => views,
+            Ok(None) => return (fetched, PostRouteStats::default(), 0),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    requested_posts = missing.len(),
+                    "page proxied getPosts batch failed; posts deferred"
+                );
+                return (fetched, PostRouteStats::default(), 1);
+            }
+        };
+        let mut routes = PostRouteStats::default();
+        for post in public_posts_from_views(&views, &missing) {
+            if missing
+                .iter()
+                .any(|requested| requested == &post.record.uri)
+            {
+                cache_live_post(&self.live_post_cache, &post.record.uri, post.clone()).await;
+                fetched.insert(post.record.uri.clone(), post);
+                routes.proxy = routes.proxy.saturating_add(1);
+            }
+        }
+        (fetched, routes, 1)
+    }
+
     async fn fetch_live_post_data(&self, uri: &str) -> Result<Option<FetchedPublicPost>, String> {
         if let Some((expires, cached)) = self.live_post_cache.lock().await.get(uri).cloned()
             && expires > tokio::time::Instant::now()
@@ -1187,6 +1257,15 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
             .remove(uri)
             .map(|post| post.record)
             .ok_or_else(|| "post could not be fetched from its author PDS".to_owned())
+    }
+
+    pub(crate) async fn fetch_post_optional(
+        &self,
+        uri: &str,
+    ) -> Result<Option<IndexedRecord>, String> {
+        self.fetch_live_post_data(uri)
+            .await
+            .map(|post| post.map(|post| post.record))
     }
 }
 

@@ -1413,6 +1413,82 @@ function fillDeferredQuotes(root = document) {
 }
 
 fillDeferredQuotes();
+
+// Parent and thread ancestor cards keep a server-rendered thread link until
+// their deferred fragment is ready. The placeholder itself is the connector's
+// slot, so replacing it leaves the surrounding chain markup intact.
+function fillDeferredParents(root = document) {
+  const placeholders = [];
+  if (root.matches?.("[data-parent-fragment]")) placeholders.push(root);
+  placeholders.push(...(root.querySelectorAll?.("[data-parent-fragment]") || []));
+  for (const placeholder of placeholders) {
+    if (placeholder.dataset?.parentLoading === "true") continue;
+    const fragmentUrl = placeholder.getAttribute("data-parent-fragment");
+    if (!fragmentUrl) continue;
+    if (placeholder.dataset) placeholder.dataset.parentLoading = "true";
+    const fetchStartedAt = Date.now();
+    fetch(fragmentUrl, {
+      credentials: "same-origin",
+      headers: { Accept: "text/html" },
+    }).then((response) => (typeof noteFetchTimingId === "function" ? noteFetchTimingId(response, fetchStartedAt) : response)).then(async (response) => {
+      if (!response.ok) throw new Error(`Parent fragment request failed (${response.status}).`);
+      const fragmentDocument = new DOMParser().parseFromString(await response.text(), "text/html");
+      const selector = fragmentUrl.includes("view=thread") ? ".post-card" : ".reply-parent-card";
+      const card = fragmentDocument.querySelector(selector);
+      if (!card) throw new Error("The parent fragment did not contain a post card.");
+      let nextAncestor = null;
+      if (fragmentUrl.includes("view=thread")) {
+        const nextUri = card.getAttribute("data-reply-parent-uri");
+        const depth = Number(placeholder.getAttribute("data-parent-depth") || 0);
+        const loaded = Array.from(document.querySelectorAll?.("[data-post-uri]") || [])
+          .some((loadedCard) => loadedCard.getAttribute("data-post-uri") === nextUri);
+        if (nextUri && !loaded && depth < 32) {
+          nextAncestor = document.createElement("div");
+          nextAncestor.className = "post-card deferred-parent-card";
+          nextAncestor.setAttribute("data-parent-fragment", `/parent-fragment?uri=${encodeURIComponent(nextUri)}&view=thread`);
+          nextAncestor.setAttribute("data-parent-view", "thread");
+          nextAncestor.setAttribute("data-parent-depth", String(depth + 1));
+          const loading = document.createElement("span");
+          loading.textContent = "Loading…";
+          const openThread = document.createElement("a");
+          openThread.href = `/app/thread?uri=${encodeURIComponent(nextUri)}`;
+          openThread.textContent = "Open thread";
+          nextAncestor.append(loading, openThread);
+          const threadGroup = placeholder.closest?.("li.thread-group");
+          const threadItem = placeholder.closest?.("li.post-item");
+          if (threadGroup) {
+            const connector = document.createElement("span");
+            connector.className = "reply-connector reply-connector-previous thread-group-connector";
+            connector.setAttribute("aria-hidden", "true");
+            threadGroup.insertBefore(nextAncestor, placeholder);
+            threadGroup.insertBefore(connector, placeholder);
+          } else if (threadItem?.parentNode) {
+            const nextItem = document.createElement("li");
+            nextItem.className = "post-item";
+            nextItem.append(nextAncestor);
+            threadItem.parentNode.insertBefore(nextItem, threadItem);
+          } else if (placeholder.parentNode) {
+            placeholder.parentNode.insertBefore(nextAncestor, placeholder);
+          } else {
+            nextAncestor = null;
+          }
+        }
+      }
+      fillDeferredQuotes(card);
+      fillDeferredParents(card);
+      placeholder.replaceWith(card);
+      if (nextAncestor) fillDeferredParents(nextAncestor);
+    }).catch(() => {
+      const fallback = document.createElement("a");
+      fallback.className = placeholder.getAttribute("data-parent-view") === "thread" ? "post-card deferred-parent-fallback" : "reply-parent-card reply-parent-fallback";
+      fallback.href = placeholder.querySelector?.("a[href]")?.getAttribute("href") || "/app";
+      fallback.textContent = "Post unavailable · Open thread";
+      placeholder.replaceWith(fallback);
+    });
+  }
+}
+
+fillDeferredParents();
 fillProfileIdentities();
 
 // A sparse profile says "Loading recent posts…" while the server fetches them from the author's PDS (worker polls every
