@@ -25893,6 +25893,90 @@ mod tests {
         drop(storage);
         remove_render_phase_database(&path);
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn each_author_on_a_rendered_page_is_read_from_storage_once_per_render() {
+        // The seed page: 30 posts by 10 authors + 3 parent cards by 2 parent
+        // authors. Every card looks its author up, so a render without a
+        // per-render identity map runs 33 storage reads for 12 distinct
+        // accounts — and queues author-9's unresolved handle refresh once per
+        // card. One render must read each identity once and queue each refresh
+        // at most once.
+        let path = render_phase_page_path("identity-map");
+        remove_render_phase_database(&path);
+        let storage = Arc::new(crate::ingest::SqliteStorage::open(&path).unwrap());
+        let seed = seed_render_phase_page(storage.as_ref());
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let token = render_phase_session_token(&public, storage.as_ref());
+        let generator_uri = format!(
+            "at://{RENDER_PAGE_VIEWER}/app.bsky.feed.generator/av71q-render-feed"
+        );
+        let flow = RenderPhaseFeedFlow {
+            generator_uri: generator_uri.clone(),
+            posts: seed.posts.clone(),
+        };
+        let app = public.router_with_flow(flow, storage.clone());
+        let writer_trace = storage.trace_writer_statements().unwrap();
+        let logs = FeedTestLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(logs.clone())
+            .finish();
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/app?limit=100")
+                    .header("cookie", format!("{SESSION_COOKIE}={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap();
+        storage.writer_barrier().unwrap();
+        let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        let line = output
+            .lines()
+            .find(|line| line.contains("web page phases"))
+            .unwrap_or_else(|| panic!("no phases line in {output}"));
+        let metric = |name: &str| -> i64 {
+            line.split_whitespace()
+                .find_map(|field| {
+                    field
+                        .strip_prefix(&format!("{name}="))
+                        .and_then(|value| value.parse().ok())
+                })
+                .unwrap_or_else(|| panic!("missing {name} in {line}"))
+        };
+        assert_eq!(
+            metric("render_profile_lookups"),
+            33,
+            "every card and parent card still performs its identity lookup"
+        );
+        assert_eq!(
+            metric("render_profile_reads"),
+            12,
+            "10 authors + 2 parent authors, read once each per render"
+        );
+        let refresh_queues = writer_trace
+            .count_containing("INSERT OR IGNORE INTO handle_refresh_queue") as i64;
+        assert_eq!(
+            refresh_queues, 1,
+            "author-9's unresolved handle must be queued at most once per render"
+        );
+        drop(app);
+        let storage = Arc::into_inner(storage).expect("the router was the last storage handle");
+        storage.writer_barrier().unwrap();
+        drop(storage);
+        remove_render_phase_database(&path);
+    }
 }
 
 #[cfg(not(unix))]
