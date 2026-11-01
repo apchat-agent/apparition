@@ -6092,6 +6092,7 @@ async fn account_web_outbound_calls<F: OAuthFlow, S: Storage + 'static>(
         tracing::info!(
             route,
             total_ms = started.elapsed().as_millis() as u64,
+            index_write = index_write_label(index_write.load(Ordering::Relaxed)),
             outbound_call_count = calls.total_calls,
             outbound_call_ms = calls.total_ms,
             dpop_nonce_retries = calls.dpop_nonce_retries,
@@ -13774,7 +13775,9 @@ fn record_index_rkey(did: &str, collection: &str, uri: &str) -> Result<String, S
     uri.strip_prefix(&prefix)
         .filter(|rkey| !rkey.is_empty() && !rkey.contains('/'))
         .map(str::to_owned)
-        .ok_or_else(|| format!("PDS record URI {uri} is outside the expected at://{did}/{collection}/ prefix"))
+        .ok_or_else(|| {
+            format!("PDS record URI {uri} is outside the expected at://{did}/{collection}/ prefix")
+        })
 }
 
 fn indexed_created_record(
@@ -13902,6 +13905,13 @@ fn hand_off_index_write<S: Storage + 'static>(
     outcome: Arc<AtomicU8>,
     pending: Option<PendingIndexWriteBinding>,
 ) {
+    outcome.store(INDEX_WRITE_QUEUED, Ordering::Relaxed);
+    if let Some(binding) = &pending {
+        binding
+            .entry
+            .phase
+            .store(INDEX_WRITE_QUEUED, Ordering::Relaxed);
+    }
     tokio::spawn(async move {
         let mark = |value: u8| {
             outcome.store(value, Ordering::Relaxed);
@@ -13909,7 +13919,6 @@ fn hand_off_index_write<S: Storage + 'static>(
                 binding.entry.phase.store(value, Ordering::Relaxed);
             }
         };
-        mark(INDEX_WRITE_QUEUED);
         let mut backoff = INDEX_WRITE_FIRST_BACKOFF;
         for attempt in 1..=INDEX_WRITE_ATTEMPTS {
             if matches!(write, IndexWrite::Put(_))
@@ -13929,9 +13938,10 @@ fn hand_off_index_write<S: Storage + 'static>(
             }
             let attempt_write = write.clone();
             let attempt_storage = storage.clone();
-            let result = tokio::task::spawn_blocking(move || attempt_write.apply(attempt_storage.as_ref()))
-                .await
-                .map_err(|error| format!("index write task failed: {error}"));
+            let result =
+                tokio::task::spawn_blocking(move || attempt_write.apply(attempt_storage.as_ref()))
+                    .await
+                    .map_err(|error| format!("index write task failed: {error}"));
             match result {
                 Ok(Ok(())) => {
                     if let Some(binding) = &pending {
@@ -13980,12 +13990,7 @@ fn hand_off_index_write<S: Storage + 'static>(
                 }
                 Ok(Err(error)) => {
                     mark(INDEX_WRITE_FAILED);
-                    count_failed_index_write(
-                        route,
-                        &write.target(),
-                        attempt,
-                        &error.to_string(),
-                    );
+                    count_failed_index_write(route, &write.target(), attempt, &error.to_string());
                     return;
                 }
                 Err(error) => {
@@ -14031,7 +14036,6 @@ const MAX_PENDING_INDEX_WRITES: usize = 4_096;
 #[derive(Clone)]
 struct PendingWriteEntry {
     uri: String,
-    rkey: String,
     expires_at: Instant,
     cancelled: Arc<AtomicBool>,
     phase: Arc<AtomicU8>,
@@ -14129,11 +14133,7 @@ where
     // The count the response reports is the page's count read BEFORE the write,
     // adjusted by this action: the index row lands in the background, so the
     // summary can no longer see it when the response goes out.
-    let pending_key = (
-        "app.bsky.feed.like".to_owned(),
-        did.clone(),
-        uri.to_owned(),
-    );
+    let pending_key = ("app.bsky.feed.like".to_owned(), did.clone(), uri.to_owned());
     if form.get("intent").is_some_and(|intent| intent == "delete") {
         let summary = match state.storage.post_interaction_summary(uri, Some(&did)) {
             Ok(summary) => summary,
@@ -14236,7 +14236,6 @@ where
             match indexed_created_record(&did, "app.bsky.feed.like", &created) {
                 Ok(record) => {
                     let entry = PendingWriteEntry {
-                        rkey: record.rkey.clone(),
                         uri: record.uri.clone(),
                         expires_at: Instant::now() + PENDING_INDEX_WRITE_TTL,
                         cancelled: Arc::new(AtomicBool::new(false)),
@@ -14244,7 +14243,9 @@ where
                         state_after: true,
                         count_after: (summary.like_count + 1) as u64,
                     };
-                    state.pending_writes.register(pending_key.clone(), entry.clone());
+                    state
+                        .pending_writes
+                        .register(pending_key.clone(), entry.clone());
                     hand_off_index_write(
                         state.storage.clone(),
                         IndexWrite::Put(Box::new(record)),
@@ -14257,9 +14258,7 @@ where
                         }),
                     );
                 }
-                Err(error) => {
-                    report_index_hand_off_failure("like", &created.uri, &error, &outcome)
-                }
+                Err(error) => report_index_hand_off_failure("like", &created.uri, &error, &outcome),
             }
             like_state_response(
                 &headers,
@@ -14342,7 +14341,6 @@ where
             match indexed_created_record(&did, "app.bsky.feed.repost", &created) {
                 Ok(record) => {
                     let entry = PendingWriteEntry {
-                        rkey: record.rkey.clone(),
                         uri: record.uri.clone(),
                         expires_at: Instant::now() + PENDING_INDEX_WRITE_TTL,
                         cancelled: Arc::new(AtomicBool::new(false)),
@@ -14350,7 +14348,9 @@ where
                         state_after: true,
                         count_after: (summary.repost_count + 1) as u64,
                     };
-                    state.pending_writes.register(pending_key.clone(), entry.clone());
+                    state
+                        .pending_writes
+                        .register(pending_key.clone(), entry.clone());
                     hand_off_index_write(
                         state.storage.clone(),
                         IndexWrite::Put(Box::new(record)),
@@ -24047,7 +24047,13 @@ mod tests {
     }
 
     impl AnswerFlow {
-        fn created(did: &str, collection: &str, rkey: &str, cid: &str, subject: &Value) -> PdsCreatedRecord {
+        fn created(
+            did: &str,
+            collection: &str,
+            rkey: &str,
+            cid: &str,
+            subject: &Value,
+        ) -> PdsCreatedRecord {
             PdsCreatedRecord {
                 uri: format!("at://{did}/{collection}/{rkey}"),
                 cid: cid.to_owned(),
@@ -24239,7 +24245,8 @@ mod tests {
             subject_uri: &str,
             limit: usize,
         ) -> Result<Vec<IndexedRecord>, StorageError> {
-            self.inner.records_for_subject(collection, subject_uri, limit)
+            self.inner
+                .records_for_subject(collection, subject_uri, limit)
         }
 
         fn records_for_actor_collection(
@@ -24248,7 +24255,8 @@ mod tests {
             collection: &str,
             limit: usize,
         ) -> Result<Vec<IndexedRecord>, StorageError> {
-            self.inner.records_for_actor_collection(did, collection, limit)
+            self.inner
+                .records_for_actor_collection(did, collection, limit)
         }
 
         fn follows_for_actor(
@@ -24279,29 +24287,32 @@ mod tests {
             self.inner.remember_recent_profile(viewer_did, profile_did)
         }
 
-        fn recent_profiles_for_viewer(&self, viewer_did: &str) -> Result<Vec<String>, StorageError> {
+        fn recent_profiles_for_viewer(
+            &self,
+            viewer_did: &str,
+        ) -> Result<Vec<String>, StorageError> {
             self.inner.recent_profiles_for_viewer(viewer_did)
         }
 
-        fn clear_recent_profiles_for_viewer(
-            &self,
-            viewer_did: &str,
-        ) -> Result<(), StorageError> {
+        fn clear_recent_profiles_for_viewer(&self, viewer_did: &str) -> Result<(), StorageError> {
             self.inner.clear_recent_profiles_for_viewer(viewer_did)
         }
 
-        fn set_last_active_feed_tab(&self, viewer_did: &str, tab: &str) -> Result<(), StorageError> {
+        fn set_last_active_feed_tab(
+            &self,
+            viewer_did: &str,
+            tab: &str,
+        ) -> Result<(), StorageError> {
             self.inner.set_last_active_feed_tab(viewer_did, tab)
         }
 
-        fn last_active_feed_tab(
-            &self,
-            viewer_did: &str,
-        ) -> Result<Option<String>, StorageError> {
+        fn last_active_feed_tab(&self, viewer_did: &str) -> Result<Option<String>, StorageError> {
             self.inner.last_active_feed_tab(viewer_did)
         }
 
-        fn profile_index_snapshot(&self) -> Result<HashMap<String, ProfileIndexEntry>, StorageError> {
+        fn profile_index_snapshot(
+            &self,
+        ) -> Result<HashMap<String, ProfileIndexEntry>, StorageError> {
             self.inner.profile_index_snapshot()
         }
 
@@ -24421,7 +24432,12 @@ mod tests {
             self.inner.delete_web_session(did, session_id)
         }
 
-        fn set_follow(&self, actor: &str, subject: &str, following: bool) -> Result<(), StorageError> {
+        fn set_follow(
+            &self,
+            actor: &str,
+            subject: &str,
+            following: bool,
+        ) -> Result<(), StorageError> {
             self.inner.set_follow(actor, subject, following)
         }
 
@@ -24501,7 +24517,11 @@ mod tests {
             self.inner.is_displayed_did(did)
         }
 
-        fn stale_handle_dids(&self, ttl: Duration, limit: usize) -> Result<Vec<String>, StorageError> {
+        fn stale_handle_dids(
+            &self,
+            ttl: Duration,
+            limit: usize,
+        ) -> Result<Vec<String>, StorageError> {
             self.inner.stale_handle_dids(ttl, limit)
         }
 
@@ -24513,10 +24533,7 @@ mod tests {
             self.inner.queue_handle_refresh_ordered(dids)
         }
 
-        fn pending_handle_refreshes(
-            &self,
-            limit: usize,
-        ) -> Result<Vec<String>, StorageError> {
+        fn pending_handle_refreshes(&self, limit: usize) -> Result<Vec<String>, StorageError> {
             self.inner.pending_handle_refreshes(limit)
         }
 
@@ -24529,7 +24546,11 @@ mod tests {
         }
     }
 
-    fn answer_session_cookie<S: Storage>(public: &OAuthPublic, storage: &S, viewer: &str) -> String {
+    fn answer_session_cookie<S: Storage>(
+        public: &OAuthPublic,
+        storage: &S,
+        viewer: &str,
+    ) -> String {
         let generation = storage
             .rotate_web_session(viewer, "answer-session")
             .unwrap();
@@ -24619,7 +24640,13 @@ mod tests {
         let path = held_writer_page_path("like-answer");
         remove_held_writer_database(&path);
         let storage = Arc::new(crate::ingest::SqliteStorage::open(&path).unwrap());
-        let post = test_web_post("did:plc:answered-author", "answered", 7, "answer me fast", None);
+        let post = test_web_post(
+            "did:plc:answered-author",
+            "answered",
+            7,
+            "answer me fast",
+            None,
+        );
         storage.put_record(&post).unwrap();
         let flow = AnswerFlow::default();
         let flow_state = flow.state.clone();
@@ -24669,7 +24696,13 @@ mod tests {
             inner: MemoryStorage::default(),
             lock_failures: AtomicUsize::new(usize::MAX),
         });
-        let post = test_web_post("did:plc:failing-author", "failing", 7, "post behind a broken index", None);
+        let post = test_web_post(
+            "did:plc:failing-author",
+            "failing",
+            7,
+            "post behind a broken index",
+            None,
+        );
         storage.inner.put_record(&post).unwrap();
         let flow = AnswerFlow::default();
         let public = OAuthPublic::new("https://appview.example").unwrap();
@@ -24717,7 +24750,13 @@ mod tests {
         let path = held_writer_page_path("double-like");
         remove_held_writer_database(&path);
         let storage = Arc::new(crate::ingest::SqliteStorage::open(&path).unwrap());
-        let post = test_web_post("did:plc:doubled-author", "doubled", 7, "clicked twice", None);
+        let post = test_web_post(
+            "did:plc:doubled-author",
+            "doubled",
+            7,
+            "clicked twice",
+            None,
+        );
         storage.put_record(&post).unwrap();
         let flow = AnswerFlow::default();
         let flow_state = flow.state.clone();
@@ -24731,7 +24770,10 @@ mod tests {
 
         let first = post_like(&app, &cookie, like_form_body(&post.uri), true).await;
         assert_eq!(first.status(), StatusCode::OK);
-        assert_eq!(json_response(first).await, json!({"liked": true, "likeCount": 1}));
+        assert_eq!(
+            json_response(first).await,
+            json!({"liked": true, "likeCount": 1})
+        );
         let second = post_like(&app, &cookie, like_form_body(&post.uri), true).await;
         assert_eq!(second.status(), StatusCode::OK);
         assert_eq!(
@@ -24777,7 +24819,13 @@ mod tests {
         let path = held_writer_page_path("pending-unlike");
         remove_held_writer_database(&path);
         let storage = Arc::new(crate::ingest::SqliteStorage::open(&path).unwrap());
-        let post = test_web_post("did:plc:toggled-author", "toggled", 7, "liked and unliked", None);
+        let post = test_web_post(
+            "did:plc:toggled-author",
+            "toggled",
+            7,
+            "liked and unliked",
+            None,
+        );
         storage.put_record(&post).unwrap();
         let flow = AnswerFlow::default();
         let flow_state = flow.state.clone();
@@ -24804,17 +24852,17 @@ mod tests {
             json_response(unlike).await,
             json!({"liked": false, "likeCount": 0})
         );
-        let state = flow_state.lock().unwrap();
-        assert_eq!(state.unlike_calls, 1);
-        assert_eq!(
-            state.unlike_uris.as_slice(),
-            [format!("at://{ANSWER_VIEWER}/app.bsky.feed.like/answer-like-r1").as_str()],
-            "the unlike must delete the rkey the pending like created"
-        );
-        drop(state);
+        {
+            let state = flow_state.lock().unwrap();
+            assert_eq!(state.unlike_calls, 1);
+            assert_eq!(
+                state.unlike_uris.as_slice(),
+                [format!("at://{ANSWER_VIEWER}/app.bsky.feed.like/answer-like-r1").as_str()],
+                "the unlike must delete the rkey the pending like created"
+            );
+        }
 
         storage.writer_barrier().unwrap();
-        let like_uri = format!("at://{ANSWER_VIEWER}/app.bsky.feed.like/answer-like-r1");
         assert!(
             wait_until(
                 || storage
@@ -24841,7 +24889,13 @@ mod tests {
         let path = held_writer_page_path("double-repost");
         remove_held_writer_database(&path);
         let storage = Arc::new(crate::ingest::SqliteStorage::open(&path).unwrap());
-        let post = test_web_post("did:plc:redoubled-author", "redoubled", 7, "reposted twice", None);
+        let post = test_web_post(
+            "did:plc:redoubled-author",
+            "redoubled",
+            7,
+            "reposted twice",
+            None,
+        );
         storage.put_record(&post).unwrap();
         let flow = AnswerFlow::default();
         let flow_state = flow.state.clone();
@@ -24870,7 +24924,11 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::SEE_OTHER, "attempt {attempt}");
+            assert_eq!(
+                response.status(),
+                StatusCode::SEE_OTHER,
+                "attempt {attempt}"
+            );
         }
         assert_eq!(
             flow_state.lock().unwrap().repost_calls,
@@ -24915,8 +24973,11 @@ mod tests {
         let output = wait_for_log(&logs, "web write", Duration::from_secs(2)).await;
         let write_line = output
             .lines()
-            .find(|line| line.contains("web write") && !line.contains("web write failed")
-                && !line.contains("web index write"))
+            .find(|line| {
+                line.contains("web write")
+                    && !line.contains("web write failed")
+                    && !line.contains("web index write")
+            })
             .unwrap_or_default()
             .to_owned();
         for field in [
@@ -24934,9 +24995,9 @@ mod tests {
             );
         }
         assert!(
-            write_line.contains("index_write=queued")
-                || write_line.contains("index_write=done")
-                || write_line.contains("index_write=failed"),
+            write_line.contains("index_write=\"queued\"")
+                || write_line.contains("index_write=\"done\"")
+                || write_line.contains("index_write=\"failed\""),
             "the web write line must say what the index write did: {write_line}"
         );
         let total_ms: u64 = write_line
@@ -24964,12 +25025,12 @@ mod tests {
         );
         let output = wait_for_log(&logs, "web index write", Duration::from_secs(2)).await;
         drop(capture);
-        let done_line = output
-            .lines()
-            .filter(|line| line.contains("web index write") && !line.contains("failed"))
-            .last()
-            .unwrap_or_default()
-            .to_owned();
+        let mut done_line = String::new();
+        for line in output.lines() {
+            if line.contains("web index write") && !line.contains("failed") {
+                done_line = line.to_owned();
+            }
+        }
         assert!(
             done_line.contains("index_write=\"done\""),
             "the landed index write must be reported: {output}"
@@ -24986,7 +25047,13 @@ mod tests {
             inner: MemoryStorage::default(),
             lock_failures: AtomicUsize::new(2),
         });
-        let post = test_web_post("did:plc:locked-author", "locked", 7, "post behind a busy writer", None);
+        let post = test_web_post(
+            "did:plc:locked-author",
+            "locked",
+            7,
+            "post behind a busy writer",
+            None,
+        );
         storage.inner.put_record(&post).unwrap();
         let flow = AnswerFlow::default();
         let public = OAuthPublic::new("https://appview.example").unwrap();

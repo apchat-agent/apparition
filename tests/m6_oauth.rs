@@ -51,18 +51,9 @@ async fn wait_until(mut check: impl FnMut() -> bool, timeout: Duration) -> bool 
     }
 }
 
-async fn wait_for_indexed<S: Storage>(
-    storage: &S,
-    collection: &str,
-    uri: &str,
-    present: bool,
-) {
+async fn wait_for_indexed<S: Storage>(storage: &S, collection: &str, uri: &str, present: bool) {
     let found = wait_until(
-        || storage
-            .record_by_uri(collection, uri)
-            .unwrap()
-            .is_some()
-            == present,
+        || storage.record_by_uri(collection, uri).unwrap().is_some() == present,
         Duration::from_secs(10),
     )
     .await;
@@ -4039,8 +4030,14 @@ async fn successful_pds_writes_are_indexed_and_jetstream_replays_are_idempotent(
         assert_eq!(response.status(), StatusCode::SEE_OTHER, "{path}");
     }
     for (collection, uri) in [
-        ("app.bsky.feed.post", "at://did:plc:alice/app.bsky.feed.post/pds-post-r1"),
-        ("app.bsky.feed.like", "at://did:plc:alice/app.bsky.feed.like/pds-like-r1"),
+        (
+            "app.bsky.feed.post",
+            "at://did:plc:alice/app.bsky.feed.post/pds-post-r1",
+        ),
+        (
+            "app.bsky.feed.like",
+            "at://did:plc:alice/app.bsky.feed.like/pds-like-r1",
+        ),
         (
             "app.bsky.feed.repost",
             "at://did:plc:alice/app.bsky.feed.repost/pds-repost-r1",
