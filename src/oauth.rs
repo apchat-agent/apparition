@@ -9776,16 +9776,27 @@ where
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
     let timeline_started = std::time::Instant::now();
-    let notification_page = match notification_window_page(
-        state.storage.as_ref(),
-        &did,
-        before.as_ref(),
-        limit,
-        last_seen_us,
-    ) {
-        Ok(page) => page,
-        Err(error) => {
+    let page_storage = Arc::clone(&state.storage);
+    let page_did = did.clone();
+    let page_cursor = before.clone();
+    let notification_page = match tokio::task::spawn_blocking(move || {
+        notification_window_page(
+            page_storage.as_ref(),
+            &page_did,
+            page_cursor.as_ref(),
+            limit,
+            last_seen_us,
+        )
+    })
+    .await
+    {
+        Ok(Ok(page)) => page,
+        Ok(Err(error)) => {
             tracing::warn!(%error, viewer = %did, "notification page read failed");
+            return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+        }
+        Err(error) => {
+            tracing::warn!(%error, viewer = %did, "notification page read task panicked");
             return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
         }
     };
