@@ -9,10 +9,45 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
+    pin::Pin,
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 use url::Url;
+
+/// How many of one page's posts arrived through each hydration route. The local index is not a
+/// network route and is counted separately (`posts_local`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct PostRouteStats {
+    /// Hydrated through the signed-in viewer's own PDS, proxied to the Bluesky AppView.
+    pub proxy: u64,
+    /// Hydrated through the anonymous public AppView.
+    pub public: u64,
+    /// Hydrated one by one from the authors' PDSes (the last-resort fallback).
+    pub pds: u64,
+}
+
+impl PostRouteStats {
+    pub(crate) fn absorb(&mut self, other: &PostRouteStats) {
+        self.proxy = self.proxy.saturating_add(other.proxy);
+        self.public = self.public.saturating_add(other.public);
+        self.pds = self.pds.saturating_add(other.pds);
+    }
+}
+
+/// One batch of proxied post views, boxed so the fetcher trait stays object-safe.
+pub type ProxiedPostViewsFetch<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<Vec<Value>>, String>> + Send + 'a>>;
+
+/// Batched post views fetched through the signed-in viewer's session, proxied to the Bluesky
+/// AppView (`atproto-proxy: did:web:api.bsky.app#bsky_appview`). `Ok(None)` means the route is
+/// unavailable for this page — no viewer, or a stored sign-in without the getPosts scope — and
+/// the caller falls back anonymously without a warning. `Err` is a failed call: the caller
+/// warns once for the batch and falls back so no post is lost.
+pub trait ProxiedPostsFetcher: Send + Sync {
+    fn fetch_post_views<'a>(&'a self, uris: &'a [String]) -> ProxiedPostViewsFetch<'a>;
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedFeed {
@@ -123,6 +158,10 @@ pub struct HydratedFeedPage {
     pub feed: Vec<HydratedFeedPost>,
     pub cursor: Option<String>,
     pub dropped_count: usize,
+    /// Skeleton posts answered by the local index without any network call.
+    pub posts_local: u64,
+    /// How the remaining posts were hydrated (proxy / anonymous public / author PDS).
+    pub post_routes: PostRouteStats,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -182,6 +221,12 @@ pub struct FeedTimelineTiming {
     pub skeleton_hydration_ms: u64,
     pub cache_hit: bool,
     pub skeleton_cache_hit: bool,
+    /// Where this page's posts came from: the local index, the signed-in viewer's proxied
+    /// session, the anonymous public AppView, and the authors' PDSes.
+    pub posts_local: u64,
+    pub posts_proxy: u64,
+    pub posts_public: u64,
+    pub posts_pds: u64,
 }
 
 const LIVE_POST_CACHE_ENTRIES: usize = 20_000;
@@ -275,6 +320,14 @@ async fn fetch_public_posts_batch(
         .get("posts")
         .and_then(Value::as_array)
         .ok_or_else(|| "Bluesky AppView getPosts response has no posts list".to_owned())?;
+    Ok(public_posts_from_views(posts, uris))
+}
+
+/// Turns `app.bsky.feed.getPosts` post views into records, keeping only the requested URIs.
+/// The anonymous public AppView and the viewer's proxied session return the same post view
+/// shape, so both routes parse through here; viewer-only fields (like/repost state) are not
+/// read, which keeps one shared cache safe across viewers.
+pub(crate) fn public_posts_from_views(posts: &[Value], uris: &[String]) -> Vec<FetchedPublicPost> {
     let requested = uris.iter().map(String::as_str).collect::<HashSet<_>>();
     let mut result = Vec::new();
     for view in posts {
@@ -312,7 +365,7 @@ async fn fetch_public_posts_batch(
             author,
         });
     }
-    Ok(result)
+    result
 }
 
 pub(crate) fn parse_public_profile_view(value: &Value) -> Option<PublicProfileView> {
@@ -809,6 +862,7 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
         &self,
         skeleton: FeedSkeletonPage,
         storage: Arc<dyn Storage>,
+        proxy: Option<Arc<dyn ProxiedPostsFetcher>>,
     ) -> Result<HydratedFeedPage, String> {
         const PAGE_BUDGET: Duration = Duration::from_secs(8);
         let count = skeleton.feed.len();
@@ -838,17 +892,19 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
             .filter(|uri| !local.contains_key(*uri))
             .cloned()
             .collect::<Vec<_>>();
-        let fetched = match tokio::time::timeout_at(deadline, self.fetch_posts(&missing)).await {
-            Ok(fetched) => fetched,
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    requested_posts = missing.len(),
-                    "public feed post lookup timed out"
-                );
-                HashMap::new()
-            }
-        };
+        let posts_local = (uris.len() - missing.len()) as u64;
+        let (fetched, post_routes) =
+            match tokio::time::timeout_at(deadline, self.fetch_posts(proxy, &missing)).await {
+                Ok(routes) => routes,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        requested_posts = missing.len(),
+                        "public feed post lookup timed out"
+                    );
+                    (HashMap::new(), PostRouteStats::default())
+                }
+            };
 
         let mut authors = Vec::new();
         let mut feed = Vec::with_capacity(count);
@@ -900,12 +956,22 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
             dropped_count: count.saturating_sub(feed.len()),
             feed,
             cursor,
+            posts_local,
+            post_routes,
         })
     }
 
-    /// Fetch unindexed posts through the public AppView in batches of 25. The long-lived cache
-    /// stays in front; only missing batch results fall back to their authors' PDSes.
-    pub async fn fetch_posts(&self, uris: &[String]) -> HashMap<String, FetchedPublicPost> {
+    /// Fetch unindexed posts in batches of 25. The long-lived cache stays in front. When a
+    /// proxied fetcher is given (a signed-in viewer's own session) every batch is first tried
+    /// through the viewer's PDS; a batch the route cannot serve (no viewer, no stored scope)
+    /// falls back anonymously without a word, a batch whose proxied call failed logs one WARN
+    /// and falls back to the anonymous public AppView, and anything still unanswered falls
+    /// back to its author's PDS exactly as before. Neither fallback loses or reorders posts.
+    pub async fn fetch_posts(
+        &self,
+        proxy: Option<Arc<dyn ProxiedPostsFetcher>>,
+        uris: &[String],
+    ) -> (HashMap<String, FetchedPublicPost>, PostRouteStats) {
         let now = tokio::time::Instant::now();
         let mut fetched = HashMap::new();
         let mut missing = Vec::new();
@@ -936,34 +1002,75 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
         let mut batch_results = stream::iter(batches.into_iter().map(|batch| {
             let http = http.clone();
             let base = base.clone();
+            let proxy = proxy.clone();
             async move {
-                let result = fetch_public_posts_batch(&http, &base, &batch).await;
-                (batch, result)
+                let mut pending = batch.clone();
+                let mut proxied = Vec::new();
+                if let Some(proxy) = &proxy {
+                    match proxy.fetch_post_views(&pending).await {
+                        Ok(Some(views)) => {
+                            proxied = public_posts_from_views(&views, &pending);
+                            let answered = proxied
+                                .iter()
+                                .map(|post| post.record.uri.clone())
+                                .collect::<HashSet<_>>();
+                            pending.retain(|uri| !answered.contains(uri));
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                requested_posts = pending.len(),
+                                "proxied get posts batch failed; using the public appview"
+                            );
+                        }
+                    }
+                }
+                let public = if pending.is_empty() {
+                    None
+                } else {
+                    Some(fetch_public_posts_batch(&http, &base, &pending).await)
+                };
+                (batch, proxied, public)
             }
         }))
         .buffer_unordered(PUBLIC_POST_BATCH_CONCURRENCY);
         let mut unanswered = Vec::new();
-        while let Some((batch, result)) = batch_results.next().await {
-            match result {
-                Ok(posts) => {
-                    for post in posts {
-                        if batch.iter().any(|requested| requested == &post.record.uri) {
-                            cache_live_post(&self.live_post_cache, &post.record.uri, post.clone())
-                                .await;
-                            fetched.insert(post.record.uri.clone(), post);
-                        }
-                    }
-                    unanswered.extend(batch.into_iter().filter(|uri| !fetched.contains_key(uri)));
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        requested_posts = batch.len(),
-                        "public appview post batch failed"
-                    );
-                    unanswered.extend(batch);
+        let mut routes = PostRouteStats::default();
+        while let Some((batch, proxied, public)) = batch_results.next().await {
+            for post in proxied {
+                if batch.iter().any(|requested| requested == &post.record.uri) {
+                    cache_live_post(&self.live_post_cache, &post.record.uri, post.clone()).await;
+                    fetched.insert(post.record.uri.clone(), post);
+                    routes.proxy = routes.proxy.saturating_add(1);
                 }
             }
+            if let Some(result) = public {
+                match result {
+                    Ok(posts) => {
+                        for post in posts {
+                            if batch.iter().any(|requested| requested == &post.record.uri) {
+                                cache_live_post(
+                                    &self.live_post_cache,
+                                    &post.record.uri,
+                                    post.clone(),
+                                )
+                                .await;
+                                fetched.insert(post.record.uri.clone(), post);
+                                routes.public = routes.public.saturating_add(1);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            requested_posts = batch.len(),
+                            "public appview post batch failed"
+                        );
+                    }
+                }
+            }
+            unanswered.extend(batch.into_iter().filter(|uri| !fetched.contains_key(uri)));
         }
 
         let client = self;
@@ -976,6 +1083,7 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
             match result {
                 Ok(Some(post)) => {
                     fetched.insert(uri, post);
+                    routes.pds = routes.pds.saturating_add(1);
                 }
                 Ok(None) => {}
                 Err(error) => tracing::warn!(
@@ -985,7 +1093,7 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
                 ),
             }
         }
-        fetched
+        (fetched, routes)
     }
 
     async fn fetch_live_post_data(&self, uri: &str) -> Result<Option<FetchedPublicPost>, String> {
@@ -1058,8 +1166,9 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
     }
 
     pub async fn fetch_post(&self, uri: &str) -> Result<IndexedRecord, String> {
-        self.fetch_posts(&[uri.to_owned()])
+        self.fetch_posts(None, &[uri.to_owned()])
             .await
+            .0
             .remove(uri)
             .map(|post| post.record)
             .ok_or_else(|| "post could not be fetched from its author PDS".to_owned())
@@ -1719,7 +1828,7 @@ mod tests {
         };
 
         let page = client
-            .hydrate_skeleton(skeleton, storage.clone())
+            .hydrate_skeleton(skeleton, storage.clone(), None)
             .await
             .unwrap();
         let uris = page
@@ -1777,7 +1886,7 @@ mod tests {
 
         let storage = Arc::new(MemoryStorage::default());
         let page = client
-            .hydrate_skeleton(skeleton, storage.clone())
+            .hydrate_skeleton(skeleton, storage.clone(), None)
             .await
             .unwrap();
 
@@ -1820,6 +1929,7 @@ mod tests {
                     cursor: None,
                 },
                 Arc::new(MemoryStorage::default()),
+                None,
             )
             .await
             .unwrap();
@@ -1852,6 +1962,7 @@ mod tests {
                         cursor: None,
                     },
                     Arc::new(MemoryStorage::default()),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -1894,6 +2005,7 @@ mod tests {
                         cursor: None,
                     },
                     Arc::new(MemoryStorage::default()),
+                    None,
                 )
                 .with_subscriber(subscriber)
                 .await

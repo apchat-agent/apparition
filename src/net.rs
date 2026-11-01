@@ -549,6 +549,13 @@ impl SafeHttpClient {
                 .ok_or_else(|| "outbound URL has no host".to_owned())?;
             let client = self.client_for(host, &addresses)?;
             let mut call_timer = OutboundCallTimer::new(request.method(), &url, call_started);
+            if request.headers().contains_key("atproto-proxy") {
+                // A call the signed-in viewer's own PDS forwards to a service AppView
+                // (`atproto-proxy: did:web:api.bsky.app#bsky_appview`): the timing list shows
+                // these as their own kind so proxied hydration can be compared to the
+                // anonymous public AppView calls.
+                call_timer.kind = "pds_proxy".to_owned();
+            }
             let response = client
                 .request(request.method().clone(), url.clone())
                 .headers(request.headers().clone())

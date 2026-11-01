@@ -30,10 +30,10 @@ use tower::ServiceExt;
 use tracing::{Event, Subscriber, field::Visit};
 use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
-const EXPECTED_READ_ONLY_SCOPE: &str = "atproto rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* rpc:app.bsky.graph.getMutes?aud=* rpc:app.bsky.feed.searchPosts?aud=*";
-const EXPECTED_LIKE_ONLY_SCOPE: &str = "atproto rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* rpc:app.bsky.graph.getMutes?aud=* rpc:app.bsky.feed.searchPosts?aud=* repo:app.bsky.feed.like?action=create&action=delete";
-const EXPECTED_ALL_BOXES_SCOPE: &str = "atproto rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* rpc:app.bsky.graph.getMutes?aud=* rpc:app.bsky.feed.searchPosts?aud=* repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete repo:app.bsky.feed.post?action=create blob:image/* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.actor.putPreferences?aud=did:web:api.bsky.app%23bsky_appview";
-const EXPECTED_OAUTH_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.graph.getMutes?aud=* rpc:app.bsky.feed.searchPosts?aud=* rpc:app.bsky.actor.putPreferences?aud=did:web:api.bsky.app%23bsky_appview";
+const EXPECTED_READ_ONLY_SCOPE: &str = "atproto rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* rpc:app.bsky.graph.getMutes?aud=* rpc:app.bsky.feed.searchPosts?aud=* rpc:app.bsky.feed.getPosts?aud=*";
+const EXPECTED_LIKE_ONLY_SCOPE: &str = "atproto rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* rpc:app.bsky.graph.getMutes?aud=* rpc:app.bsky.feed.searchPosts?aud=* rpc:app.bsky.feed.getPosts?aud=* repo:app.bsky.feed.like?action=create&action=delete";
+const EXPECTED_ALL_BOXES_SCOPE: &str = "atproto rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* rpc:app.bsky.graph.getMutes?aud=* rpc:app.bsky.feed.searchPosts?aud=* rpc:app.bsky.feed.getPosts?aud=* repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete repo:app.bsky.feed.post?action=create blob:image/* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.actor.putPreferences?aud=did:web:api.bsky.app%23bsky_appview";
+const EXPECTED_OAUTH_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.graph.getMutes?aud=* rpc:app.bsky.feed.searchPosts?aud=* rpc:app.bsky.feed.getPosts?aud=* rpc:app.bsky.actor.putPreferences?aud=did:web:api.bsky.app%23bsky_appview";
 
 /// Web writes answer on PDS OK and index in the background: a test that reads the
 /// index back must wait for the handed-off write to land instead of asserting at
@@ -591,6 +591,8 @@ impl OAuthFlow for FakeOAuthFlow {
                         .collect(),
                     cursor: None,
                     dropped_count: 0,
+                    posts_local: 0,
+                    post_routes: Default::default(),
                 },
                 timing: FeedTimelineTiming::default(),
             })

@@ -138,7 +138,7 @@ const OAUTH_METADATA_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const OAUTH_METADATA_RESOLVER_CACHE_TTL: Duration = Duration::from_secs(1);
 const VIDEO_SERVICE_DID: &str = "did:web:video.bsky.app";
 const VIDEO_SERVICE_URL: &str = "https://video.bsky.app";
-const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.graph.getMutes?aud=* rpc:app.bsky.feed.searchPosts?aud=* rpc:app.bsky.actor.putPreferences?aud=did:web:api.bsky.app%23bsky_appview";
+const REQUESTED_SCOPE: &str = "atproto repo:app.bsky.feed.post?action=create repo:app.bsky.feed.like?action=create&action=delete repo:app.bsky.feed.repost?action=create&action=delete blob:image/* rpc:app.bsky.actor.getPreferences?aud=* rpc:app.bsky.feed.getFeedSkeleton?aud=* blob:video/* rpc:app.bsky.video.getUploadLimits?aud=* rpc:com.atproto.repo.uploadBlob?aud=* repo:app.bsky.graph.follow?action=create&action=delete repo:app.bsky.graph.block?action=create&action=delete repo:app.bsky.graph.listitem?action=create&action=delete rpc:app.bsky.graph.muteActor?aud=* rpc:app.bsky.graph.unmuteActor?aud=* rpc:app.bsky.graph.getMutes?aud=* rpc:app.bsky.feed.searchPosts?aud=* rpc:app.bsky.feed.getPosts?aud=* rpc:app.bsky.actor.putPreferences?aud=did:web:api.bsky.app%23bsky_appview";
 const BLOB_SCOPE: &str = "blob:image/*";
 const VIDEO_BLOB_SCOPE: &str = "blob:video/*";
 const VIDEO_SCOPES: [&str; 3] = [
@@ -157,6 +157,10 @@ const MUTE_SCOPES: [&str; 3] = [
 /// Granted on every sign-in (it is in READ_ONLY_SCOPES); checked before spending a signed
 /// searchPosts call so a session signed in before this scope existed just returns None.
 const SEARCH_POSTS_SCOPES: [&str; 1] = ["rpc:app.bsky.feed.searchPosts?aud=*"];
+/// Granted on every sign-in (it is in READ_ONLY_SCOPES); checked before feeding a page's missing
+/// posts through the viewer's proxied getPosts, so a session signed in before this scope existed
+/// keeps the anonymous public AppView route without spending a call the PDS would reject.
+const GET_POSTS_SCOPES: [&str; 1] = ["rpc:app.bsky.feed.getPosts?aud=*"];
 /// Removing a dead saved feed rewrites the viewer's preferences (owner, 2026-10-31).
 /// The audience must be named exactly: bsky.social grants `aud=*` for putPreferences but its PDS
 /// then rejects the call with ScopeMissingError naming this audience (measured 2026-10-31).
@@ -195,12 +199,15 @@ const FEED_SCOPES: [&str; 2] = [
 /// checkbox requests: atproto plus the read rpc scopes the read pages need. The client metadata
 /// `scope` (REQUESTED_SCOPE) stays the FULL list: it is the maximum a request may ask for.
 /// Posts search runs through the viewer's own session (owner, msgd 2026-10-31), so its rpc scope
-/// belongs to every sign-in, not to a checkbox.
-const READ_ONLY_SCOPES: [&str; 4] = [
+/// belongs to every sign-in, not to a checkbox. Feed hydration through the viewer's session
+/// (owner, 2026-11-01: "let's try to use logged in version - the anonymous may be throttled")
+/// works the same way.
+const READ_ONLY_SCOPES: [&str; 5] = [
     "rpc:app.bsky.actor.getPreferences?aud=*",
     "rpc:app.bsky.feed.getFeedSkeleton?aud=*",
     "rpc:app.bsky.graph.getMutes?aud=*",
     "rpc:app.bsky.feed.searchPosts?aud=*",
+    "rpc:app.bsky.feed.getPosts?aud=*",
 ];
 /// The sign-in checkboxes (owner, msgd 2026-10-31: "multiple checkboxes describing activities
 /// that a user would like to do ... with 'like' being checked by default", then again
@@ -601,6 +608,14 @@ pub struct BlockListDetail {
     pub member_dids: Vec<String>,
 }
 
+/// A page's batched post hydration: the posts keyed by URI plus the route counts.
+pub type PublicPostsPage = (
+    HashMap<String, crate::feeds::FetchedPublicPost>,
+    crate::feeds::PostRouteStats,
+);
+/// One boxed `OAuthFlow::fetch_public_posts` future.
+pub type PublicPostsFetch<'a> = Pin<Box<dyn Future<Output = PublicPostsPage> + Send + 'a>>;
+
 pub trait OAuthFlow: Clone + Send + Sync + 'static {
     /// `scopes` is the scope list chosen for this sign-in: atproto + the read-only list + the
     /// scopes of the activity boxes the login form ticked (`allow` checkboxes, owner 2026-10-31).
@@ -712,13 +727,16 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<IndexedRecord, String>> + Send + 'a>> {
         Box::pin(async { Err("post fetch is not available".to_owned()) })
     }
+    /// Batch-hydrate posts for a page, through the viewer's proxied session when the flow
+    /// supports it (`viewer_did` empty = anonymous). Returns the posts and where each route
+    /// served them.
     fn fetch_public_posts<'a>(
         &'a self,
+        _viewer_did: &'a str,
         uris: &'a [String],
-    ) -> Pin<Box<dyn Future<Output = HashMap<String, crate::feeds::FetchedPublicPost>> + Send + 'a>>
-    {
+    ) -> PublicPostsFetch<'a> {
         Box::pin(async move {
-            futures_util::stream::iter(uris.iter().cloned().map(|uri| async move {
+            let posts = futures_util::stream::iter(uris.iter().cloned().map(|uri| async move {
                 self.fetch_post(&uri).await.ok().map(|record| {
                     (
                         uri,
@@ -732,7 +750,12 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
             .buffer_unordered(PAGE_QUOTE_CONCURRENCY)
             .filter_map(|post| async move { post })
             .collect::<HashMap<_, _>>()
-            .await
+            .await;
+            let routes = crate::feeds::PostRouteStats {
+                public: posts.len() as u64,
+                ..Default::default()
+            };
+            (posts, routes)
         })
     }
     fn supports_public_post_batching(&self) -> bool {
@@ -950,6 +973,8 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
                     feed: Vec::new(),
                     cursor: None,
                     dropped_count: 0,
+                    posts_local: 0,
+                    post_routes: crate::feeds::PostRouteStats::default(),
                 },
                 timing: FeedTimelineTiming::default(),
             })
@@ -2222,6 +2247,28 @@ impl<B: crate::identity::IdentityBackend> Clone for AtriumOAuthFlow<B> {
     }
 }
 
+/// A page's batched post hydration through the signed-in viewer's own proxied session
+/// (see [`AtriumOAuthFlow::proxied_get_post_views`]).
+struct FlowProxiedPosts<B: crate::identity::IdentityBackend> {
+    flow: AtriumOAuthFlow<B>,
+    viewer_did: String,
+}
+
+impl<B: crate::identity::IdentityBackend + 'static> crate::feeds::ProxiedPostsFetcher
+    for FlowProxiedPosts<B>
+{
+    fn fetch_post_views<'a>(
+        &'a self,
+        uris: &'a [String],
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Vec<Value>>, String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.flow
+                .proxied_get_post_views(&self.viewer_did, uris)
+                .await
+        })
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 struct ExpectedOAuthIdentity {
     did: String,
@@ -3388,6 +3435,69 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         serde_json::to_value(&output)
             .map(Some)
             .map_err(|error| error.to_string())
+    }
+
+    /// The page's batched post hydration route through the viewer's own session. Cheap to
+    /// build; the scope and stored-session checks happen per batch inside
+    /// [`Self::proxied_get_post_views`], exactly like the signed search above.
+    fn posts_proxy(&self, viewer_did: &str) -> Arc<dyn crate::feeds::ProxiedPostsFetcher> {
+        Arc::new(FlowProxiedPosts {
+            flow: self.clone(),
+            viewer_did: viewer_did.to_owned(),
+        })
+    }
+
+    /// Feed posts the page's index does not have, hydrated through the viewer's PDS and proxied
+    /// to the Bluesky AppView exactly like [`Self::signed_search_posts_body`]. `Ok(None)` means
+    /// the route is unavailable for this page: no signed-in viewer, no stored sign-in, or a
+    /// sign-in made before the getPosts scope existed. Non-success statuses arrive as `Err`
+    /// through the XRPC client; the caller warns once per batch and falls back to the anonymous
+    /// public AppView so no post is lost.
+    async fn proxied_get_post_views(
+        &self,
+        viewer_did: &str,
+        uris: &[String],
+    ) -> Result<Option<Vec<Value>>, String> {
+        if viewer_did.is_empty() || uris.is_empty() {
+            return Ok(None);
+        }
+        let parsed_did = viewer_did
+            .parse::<Did>()
+            .map_err(|_| "viewer DID is invalid".to_owned())?;
+        let Some(stored) = self
+            .store
+            .get(&parsed_did)
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        if !has_all_scopes(stored.token_set.scope.as_deref(), &GET_POSTS_SCOPES) {
+            return Ok(None);
+        }
+        let session = self.restored_session(&parsed_did).await?;
+        let proxy_did = BSKY_APPVIEW_DID
+            .parse::<Did>()
+            .map_err(|_| "Bluesky AppView service DID is invalid".to_owned())?;
+        let api = Self::session_agent(&session).api_with_proxy(proxy_did, BSKY_APPVIEW_SERVICE);
+        let parameters = atrium_api::app::bsky::feed::get_posts::ParametersData {
+            uris: uris.to_vec(),
+        }
+        .into();
+        let output = api
+            .app
+            .bsky
+            .feed
+            .get_posts(parameters)
+            .await
+            .map_err(|error| format!("Bluesky getPosts request failed: {error:?}"))?;
+        let body = serde_json::to_value(&output).map_err(|error| error.to_string())?;
+        Ok(Some(
+            body.get("posts")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        ))
     }
 
     async fn schedule_muted_actor_refresh(&self, did: &str) {
@@ -4918,11 +5028,12 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
 
     fn fetch_public_posts<'a>(
         &'a self,
+        viewer_did: &'a str,
         uris: &'a [String],
-    ) -> Pin<Box<dyn Future<Output = HashMap<String, crate::feeds::FetchedPublicPost>> + Send + 'a>>
-    {
+    ) -> PublicPostsFetch<'a> {
         let uris = uris.to_vec();
-        Box::pin(async move { self.feed_client.fetch_posts(&uris).await })
+        let proxy = self.posts_proxy(viewer_did);
+        Box::pin(async move { self.feed_client.fetch_posts(Some(proxy), &uris).await })
     }
 
     fn supports_public_post_batching(&self) -> bool {
@@ -5487,9 +5598,14 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
             };
             let skeleton_ms = skeleton_started.elapsed().as_millis() as u64;
             let hydration_started = std::time::Instant::now();
+            let proxy = if did.is_empty() {
+                None
+            } else {
+                Some(self.posts_proxy(did))
+            };
             let timeline = self
                 .feed_client
-                .hydrate_skeleton(skeleton, Arc::clone(&storage))
+                .hydrate_skeleton(skeleton, Arc::clone(&storage), proxy)
                 .await?;
             tracing::debug!(
                 feed = uri,
@@ -5501,6 +5617,8 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
                 dropped = timeline.dropped_count,
                 "feed page loaded"
             );
+            let post_routes = timeline.post_routes;
+            let posts_local = timeline.posts_local;
             let page = FeedTimeline {
                 generator,
                 timeline,
@@ -5510,6 +5628,10 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
                     skeleton_hydration_ms: hydration_started.elapsed().as_millis() as u64,
                     cache_hit: false,
                     skeleton_cache_hit,
+                    posts_local,
+                    posts_proxy: post_routes.proxy,
+                    posts_public: post_routes.public,
+                    posts_pds: post_routes.pds,
                 },
             };
             let mut cache = self.feed_page_cache.lock().await;
@@ -5972,6 +6094,8 @@ struct ParentHydrationStats {
     rounds: u64,
     public_ms: u64,
     local_pending: bool,
+    /// Which route served the parent posts the index did not have.
+    routes: crate::feeds::PostRouteStats,
 }
 
 #[derive(Default)]
@@ -6320,12 +6444,26 @@ struct WebPageTiming {
     mutes_ms: u64,
     list_blocks_ms: u64,
     list_blocked_posts: u64,
+    /// Feed-page posts answered by the local index (no network).
+    feed_posts_index: u64,
+    /// Feed-page posts the viewer's proxied getPosts served (lane av77q).
+    feed_posts_proxy: u64,
+    /// Feed-page posts the anonymous public AppView served.
+    feed_posts_public: u64,
+    /// Feed-page posts the authors' PDSes served.
+    feed_posts_pds: u64,
     parent_hydration_ms: u64,
     parent_local_ms: u64,
     parent_rows: u64,
     parent_rounds: u64,
     parent_public_ms: u64,
     parent_local_pending: bool,
+    /// Parent/reply posts the viewer's proxied getPosts served (lane av77q).
+    parent_posts_proxy: u64,
+    /// Parent/reply posts the anonymous public AppView served.
+    parent_posts_public: u64,
+    /// Parent/reply posts the authors' PDSes served.
+    parent_posts_pds: u64,
     content_hydration_ms: u64,
     profile_hydration_ms: u64,
     quote_hydration_ms: u64,
@@ -6372,12 +6510,19 @@ impl WebPageTiming {
             mutes_ms: 0,
             list_blocks_ms: 0,
             list_blocked_posts: 0,
+            feed_posts_index: 0,
+            feed_posts_proxy: 0,
+            feed_posts_public: 0,
+            feed_posts_pds: 0,
             parent_hydration_ms: 0,
             parent_local_ms: 0,
             parent_rows: 0,
             parent_rounds: 0,
             parent_public_ms: 0,
             parent_local_pending: false,
+            parent_posts_proxy: 0,
+            parent_posts_public: 0,
+            parent_posts_pds: 0,
             content_hydration_ms: 0,
             profile_hydration_ms: 0,
             quote_hydration_ms: 0,
@@ -6412,6 +6557,9 @@ impl WebPageTiming {
         self.parent_rounds = stats.rounds;
         self.parent_public_ms = stats.public_ms;
         self.parent_local_pending = stats.local_pending;
+        self.parent_posts_proxy = stats.routes.proxy;
+        self.parent_posts_public = stats.routes.public;
+        self.parent_posts_pds = stats.routes.pds;
     }
 }
 
@@ -6588,12 +6736,19 @@ impl Drop for WebPageTiming {
             mutes_ms = self.mutes_ms,
             list_blocks_ms = self.list_blocks_ms,
             list_blocked_posts = self.list_blocked_posts,
+            feed_posts_index = self.feed_posts_index,
+            feed_posts_proxy = self.feed_posts_proxy,
+            feed_posts_public = self.feed_posts_public,
+            feed_posts_pds = self.feed_posts_pds,
             parent_hydration_ms = self.parent_hydration_ms,
             parent_local_ms = self.parent_local_ms,
             parent_rows = self.parent_rows,
             parent_rounds = self.parent_rounds,
             parent_public_ms = self.parent_public_ms,
             parent_local_pending = self.parent_local_pending,
+            parent_posts_proxy = self.parent_posts_proxy,
+            parent_posts_public = self.parent_posts_public,
+            parent_posts_pds = self.parent_posts_pds,
             content_hydration_ms = self.content_hydration_ms,
             profile_hydration_ms = self.profile_hydration_ms,
             quote_hydration_ms = self.quote_hydration_ms,
@@ -6640,12 +6795,19 @@ impl Drop for WebPageTiming {
                 ("mutes_ms", self.mutes_ms),
                 ("list_blocks_ms", self.list_blocks_ms),
                 ("list_blocked_posts", self.list_blocked_posts),
+                ("feed_posts_index", self.feed_posts_index),
+                ("feed_posts_proxy", self.feed_posts_proxy),
+                ("feed_posts_public", self.feed_posts_public),
+                ("feed_posts_pds", self.feed_posts_pds),
                 ("parent_hydration_ms", self.parent_hydration_ms),
                 ("parent_local_ms", self.parent_local_ms),
                 ("parent_rows", self.parent_rows),
                 ("parent_rounds", self.parent_rounds),
                 ("parent_public_ms", self.parent_public_ms),
                 ("parent_local_pending", u64::from(self.parent_local_pending)),
+                ("parent_posts_proxy", self.parent_posts_proxy),
+                ("parent_posts_public", self.parent_posts_public),
+                ("parent_posts_pds", self.parent_posts_pds),
                 ("content_hydration_ms", self.content_hydration_ms),
                 ("profile_hydration_ms", self.profile_hydration_ms),
                 ("quote_hydration_ms", self.quote_hydration_ms),
@@ -6946,6 +7108,7 @@ async fn hydrate_page_content<F: OAuthFlow, S: Storage + 'static>(
     };
     let account_flow = flow.clone();
     let viewer_did = viewer_did.to_owned();
+    let quote_viewer_did = viewer_did.clone();
     let label_actor_count = label_actor_dids.len();
     let account_data_hydration = async move {
         let started = std::time::Instant::now();
@@ -6974,7 +7137,14 @@ async fn hydrate_page_content<F: OAuthFlow, S: Storage + 'static>(
     let quote_storage = storage.clone();
     let quote_hydration = async {
         let started = std::time::Instant::now();
-        let quotes = hydrate_page_quotes(flow, quote_storage.as_ref(), refs, deadline).await;
+        let quotes = hydrate_page_quotes(
+            flow,
+            &quote_viewer_did,
+            quote_storage.as_ref(),
+            refs,
+            deadline,
+        )
+        .await;
         (quotes, started.elapsed().as_millis() as u64)
     };
     let (quote_hydration, (account_data, account_labels_ms)) =
@@ -7021,6 +7191,7 @@ fn page_records_with_parents<'a>(
 
 async fn hydrate_page_parents<F: OAuthFlow, S: Storage + 'static>(
     flow: &F,
+    viewer_did: &str,
     storage: Arc<S>,
     page_records: &[&IndexedRecord],
     deadline: tokio::time::Instant,
@@ -7105,6 +7276,7 @@ async fn hydrate_page_parents<F: OAuthFlow, S: Storage + 'static>(
         }
         hydrate_parent_uri_batch(
             flow,
+            viewer_did,
             Arc::clone(&storage),
             uris,
             &mut parents,
@@ -7136,6 +7308,7 @@ async fn hydrate_page_parents<F: OAuthFlow, S: Storage + 'static>(
 
 async fn hydrate_parent_uri_batch<F: OAuthFlow, S: Storage + 'static>(
     flow: &F,
+    viewer_did: &str,
     storage: Arc<S>,
     parent_uris: &[String],
     parents: &mut PageParentIndex,
@@ -7180,8 +7353,8 @@ async fn hydrate_parent_uri_batch<F: OAuthFlow, S: Storage + 'static>(
         if let Ok(mut public_started_at) = public_started_for_fetch.lock() {
             *public_started_at = Some(started);
         }
-        let fetched = fetch_parent_posts(flow, parent_uris).await;
-        (started.elapsed(), fetched)
+        let (fetched, routes) = fetch_parent_posts(flow, viewer_did, parent_uris).await;
+        (started.elapsed(), fetched, routes)
     };
     tokio::pin!(public_fetch);
     tokio::select! {
@@ -7211,8 +7384,9 @@ async fn hydrate_parent_uri_batch<F: OAuthFlow, S: Storage + 'static>(
                 let _ = start.send(());
             }
             let fetched = tokio::time::timeout_at(deadline, &mut public_fetch).await;
-            if let Ok((elapsed, fetched)) = fetched {
+            if let Ok((elapsed, fetched, routes)) = fetched {
                 stats.public_ms = stats.public_ms.saturating_add(elapsed.as_millis() as u64);
+                stats.routes.absorb(&routes);
                 persist_fetched_parent_posts(Arc::clone(&storage), &missing, fetched, parents).await?;
             } else {
                 stats.public_ms = stats
@@ -7223,8 +7397,9 @@ async fn hydrate_parent_uri_batch<F: OAuthFlow, S: Storage + 'static>(
         fetched = tokio::time::timeout_at(deadline, &mut public_fetch) => {
             let local_elapsed_at_public = local_started.elapsed().as_millis() as u64;
             stats.local_pending = true;
-            if let Ok((elapsed, fetched)) = fetched {
+            if let Ok((elapsed, fetched, routes)) = fetched {
                 stats.public_ms = stats.public_ms.saturating_add(elapsed.as_millis() as u64);
+                stats.routes.absorb(&routes);
                 persist_fetched_parent_posts(Arc::clone(&storage), parent_uris, fetched, parents).await?;
             } else {
                 stats.public_ms = stats
@@ -7269,13 +7444,14 @@ async fn hydrate_parent_uri_batch<F: OAuthFlow, S: Storage + 'static>(
 
 async fn fetch_parent_posts<F: OAuthFlow>(
     flow: &F,
+    viewer_did: &str,
     uris: &[String],
-) -> HashMap<String, crate::feeds::FetchedPublicPost> {
+) -> PublicPostsPage {
     if flow.supports_public_post_batching() {
-        return flow.fetch_public_posts(uris).await;
+        return flow.fetch_public_posts(viewer_did, uris).await;
     }
     let flow = flow.clone();
-    stream::iter(uris.iter().cloned().map(|uri| {
+    let posts = stream::iter(uris.iter().cloned().map(|uri| {
         let flow = flow.clone();
         async move {
             match flow.fetch_post(&uri).await {
@@ -7298,8 +7474,13 @@ async fn fetch_parent_posts<F: OAuthFlow>(
     }))
     .buffer_unordered(PAGE_QUOTE_CONCURRENCY)
     .filter_map(|post| async move { post })
-    .collect()
-    .await
+    .collect::<HashMap<_, _>>()
+    .await;
+    let routes = crate::feeds::PostRouteStats {
+        public: posts.len() as u64,
+        ..Default::default()
+    };
+    (posts, routes)
 }
 
 fn parent_public_elapsed_ms(started_at: &Arc<Mutex<Option<std::time::Instant>>>) -> u64 {
@@ -7416,6 +7597,7 @@ fn at_uri_collection(uri: &str) -> Option<&str> {
 
 async fn hydrate_page_quotes<F: OAuthFlow, S: Storage>(
     flow: &F,
+    viewer_did: &str,
     storage: &S,
     refs: Vec<QuotedRecordRef>,
     deadline: tokio::time::Instant,
@@ -7476,8 +7658,11 @@ async fn hydrate_page_quotes<F: OAuthFlow, S: Storage>(
                 "quoted post hydration reached page budget"
             );
         }
-    } else if let Ok(fetched) =
-        tokio::time::timeout_at(deadline, flow.fetch_public_posts(&missing_posts)).await
+    } else if let Ok((fetched, _routes)) = tokio::time::timeout_at(
+        deadline,
+        flow.fetch_public_posts(viewer_did, &missing_posts),
+    )
+    .await
     {
         let mut public_profiles = Vec::new();
         for uri in missing_posts {
@@ -8473,6 +8658,7 @@ where
     let mut parent_stats = ParentHydrationStats::default();
     let parent_result = hydrate_page_parents(
         &state.flow,
+        &did,
         state.storage.clone(),
         &timeline,
         content_deadline,
@@ -8838,6 +9024,7 @@ where
     let mut parent_stats = ParentHydrationStats::default();
     let parents = match hydrate_page_parents(
         &state.flow,
+        &did,
         state.storage.clone(),
         &visible,
         content_deadline,
@@ -9277,6 +9464,10 @@ where
         }
     }
     page_timing.feed_timeline_ms = timeline_started.elapsed().as_millis() as u64;
+    page_timing.feed_posts_index = page.timeline.posts_local;
+    page_timing.feed_posts_proxy = page.timeline.post_routes.proxy;
+    page_timing.feed_posts_public = page.timeline.post_routes.public;
+    page_timing.feed_posts_pds = page.timeline.post_routes.pds;
     page_timing.session_token_refresh_ms = page
         .timing
         .session_token_refresh_ms
@@ -9316,6 +9507,7 @@ where
     let mut parent_stats = ParentHydrationStats::default();
     let parent_result = hydrate_page_parents(
         &state.flow,
+        &did,
         state.storage.clone(),
         &feed_records,
         content_deadline,
@@ -10190,6 +10382,7 @@ where
     let mut parent_stats = ParentHydrationStats::default();
     let parent_result = hydrate_page_parents(
         &state.flow,
+        &did,
         state.storage.clone(),
         &notification_records,
         content_deadline,
@@ -11103,6 +11296,7 @@ where
     let mut parent_stats = ParentHydrationStats::default();
     let parent_result = hydrate_page_parents(
         &state.flow,
+        &did,
         state.storage.clone(),
         &records,
         content_deadline,
@@ -18389,6 +18583,7 @@ mod tests {
 
         let hydrated = hydrate_page_parents(
             &flow,
+            "",
             storage.clone(),
             &page_records,
             tokio::time::Instant::now() + Duration::from_secs(1),
@@ -20666,6 +20861,7 @@ mod tests {
         let mut stats = ParentHydrationStats::default();
         let parents = hydrate_page_parents(
             &DisabledOAuthFlow,
+            "",
             storage.clone(),
             &page_records,
             tokio::time::Instant::now() + Duration::from_secs(1),
@@ -20721,6 +20917,7 @@ mod tests {
         let mut stats = ParentHydrationStats::default();
         let parents = hydrate_page_parents(
             &DisabledOAuthFlow,
+            "",
             storage.clone(),
             &page_records,
             tokio::time::Instant::now() + Duration::from_secs(1),
@@ -20776,6 +20973,7 @@ mod tests {
         let mut stats = ParentHydrationStats::default();
         let parents = hydrate_page_parents(
             &DisabledOAuthFlow,
+            "",
             storage.clone(),
             &page_records,
             tokio::time::Instant::now() + Duration::from_secs(1),
@@ -20852,6 +21050,7 @@ mod tests {
 
         let parents = hydrate_page_parents(
             &flow,
+            "",
             storage.clone(),
             &page_records,
             tokio::time::Instant::now() + Duration::from_secs(2),
@@ -20903,6 +21102,7 @@ mod tests {
 
         let parents = hydrate_page_parents(
             &flow,
+            "",
             storage.clone(),
             &page_records,
             tokio::time::Instant::now() + Duration::from_secs(5),
@@ -21081,10 +21281,9 @@ mod tests {
 
         fn fetch_public_posts<'a>(
             &'a self,
+            _viewer_did: &'a str,
             uris: &'a [String],
-        ) -> Pin<
-            Box<dyn Future<Output = HashMap<String, crate::feeds::FetchedPublicPost>> + Send + 'a>,
-        > {
+        ) -> PublicPostsFetch<'a> {
             let uris = uris.to_vec();
             let records = self.records.clone();
             let fetched = self.fetched.clone();
@@ -21107,7 +21306,8 @@ mod tests {
                     batches.lock().unwrap().push(fresh.clone());
                     fetched.lock().unwrap().extend(fresh);
                 }
-                uris.into_iter()
+                let posts = uris
+                    .into_iter()
                     .filter_map(|uri| {
                         records.get(&uri).cloned().map(|record| {
                             (
@@ -21127,7 +21327,12 @@ mod tests {
                             )
                         })
                     })
-                    .collect()
+                    .collect::<HashMap<_, _>>();
+                let routes = crate::feeds::PostRouteStats {
+                    public: posts.len() as u64,
+                    ..Default::default()
+                };
+                (posts, routes)
             })
         }
 
@@ -21379,9 +21584,11 @@ mod tests {
         search_posts_requests: Vec<(String, Option<String>)>,
         // (query, atproto-proxy header) per getPosts call: Some(header) means the call came
         // through the viewer's PDS proxy, None means it came anonymous to the public AppView.
-        get_posts_requests: Vec<(String, Option<String>)>,
+        get_posts_requests: Vec<GetPostsCall>,
         get_posts_fail_proxied: bool,
     }
+
+    type GetPostsCall = (String, Option<String>);
 
     #[derive(Clone, Default)]
     struct FeedTestLogs(Arc<Mutex<Vec<u8>>>);
@@ -21974,14 +22181,13 @@ mod tests {
             .await
             .unwrap()
             .expect("the test session is stored");
-        stored.token_set.scope =
-            Some("atproto rpc:app.bsky.feed.getPosts?aud=*".to_owned());
+        stored.token_set.scope = Some("atproto rpc:app.bsky.feed.getPosts?aud=*".to_owned());
         flow.store.set(viewer_did.clone(), stored).await.unwrap();
     }
 
     fn get_posts_calls(
         state: &Arc<Mutex<FeedTestState>>,
-    ) -> (Vec<(String, Option<String>)>, Vec<(String, Option<String>)>) {
+    ) -> (Vec<GetPostsCall>, Vec<GetPostsCall>) {
         let requests = state.lock().unwrap().get_posts_requests.clone();
         let (proxied, anonymous): (Vec<_>, Vec<_>) =
             requests.into_iter().partition(|(_, proxy)| proxy.is_some());
@@ -22057,8 +22263,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_proxied_get_posts_falls_back_to_the_public_appview_keeping_posts_and_order()
-    {
+    async fn a_failed_proxied_get_posts_falls_back_to_the_public_appview_keeping_posts_and_order() {
         let (flow, state, server) = feed_test_flow(false).await;
         grant_get_posts_scope(&flow).await;
         state.lock().unwrap().get_posts_fail_proxied = true;
@@ -22110,15 +22315,23 @@ mod tests {
         let (flow, state, server) = feed_test_flow(false).await;
         let storage = Arc::new(MemoryStorage::default());
 
-        let page = flow.feed_timeline("", FEED_URI, None, storage).await.unwrap();
+        let page = flow
+            .feed_timeline("", FEED_URI, None, storage)
+            .await
+            .unwrap();
 
-        assert_eq!(
-            feed_hydration_uris(&page),
-            vec![PLACEHOLDER_URI.to_owned()]
-        );
+        assert_eq!(feed_hydration_uris(&page), vec![PLACEHOLDER_URI.to_owned()]);
         let (proxied, anonymous) = get_posts_calls(&state);
-        assert_eq!(proxied.len(), 0, "an anonymous page has no session to proxy with");
-        assert_eq!(anonymous.len(), 1, "the public fake serves the anonymous page");
+        assert_eq!(
+            proxied.len(),
+            0,
+            "an anonymous page has no session to proxy with"
+        );
+        assert_eq!(
+            anonymous.len(),
+            1,
+            "the public fake serves the anonymous page"
+        );
         server.abort();
     }
 
@@ -22829,14 +23042,14 @@ mod tests {
 
         fn fetch_public_posts<'a>(
             &'a self,
+            _viewer_did: &'a str,
             uris: &'a [String],
-        ) -> Pin<
-            Box<dyn Future<Output = HashMap<String, crate::feeds::FetchedPublicPost>> + Send + 'a>,
-        > {
+        ) -> PublicPostsFetch<'a> {
             let uris = uris.to_vec();
             let records = self.fetched_posts.clone();
             Box::pin(async move {
-                uris.into_iter()
+                let posts = uris
+                    .into_iter()
                     .filter_map(|uri| {
                         records.get(&uri).cloned().map(|record| {
                             let author_did = record.did.clone();
@@ -22855,7 +23068,12 @@ mod tests {
                             )
                         })
                     })
-                    .collect()
+                    .collect::<HashMap<_, _>>();
+                let routes = crate::feeds::PostRouteStats {
+                    public: posts.len() as u64,
+                    ..Default::default()
+                };
+                (posts, routes)
             })
         }
 
@@ -27023,6 +27241,8 @@ mod tests {
                         feed,
                         cursor: None,
                         dropped_count: 0,
+                        posts_local: 0,
+                        post_routes: crate::feeds::PostRouteStats::default(),
                     },
                     timing: FeedTimelineTiming::default(),
                 })
