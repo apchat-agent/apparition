@@ -2400,3 +2400,85 @@ Deno.test("a profile loading its recent posts re-checks a bounded number of time
   assertEquals(result.fetches, 0);
   assertEquals(result.reloads, 0);
 });
+
+Deno.test("the timing console footer shows the render subphases", async () => {
+  const source = await Deno.readTextFile(new URL("../static/app.js", import.meta.url));
+  const start = source.indexOf("function installTimingConsole");
+  assert(start >= 0, "app.js must define installTimingConsole");
+  const call = source.indexOf("installTimingConsole();", start);
+  assert(call > start, "app.js must install the timing console on load");
+  const installTimingConsole = new Function(`${source.slice(start, call)}; return installTimingConsole;`)();
+
+  class Element {
+    constructor(tag) {
+      this.tagName = tag;
+      this.className = "";
+      this.textContent = "";
+      this.hidden = false;
+      this.attributes = new Map();
+      this.children = [];
+      this.listeners = new Map();
+    }
+    setAttribute(name, value) { this.attributes.set(name, String(value)); }
+    getAttribute(name) { return this.attributes.get(name) ?? null; }
+    append(...nodes) { this.children.push(...nodes); }
+    replaceChildren(...nodes) { this.children = [...nodes]; }
+    addEventListener(name, listener) { this.listeners.set(name, listener); }
+  }
+  const findAllByClass = (node, className) => {
+    const found = [];
+    if (node.className === className) found.push(node);
+    for (const child of node.children) found.push(...findAllByClass(child, className));
+    return found;
+  };
+  const pageRecord = {
+    id: "rsp1", viewer: "did:plc:owner", method: "GET", path: "/app", status: 200,
+    started_at_ms: 1780000000000, total_ms: 120, page: "app",
+    phases: {
+      render_ms: 20,
+      render_profiles_ms: 9,
+      render_interactions_ms: 4,
+      render_embeds_ms: 3,
+      render_shell_ms: 4,
+      render_profile_lookups: 12,
+      render_profile_count_queries: 2,
+    },
+    calls: [],
+    calls_overflow: 0,
+  };
+  const body = new Element("body");
+  body.setAttribute("data-timing-id", "rsp1");
+  const documentMock = {
+    body,
+    createElement: (tag) => new Element(tag),
+    querySelector: (selector) => (selector === 'form[action="/logout"]' ? new Element("form") : null),
+  };
+  const windowMock = { performance: { getEntriesByType: () => [] } };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ records: [pageRecord] }) });
+  try {
+    installTimingConsole(documentMock, windowMock, new Map());
+    const button = findAllByClass(body, "timing-console-button")[0];
+    button.listeners.get("click")();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const panel = findAllByClass(body, "timing-console-panel")[0];
+    const texts = findAllByClass(panel, "timing-console-phase").map((row) => row.textContent);
+    for (const duration of [
+      "render_profiles_ms 9 ms",
+      "render_interactions_ms 4 ms",
+      "render_embeds_ms 3 ms",
+      "render_shell_ms 4 ms",
+    ]) {
+      assert(texts.includes(duration), `render durations keep the ms suffix: ${JSON.stringify(texts)}`);
+    }
+    for (const count of ["render_profile_lookups 12", "render_profile_count_queries 2"]) {
+      assert(texts.includes(count), `the count phase must render without a unit: ${JSON.stringify(texts)}`);
+    }
+    assert(
+      !texts.some((text) => /render_profile_(lookups|count_queries) \d+ ms/.test(text)),
+      `no lookup count may carry an ms suffix: ${JSON.stringify(texts)}`,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

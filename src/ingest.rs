@@ -5,6 +5,7 @@ use serde_json::Value;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::{
+    cell::RefCell,
     cmp::Reverse,
     collections::{HashMap, HashSet, VecDeque},
     fs,
@@ -2911,6 +2912,75 @@ fn viewer_interaction_uris(
         .map_err(Into::into)
 }
 
+/// Records the SQL of every statement that finishes executing on the thread
+/// that installed the trace (or on the writer thread, via
+/// `trace_writer_statements`). Kept public like `hold_writer` for regression
+/// tests that assert what a code path asks the database — for example that a
+/// render no longer runs a `profile_counts` statement per card. SQLite's
+/// trace callback is a plain `fn` pointer in rusqlite, so the sink travels in
+/// a thread-local instead of a captured closure.
+#[derive(Clone, Default)]
+pub struct StatementTrace {
+    statements: Arc<Mutex<Vec<String>>>,
+}
+
+impl StatementTrace {
+    /// The SQL that only `profile_counts` runs: one SELECT bundling the three
+    /// COUNT subqueries. Counting its executions counts the profile-count
+    /// queries a code path asks the database for.
+    pub const PROFILE_COUNTS_SQL: &'static str =
+        "(SELECT COUNT(*) FROM records WHERE collection='app.bsky.feed.post' AND did=?1)";
+
+    fn push(&self, sql: &str) {
+        if let Ok(mut statements) = self.statements.lock() {
+            statements.push(sql.to_owned());
+        }
+    }
+
+    /// Drops everything recorded so far, so the next `count_containing` only
+    /// sees statements executed after this call.
+    pub fn clear(&self) {
+        if let Ok(mut statements) = self.statements.lock() {
+            statements.clear();
+        }
+    }
+
+    /// Executed statements whose SQL contains `needle`.
+    pub fn count_containing(&self, needle: &str) -> usize {
+        self.statements
+            .lock()
+            .map(|statements| statements.iter().filter(|sql| sql.contains(needle)).count())
+            .unwrap_or_default()
+    }
+
+    pub fn statements(&self) -> Vec<String> {
+        self.statements
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default()
+    }
+}
+
+thread_local! {
+    static STATEMENT_TRACE_SINK: RefCell<Option<StatementTrace>> = const { RefCell::new(None) };
+}
+
+fn push_traced_statement(sql: &str) {
+    STATEMENT_TRACE_SINK.with(|sink| {
+        if let Some(sink) = sink.borrow().as_ref() {
+            sink.push(sql);
+        }
+    });
+}
+
+fn route_statement_profile(event: rusqlite::trace::TraceEvent<'_>) {
+    // PROFILE fires exactly once per executed statement; STMT can fire again
+    // inside triggers, so counting PROFILE keeps one entry per execution.
+    if let rusqlite::trace::TraceEvent::Profile(statement, _) = event {
+        push_traced_statement(&statement.sql());
+    }
+}
+
 pub struct SqliteStorage {
     writer: SqliteWriter,
     read_connections: Vec<Mutex<Connection>>,
@@ -3779,6 +3849,40 @@ impl SqliteStorage {
     /// and investigations use this to observe them once the writer catches up.
     pub fn writer_barrier(&self) -> Result<(), StorageError> {
         self.writer.flush()
+    }
+
+    /// Records statements executed on the calling thread from now on (read
+    /// pool connections get the tracer installed; the sink lives in a
+    /// thread-local, so other threads' queries are not recorded).
+    pub fn trace_statements(&self) -> StatementTrace {
+        let trace = StatementTrace::default();
+        for connection in &self.read_connections {
+            if let Ok(connection) = connection.lock() {
+                connection.trace_v2(
+                    rusqlite::trace::TraceEventCodes::SQLITE_TRACE_PROFILE,
+                    Some(route_statement_profile),
+                );
+            }
+        }
+        STATEMENT_TRACE_SINK.with(|sink| *sink.borrow_mut() = Some(trace.clone()));
+        trace
+    }
+
+    /// Records statements executed by the writer thread. Runs on the writer,
+    /// installs its tracer, and binds the sink to the writer thread's local,
+    /// so only this storage's writes land in the recorder.
+    pub fn trace_writer_statements(&self) -> Result<StatementTrace, StorageError> {
+        let trace = StatementTrace::default();
+        let sink = trace.clone();
+        self.writer.call(move |connection| {
+            connection.trace_v2(
+                rusqlite::trace::TraceEventCodes::SQLITE_TRACE_PROFILE,
+                Some(route_statement_profile),
+            );
+            STATEMENT_TRACE_SINK.with(|slot| *slot.borrow_mut() = Some(sink));
+            Ok(())
+        })?;
+        Ok(trace)
     }
 
     /// A post's interaction summary and the SQLite work performed by its

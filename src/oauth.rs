@@ -6194,6 +6194,12 @@ struct WebPageTiming {
     profile_action_mutes_ms: u64,
     profile_list_choices_ms: u64,
     render_ms: u64,
+    render_profiles_ms: u64,
+    render_interactions_ms: u64,
+    render_embeds_ms: u64,
+    render_shell_ms: u64,
+    render_profile_lookups: u64,
+    render_profile_count_queries: u64,
     ancestors_from_index: usize,
     ancestors_live: usize,
     ancestors_timed_out: usize,
@@ -6236,6 +6242,12 @@ impl WebPageTiming {
             profile_action_mutes_ms: 0,
             profile_list_choices_ms: 0,
             render_ms: 0,
+            render_profiles_ms: 0,
+            render_interactions_ms: 0,
+            render_embeds_ms: 0,
+            render_shell_ms: 0,
+            render_profile_lookups: 0,
+            render_profile_count_queries: 0,
             ancestors_from_index: 0,
             ancestors_live: 0,
             ancestors_timed_out: 0,
@@ -6253,12 +6265,106 @@ impl WebPageTiming {
     }
 }
 
+/// Where one page render accumulates its render sub-phase timings (lane av71q,
+/// 2026-11-01: the custom-feed page showed `render_ms 1923` of `2846 ms server
+/// total` and the phases line said nothing about which part of the render cost
+/// that). The handler builds one per page request, passes it to the render
+/// helpers, and copies the totals into its `WebPageTiming` when the render is
+/// done; the render helpers are synchronous, so the counters need no locks.
+#[derive(Default)]
+struct WebRenderContext {
+    profiles_us: AtomicU64,
+    interactions_us: AtomicU64,
+    embeds_us: AtomicU64,
+    shell_us: AtomicU64,
+    profile_lookups: AtomicU64,
+    profile_count_queries: AtomicU64,
+}
+
+impl WebRenderContext {
+    fn timed<T>(&self, counter: &AtomicU64, run: impl FnOnce() -> T) -> T {
+        let started = std::time::Instant::now();
+        let value = run();
+        self.add(counter, started.elapsed());
+        value
+    }
+
+    fn add(&self, counter: &AtomicU64, elapsed: std::time::Duration) {
+        counter.fetch_add(
+            u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// The author (or parent) identity behind a card: the same handle rules as
+    /// the full profile view, and (until the light card lookup lands) the same
+    /// `profile_counts` query too. Timed and counted here so the phases line
+    /// can say how much of `render_ms` the identity lookups cost.
+    fn author_identity<S: Storage>(&self, storage: &S, did: &str) -> Value {
+        self.profile_lookups.fetch_add(1, Ordering::Relaxed);
+        self.profile_count_queries.fetch_add(1, Ordering::Relaxed);
+        self.timed(&self.profiles_us, || {
+            profile_view_from_storage(storage, did).unwrap_or_else(|error| {
+                tracing::warn!(%error, did, "could not load a profile identity; showing the did");
+                json!({"did":did,"handle":did})
+            })
+        })
+    }
+
+    /// The viewer's own identity for the composer avatar, reply bar or shell
+    /// menu. It runs the same `profile_view_from_storage` (its `profile_counts`
+    /// included) until the light card lookup lands, but it is timed under the
+    /// shell: the brief counts identity lookups for post/parent authors, not
+    /// for the viewer's own card.
+    fn viewer_identity<S: Storage>(&self, storage: &S, did: &str) -> Value {
+        self.profile_count_queries.fetch_add(1, Ordering::Relaxed);
+        self.timed(&self.shell_us, || {
+            profile_view_from_storage(storage, did).unwrap_or_else(|error| {
+                tracing::warn!(%error, did, "could not load the viewer's profile; showing the did");
+                json!({"did":did,"handle":did})
+            })
+        })
+    }
+
+    fn timed_interactions<T>(&self, run: impl FnOnce() -> T) -> T {
+        self.timed(&self.interactions_us, run)
+    }
+
+    fn timed_embeds<T>(&self, run: impl FnOnce() -> T) -> T {
+        self.timed(&self.embeds_us, run)
+    }
+
+    fn add_interactions(&self, elapsed: std::time::Duration) {
+        self.add(&self.interactions_us, elapsed);
+    }
+
+    /// Copies the accumulated sub-timers into the page timing when the render
+    /// window closes; callers set `render_ms` first. `render_shell_ms` is the
+    /// rest of `render_ms`: whatever the identity, interaction and embed
+    /// phases did not account for (cookie checks, the unread badge, building
+    /// the page shell itself).
+    fn finish_into(self, timing: &mut WebPageTiming) {
+        timing.render_profiles_ms = self.profiles_us.load(Ordering::Relaxed) / 1_000;
+        timing.render_interactions_ms = self.interactions_us.load(Ordering::Relaxed) / 1_000;
+        timing.render_embeds_ms = self.embeds_us.load(Ordering::Relaxed) / 1_000;
+        let shell_timed_ms = self.shell_us.load(Ordering::Relaxed) / 1_000;
+        let accounted_ms = timing.render_profiles_ms
+            + timing.render_interactions_ms
+            + timing.render_embeds_ms
+            + shell_timed_ms;
+        timing.render_shell_ms = shell_timed_ms + timing.render_ms.saturating_sub(accounted_ms);
+        timing.render_profile_lookups = self.profile_lookups.load(Ordering::Relaxed);
+        timing.render_profile_count_queries = self.profile_count_queries.load(Ordering::Relaxed);
+    }
+}
+
 impl Drop for WebPageTiming {
     fn drop(&mut self) {
         let total_ms = self.started.elapsed().as_millis() as u64;
-        // The parent/content hydration details, preferences_ms/tabs_ms, and profile action
-        // subphase fields are nested within their enclosing wall-clock phase. Keep those details
-        // out of this additive coverage sum because hydration and its subphases overlap.
+        // The parent/content hydration details, preferences_ms/tabs_ms, profile action
+        // subphase fields, and the render_* sub-timers are nested within their enclosing
+        // wall-clock phase (the render_* sub-timers and counters inside render_ms). Keep those
+        // details out of this additive coverage sum because the subphases overlap.
         let timeline_phase_ms = if self.page == "feed" {
             self.feed_timeline_ms
         } else {
@@ -6315,6 +6421,12 @@ impl Drop for WebPageTiming {
             profile_action_mutes_ms = self.profile_action_mutes_ms,
             profile_list_choices_ms = self.profile_list_choices_ms,
             render_ms = self.render_ms,
+            render_profiles_ms = self.render_profiles_ms,
+            render_interactions_ms = self.render_interactions_ms,
+            render_embeds_ms = self.render_embeds_ms,
+            render_shell_ms = self.render_shell_ms,
+            render_profile_lookups = self.render_profile_lookups,
+            render_profile_count_queries = self.render_profile_count_queries,
             ancestors_from_index = self.ancestors_from_index,
             ancestors_live = self.ancestors_live,
             ancestors_timed_out = self.ancestors_timed_out,
@@ -6365,6 +6477,15 @@ impl Drop for WebPageTiming {
                 ("profile_action_mutes_ms", self.profile_action_mutes_ms),
                 ("profile_list_choices_ms", self.profile_list_choices_ms),
                 ("render_ms", self.render_ms),
+                ("render_profiles_ms", self.render_profiles_ms),
+                ("render_interactions_ms", self.render_interactions_ms),
+                ("render_embeds_ms", self.render_embeds_ms),
+                ("render_shell_ms", self.render_shell_ms),
+                ("render_profile_lookups", self.render_profile_lookups),
+                (
+                    "render_profile_count_queries",
+                    self.render_profile_count_queries,
+                ),
                 ("ancestors_from_index", self.ancestors_from_index as u64),
                 ("ancestors_live", self.ancestors_live as u64),
                 ("ancestors_timed_out", self.ancestors_timed_out as u64),
@@ -8198,6 +8319,7 @@ where
     let page_interactions =
         load_page_interactions(&state.storage, &interaction_uris, Some(&did)).await;
     let render_started = std::time::Instant::now();
+    let render = WebRenderContext::default();
     let posts = render_timeline_post_items(
         state.storage.as_ref(),
         &timeline,
@@ -8209,6 +8331,7 @@ where
             quote_index: &quote_index,
             page_interactions: &page_interactions,
             list_blocks: &list_blocks,
+            render: &render,
         },
     );
     let posts = if posts.is_empty() {
@@ -8255,8 +8378,7 @@ where
             verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref());
         let video_access =
             verified_cookie_video_access(&state.public, &headers, state.storage.as_ref());
-        let profile = profile_view_from_storage(state.storage.as_ref(), &did)
-            .unwrap_or_else(|_| json!({"did":did,"handle":did}));
+        let profile = render.viewer_identity(state.storage.as_ref(), &did);
         render_composer(ComposerSpec {
             form_attributes: "",
             classes: "media-composer",
@@ -8295,7 +8417,7 @@ where
     } else {
         String::new()
     };
-    let viewer_profile = viewer_profile_view(state.storage.as_ref(), &did);
+    let viewer_profile = render.viewer_identity(state.storage.as_ref(), &did);
     let allow_more = verified_cookie_allow_more(&state.public, &headers, state.storage.as_ref());
     let response = Html(page_shell_with_options(
         "Timeline",
@@ -8315,6 +8437,7 @@ where
     ))
     .into_response();
     page_timing.render_ms = posts_render_ms + rest_render_started.elapsed().as_millis() as u64;
+    render.finish_into(&mut page_timing);
     response
 }
 
@@ -8566,6 +8689,7 @@ where
             quote_index: &hydration.quote_index,
             page_interactions: &page_interactions,
             list_blocks: &HashMap::new(),
+            render: &WebRenderContext::default(),
         },
     );
     let posts = if posts.is_empty() {
@@ -9032,6 +9156,7 @@ where
     }
     let rights = verified_cookie_form_rights(&state.public, &headers, state.storage.as_ref());
     let render_started = std::time::Instant::now();
+    let render = WebRenderContext::default();
     let feed_preludes = feed_items
         .iter()
         .map(|post| {
@@ -9050,8 +9175,10 @@ where
         .iter()
         .map(|record| record.uri.clone())
         .collect::<Vec<_>>();
+    let interactions_started = std::time::Instant::now();
     let page_interactions =
         load_page_interactions(&state.storage, &interaction_uris, Some(&did)).await;
+    render.add_interactions(interactions_started.elapsed());
     let posts = render_timeline_post_items(
         state.storage.as_ref(),
         &feed_records,
@@ -9063,6 +9190,7 @@ where
             quote_index: &quote_index,
             page_interactions: &page_interactions,
             list_blocks: &list_blocks,
+            render: &render,
         },
     );
     let posts = if posts.is_empty() {
@@ -9097,7 +9225,7 @@ where
     page_timing.preferences_ms = tabs.preferences_ms;
     page_timing.tabs_ms = tabs.tabs_ms;
     let shell_render_started = std::time::Instant::now();
-    let viewer_profile = viewer_profile_view(state.storage.as_ref(), &did);
+    let viewer_profile = render.viewer_identity(state.storage.as_ref(), &did);
     let allow_more = verified_cookie_allow_more(&state.public, &headers, state.storage.as_ref());
     let response = Html(page_shell_with_options(
         &page.generator.display_name,
@@ -9119,6 +9247,7 @@ where
     ))
     .into_response();
     page_timing.render_ms = pre_tabs_render_ms + shell_render_started.elapsed().as_millis() as u64;
+    render.finish_into(&mut page_timing);
     response
 }
 
@@ -9900,11 +10029,18 @@ where
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
     let render_started = std::time::Instant::now();
+    let render = WebRenderContext::default();
     let items = notification_page
         .groups
         .iter()
         .map(|group| {
-            render_web_notification_group(state.storage.as_ref(), group, &quote_index, &parents)
+            render_web_notification_group(
+                state.storage.as_ref(),
+                group,
+                &quote_index,
+                &parents,
+                &render,
+            )
         })
         .collect::<String>();
     let items = if items.is_empty() {
@@ -9946,6 +10082,7 @@ where
     ))
     .into_response();
     page_timing.render_ms = render_started.elapsed().as_millis() as u64;
+    render.finish_into(&mut page_timing);
     response
 }
 
@@ -9954,15 +10091,15 @@ fn render_web_notification_group<'a, S: Storage, G: NotificationGroupView<'a>>(
     group: &'a G,
     quote_index: &QuoteRenderIndex,
     parents: &PageParentIndex,
+    render: &WebRenderContext,
 ) -> String {
     let view = group.notification_group_view();
     if !matches!(view.reason, "like" | "repost" | "follow") {
-        return render_web_notification(storage, view.head, quote_index, parents);
+        return render_web_notification(storage, view.head, quote_index, parents, render);
     }
 
     let newest = view.head;
-    let author = profile_view_from_storage(storage, &newest.record.did)
-        .unwrap_or_else(|_| json!({"did":newest.record.did,"handle":newest.record.did}));
+    let author = render.author_identity(storage, &newest.record.did);
     let handle = profile_handle(&author, &newest.record.did);
     let display_name = author
         .get("displayName")
@@ -10049,10 +10186,10 @@ fn render_web_notification<S: Storage>(
     notification: &IndexedNotification,
     quote_index: &QuoteRenderIndex,
     parents: &PageParentIndex,
+    render: &WebRenderContext,
 ) -> String {
     let record = &notification.record;
-    let author = profile_view_from_storage(storage, &record.did)
-        .unwrap_or_else(|_| json!({"did":record.did,"handle":record.did}));
+    let author = render.author_identity(storage, &record.did);
     let handle = profile_handle(&author, &record.did);
     let author_uri = format!(
         "/profile?did={}",
@@ -10077,11 +10214,15 @@ fn render_web_notification<S: Storage>(
     } else {
         format!("<p>{}</p>", html_escape(text))
     };
-    let parent = render_notification_parent(storage, record, parents);
+    let parent = render_notification_parent(render, storage, record, parents);
     let embed = record
         .record
         .get("embed")
-        .map(|embed| render_web_embed_with_quotes(storage, &record.did, embed, quote_index, 0))
+        .map(|embed| {
+            render.timed_embeds(|| {
+                render_web_embed_with_quotes(render, storage, &record.did, embed, quote_index, 0)
+            })
+        })
         .unwrap_or_default();
     let target_uri = notification
         .reason_subject
@@ -10813,13 +10954,16 @@ where
     .collect::<String>();
     let rights = verified_cookie_form_rights(&state.public, &headers, state.storage.as_ref());
     let render_started = std::time::Instant::now();
+    let render = WebRenderContext::default();
     let no_list_blocks = HashMap::new();
     let interaction_uris = quote_records
         .iter()
         .map(|record| record.uri.clone())
         .collect::<Vec<_>>();
+    let interactions_started = std::time::Instant::now();
     let page_interactions =
         load_page_interactions(&state.storage, &interaction_uris, Some(&did)).await;
+    render.add_interactions(interactions_started.elapsed());
     let posts = render_timeline_post_items(
         state.storage.as_ref(),
         &records,
@@ -10831,6 +10975,7 @@ where
             quote_index: &quote_index,
             page_interactions: &page_interactions,
             list_blocks: &no_list_blocks,
+            render: &render,
         },
     );
     let posts = if posts.is_empty() {
@@ -10887,7 +11032,7 @@ where
         posts: &posts,
         older: &older,
     });
-    let viewer_profile = viewer_profile_view(state.storage.as_ref(), &did);
+    let viewer_profile = render.viewer_identity(state.storage.as_ref(), &did);
     let allow_more = verified_cookie_allow_more(&state.public, &headers, state.storage.as_ref());
     let response = Html(page_shell_with_options(
         display_name,
@@ -10905,6 +11050,7 @@ where
     ))
     .into_response();
     page_timing.render_ms = render_started.elapsed().as_millis() as u64;
+    render.finish_into(&mut page_timing);
     response
 }
 
@@ -11644,12 +11790,15 @@ where
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
     let render_started = std::time::Instant::now();
+    let render = WebRenderContext::default();
     let interaction_uris = page_records
         .iter()
         .map(|record| record.uri.clone())
         .collect::<Vec<_>>();
+    let interactions_started = std::time::Instant::now();
     let page_interactions =
         load_page_interactions(&state.storage, &interaction_uris, Some(&viewer_did)).await;
+    render.add_interactions(interactions_started.elapsed());
     let ancestors_html = ancestors
         .iter()
         .enumerate()
@@ -11666,6 +11815,7 @@ where
                         eager_avatar: index < 6,
                         quote_index: &quote_index,
                         page_interactions: &page_interactions,
+                        render: &render,
                     },
                 )
             )
@@ -11683,6 +11833,7 @@ where
         thread_continuations: &thread_continuations,
         quote_index: &quote_index,
         page_interactions: &page_interactions,
+        render: &render,
     };
     let replies_html = match render_thread_replies(
         state.storage.as_ref(),
@@ -11706,17 +11857,18 @@ where
             &record,
             verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref()),
             verified_cookie_video_access(&state.public, &headers, state.storage.as_ref()),
+            &render,
         )
     } else {
         String::new()
     };
     let reply_bar = if rights.post {
-        render_thread_reply_bar(state.storage.as_ref(), &viewer_did)
+        render_thread_reply_bar(state.storage.as_ref(), &viewer_did, &render)
     } else {
         String::new()
     };
     let badge_count = unread_badge_count(state.storage.as_ref(), &viewer_did);
-    let viewer_profile = viewer_profile_view(state.storage.as_ref(), &viewer_did);
+    let viewer_profile = render.viewer_identity(state.storage.as_ref(), &viewer_did);
     let allow_more = verified_cookie_allow_more(&state.public, &headers, state.storage.as_ref());
     let response = Html(page_shell_with_options(
         "Thread",
@@ -11729,6 +11881,7 @@ where
                 rights,
                 true,
                 &quote_index,
+                &render,
             )
         ),
         true,
@@ -11744,6 +11897,7 @@ where
     ))
     .into_response();
     page_timing.render_ms = render_started.elapsed().as_millis() as u64;
+    render.finish_into(&mut page_timing);
     response
 }
 
@@ -11879,7 +12033,14 @@ where
     let mut index = QuoteRenderIndex::default();
     index.insert(uri.clone(), QuoteRenderState::Found(record));
     let embed = json!({"$type":"app.bsky.embed.record","record":{"record":{"uri":uri}}});
-    Html(render_web_quote(state.storage.as_ref(), &embed, &index, 0)).into_response()
+    Html(render_web_quote(
+        &WebRenderContext::default(),
+        state.storage.as_ref(),
+        &embed,
+        &index,
+        0,
+    ))
+    .into_response()
 }
 
 async fn profile_fragment<F, S>(
@@ -11966,8 +12127,8 @@ where
 }
 
 fn render_quote_preview<S: Storage>(storage: &S, quoted: &IndexedRecord) -> String {
-    let profile = profile_view_from_storage(storage, &quoted.did)
-        .unwrap_or_else(|_| json!({"did":quoted.did,"handle":quoted.did}));
+    let render = WebRenderContext::default();
+    let profile = render.author_identity(storage, &quoted.did);
     let handle = profile_handle(&profile, &quoted.did);
     let display_name = profile
         .get("displayName")
@@ -11981,7 +12142,7 @@ fn render_quote_preview<S: Storage>(storage: &S, quoted: &IndexedRecord) -> Stri
     let embed = quoted
         .record
         .get("embed")
-        .map(|embed| render_web_embed(storage, &quoted.did, embed))
+        .map(|embed| render_web_embed(&render, storage, &quoted.did, embed))
         .unwrap_or_default();
     let author = format!(
         "<span class=\"quoted-author\"><strong>{}</strong> <span>@{}</span></span>",
@@ -12185,12 +12346,11 @@ fn render_reply_composer<S: Storage>(
     parent: &IndexedRecord,
     blob_access: bool,
     video_access: bool,
+    render: &WebRenderContext,
 ) -> String {
-    let profile = profile_view_from_storage(storage, &parent.did)
-        .unwrap_or_else(|_| json!({"did":parent.did,"handle":parent.did}));
+    let profile = render.author_identity(storage, &parent.did);
     let handle = profile_handle(&profile, &parent.did);
-    let viewer = profile_view_from_storage(storage, viewer_did)
-        .unwrap_or_else(|_| json!({"did":viewer_did,"handle":viewer_did}));
+    let viewer = render.viewer_identity(storage, viewer_did);
     render_composer(ComposerSpec {
         form_attributes: "id=\"reply-composer\"",
         classes: "reply-composer media-composer",
@@ -12282,9 +12442,12 @@ fn render_link_picker(id: &str) -> String {
     )
 }
 
-fn render_thread_reply_bar<S: Storage>(storage: &S, viewer_did: &str) -> String {
-    let profile = profile_view_from_storage(storage, viewer_did)
-        .unwrap_or_else(|_| json!({"did":viewer_did,"handle":viewer_did}));
+fn render_thread_reply_bar<S: Storage>(
+    storage: &S,
+    viewer_did: &str,
+    render: &WebRenderContext,
+) -> String {
+    let profile = render.viewer_identity(storage, viewer_did);
     format!(
         "<aside class=\"thread-reply-bar\" aria-label=\"Mobile reply bar\">{}<a href=\"#reply-composer\">Write your reply</a></aside>",
         avatar_markup(&profile, "small-avatar")
@@ -12298,9 +12461,9 @@ fn render_thread_focus<S: Storage>(
     rights: FormRights,
     eager_avatar: bool,
     quote_index: &QuoteRenderIndex,
+    render: &WebRenderContext,
 ) -> String {
-    let profile = profile_view_from_storage(storage, &record.did)
-        .unwrap_or_else(|_| json!({"did":record.did,"handle":record.did}));
+    let profile = render.author_identity(storage, &record.did);
     let handle = profile_handle(&profile, &record.did);
     let display_name = profile
         .get("displayName")
@@ -12336,9 +12499,11 @@ fn render_thread_focus<S: Storage>(
     } else {
         ""
     };
-    let interactions = storage
-        .post_interaction_summary(&record.uri, Some(viewer_did))
-        .unwrap_or_default();
+    let interactions = render.timed_interactions(|| {
+        storage
+            .post_interaction_summary(&record.uri, Some(viewer_did))
+            .unwrap_or_default()
+    });
     let stats = [
         (interactions.repost_count, "repost", "reposts"),
         (interactions.quote_count, "quote", "quotes"),
@@ -12427,7 +12592,11 @@ fn render_thread_focus<S: Storage>(
     let embed = record
         .record
         .get("embed")
-        .map(|embed| render_web_embed_with_quotes(storage, &record.did, embed, quote_index, 0))
+        .map(|embed| {
+            render.timed_embeds(|| {
+                render_web_embed_with_quotes(render, storage, &record.did, embed, quote_index, 0)
+            })
+        })
         .unwrap_or_default();
     let fill = author_fill(&profile, &record.did);
     format!(
@@ -12493,6 +12662,7 @@ struct ThreadReplyRenderOptions<'a> {
     thread_continuations: &'a HashSet<String>,
     quote_index: &'a QuoteRenderIndex,
     page_interactions: &'a PageInteractionIndex,
+    render: &'a WebRenderContext,
 }
 
 fn render_thread_replies<S: Storage>(
@@ -12530,6 +12700,7 @@ fn render_thread_replies<S: Storage>(
                     eager_avatar: false,
                     quote_index: options.quote_index,
                     page_interactions: options.page_interactions,
+                    render: options.render,
                 },
             )
         ));
@@ -15319,6 +15490,7 @@ struct WebPostRenderOptions<'a> {
     eager_avatar: bool,
     quote_index: &'a QuoteRenderIndex,
     page_interactions: &'a PageInteractionIndex,
+    render: &'a WebRenderContext,
 }
 
 fn render_web_post<S: Storage>(
@@ -15333,9 +15505,9 @@ fn render_web_post<S: Storage>(
         eager_avatar,
         quote_index,
         page_interactions,
+        render,
     } = options;
-    let profile = profile_view_from_storage(storage, &record.did)
-        .unwrap_or_else(|_| json!({"did":record.did,"handle":record.did}));
+    let profile = render.author_identity(storage, &record.did);
     let handle = profile_handle(&profile, &record.did);
     let display_name = profile
         .get("displayName")
@@ -15393,9 +15565,14 @@ fn render_web_post<S: Storage>(
     };
     let interactions = match page_interactions.get(&record.uri) {
         Some(interactions) => interactions.clone(),
-        None => storage
-            .post_interaction_summary(&record.uri, Some(viewer_did))
-            .unwrap_or_default(),
+        None => render.timed_interactions(|| {
+            storage
+                .post_interaction_summary(&record.uri, Some(viewer_did))
+                .unwrap_or_else(|error| {
+                    tracing::warn!(%error, uri = %record.uri, "could not summarize a post's interactions; rendering zeros");
+                    Default::default()
+                })
+        }),
     };
     let thread_uri = format!(
         "/app/thread?uri={}",
@@ -15478,7 +15655,11 @@ fn render_web_post<S: Storage>(
     let embed = record
         .record
         .get("embed")
-        .map(|embed| render_web_embed_with_quotes(storage, &record.did, embed, quote_index, 0))
+        .map(|embed| {
+            render.timed_embeds(|| {
+                render_web_embed_with_quotes(render, storage, &record.did, embed, quote_index, 0)
+            })
+        })
         .unwrap_or_default();
     let anchor = post_anchor(&record.uri);
     format!(
@@ -15495,9 +15676,12 @@ fn short_did(did: &str) -> String {
     }
 }
 
-fn parent_display_identity<S: Storage>(storage: &S, did: &str) -> (Value, String, String) {
-    let profile =
-        profile_view_from_storage(storage, did).unwrap_or_else(|_| json!({"did":did,"handle":did}));
+fn parent_display_identity<S: Storage>(
+    render: &WebRenderContext,
+    storage: &S,
+    did: &str,
+) -> (Value, String, String) {
+    let profile = render.author_identity(storage, did);
     let cached_handle = profile_handle(&profile, did);
     let handle = if cached_handle == did {
         short_did(did)
@@ -15513,8 +15697,12 @@ fn parent_display_identity<S: Storage>(storage: &S, did: &str) -> (Value, String
     (profile, handle, display_name)
 }
 
-fn render_reply_parent_card<S: Storage>(storage: &S, parent: &IndexedRecord) -> String {
-    let (profile, handle, display_name) = parent_display_identity(storage, &parent.did);
+fn render_reply_parent_card<S: Storage>(
+    render: &WebRenderContext,
+    storage: &S,
+    parent: &IndexedRecord,
+) -> String {
+    let (profile, handle, display_name) = parent_display_identity(render, storage, &parent.did);
     let thread_uri = format!("/app/thread?uri={}", form_encoded(&parent.uri));
     let text = parent
         .record
@@ -15542,12 +15730,16 @@ fn render_reply_parent_card<S: Storage>(storage: &S, parent: &IndexedRecord) -> 
     )
 }
 
-fn render_reply_parent_fallback<S: Storage>(storage: &S, parent_uri: &str) -> String {
+fn render_reply_parent_fallback<S: Storage>(
+    render: &WebRenderContext,
+    storage: &S,
+    parent_uri: &str,
+) -> String {
     let thread_uri = format!("/app/thread?uri={}", form_encoded(parent_uri));
     let Some(did) = post_uri_did(parent_uri) else {
         return "<p class=\"reply-parent-fallback\">Reply to a deleted post</p>".to_owned();
     };
-    let (profile, handle, _) = parent_display_identity(storage, did);
+    let (profile, handle, _) = parent_display_identity(render, storage, did);
     let fill = author_fill(&profile, did);
     let link_attrs = format!("{}{}", fill.container, fill.handle);
     format!(
@@ -15568,6 +15760,7 @@ struct TimelinePostItemOptions<'a> {
     quote_index: &'a QuoteRenderIndex,
     page_interactions: &'a PageInteractionIndex,
     list_block_attrs: String,
+    render: &'a WebRenderContext,
 }
 
 #[derive(Default)]
@@ -15697,6 +15890,7 @@ struct TimelineRenderContext<'a> {
     quote_index: &'a QuoteRenderIndex,
     page_interactions: &'a PageInteractionIndex,
     list_blocks: &'a HashMap<String, ListBlockMark>,
+    render: &'a WebRenderContext,
 }
 
 fn render_timeline_post_items<S: Storage>(
@@ -15764,6 +15958,7 @@ fn render_timeline_post_items<S: Storage>(
                         eager_avatar: page_index.is_none_or(|page_index| page_index < 6),
                         quote_index: context.quote_index,
                         page_interactions: context.page_interactions,
+                        render: context.render,
                     },
                 ));
             }
@@ -15803,6 +15998,7 @@ fn render_timeline_post_items<S: Storage>(
                         context.list_blocks,
                         [record.did.as_str()],
                     ),
+                    render: context.render,
                 },
             ));
         }
@@ -15825,6 +16021,7 @@ fn render_timeline_post_item<S: Storage>(
             eager_avatar: options.eager_avatar,
             quote_index: options.quote_index,
             page_interactions: options.page_interactions,
+            render: options.render,
         },
     );
     let Some(parent_uri) = record
@@ -15845,8 +16042,8 @@ fn render_timeline_post_item<S: Storage>(
     }
     let parent = options.parents.get(parent_uri).and_then(Option::as_ref);
     let parent_markup = parent
-        .map(|parent| render_reply_parent_card(storage, parent))
-        .unwrap_or_else(|| render_reply_parent_fallback(storage, parent_uri));
+        .map(|parent| render_reply_parent_card(options.render, storage, parent))
+        .unwrap_or_else(|| render_reply_parent_fallback(options.render, storage, parent_uri));
     format!(
         "<li class=\"post-item reply-with-parent\"{}>{}<div class=\"reply-parent-slot\">{parent_markup}<span class=\"reply-connector\" aria-hidden=\"true\"></span></div>{article}</li>",
         options.list_block_attrs, options.prelude
@@ -15854,6 +16051,7 @@ fn render_timeline_post_item<S: Storage>(
 }
 
 fn render_notification_parent<S: Storage>(
+    render: &WebRenderContext,
     storage: &S,
     record: &IndexedRecord,
     parents: &PageParentIndex,
@@ -15867,8 +16065,8 @@ fn render_notification_parent<S: Storage>(
     };
     let parent = parents.get(parent_uri).and_then(Option::as_ref);
     let markup = parent
-        .map(|parent| render_reply_parent_card(storage, parent))
-        .unwrap_or_else(|| render_reply_parent_fallback(storage, parent_uri));
+        .map(|parent| render_reply_parent_card(render, storage, parent))
+        .unwrap_or_else(|| render_reply_parent_fallback(render, storage, parent_uri));
     format!(
         "<div class=\"notification-reply-parent\">{markup}<span class=\"reply-connector\" aria-hidden=\"true\"></span></div>"
     )
@@ -15886,11 +16084,24 @@ fn post_uri_did(uri: &str) -> Option<&str> {
         .then_some(did)
 }
 
-fn render_web_embed<S: Storage>(storage: &S, author_did: &str, embed: &Value) -> String {
-    render_web_embed_with_quotes(storage, author_did, embed, &QuoteRenderIndex::new(), 0)
+fn render_web_embed<S: Storage>(
+    render: &WebRenderContext,
+    storage: &S,
+    author_did: &str,
+    embed: &Value,
+) -> String {
+    render_web_embed_with_quotes(
+        render,
+        storage,
+        author_did,
+        embed,
+        &QuoteRenderIndex::new(),
+        0,
+    )
 }
 
 fn render_web_embed_with_quotes<S: Storage>(
+    render: &WebRenderContext,
     storage: &S,
     author_did: &str,
     embed: &Value,
@@ -15900,7 +16111,7 @@ fn render_web_embed_with_quotes<S: Storage>(
     if quote_depth > 0
         && embed.get("$type").and_then(Value::as_str) == Some("app.bsky.embed.recordWithMedia")
     {
-        return render_web_quote(storage, embed, quote_index, quote_depth);
+        return render_web_quote(render, storage, embed, quote_index, quote_depth);
     }
     match embed.get("$type").and_then(Value::as_str) {
         Some("app.bsky.embed.images") => render_web_images(author_did, embed),
@@ -15909,13 +16120,14 @@ fn render_web_embed_with_quotes<S: Storage>(
         }
         Some("app.bsky.embed.external") => render_web_external(author_did, embed),
         Some("app.bsky.embed.record") | Some("app.bsky.embed.record#view") => {
-            render_web_quote(storage, embed, quote_index, quote_depth)
+            render_web_quote(render, storage, embed, quote_index, quote_depth)
         }
         Some("app.bsky.embed.recordWithMedia") => {
             let media = embed
                 .get("media")
                 .map(|media| {
                     render_web_embed_with_quotes(
+                        render,
                         storage,
                         author_did,
                         media,
@@ -15926,7 +16138,7 @@ fn render_web_embed_with_quotes<S: Storage>(
                 .unwrap_or_default();
             let quote = embed
                 .get("record")
-                .map(|record| render_web_quote(storage, record, quote_index, quote_depth))
+                .map(|record| render_web_quote(render, storage, record, quote_index, quote_depth))
                 .unwrap_or_default();
             format!("<section class=\"record-with-media\">{media}{quote}</section>")
         }
@@ -16075,6 +16287,7 @@ fn safe_external_url(uri: &str) -> bool {
 }
 
 fn render_web_quote<S: Storage>(
+    render: &WebRenderContext,
     storage: &S,
     embed: &Value,
     quote_index: &QuoteRenderIndex,
@@ -16091,7 +16304,7 @@ fn render_web_quote<S: Storage>(
     if quote_depth > 0 {
         let handle = post_uri_did(uri)
             .and_then(|did| {
-                let profile = profile_view_from_storage(storage, did).ok()?;
+                let profile = render.author_identity(storage, did);
                 let handle = profile_handle(&profile, did);
                 (handle != did).then_some(handle)
             })
@@ -16153,8 +16366,7 @@ fn render_web_quote<S: Storage>(
             );
         }
     };
-    let profile = profile_view_from_storage(storage, &quoted.did)
-        .unwrap_or_else(|_| json!({"did":quoted.did,"handle":quoted.did}));
+    let profile = render.author_identity(storage, &quoted.did);
     let handle = profile_handle(&profile, &quoted.did);
     let display_name = profile
         .get("displayName")
@@ -16179,7 +16391,14 @@ fn render_web_quote<S: Storage>(
         .record
         .get("embed")
         .map(|embed| {
-            render_web_embed_with_quotes(storage, &quoted.did, embed, quote_index, quote_depth + 1)
+            render_web_embed_with_quotes(
+                render,
+                storage,
+                &quoted.did,
+                embed,
+                quote_index,
+                quote_depth + 1,
+            )
         })
         .unwrap_or_default();
     let fill = author_fill(&profile, &quoted.did);
@@ -17757,6 +17976,7 @@ mod tests {
     fn video_embed_renders_playlist_alt_text_and_aspect_ratio() {
         let storage = MemoryStorage::default();
         let rendered = render_web_embed(
+            &WebRenderContext::default(),
             &storage,
             "did:plc:case31author",
             &json!({
@@ -17789,7 +18009,7 @@ mod tests {
         let mut index = QuoteRenderIndex::default();
         index.insert(uri.to_owned(), QuoteRenderState::Pending);
 
-        let rendered = render_web_quote(&storage, &embed, &index, 0);
+        let rendered = render_web_quote(&WebRenderContext::default(), &storage, &embed, &index, 0);
 
         assert!(
             rendered.contains("data-quote-fragment=\"/quote-fragment?uri="),
@@ -17808,7 +18028,13 @@ mod tests {
             .unwrap();
         let embed = quote_embed(&format!("at://{did}/app.bsky.feed.post/nested"));
 
-        let rendered = render_web_quote(&storage, &embed, &QuoteRenderIndex::new(), 1);
+        let rendered = render_web_quote(
+            &WebRenderContext::default(),
+            &storage,
+            &embed,
+            &QuoteRenderIndex::new(),
+            1,
+        );
 
         assert!(rendered.contains("Quoted post"), "{rendered}");
         assert!(rendered.contains("@nested.author.test"), "{rendered}");
@@ -19740,6 +19966,7 @@ mod tests {
             group,
             &QuoteRenderIndex::default(),
             &HashMap::new(),
+            &WebRenderContext::default(),
         );
         assert!(html.contains("alice.test</a> and 1 other liked your post"));
         assert_eq!(
@@ -20289,6 +20516,7 @@ mod tests {
                     quote_index: &quote_index,
                     page_interactions: &HashMap::new(),
                     list_blocks: &list_blocks,
+                    render: &WebRenderContext::default(),
                 },
             )
         };
@@ -20302,8 +20530,18 @@ mod tests {
             render_timeline_for(&legacy_parents, "did:plc:profile-viewer")
         );
         assert_eq!(
-            render_notification_parent(storage.as_ref(), &reply, &parents),
-            render_notification_parent(storage.as_ref(), &reply, &legacy_parents)
+            render_notification_parent(
+                &WebRenderContext::default(),
+                storage.as_ref(),
+                &reply,
+                &parents,
+            ),
+            render_notification_parent(
+                &WebRenderContext::default(),
+                storage.as_ref(),
+                &reply,
+                &legacy_parents,
+            )
         );
     }
 
@@ -21905,6 +22143,7 @@ mod tests {
                 quote_index: &hydration.quote_index,
                 page_interactions: &HashMap::new(),
                 list_blocks: &HashMap::new(),
+                render: &WebRenderContext::default(),
             },
         );
         let render_ms = render_started.elapsed().as_millis() as u64;
@@ -22564,6 +22803,7 @@ mod tests {
                 eager_avatar: false,
                 quote_index: &index,
                 page_interactions: &HashMap::new(),
+                render: &WebRenderContext::default(),
             },
         );
 
@@ -22605,7 +22845,7 @@ mod tests {
             ),
         );
 
-        let rendered = render_web_quote(&storage, &embed, &index, 0);
+        let rendered = render_web_quote(&WebRenderContext::default(), &storage, &embed, &index, 0);
 
         assert!(
             rendered.contains("<details class=\"account-labels\">"),
@@ -23116,6 +23356,7 @@ mod tests {
                 eager_avatar: false,
                 quote_index: &index,
                 page_interactions: &HashMap::new(),
+                render: &WebRenderContext::default(),
             },
         );
 
@@ -23151,6 +23392,7 @@ mod tests {
             FormRights::default(),
             false,
             &index,
+            &WebRenderContext::default(),
         );
 
         assert!(
@@ -25318,9 +25560,7 @@ mod tests {
                     did: RENDER_PAGE_VIEWER.to_owned(),
                     collection: "app.bsky.graph.follow".to_owned(),
                     rkey: format!("follow-{index}"),
-                    uri: format!(
-                        "at://{RENDER_PAGE_VIEWER}/app.bsky.graph.follow/follow-{index}"
-                    ),
+                    uri: format!("at://{RENDER_PAGE_VIEWER}/app.bsky.graph.follow/follow-{index}"),
                     cid: None,
                     time_us: 20 + index as u64,
                     record: json!({"subject": author, "createdAt": "2026-10-29T12:00:00Z"}),
@@ -25487,19 +25727,15 @@ mod tests {
         let seed = seed_render_phase_page(storage.as_ref());
         let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
         let token = render_phase_session_token(&public, storage.as_ref());
-        let generator_uri = format!(
-            "at://{RENDER_PAGE_VIEWER}/app.bsky.feed.generator/av71q-render-feed"
-        );
+        let generator_uri =
+            format!("at://{RENDER_PAGE_VIEWER}/app.bsky.feed.generator/av71q-render-feed");
         let flow = RenderPhaseFeedFlow {
             generator_uri: generator_uri.clone(),
             posts: seed.posts.clone(),
         };
         let app = public.router_with_flow(flow, storage.clone());
         let logs = FeedTestLogs::default();
-        let thread_uri = format!(
-            "/thread?uri={}",
-            form_encoded(&seed.posts[3].uri)
-        );
+        let thread_uri = format!("/thread?uri={}", form_encoded(&seed.posts[3].uri));
         let paths = [
             "/app?limit=100".to_owned(),
             format!("/app/feed?uri={}", form_encoded(&generator_uri)),
@@ -25536,12 +25772,14 @@ mod tests {
         }
         let home = &bodies[0];
         assert_eq!(home.matches("<article class=\"post-card\"").count(), 30);
-        assert!(home.contains("class=\"reply-parent-card\""), "a parent card");
+        assert!(
+            home.contains("class=\"reply-parent-card\""),
+            "a parent card"
+        );
         assert!(home.contains("@author-0.test") && home.contains("@parent-0.test"));
         assert!(home.contains("@did:plc:av71q-render-author-9"));
         assert_eq!(
-            seed
-                .parents
+            seed.parents
                 .iter()
                 .filter(|parent| home.contains(&parent.uri))
                 .count(),
@@ -25591,6 +25829,66 @@ mod tests {
                 "counters must not carry an ms unit: {line}"
             );
         }
+        drop(app);
+        let storage = Arc::into_inner(storage).expect("the router was the last storage handle");
+        storage.writer_barrier().unwrap();
+        drop(storage);
+        remove_render_phase_database(&path);
+    }
+
+    #[tokio::test]
+    async fn rendering_the_seed_page_asks_the_database_for_one_profile_counts_statement_per_identity()
+     {
+        // Before-numbers for the report: the same 30-post page (10 distinct
+        // authors, 3 reply parent cards with 2 parent authors) plus the
+        // viewer's own shell lookup. Every identity lookup runs its own
+        // profile_counts SELECT today.
+        let path = render_phase_page_path("statements");
+        remove_render_phase_database(&path);
+        let storage = Arc::new(crate::ingest::SqliteStorage::open(&path).unwrap());
+        let seed = seed_render_phase_page(storage.as_ref());
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let token = render_phase_session_token(&public, storage.as_ref());
+        let generator_uri =
+            format!("at://{RENDER_PAGE_VIEWER}/app.bsky.feed.generator/av71q-render-feed");
+        let flow = RenderPhaseFeedFlow {
+            generator_uri: generator_uri.clone(),
+            posts: seed.posts.clone(),
+        };
+        let app = public.router_with_flow(flow, storage.clone());
+        let trace = storage.trace_statements();
+        let paths = [
+            "/app?limit=100".to_owned(),
+            format!("/app/feed?uri={}", form_encoded(&generator_uri)),
+            format!("/thread?uri={}", form_encoded(&seed.posts[3].uri)),
+            format!("/profile?did={}", render_page_author(0)),
+        ];
+        let mut counts = Vec::new();
+        for path in &paths {
+            trace.clear();
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(path.clone())
+                        .header("cookie", format!("{SESSION_COOKIE}={token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "for {path}");
+            http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .unwrap();
+            counts.push(trace.count_containing(crate::ingest::StatementTrace::PROFILE_COUNTS_SQL));
+        }
+        eprintln!("profile_counts statements per page: {counts:?}");
+        // home/feed: 30 post cards + 3 reply parent cards + the viewer shell
+        // lookup. thread: focus author + ancestor author + viewer. profile:
+        // the subject's own full view (outside the render window) + its 3
+        // posts + the viewer. One statement per identity lookup, no sharing.
+        assert_eq!(counts, vec![34, 34, 3, 5], "pages: {paths:?}");
         drop(app);
         let storage = Arc::into_inner(storage).expect("the router was the last storage handle");
         storage.writer_barrier().unwrap();
