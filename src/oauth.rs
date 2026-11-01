@@ -988,6 +988,7 @@ pub struct OAuthWebState<F, S> {
     block_lists: Arc<BlockListCache>,
     notification_streams: Arc<Mutex<HashMap<String, usize>>>,
     timing_console: Arc<TimingConsole>,
+    pending_writes: Arc<PendingIndexWrites>,
     shutdown: WebShutdown,
 }
 
@@ -1322,6 +1323,7 @@ impl OAuthPublic {
             block_lists: Arc::new(BlockListCache::default()),
             notification_streams: Arc::new(Mutex::new(HashMap::new())),
             timing_console,
+            pending_writes: Arc::new(PendingIndexWrites::default()),
         });
         let regular_routes = Router::new()
             .route(METADATA_PATH, get(metadata::<F, S>))
@@ -13899,11 +13901,33 @@ fn hand_off_index_write<S: Storage + 'static>(
     write: IndexWrite,
     route: &'static str,
     outcome: Arc<AtomicU8>,
+    pending: Option<PendingIndexWriteBinding>,
 ) {
-    outcome.store(INDEX_WRITE_QUEUED, Ordering::Relaxed);
     tokio::spawn(async move {
+        let mark = |value: u8| {
+            outcome.store(value, Ordering::Relaxed);
+            if let Some(binding) = &pending {
+                binding.entry.phase.store(value, Ordering::Relaxed);
+            }
+        };
+        mark(INDEX_WRITE_QUEUED);
         let mut backoff = INDEX_WRITE_FIRST_BACKOFF;
         for attempt in 1..=INDEX_WRITE_ATTEMPTS {
+            if matches!(write, IndexWrite::Put(_))
+                && pending
+                    .as_ref()
+                    .is_some_and(|binding| binding.entry.cancelled.load(Ordering::Relaxed))
+            {
+                // An unlike answered while this write was in flight; the unlike
+                // already handed the delete to the writer, so do not put it back.
+                tracing::info!(
+                    route,
+                    uri = %write.target(),
+                    index_write = "cancelled",
+                    "web index write"
+                );
+                return;
+            }
             let attempt_write = write.clone();
             let attempt_storage = storage.clone();
             let result = tokio::task::spawn_blocking(move || attempt_write.apply(attempt_storage.as_ref()))
@@ -13911,7 +13935,27 @@ fn hand_off_index_write<S: Storage + 'static>(
                 .map_err(|error| format!("index write task failed: {error}"));
             match result {
                 Ok(Ok(())) => {
-                    outcome.store(INDEX_WRITE_DONE, Ordering::Relaxed);
+                    if let Some(binding) = &pending {
+                        binding.writes.complete(&binding.key);
+                        if binding.entry.cancelled.load(Ordering::Relaxed)
+                            && let IndexWrite::Put(record) = &write
+                        {
+                            // The row landed after the unlike asked to cancel: delete
+                            // it again so the unlike can never leave a stale row.
+                            hand_off_index_write(
+                                storage.clone(),
+                                IndexWrite::Delete {
+                                    did: record.did.clone(),
+                                    collection: record.collection.clone(),
+                                    rkey: record.rkey.clone(),
+                                },
+                                route,
+                                Arc::new(AtomicU8::new(INDEX_WRITE_UNSET)),
+                                None,
+                            );
+                        }
+                    }
+                    mark(INDEX_WRITE_DONE);
                     tracing::info!(
                         route,
                         uri = %write.target(),
@@ -13936,7 +13980,7 @@ fn hand_off_index_write<S: Storage + 'static>(
                     backoff = (backoff * 2).min(INDEX_WRITE_MAX_BACKOFF);
                 }
                 Ok(Err(error)) => {
-                    outcome.store(INDEX_WRITE_FAILED, Ordering::Relaxed);
+                    mark(INDEX_WRITE_FAILED);
                     count_failed_index_write(
                         route,
                         &write.target(),
@@ -13946,13 +13990,13 @@ fn hand_off_index_write<S: Storage + 'static>(
                     return;
                 }
                 Err(error) => {
-                    outcome.store(INDEX_WRITE_FAILED, Ordering::Relaxed);
+                    mark(INDEX_WRITE_FAILED);
                     count_failed_index_write(route, &write.target(), attempt, &error);
                     return;
                 }
             }
         }
-        outcome.store(INDEX_WRITE_FAILED, Ordering::Relaxed);
+        mark(INDEX_WRITE_FAILED);
         count_failed_index_write(
             route,
             &write.target(),
@@ -13973,6 +14017,90 @@ fn report_index_hand_off_failure(
 ) {
     outcome.store(INDEX_WRITE_FAILED, Ordering::Relaxed);
     count_failed_index_write(route, target, 0, error);
+}
+
+/// `(collection, viewer, subject)` — the key of a like/repost the viewer just
+/// made whose index write has not landed yet.
+type PendingWriteKey = (String, String, String);
+
+/// A pending entry outlives one writer stall (live transaction max ~20 s) and
+/// a full retry window; after it expires a repeat click may reach the PDS
+/// again, which is the safe direction (the map only ever suppresses writes).
+const PENDING_INDEX_WRITE_TTL: Duration = Duration::from_secs(60);
+const MAX_PENDING_INDEX_WRITES: usize = 4_096;
+
+#[derive(Clone)]
+struct PendingWriteEntry {
+    uri: String,
+    rkey: String,
+    expires_at: Instant,
+    cancelled: Arc<AtomicBool>,
+    phase: Arc<AtomicU8>,
+    state_after: bool,
+    count_after: u64,
+}
+
+/// The in-memory record of writes answered on PDS OK whose index row is still
+/// in flight: consulted before calling the PDS so a double click cannot make a
+/// second createRecord, and cancelled by the matching delete.
+#[derive(Default)]
+struct PendingIndexWrites {
+    entries: Mutex<HashMap<PendingWriteKey, PendingWriteEntry>>,
+}
+
+impl PendingIndexWrites {
+    fn consult(&self, key: &PendingWriteKey) -> Option<PendingWriteEntry> {
+        let mut entries = self.entries.lock().ok()?;
+        Self::prune(&mut entries);
+        let entry = entries.get(key)?;
+        (!entry.cancelled.load(Ordering::Relaxed)).then(|| entry.clone())
+    }
+
+    fn register(&self, key: PendingWriteKey, entry: PendingWriteEntry) {
+        if let Ok(mut entries) = self.entries.lock() {
+            Self::prune(&mut entries);
+            if entries.len() >= MAX_PENDING_INDEX_WRITES
+                && let Some(oldest) = entries
+                    .iter()
+                    .min_by_key(|(_, held)| held.expires_at)
+                    .map(|(key, _)| key.clone())
+            {
+                entries.remove(&oldest);
+            }
+            entries.insert(key, entry);
+        }
+    }
+
+    /// The index write landed: later clicks must reach the PDS again (the row
+    /// they see is now authoritative).
+    fn complete(&self, key: &PendingWriteKey) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.remove(key);
+        }
+    }
+
+    /// A delete answered for this write (unlike right after the like): stop the
+    /// pending index write from re-adding the row the user just removed.
+    fn cancel(&self, key: &PendingWriteKey) -> Option<PendingWriteEntry> {
+        let entry = self.entries.lock().ok()?.remove(key);
+        if let Some(entry) = entry.as_ref() {
+            entry.cancelled.store(true, Ordering::Relaxed);
+        }
+        entry
+    }
+
+    fn prune(entries: &mut HashMap<PendingWriteKey, PendingWriteEntry>) {
+        entries.retain(|_, entry| {
+            entry.expires_at > Instant::now() && !entry.cancelled.load(Ordering::Relaxed)
+        });
+    }
+}
+
+/// Ties a handed-off `IndexWrite` to its pending entry.
+struct PendingIndexWriteBinding {
+    writes: Arc<PendingIndexWrites>,
+    key: PendingWriteKey,
+    entry: PendingWriteEntry,
 }
 
 async fn write_like<F, S>(
@@ -14002,6 +14130,11 @@ where
     // The count the response reports is the page's count read BEFORE the write,
     // adjusted by this action: the index row lands in the background, so the
     // summary can no longer see it when the response goes out.
+    let pending_key = (
+        "app.bsky.feed.like".to_owned(),
+        did.clone(),
+        uri.to_owned(),
+    );
     if form.get("intent").is_some_and(|intent| intent == "delete") {
         let summary = match state.storage.post_interaction_summary(uri, Some(&did)) {
             Ok(summary) => summary,
@@ -14018,7 +14151,14 @@ where
                 );
             }
         };
-        let Some(like_uri) = summary.viewer_like else {
+        // The like to delete lives in the local index, or in the pending map when
+        // the like was answered seconds ago and its index write has not landed.
+        let Some(like_uri) = summary.viewer_like.or_else(|| {
+            state
+                .pending_writes
+                .consult(&pending_key)
+                .map(|entry| entry.uri)
+        }) else {
             return oauth_error(
                 StatusCode::BAD_REQUEST,
                 "like record was not found in the local index",
@@ -14026,6 +14166,7 @@ where
         };
         return match state.flow.delete_like(&did, &like_uri).await {
             Ok(()) => {
+                state.pending_writes.cancel(&pending_key);
                 let outcome = index_write_outcome_slot();
                 match record_index_rkey(&did, "app.bsky.feed.like", &like_uri) {
                     Ok(rkey) => hand_off_index_write(
@@ -14037,6 +14178,7 @@ where
                         },
                         "like",
                         outcome,
+                        None,
                     ),
                     Err(error) => {
                         report_index_hand_off_failure("like", &like_uri, &error, &outcome)
@@ -14065,16 +14207,57 @@ where
         .storage
         .post_interaction_summary(uri, Some(&did))
         .unwrap_or_default();
+    if summary.viewer_like.is_some() {
+        // The index already has this like: a click on a stale page must not make
+        // a second PDS like.
+        return like_state_response(
+            &headers,
+            &state.public.public_url,
+            uri,
+            true,
+            summary.like_count as u64,
+        );
+    }
+    if let Some(entry) = state.pending_writes.consult(&pending_key) {
+        // Double click: the like whose index write is still in flight answers the
+        // second click with the same state, and the PDS is not called again.
+        let outcome = index_write_outcome_slot();
+        outcome.store(entry.phase.load(Ordering::Relaxed), Ordering::Relaxed);
+        return like_state_response(
+            &headers,
+            &state.public.public_url,
+            uri,
+            entry.state_after,
+            entry.count_after,
+        );
+    }
     match state.flow.like(&did, uri, cid).await {
         Ok(created) => {
             let outcome = index_write_outcome_slot();
             match indexed_created_record(&did, "app.bsky.feed.like", &created) {
-                Ok(record) => hand_off_index_write(
-                    state.storage.clone(),
-                    IndexWrite::Put(Box::new(record)),
-                    "like",
-                    outcome,
-                ),
+                Ok(record) => {
+                    let entry = PendingWriteEntry {
+                        rkey: record.rkey.clone(),
+                        uri: record.uri.clone(),
+                        expires_at: Instant::now() + PENDING_INDEX_WRITE_TTL,
+                        cancelled: Arc::new(AtomicBool::new(false)),
+                        phase: Arc::new(AtomicU8::new(INDEX_WRITE_QUEUED)),
+                        state_after: true,
+                        count_after: (summary.like_count + 1) as u64,
+                    };
+                    state.pending_writes.register(pending_key.clone(), entry.clone());
+                    hand_off_index_write(
+                        state.storage.clone(),
+                        IndexWrite::Put(Box::new(record)),
+                        "like",
+                        outcome,
+                        Some(PendingIndexWriteBinding {
+                            writes: state.pending_writes.clone(),
+                            key: pending_key.clone(),
+                            entry,
+                        }),
+                    );
+                }
                 Err(error) => {
                     report_index_hand_off_failure("like", &created.uri, &error, &outcome)
                 }
@@ -14129,16 +14312,58 @@ where
         .storage
         .post_interaction_summary(uri, Some(&did))
         .unwrap_or_default();
+    let pending_key = (
+        "app.bsky.feed.repost".to_owned(),
+        did.clone(),
+        uri.to_owned(),
+    );
+    if summary.viewer_repost.is_some() {
+        return repost_state_response(
+            &headers,
+            &state.public.public_url,
+            uri,
+            true,
+            summary.repost_count as u64,
+        );
+    }
+    if let Some(entry) = state.pending_writes.consult(&pending_key) {
+        let outcome = index_write_outcome_slot();
+        outcome.store(entry.phase.load(Ordering::Relaxed), Ordering::Relaxed);
+        return repost_state_response(
+            &headers,
+            &state.public.public_url,
+            uri,
+            entry.state_after,
+            entry.count_after,
+        );
+    }
     match state.flow.repost(&did, uri, cid).await {
         Ok(created) => {
             let outcome = index_write_outcome_slot();
             match indexed_created_record(&did, "app.bsky.feed.repost", &created) {
-                Ok(record) => hand_off_index_write(
-                    state.storage.clone(),
-                    IndexWrite::Put(Box::new(record)),
-                    "repost",
-                    outcome,
-                ),
+                Ok(record) => {
+                    let entry = PendingWriteEntry {
+                        rkey: record.rkey.clone(),
+                        uri: record.uri.clone(),
+                        expires_at: Instant::now() + PENDING_INDEX_WRITE_TTL,
+                        cancelled: Arc::new(AtomicBool::new(false)),
+                        phase: Arc::new(AtomicU8::new(INDEX_WRITE_QUEUED)),
+                        state_after: true,
+                        count_after: (summary.repost_count + 1) as u64,
+                    };
+                    state.pending_writes.register(pending_key.clone(), entry.clone());
+                    hand_off_index_write(
+                        state.storage.clone(),
+                        IndexWrite::Put(Box::new(record)),
+                        "repost",
+                        outcome,
+                        Some(PendingIndexWriteBinding {
+                            writes: state.pending_writes.clone(),
+                            key: pending_key.clone(),
+                            entry,
+                        }),
+                    );
+                }
                 Err(error) => {
                     report_index_hand_off_failure("repost", &created.uri, &error, &outcome)
                 }
