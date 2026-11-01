@@ -710,6 +710,201 @@ async fn backfill_worker_backs_off_after_a_failed_repository_fetch() {
     assert_eq!(storage.backfill_failure_count(did).unwrap(), 1);
 }
 
+mod windowed_backfill {
+    use appview_rs::{
+        backfill::{
+            BackfillError, HostRateLimiter, RepoBackfiller, RepoFetcher, RepoVerifier, RepoRecord,
+            VerifiedRepo,
+        },
+        ingest::{MemoryStorage, Storage},
+    };
+    use serde_json::json;
+    use std::{
+        io::Write,
+        sync::{Arc, Mutex},
+    };
+
+    const DID: &str = "did:plc:windowowner";
+
+    struct ScriptedFetcher;
+    impl RepoFetcher for ScriptedFetcher {
+        async fn fetch_repo(&self, _: &str, _: &str) -> Result<Vec<u8>, BackfillError> {
+            Ok(vec![0u8; 8])
+        }
+    }
+
+    struct ScriptedVerifier(Vec<RepoRecord>);
+    impl RepoVerifier for ScriptedVerifier {
+        async fn verify(
+            &self,
+            _: &[u8],
+            _: &str,
+            _: &str,
+        ) -> Result<VerifiedRepo, BackfillError> {
+            Ok(VerifiedRepo {
+                records: self.0.clone(),
+            })
+        }
+    }
+
+    fn aged_created_at(days: i64) -> String {
+        let moment = time::OffsetDateTime::now_utc() - time::Duration::days(days);
+        moment
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    }
+
+    fn aged_record(collection: &str, rkey: &str, days: i64) -> RepoRecord {
+        RepoRecord {
+            collection: collection.to_owned(),
+            rkey: rkey.to_owned(),
+            cid: format!("cid-{rkey}"),
+            record: json!({
+                "$type": collection,
+                "createdAt": aged_created_at(days),
+                "subject": "did:plc:windowfriend",
+            }),
+        }
+    }
+
+    fn windowed_repo() -> Vec<RepoRecord> {
+        let mut records = Vec::new();
+        for days in [5, 29, 31, 400] {
+            records.push(aged_record("app.bsky.feed.post", &format!("p{days}"), days));
+            records.push(aged_record("app.bsky.feed.like", &format!("l{days}"), days));
+            records.push(aged_record("app.bsky.feed.repost", &format!("r{days}"), days));
+        }
+        records.push(aged_record("app.bsky.graph.follow", "f400", 400));
+        records.push(aged_record("app.bsky.graph.block", "b400", 400));
+        records.push(aged_record("app.bsky.actor.profile", "self", 400));
+        records
+    }
+
+    fn backfiller(storage: Arc<MemoryStorage>) -> RepoBackfiller<MemoryStorage, ScriptedFetcher, ScriptedVerifier> {
+        RepoBackfiller::new(
+            storage,
+            ScriptedFetcher,
+            ScriptedVerifier(windowed_repo()),
+            HostRateLimiter::new(std::time::Duration::ZERO),
+        )
+    }
+
+    #[derive(Clone, Default)]
+    struct CaptureLogs(Arc<Mutex<Vec<u8>>>);
+    impl Write for CaptureLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureLogs {
+        type Writer = CaptureLogs;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn indexed(storage: &MemoryStorage, collection: &str, rkey: &str) -> bool {
+        storage
+            .get_record(DID, collection, rkey)
+            .unwrap()
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn default_window_indexes_only_recent_posts_likes_reposts_and_keeps_all_graph_state() {
+        let storage = Arc::new(MemoryStorage::default());
+        let backfiller = backfiller(storage.clone());
+        let logs = CaptureLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(logs.clone())
+            .finish();
+        let count = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            backfiller
+                .backfill(DID, "https://pds.example", "did:key:zDnaem-window-test-key")
+                .await
+                .unwrap()
+        };
+
+        assert_eq!(count, 9, "the 5- and 29-day windowed records plus all 400-day graph records");
+        for days in [5, 29] {
+            for (collection, prefix) in [
+                ("app.bsky.feed.post", "p"),
+                ("app.bsky.feed.like", "l"),
+                ("app.bsky.feed.repost", "r"),
+            ] {
+                assert!(
+                    indexed(&storage, collection, &format!("{prefix}{days}")),
+                    "a {days}-day-old {collection} must be indexed inside the window"
+                );
+            }
+        }
+        for days in [31, 400] {
+            for (collection, prefix) in [
+                ("app.bsky.feed.post", "p"),
+                ("app.bsky.feed.like", "l"),
+                ("app.bsky.feed.repost", "r"),
+            ] {
+                assert!(
+                    !indexed(&storage, collection, &format!("{prefix}{days}")),
+                    "a {days}-day-old {collection} must not be indexed outside the window"
+                );
+            }
+        }
+        assert!(indexed(&storage, "app.bsky.graph.follow", "f400"));
+        assert!(indexed(&storage, "app.bsky.graph.block", "b400"));
+        assert!(indexed(&storage, "app.bsky.actor.profile", "self"));
+
+        let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        let completed = output
+            .lines()
+            .find(|line| line.contains("repository backfill completed"))
+            .expect("the completed line must be logged");
+        assert!(
+            completed.contains("skipped_old_records=6"),
+            "the completed line must carry the skipped count: {completed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn records_without_a_parsable_created_at_are_kept() {
+        let storage = Arc::new(MemoryStorage::default());
+        let mut records = windowed_repo();
+        records.push(RepoRecord {
+            collection: "app.bsky.feed.post".to_owned(),
+            rkey: "nodate".to_owned(),
+            cid: "cid-nodate".to_owned(),
+            record: json!({"$type":"app.bsky.feed.post","text":"no createdAt"}),
+        });
+        records.push(RepoRecord {
+            collection: "app.bsky.feed.post".to_owned(),
+            rkey: "baddate".to_owned(),
+            cid: "cid-baddate".to_owned(),
+            record: json!({"$type":"app.bsky.feed.post","createdAt":"last tuesday"}),
+        });
+        let backfiller = RepoBackfiller::new(
+            storage.clone(),
+            ScriptedFetcher,
+            ScriptedVerifier(records),
+            HostRateLimiter::new(std::time::Duration::ZERO),
+        );
+        let count = backfiller
+            .backfill(DID, "https://pds.example", "did:key:zDnaem-window-test-key")
+            .await
+            .unwrap();
+        assert_eq!(count, 11, "the two undated posts must be kept, not skipped");
+        assert!(indexed(&storage, "app.bsky.feed.post", "nodate"));
+        assert!(indexed(&storage, "app.bsky.feed.post", "baddate"));
+    }
+}
+
 #[test]
 fn failed_repository_retry_delay_doubles_and_caps_at_one_hour() {
     fn check(storage: &impl Storage) {

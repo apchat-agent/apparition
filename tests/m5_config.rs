@@ -49,6 +49,49 @@ fn backfill_record_rate_rejects_zero_and_non_numbers() {
 }
 
 #[test]
+fn backfill_max_age_days_defaults_to_thirty_and_is_configurable() {
+    let default = Config::from_toml_and_env("", std::iter::empty::<(&str, &str)>()).unwrap();
+    assert!(
+        format!("{default:?}").contains("backfill_max_age_days: 30"),
+        "backfill keeps only 30 days of post/like/repost history by default"
+    );
+
+    let from_env =
+        Config::from_toml_and_env("", [("APPVIEW_BACKFILL_MAX_AGE_DAYS", "7")]).unwrap();
+    assert!(format!("{from_env:?}").contains("backfill_max_age_days: 7"));
+
+    let from_toml =
+        Config::from_toml_and_env("backfill_max_age_days = 14", std::iter::empty::<(&str, &str)>())
+            .unwrap();
+    assert!(format!("{from_toml:?}").contains("backfill_max_age_days: 14"));
+
+    let env_over_toml = Config::from_toml_and_env(
+        "backfill_max_age_days = 14",
+        [("APPVIEW_BACKFILL_MAX_AGE_DAYS", "7")],
+    )
+    .unwrap();
+    assert!(format!("{env_over_toml:?}").contains("backfill_max_age_days: 7"));
+}
+
+#[test]
+fn backfill_max_age_days_accepts_zero_and_rejects_garbage() {
+    let unlimited = Config::from_toml_and_env("", [("APPVIEW_BACKFILL_MAX_AGE_DAYS", "0")]).unwrap();
+    assert!(
+        format!("{unlimited:?}").contains("backfill_max_age_days: 0"),
+        "0 means no window: index the whole repository as before"
+    );
+
+    for value in ["many", "-1", "1.5"] {
+        let error = Config::from_toml_and_env("", [("APPVIEW_BACKFILL_MAX_AGE_DAYS", value)])
+            .expect_err("garbage max age must be rejected");
+        assert!(
+            format!("{error}").contains("APPVIEW_BACKFILL_MAX_AGE_DAYS"),
+            "the error for {value:?} must name the variable: {error}"
+        );
+    }
+}
+
+#[test]
 fn repository_backfill_is_disabled_by_default_and_requires_explicit_enablement() {
     let default = Config::from_toml_and_env("", std::iter::empty::<(&str, &str)>()).unwrap();
     assert!(format!("{default:?}").contains("backfill_enabled: false"));
