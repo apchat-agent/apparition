@@ -108,6 +108,7 @@ const MAX_RENDERED_REMOTE_CHARS: usize = 4096;
 const PROFILE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const PROFILE_NEGATIVE_TTL: Duration = Duration::from_secs(60 * 60);
 const PAGE_PROFILE_BUDGET: Duration = Duration::from_millis(1500);
+const PARENT_PUBLIC_LOOKUP_HEAD_START: Duration = Duration::from_millis(50);
 /// How long a spawned block-list refresh may run. The page waits only PAGE_PROFILE_BUDGET for it,
 /// but the refresh itself must be allowed to finish: a 742-member list is ~8 getList pages (~4 s),
 /// and cutting it at the page budget meant it never filled the cache (2026-10-30).
@@ -6132,6 +6133,9 @@ struct PageContentHydration {
 }
 
 type PageParentIndex = HashMap<String, Option<IndexedRecord>>;
+type PageLocalParentLookupRows = (u64, HashMap<String, IndexedRecord>);
+type PageLocalParentLookupTask =
+    tokio::task::JoinHandle<Result<PageLocalParentLookupRows, StorageError>>;
 
 #[derive(Default, Clone, Copy)]
 struct ParentHydrationStats {
@@ -7387,7 +7391,7 @@ fn page_records_with_parents<'a>(
 }
 
 const MAX_PENDING_PAGE_POSTS: usize = 5_000;
-const MAX_LOCAL_PAGE_ANCESTORS: usize = 500;
+const MAX_LOCAL_PAGE_ANCESTOR_LEVELS: usize = 2;
 const MAX_DEFERRED_PAGE_POST_WORKERS: usize = 4;
 static DEFERRED_PAGE_POSTS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static DEFERRED_PAGE_POST_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
@@ -7427,6 +7431,14 @@ async fn hydrate_page_parents<F: OAuthFlow, S: Storage + 'static>(
         .iter()
         .map(|record| record.uri.as_str())
         .collect::<HashSet<_>>();
+    let has_page_thread_chain = include_thread_ancestors
+        && page_records.iter().any(|record| {
+            record
+                .record
+                .pointer("/reply/parent/uri")
+                .and_then(Value::as_str)
+                .is_some_and(|uri| page_uris.contains(uri))
+        });
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
     let mut direct_uris = Vec::new();
@@ -7439,11 +7451,10 @@ async fn hydrate_page_parents<F: OAuthFlow, S: Storage + 'static>(
             .pointer("/reply/parent/uri")
             .and_then(Value::as_str)
             .filter(|uri| post_uri_did(uri).is_some())
+            && seen.insert(uri.to_owned())
         {
             direct_uris.push(uri.to_owned());
-            if seen.insert(uri.to_owned()) {
-                candidates.push(uri.to_owned());
-            }
+            candidates.push(uri.to_owned());
         }
     }
     if include_thread_ancestors {
@@ -7484,10 +7495,25 @@ async fn hydrate_page_parents<F: OAuthFlow, S: Storage + 'static>(
         .cloned()
         .collect::<Vec<_>>();
     let mut fetched_inline = Vec::new();
-    if !local_candidates.is_empty() {
+    let mut local_lookup = if local_candidates.is_empty() {
+        None
+    } else {
         stats.rounds = stats.rounds.saturating_add(1);
-        match page_local_parent_records(Arc::clone(&storage), &local_candidates, deadline).await? {
-            Some((elapsed, records)) => {
+        Some(start_page_local_parent_lookup(
+            Arc::clone(&storage),
+            local_candidates,
+        ))
+    };
+
+    // Give the local batch a short head start. If it has not completed,
+    // start the page's single network batch while the blocking storage query
+    // continues in the background.
+    if let Some(lookup) = local_lookup.as_mut() {
+        let head_start_deadline =
+            (tokio::time::Instant::now() + PARENT_PUBLIC_LOOKUP_HEAD_START).min(deadline);
+        match tokio::time::timeout_at(head_start_deadline, lookup).await {
+            Ok(result) => {
+                let (elapsed, records) = page_local_parent_lookup_result(result)?;
                 stats.local_ms = stats.local_ms.saturating_add(elapsed);
                 stats.rows = stats.rows.saturating_add(records.len() as u64);
                 for (uri, record) in records {
@@ -7495,8 +7521,9 @@ async fn hydrate_page_parents<F: OAuthFlow, S: Storage + 'static>(
                         parents.insert(uri, Some(record));
                     }
                 }
+                local_lookup = None;
             }
-            None => stats.local_pending = true,
+            Err(_) => stats.local_pending = true,
         }
     }
 
@@ -7515,11 +7542,7 @@ async fn hydrate_page_parents<F: OAuthFlow, S: Storage + 'static>(
         .take(25)
         .cloned()
         .collect::<Vec<_>>();
-    let mut deferred = missing
-        .iter()
-        .filter(|uri| !request_uris.contains(uri))
-        .cloned()
-        .collect::<HashSet<_>>();
+    let mut deferred = missing.iter().cloned().collect::<HashSet<_>>();
     if !request_uris.is_empty() && flow.supports_public_post_batching() {
         let started = std::time::Instant::now();
         match tokio::time::timeout_at(
@@ -7539,8 +7562,10 @@ async fn hydrate_page_parents<F: OAuthFlow, S: Storage + 'static>(
                         && post.record.uri == *uri
                         && post.record.collection == "app.bsky.feed.post"
                     {
-                        parents.insert(uri.clone(), Some(post.record.clone()));
-                        fetched_inline.push(post.clone());
+                        if !parents.get(uri).is_some_and(Option::is_some) {
+                            parents.insert(uri.clone(), Some(post.record.clone()));
+                            fetched_inline.push(post.clone());
+                        }
                     } else {
                         deferred.insert(uri.clone());
                     }
@@ -7563,76 +7588,103 @@ async fn hydrate_page_parents<F: OAuthFlow, S: Storage + 'static>(
         deferred.extend(request_uris.iter().cloned());
     }
 
-    // Continue down ancestry only when each next level is already local. Missing
-    // levels become placeholders and are filled by the background worker.
-    let mut frontier = direct_uris
-        .iter()
-        .filter_map(|uri| parents.get(uri).and_then(Option::as_ref))
-        .map(|record| record.uri.clone())
-        .collect::<Vec<_>>();
-    let mut visited = candidates.iter().cloned().collect::<HashSet<_>>();
-    let mut local_ancestor_count = 0usize;
-    while !frontier.is_empty() && local_ancestor_count < MAX_LOCAL_PAGE_ANCESTORS {
-        let next = frontier
-            .iter()
-            .filter_map(|uri| parents.get(uri).and_then(Option::as_ref))
-            .filter_map(|record| {
-                record
-                    .record
-                    .pointer("/reply/parent/uri")
-                    .and_then(Value::as_str)
-                    .filter(|uri| post_uri_did(uri).is_some())
-                    .map(str::to_owned)
-            })
-            .filter(|uri| visited.insert(uri.clone()))
-            .collect::<Vec<_>>();
-        if next.is_empty() {
-            break;
-        }
-        for uri in &next {
-            parents.insert(uri.clone(), None);
-        }
-        stats.rounds = stats.rounds.saturating_add(1);
-        match page_local_parent_records(Arc::clone(&storage), &next, deadline).await? {
-            Some((elapsed, records)) => {
-                stats.local_ms = stats.local_ms.saturating_add(elapsed);
-                stats.rows = stats.rows.saturating_add(records.len() as u64);
-                let mut next_frontier = Vec::new();
-                for uri in &next {
-                    if let Some(record) = records.get(uri)
-                        && record.uri == *uri
-                        && record.collection == "app.bsky.feed.post"
-                    {
-                        parents.insert(uri.clone(), Some(record.clone()));
-                        next_frontier.push(uri.clone());
-                        local_ancestor_count += 1;
-                    } else {
-                        deferred.insert(uri.clone());
+    // When local storage completed during the public request, apply its rows
+    // last so they win for any URI returned by both sources. A slow local
+    // lookup stays detached; its duration cannot hold the page open.
+    if let Some(mut lookup) = local_lookup.take() {
+        let page_request_started = !request_uris.is_empty() && flow.supports_public_post_batching();
+        if lookup.is_finished() || (!page_request_started && !request_uris.is_empty()) {
+            match tokio::time::timeout_at(deadline, &mut lookup).await {
+                Ok(result) => {
+                    let (elapsed, records) = page_local_parent_lookup_result(result)?;
+                    stats.local_ms = stats.local_ms.saturating_add(elapsed);
+                    stats.rows = stats.rows.saturating_add(records.len() as u64);
+                    for (uri, record) in records {
+                        if record.uri == uri && record.collection == "app.bsky.feed.post" {
+                            parents.insert(uri, Some(record));
+                        }
                     }
+                    stats.local_pending = false;
                 }
-                frontier = next_frontier;
+                Err(_) => stats.local_pending = true,
             }
-            None => {
-                stats.local_pending = true;
-                deferred.extend(next);
-                break;
-            }
+        } else {
+            stats.local_pending = true;
         }
     }
-    if local_ancestor_count >= MAX_LOCAL_PAGE_ANCESTORS {
-        for uri in frontier {
-            let parent_uri = parents
-                .get(&uri)
-                .and_then(Option::as_ref)
-                .and_then(|record| record.record.pointer("/reply/parent/uri"))
-                .and_then(Value::as_str)
-                .filter(|uri| post_uri_did(uri).is_some())
-                .map(str::to_owned);
-            if let Some(parent_uri) = parent_uri
-                && !parents.get(&parent_uri).is_some_and(Option::is_some)
-            {
-                parents.entry(parent_uri.clone()).or_insert(None);
-                deferred.insert(parent_uri);
+
+    // Walk at most two more levels, and only when the rendered page itself
+    // contains a thread chain. These extra reads are local only.
+    if has_page_thread_chain {
+        let mut frontier = direct_uris
+            .iter()
+            .filter_map(|uri| parents.get(uri).and_then(Option::as_ref))
+            .map(|record| record.uri.clone())
+            .collect::<Vec<_>>();
+        let mut visited = candidates.iter().cloned().collect::<HashSet<_>>();
+        let mut levels = 0usize;
+        while !frontier.is_empty() && levels < MAX_LOCAL_PAGE_ANCESTOR_LEVELS {
+            let next = frontier
+                .iter()
+                .filter_map(|uri| parents.get(uri).and_then(Option::as_ref))
+                .filter_map(|record| {
+                    record
+                        .record
+                        .pointer("/reply/parent/uri")
+                        .and_then(Value::as_str)
+                        .filter(|uri| post_uri_did(uri).is_some())
+                        .map(str::to_owned)
+                })
+                .filter(|uri| visited.insert(uri.clone()))
+                .collect::<Vec<_>>();
+            if next.is_empty() {
+                break;
+            }
+            for uri in &next {
+                parents.insert(uri.clone(), None);
+            }
+            stats.rounds = stats.rounds.saturating_add(1);
+            levels += 1;
+            match page_local_parent_records(Arc::clone(&storage), &next, deadline).await? {
+                Some((elapsed, records)) => {
+                    stats.local_ms = stats.local_ms.saturating_add(elapsed);
+                    stats.rows = stats.rows.saturating_add(records.len() as u64);
+                    let mut next_frontier = Vec::new();
+                    for uri in &next {
+                        if let Some(record) = records.get(uri)
+                            && record.uri == *uri
+                            && record.collection == "app.bsky.feed.post"
+                        {
+                            parents.insert(uri.clone(), Some(record.clone()));
+                            next_frontier.push(uri.clone());
+                        } else {
+                            deferred.insert(uri.clone());
+                        }
+                    }
+                    frontier = next_frontier;
+                }
+                None => {
+                    stats.local_pending = true;
+                    deferred.extend(next);
+                    break;
+                }
+            }
+        }
+        if levels == MAX_LOCAL_PAGE_ANCESTOR_LEVELS {
+            for uri in frontier {
+                let parent_uri = parents
+                    .get(&uri)
+                    .and_then(Option::as_ref)
+                    .and_then(|record| record.record.pointer("/reply/parent/uri"))
+                    .and_then(Value::as_str)
+                    .filter(|uri| post_uri_did(uri).is_some())
+                    .map(str::to_owned);
+                if let Some(parent_uri) = parent_uri
+                    && !parents.get(&parent_uri).is_some_and(Option::is_some)
+                {
+                    parents.entry(parent_uri.clone()).or_insert(None);
+                    deferred.insert(parent_uri);
+                }
             }
         }
     }
@@ -7650,6 +7702,7 @@ async fn hydrate_page_parents<F: OAuthFlow, S: Storage + 'static>(
             deferred.insert(parent_uri.to_owned());
         }
     }
+    deferred.retain(|uri| !parents.get(uri).is_some_and(Option::is_some));
     stats.deferred = deferred.len() as u64;
     let public_profiles = fetched_inline
         .into_iter()
@@ -7696,24 +7749,47 @@ async fn page_local_parent_records<S: Storage + 'static>(
     uris: &[String],
     deadline: tokio::time::Instant,
 ) -> Result<Option<(u64, HashMap<String, IndexedRecord>)>, StorageError> {
-    let local_uris = uris.to_vec();
-    let worker = tokio::task::spawn_blocking(move || {
-        let started = std::time::Instant::now();
-        storage
-            .records_by_uri("app.bsky.feed.post", &local_uris)
-            .map(|records| (started.elapsed().as_millis() as u64, records))
-    });
-    match tokio::time::timeout_at(deadline, worker).await {
-        Ok(Ok(Ok((elapsed, records)))) => Ok(Some((elapsed, records))),
-        Ok(Ok(Err(error))) => {
-            tracing::warn!(%error, "local parent record lookup failed");
-            Err(error)
+    let mut lookup = start_page_local_parent_lookup(storage, uris.to_vec());
+    match tokio::time::timeout_at(deadline, &mut lookup).await {
+        Ok(result) => page_local_parent_lookup_result(result).map(Some),
+        Err(_) => Ok(None),
+    }
+}
+
+fn start_page_local_parent_lookup<S: Storage + 'static>(
+    storage: Arc<S>,
+    uris: Vec<String>,
+) -> PageLocalParentLookupTask {
+    tokio::spawn(async move {
+        let worker = tokio::task::spawn_blocking(move || {
+            let started = std::time::Instant::now();
+            storage
+                .records_by_uri("app.bsky.feed.post", &uris)
+                .map(|records| (started.elapsed().as_millis() as u64, records))
+        });
+        match worker.await {
+            Ok(Ok((elapsed, records))) => Ok((elapsed, records)),
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "local parent record lookup failed");
+                Err(error)
+            }
+            Err(error) => {
+                tracing::error!(%error, "blocking parent lookup task failed");
+                Err(StorageError::BlockingTask(error.to_string()))
+            }
         }
-        Ok(Err(error)) => {
-            tracing::error!(%error, "blocking parent lookup task failed");
+    })
+}
+
+fn page_local_parent_lookup_result(
+    result: Result<Result<PageLocalParentLookupRows, StorageError>, tokio::task::JoinError>,
+) -> Result<PageLocalParentLookupRows, StorageError> {
+    match result {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::error!(%error, "parent lookup supervisor task failed");
             Err(StorageError::BlockingTask(error.to_string()))
         }
-        Err(_) => Ok(None),
     }
 }
 
@@ -21715,7 +21791,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parent_hydration_loads_local_ancestors_without_network_rounds() {
+    async fn parent_hydration_batches_each_level_and_stops_after_two_extra_levels() {
         let storage = Arc::new(MemoryStorage::default());
         let mut leaves = Vec::new();
         let mut fourth_level_uris = Vec::new();
@@ -21760,14 +21836,15 @@ mod tests {
             "parent hydration must not look up one URI at a time"
         );
         assert_eq!(
-            batch_lookups, 4,
-            "the page loads direct parents and each available local ancestor level"
+            batch_lookups, 3,
+            "the page loads direct parents and at most two extra local levels"
         );
-        assert_eq!(stats.rounds, 4);
+        assert_eq!(stats.rounds, 3);
+        assert_eq!(stats.rows, 100);
         assert_eq!(
             parents.len(),
             150,
-            "root plus every local ancestor per thread"
+            "root, direct parents, two local ancestor levels, and deeper placeholders"
         );
         assert!(
             (0..25).all(|index| parents.contains_key(&format!(
@@ -21778,12 +21855,12 @@ mod tests {
         assert!(
             fourth_level_uris
                 .iter()
-                .all(|uri| parents.contains_key(uri))
+                .all(|uri| { parents.get(uri).is_some_and(Option::is_none) })
         );
     }
 
     #[tokio::test]
-    async fn parent_hydration_walks_local_ancestors_even_without_a_page_thread_chain() {
+    async fn parent_hydration_reads_only_the_rendered_parent_when_the_page_has_no_thread_chain() {
         let storage = Arc::new(MemoryStorage::default());
         let mut replies = Vec::new();
         for index in 0..50_u64 {
@@ -21817,20 +21894,17 @@ mod tests {
 
         assert_eq!(single_lookups, 0);
         assert_eq!(
-            batch_lookups, 3,
-            "the page reads the direct parent, middle, and root from local storage"
+            batch_lookups, 1,
+            "only the rendered parent should be queried"
         );
-        assert_eq!(stats.rounds, 3);
-        assert_eq!(stats.rows, 150);
-        assert_eq!(parents.len(), 150);
-        assert_eq!(
-            parents
-                .values()
-                .flatten()
-                .filter(|record| record.record["text"] == "Rendered parent")
-                .count(),
-            50
-        );
+        assert_eq!(stats.rounds, 1);
+        assert_eq!(stats.rows, 50);
+        assert_eq!(parents.len(), 50);
+        assert!(parents.values().all(|parent| {
+            parent
+                .as_ref()
+                .is_some_and(|record| record.record["text"] == "Rendered parent")
+        }));
     }
 
     #[tokio::test]
@@ -21921,9 +21995,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parent_hydration_reads_local_records_before_the_single_proxy_batch() {
+    async fn parent_hydration_overlaps_slow_local_lookup_with_fast_public_appview() {
         let storage = Arc::new(MemoryStorage::default());
-        storage.set_record_uri_batch_delay(Duration::from_millis(500));
+        storage.set_record_uri_batch_delay(Duration::from_secs(2));
         let parent = test_web_post("did:plc:overlap-parent", "parent", 1, "Public parent", None);
         let reply = test_web_post(
             "did:plc:overlap-reply",
@@ -21953,14 +22027,66 @@ mod tests {
 
         assert!(parents.get(&parent.uri).is_some_and(Option::is_some));
         assert_eq!(stats.rounds, 1);
-        assert!(!stats.local_pending, "the local batch must finish first");
+        assert!(
+            stats.local_pending,
+            "the local query should continue off-worker"
+        );
         assert_eq!(stats.requests, 1);
         assert!(
             stats.public_ms >= 25 && stats.public_ms < 200,
             "public_ms={}",
             stats.public_ms
         );
-        assert!(elapsed >= Duration::from_millis(500));
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "parent hydration waited {elapsed:?} for the two-second local store"
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_hydration_prefers_local_rows_when_they_overlap_the_public_batch() {
+        let storage = Arc::new(MemoryStorage::default());
+        let local_parent = test_web_post(
+            "did:plc:overlap-priority-parent",
+            "parent",
+            1,
+            "Local parent version",
+            None,
+        );
+        storage.put_record(&local_parent).unwrap();
+        storage.set_record_uri_batch_delay(Duration::from_millis(100));
+        let mut public_parent = local_parent.clone();
+        public_parent.record["text"] = json!("Public parent version");
+        let reply = test_web_post(
+            "did:plc:overlap-priority-reply",
+            "reply",
+            2,
+            "Reply",
+            Some(&local_parent.uri),
+        );
+        let flow =
+            QuoteHydrationTestFlow::with_public_delay([public_parent], Duration::from_millis(250));
+        let page_records = [&reply];
+        let mut stats = ParentHydrationStats::default();
+
+        let parents = hydrate_page_parents(
+            &flow,
+            "",
+            storage,
+            &page_records,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            false,
+            &mut stats,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.requests, 1);
+        assert!(!stats.local_pending);
+        assert_eq!(
+            parents[&local_parent.uri].as_ref().unwrap().record["text"],
+            "Local parent version"
+        );
     }
 
     #[tokio::test]
