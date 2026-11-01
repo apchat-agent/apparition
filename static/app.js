@@ -1555,6 +1555,13 @@ function installTimingConsole(pageDocument = document, pageWindow = window, fetc
         rows.push(line("timing-console-phase", `${name} ${phases[name]}`));
         continue;
       }
+      // Only *_ms fields are durations; parent_rows, parent_rounds,
+      // parent_local_pending and the other count fields are counts and get
+      // no unit and no duration bar.
+      if (!name.endsWith("_ms")) {
+        rows.push(line("timing-console-phase", `${name} ${Math.round(value)}`));
+        continue;
+      }
       const row = line("timing-console-phase", `${name} ${Math.round(value)} ms`);
       row.append(scale(value / total, 0));
       rows.push(row);
