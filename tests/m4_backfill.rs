@@ -1154,6 +1154,54 @@ mod windowed_backfill {
             "the old like's notification event survives; the deleted in-window like's event does not"
         );
     }
+
+    #[tokio::test]
+    async fn backfill_with_the_window_disabled_marks_the_history_complete_for_scrolling() {
+        async fn check<S: appview_rs::ingest::Storage + 'static>(
+            storage: &Arc<S>,
+            max_age_days: u64,
+        ) {
+            let backfiller = RepoBackfiller::new(
+                storage.clone(),
+                ScriptedFetcher,
+                ScriptedVerifier(vec![aged_record("app.bsky.feed.post", "p5", 400)]),
+                HostRateLimiter::new(std::time::Duration::ZERO),
+            )
+            .with_max_age_days(max_age_days);
+            backfiller
+                .backfill(DID, "https://pds.example", "did:key:zDnaem-window-test-key")
+                .await
+                .unwrap();
+            let state = storage.older_posts_state(DID).unwrap();
+            if max_age_days == 0 {
+                assert_eq!(
+                    state,
+                    Some(appview_rs::ingest::OlderPostsState {
+                        cursor: None,
+                        exhausted: true,
+                    }),
+                    "a full-repository backfill is the whole history: scrolling must not walk the PDS"
+                );
+            } else {
+                assert_eq!(
+                    state, None,
+                    "a windowed backfill stops at the window edge, so it must not claim the history is complete"
+                );
+            }
+        }
+        check(&Arc::new(MemoryStorage::default()), 0).await;
+        check(
+            &Arc::new(appview_rs::ingest::SqliteStorage::open(":memory:").unwrap()),
+            0,
+        )
+        .await;
+        check(&Arc::new(MemoryStorage::default()), 30).await;
+        check(
+            &Arc::new(appview_rs::ingest::SqliteStorage::open(":memory:").unwrap()),
+            30,
+        )
+        .await;
+    }
 }
 
 #[test]
