@@ -24345,6 +24345,42 @@ mod tests {
             self.inner.notifications_for(did, before, limit)
         }
 
+        fn notification_events_window(
+            &self,
+            did: &str,
+            before: Option<&NotificationCursor>,
+            skip: &[NotificationGroupSkip],
+            limit: usize,
+        ) -> Result<Vec<NotificationEventRow>, StorageError> {
+            self.inner
+                .notification_events_window(did, before, skip, limit)
+        }
+
+        fn notification_key_event_count(
+            &self,
+            did: &str,
+            reason: &str,
+            reason_subject: Option<&str>,
+            from_us: u64,
+            to_us: u64,
+        ) -> Result<usize, StorageError> {
+            self.inner
+                .notification_key_event_count(did, reason, reason_subject, from_us, to_us)
+        }
+
+        fn notification_key_events(
+            &self,
+            did: &str,
+            reason: &str,
+            reason_subject: Option<&str>,
+            before: Option<&NotificationCursor>,
+            window: &NotificationKeyWindow,
+            limit: usize,
+        ) -> Result<Vec<NotificationEventRow>, StorageError> {
+            self.inner
+                .notification_key_events(did, reason, reason_subject, before, window, limit)
+        }
+
         fn notification_count(&self, did: &str) -> Result<usize, StorageError> {
             self.inner.notification_count(did)
         }
