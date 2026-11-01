@@ -2349,3 +2349,13 @@ Deno.test("the timing console shows count phases without an ms suffix", async ()
     globalThis.fetch = originalFetch;
   }
 });
+
+Deno.test("the mobile nav hides its text labels but keeps the unread notification badge visible", async () => {
+  const css = await Deno.readTextFile(new URL("../static/app.css", import.meta.url));
+  const hiding = [...css.matchAll(/([^{}]*)\{\s*position:\s*absolute;\s*width:\s*1px;\s*height:\s*1px;[^}]*clip-path:\s*inset\(50%\)/g)];
+  const selectors = hiding.flatMap((rule) => rule[1].split(",")).map((s) => s.trim()).filter((s) => s.includes(".mobile-nav"));
+  assert(selectors.length > 0, "the mobile nav still visually hides its text labels");
+  for (const selector of selectors) {
+    assert(selector.includes(":not(.notification-badge)"), `the label-hiding selector must spare the badge: ${selector}`);
+  }
+});

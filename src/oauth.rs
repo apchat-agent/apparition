@@ -22127,6 +22127,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_tracked_profile_queues_no_recent_posts_fetch() {
+        let storage = Arc::new(MemoryStorage::default());
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let viewer = "did:plc:recent-posts-tracked-viewer";
+        let subject = "did:plc:recent-posts-tracked";
+        storage.register_user(subject).unwrap();
+        let fetched = vec![test_web_post(
+            subject,
+            "one",
+            1_800_000_000_000_000,
+            "a post the firehose already delivers",
+            None,
+        )];
+        let flow = RecentPostsTestFlow::new([(subject.to_owned(), fetched)]);
+        let token = recent_posts_session(&storage, &public, viewer);
+        let app = public.router_with_flow(flow.clone(), storage.clone());
+        let cookie = format!("{SESSION_COOKIE}={token}");
+        let worker = RecentPostsWorker::new(flow.clone(), storage.clone(), Duration::from_secs(30));
+        let (status, html) =
+            recent_posts_get(&app, format!("/profile?did={subject}"), &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        worker.run_once().await.unwrap();
+        assert_eq!(
+            storage.pending_recent_posts_fetches(20).unwrap(),
+            Vec::<String>::new(),
+            "the firehose already carries a tracked account's posts, so its page queues nothing"
+        );
+        assert_eq!(flow.call_count(), 0, "no PDS fetch for a tracked account");
+        assert!(!html.contains("recent-posts-loading"));
+        assert!(html.contains(&profile_recent_posts_footer("cached")));
+    }
+
+    #[tokio::test]
     async fn the_profile_footer_reports_the_recent_posts_state() {
         let storage = Arc::new(MemoryStorage::default());
         let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
