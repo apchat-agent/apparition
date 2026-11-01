@@ -24882,6 +24882,103 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn the_web_write_line_reports_the_index_write_outcome_and_the_fast_response() {
+        // Live 2026-11-01 06:47Z: total_ms 13699 against an outbound_call_ms of 297 — the
+        // timing line could not tell a PDS wait from an index wait. The line must keep
+        // every field it had, add index_write (queued | done | failed), and total_ms must
+        // be PDS time + a few ms now that the index write runs in the background.
+        let path = held_writer_page_path("timed-write");
+        remove_held_writer_database(&path);
+        let storage = Arc::new(crate::ingest::SqliteStorage::open(&path).unwrap());
+        let post = test_web_post("did:plc:timed-author", "timed", 7, "timed write", None);
+        storage.put_record(&post).unwrap();
+        let flow = AnswerFlow::default();
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        let app = public.router_with_flow(flow, storage.clone());
+        let cookie = answer_session_cookie(&public, storage.as_ref(), ANSWER_VIEWER);
+
+        // The writer of a real SQLite file is held, so "writer behind" is the live shape.
+        let gate = storage.hold_writer(Duration::from_secs(3));
+        gate.recv_timeout(Duration::from_secs(1))
+            .expect("the writer picked up the hold");
+        let logs = FeedTestLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(logs.clone())
+            .finish();
+        let capture = tracing::subscriber::set_default(subscriber);
+        let response = post_like(&app, &cookie, like_form_body(&post.uri), true).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(json_response(response).await);
+        let output = wait_for_log(&logs, "web write", Duration::from_secs(2)).await;
+        let write_line = output
+            .lines()
+            .find(|line| line.contains("web write") && !line.contains("web write failed")
+                && !line.contains("web index write"))
+            .unwrap_or_default()
+            .to_owned();
+        for field in [
+            "route=\"like\"",
+            "total_ms=",
+            "outbound_call_count=",
+            "outbound_call_ms=",
+            "dpop_nonce_retries=",
+            "dpop_nonce_retry=",
+            "outbound_calls=",
+        ] {
+            assert!(
+                write_line.contains(field),
+                "{field} must stay on the web write line: {write_line}"
+            );
+        }
+        assert!(
+            write_line.contains("index_write=queued")
+                || write_line.contains("index_write=done")
+                || write_line.contains("index_write=failed"),
+            "the web write line must say what the index write did: {write_line}"
+        );
+        let total_ms: u64 = write_line
+            .split_whitespace()
+            .find_map(|token| {
+                token
+                    .strip_prefix("total_ms=")
+                    .and_then(|value| value.parse().ok())
+            })
+            .unwrap_or(u64::MAX);
+        assert!(
+            total_ms < 500,
+            "total_ms must be PDS time + a few ms now, got {total_ms}: {write_line}"
+        );
+        let like_uri = format!("at://{ANSWER_VIEWER}/app.bsky.feed.like/answer-like-r1");
+        assert!(
+            wait_until(
+                || storage
+                    .record_by_uri("app.bsky.feed.like", &like_uri)
+                    .unwrap()
+                    .is_some(),
+                Duration::from_secs(10)
+            )
+            .await
+        );
+        let output = wait_for_log(&logs, "web index write", Duration::from_secs(2)).await;
+        drop(capture);
+        let done_line = output
+            .lines()
+            .filter(|line| line.contains("web index write") && !line.contains("failed"))
+            .last()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            done_line.contains("index_write=\"done\""),
+            "the landed index write must be reported: {output}"
+        );
+        drop(storage);
+        remove_held_writer_database(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn a_like_is_indexed_after_the_writer_lock_clears() {
         // A writer that answers "database is locked" twice and then succeeds: the user saw
         // success, the retries are logged, and the index row lands.
