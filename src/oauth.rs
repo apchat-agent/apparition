@@ -6809,19 +6809,27 @@ async fn persist_fetched_parent_posts<S: Storage + 'static>(
             }
         }
     }
+    if public_profiles.is_empty() {
+        return Ok(());
+    }
+    // The page already has the parents; the author profiles only warm the index for later
+    // pages. Writing them goes through the shared SQLite writer, which can be seconds behind,
+    // so the page must not wait for it (live 2026-11-01: 12.2 s of parent hydration).
     let profile_storage = Arc::clone(&storage);
-    tokio::task::spawn_blocking(move || {
-        crate::feeds::persist_public_profiles(profile_storage.as_ref(), public_profiles)
-    })
-    .await
-    .map_err(|error| {
-        tracing::error!(%error, "blocking parent profile persistence task failed");
-        StorageError::BlockingTask(error.to_string())
-    })?
-    .map_err(|error| {
-        tracing::warn!(%error, "public parent profile persistence failed");
-        error
-    })
+    tokio::spawn(async move {
+        match tokio::task::spawn_blocking(move || {
+            crate::feeds::persist_public_profiles(profile_storage.as_ref(), public_profiles)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "public parent profile persistence failed"),
+            Err(error) => {
+                tracing::error!(%error, "blocking parent profile persistence task failed")
+            }
+        }
+    });
+    Ok(())
 }
 
 fn queue_missing_parent_authors<S: Storage>(
