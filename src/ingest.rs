@@ -34,6 +34,12 @@ const MAX_BACKFILL_QUEUE: usize = 1_000;
 const BACKFILL_BATCH_SIZE: usize = 8;
 const MAX_PROFILE_FETCH_QUEUE: usize = 10_000;
 const SQLITE_WRITER_QUEUE: usize = 256;
+/// Coarse bound on post-count fills tracked as waiting for the writer. The
+/// writer's own queue (256 slots, full means dropped) is the tighter bound;
+/// this one keeps the dedup set itself small whatever the queue does. The fill
+/// is a warm-cache optimization, so dropping one only means the next page
+/// recomputes the counts on a read connection.
+const MAX_PENDING_POST_COUNTS_FILLS: usize = 2_048;
 const SQLITE_WRITER_BATCH_SIZE: usize = 64;
 const SQLITE_WRITER_BATCH_DELAY: Duration = Duration::from_millis(5);
 const WAL_JOURNAL_SIZE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
@@ -482,6 +488,21 @@ pub trait Storage: Send + Sync {
         uri: &str,
         viewer_did: Option<&str>,
     ) -> Result<PostInteractionSummary, StorageError>;
+    /// Interaction summaries for a whole page of posts. Counts come from the
+    /// `post_counts` cache where warm and from one batched read pass otherwise
+    /// (never from the writer), and cache fills are queued fire-and-forget, so
+    /// a page never waits on pending writes. Counts may be one render stale.
+    fn page_post_interaction_summaries(
+        &self,
+        uris: &[String],
+        viewer_did: Option<&str>,
+    ) -> Result<HashMap<String, PostInteractionSummary>, StorageError> {
+        let mut summaries = HashMap::new();
+        for uri in uris {
+            summaries.insert(uri.clone(), self.post_interaction_summary(uri, viewer_did)?);
+        }
+        Ok(summaries)
+    }
     fn records(&self) -> Result<Vec<IndexedRecord>, StorageError>;
     fn cursor(&self) -> Result<Option<u64>, StorageError>;
     fn set_cursor(&self, cursor: u64) -> Result<(), StorageError>;
@@ -2189,28 +2210,35 @@ impl SqliteWriter {
         result.recv().map_err(|_| StorageError::WriterStopped)?
     }
 
+    /// Queues a fire-and-forget write. Returns whether it was enqueued; a caller
+    /// that tracks the write (e.g. the post-count fill dedup set) must undo its
+    /// bookkeeping when this returns `false`.
     fn fire(
         &self,
         operation: impl FnOnce(&Connection) -> Result<Option<FireCompletion>, StorageError>
         + Send
         + 'static,
-    ) {
+    ) -> bool {
         let Some(sender) = self.sender.as_ref() else {
             self.metrics.dropped.fetch_add(1, Ordering::Relaxed);
-            return;
+            return false;
         };
         self.metrics.queued();
-        if let Err(error) = sender.try_send(SqliteWriterMessage::Fire(Box::new(operation))) {
-            self.metrics.dequeued();
-            match error {
-                mpsc::TrySendError::Full(_) => {
-                    self.metrics.dropped.fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!("SQLite writer queue full; dropped request-path write");
+        match sender.try_send(SqliteWriterMessage::Fire(Box::new(operation))) {
+            Ok(()) => true,
+            Err(error) => {
+                self.metrics.dequeued();
+                match error {
+                    mpsc::TrySendError::Full(_) => {
+                        self.metrics.dropped.fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!("SQLite writer queue full; dropped request-path write");
+                    }
+                    mpsc::TrySendError::Disconnected(_) => {
+                        self.metrics.dropped.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!("SQLite writer stopped; dropped request-path write");
+                    }
                 }
-                mpsc::TrySendError::Disconnected(_) => {
-                    self.metrics.dropped.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!("SQLite writer stopped; dropped request-path write");
-                }
+                false
             }
         }
     }
@@ -2374,6 +2402,107 @@ fn sqlite_writer_loop(
     }
 }
 
+/// (collection, JSON path, pinned expression index) for each counted relation.
+/// Every pinned index leads with (collection, json_extract(...)), so a batched
+/// count performs one index seek per requested post and never walks the whole
+/// records table: one statement per relation for the WHOLE batch of uncounted
+/// posts, not four queries per post.
+const POST_COUNT_RELATIONS: [(&str, &str, &str); 4] = [
+    (
+        "app.bsky.feed.like",
+        "$.subject.uri",
+        "records_collection_subject_uri",
+    ),
+    (
+        "app.bsky.feed.repost",
+        "$.subject.uri",
+        "records_collection_subject_uri",
+    ),
+    (
+        "app.bsky.feed.post",
+        "$.reply.parent.uri",
+        "records_collection_parent_uri",
+    ),
+    (
+        "app.bsky.feed.post",
+        "$.embed.record.uri",
+        "records_collection_embed_record_uri",
+    ),
+];
+
+/// Counts the four interactions of every listed post in one pass per relation
+/// (four statements for the whole batch), on whatever connection is given — a
+/// read-pool connection for page rendering, the writer connection for the fill
+/// that re-checks inside its own transaction.
+fn compute_post_counts(
+    connection: &Connection,
+    uris: &[String],
+) -> Result<(HashMap<String, [usize; 4]>, StatementWork), StorageError> {
+    let mut counts = uris
+        .iter()
+        .map(|uri| (uri.clone(), [0_usize; 4]))
+        .collect::<HashMap<_, _>>();
+    if uris.is_empty() {
+        return Ok((counts, StatementWork::default()));
+    }
+    let batch = serde_json::to_string(uris)?;
+    let mut work = StatementWork::default();
+    for (index, (collection, path, index_name)) in POST_COUNT_RELATIONS.into_iter().enumerate() {
+        let mut statement = connection.prepare(&format!(
+            "SELECT json_extract(record_json, '{path}'), COUNT(*) FROM records
+             INDEXED BY {index_name}
+             WHERE collection=?1
+               AND json_extract(record_json, '{path}') IN (SELECT value FROM json_each(?2))
+             GROUP BY 1"
+        ))?;
+        let rows = statement
+            .query_map(params![collection, batch], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        work.observe(&statement);
+        for (subject_uri, count) in rows {
+            if let Some(entry) = counts.get_mut(&subject_uri) {
+                entry[index] = usize::try_from(count).unwrap_or(0);
+            }
+        }
+    }
+    Ok((counts, work))
+}
+
+/// The newest like (or repost, per `collection`) the viewer made against each
+/// listed post, in one statement for the whole batch. Same per-activity
+/// semantics as the per-post lookup: the newest row wins.
+fn viewer_interaction_uris(
+    connection: &Connection,
+    uris: &[String],
+    viewer_did: &str,
+    collection: &str,
+) -> Result<HashMap<String, String>, StorageError> {
+    if uris.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let batch = serde_json::to_string(uris)?;
+    let mut statement = connection.prepare(
+        "SELECT subject_uri, uri FROM (
+             SELECT json_extract(record_json, '$.subject.uri') AS subject_uri, uri,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY json_extract(record_json, '$.subject.uri')
+                        ORDER BY time_us DESC, uri DESC
+                    ) AS newest
+             FROM records INDEXED BY records_author_subject_uri
+             WHERE collection=?1 AND did=?2
+               AND json_extract(record_json, '$.subject.uri') IN (SELECT value FROM json_each(?3))
+         ) WHERE newest=1",
+    )?;
+    statement
+        .query_map(params![collection, viewer_did, batch], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<HashMap<_, _>, _>>()
+        .map_err(Into::into)
+}
+
 pub struct SqliteStorage {
     writer: SqliteWriter,
     read_connections: Vec<Mutex<Connection>>,
@@ -2388,6 +2517,7 @@ pub struct SqliteStorage {
     tracked: Arc<RwLock<TrackedSet>>,
     profile_index: Arc<RwLock<HashMap<String, ProfileIndexEntry>>>,
     notification_hub: NotificationHub,
+    pending_counts_fills: Arc<RwLock<HashSet<String>>>,
     _ephemeral_database: Option<EphemeralDatabase>,
 }
 
@@ -3021,6 +3151,7 @@ impl SqliteStorage {
             tracked: Arc::new(RwLock::new(tracked_set)),
             profile_index: Arc::new(RwLock::new(profile_index)),
             notification_hub: NotificationHub::default(),
+            pending_counts_fills: Arc::new(RwLock::new(HashSet::new())),
             _ephemeral_database: ephemeral_database,
         })
     }
@@ -3204,63 +3335,30 @@ impl SqliteStorage {
         let counts = if let Some(counts) = cached_counts {
             counts
         } else {
-            // The writer serializes this first-time scan with every record
-            // mutation, so an interaction cannot land between the COUNTs and
-            // the cache insert and be lost from the projection.
-            let writer_uri = uri.to_owned();
-            let (counts, writer_work) = self.writer.call(move |connection| {
-                let transaction = connection.transaction()?;
-                let mut writer_work = StatementWork::default();
-                let cached = {
-                    let mut statement = transaction.prepare(
-                        "SELECT like_count,repost_count,reply_count,quote_count
-                         FROM post_counts WHERE uri=?1",
-                    )?;
-                    let cached = statement
-                        .query_row([writer_uri.as_str()], |row| {
-                            Ok([row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?])
-                        })
-                        .optional()?;
-                    writer_work.observe(&statement);
-                    cached
-                };
-                let counts = if let Some(counts) = cached {
-                    counts
-                } else {
-                    let mut counts = [0_usize; 4];
-                    for (index, (collection, path)) in [
-                        ("app.bsky.feed.like", "$.subject.uri"),
-                        ("app.bsky.feed.repost", "$.subject.uri"),
-                        ("app.bsky.feed.post", "$.reply.parent.uri"),
-                        ("app.bsky.feed.post", "$.embed.record.uri"),
-                    ]
-                    .into_iter()
-                    .enumerate()
-                    {
-                        let mut statement = transaction.prepare(&format!(
-                            "SELECT COUNT(*) FROM records WHERE collection=?1
-                             AND json_extract(record_json, '{path}')=?2"
-                        ))?;
-                        counts[index] = statement
-                            .query_row(params![collection, writer_uri], |row| row.get(0))?;
-                        writer_work.observe(&statement);
-                    }
-                    transaction.execute(
-                        "INSERT INTO post_counts
-                         (uri,like_count,repost_count,reply_count,quote_count)
-                         VALUES(?1,?2,?3,?4,?5)",
-                        params![writer_uri, counts[0], counts[1], counts[2], counts[3]],
-                    )?;
-                    counts
-                };
-                transaction.commit()?;
-                Ok((counts, writer_work))
-            })?;
+            // A post_counts miss must not queue behind pending writes: the same
+            // first-time scan used to run inside `writer.call` so an interaction
+            // could not land between the COUNTs and the cache insert, but one
+            // writer round trip per uncounted post made whole pages wait
+            // (live 2026-11-01: render_ms 26510 for ~50 posts). Compute the
+            // counts on a read connection instead and hand the cache fill to
+            // the writer without waiting. The fill re-checks the row and
+            // recomputes inside the writer's own transaction, so an interaction
+            // that lands between this read and the fill is counted there (and
+            // once the row exists, the post_counts triggers keep it exact).
+            // Consequence: the counts shown for one render can be slightly
+            // stale — an interaction that lands after this read first appears
+            // on the next render.
+            let read_uri = uri.to_owned();
+            let (computed, read_work) = {
+                let conn = self.read_conn()?;
+                compute_post_counts(&conn, std::slice::from_ref(&read_uri))?
+            };
             if let Some(work) = work.as_deref_mut() {
-                work.fullscan_steps += writer_work.fullscan_steps;
-                work.vm_steps += writer_work.vm_steps;
+                work.fullscan_steps += read_work.fullscan_steps;
+                work.vm_steps += read_work.vm_steps;
             }
-            counts
+            self.queue_post_counts_fill(&read_uri);
+            computed.get(&read_uri).copied().unwrap_or([0_usize; 4])
         };
         let mut summary = PostInteractionSummary {
             like_count: counts[0],
@@ -3297,6 +3395,83 @@ impl SqliteStorage {
             }
         }
         Ok(summary)
+    }
+
+    /// Queues a `post_counts` fill for one post without waiting for the writer.
+    /// A fill already pending for the same uri is not queued twice, and at most
+    /// [`MAX_PENDING_POST_COUNTS_FILLS`] are outstanding at once: a dropped fill
+    /// only means the next page recomputes the counts on a read connection. The
+    /// fill re-checks the row and recomputes inside the writer's own
+    /// transaction, so an interaction that landed between the page read and the
+    /// fill is counted there and never lost.
+    fn queue_post_counts_fill(&self, uri: &str) {
+        {
+            let Ok(mut pending) = self.pending_counts_fills.write() else {
+                tracing::warn!("post counts fill tracker is poisoned; skipping the fill");
+                return;
+            };
+            if pending.contains(uri) {
+                return;
+            }
+            if pending.len() >= MAX_PENDING_POST_COUNTS_FILLS {
+                drop(pending);
+                tracing::debug!(
+                    post_uri = %uri,
+                    "post counts fill queue is full; the next page will recompute these counts"
+                );
+                return;
+            }
+            pending.insert(uri.to_owned());
+        }
+        let writer_uri = uri.to_owned();
+        let tracked_uri = uri.to_owned();
+        let pending = Arc::clone(&self.pending_counts_fills);
+        let requeue_reason = Arc::clone(&self.pending_counts_fills);
+        let requeue_uri = uri.to_owned();
+        let enqueued = self.writer.fire(move |connection| {
+            // Un-mark before working: if this write later fails the savepoint
+            // rolls back and a later page may queue a fresh fill.
+            if let Ok(mut pending) = pending.write() {
+                pending.remove(&tracked_uri);
+            }
+            let exists: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM post_counts WHERE uri=?1)",
+                [&writer_uri],
+                |row| row.get(0),
+            )?;
+            if exists {
+                return Ok(None);
+            }
+            let (computed, _work) =
+                compute_post_counts(connection, std::slice::from_ref(&writer_uri))?;
+            let counts = computed.get(&writer_uri).copied().unwrap_or([0_usize; 4]);
+            connection.execute(
+                "INSERT INTO post_counts
+                 (uri,like_count,repost_count,reply_count,quote_count)
+                 VALUES(?1,?2,?3,?4,?5)
+                 ON CONFLICT(uri) DO NOTHING",
+                params![
+                    writer_uri,
+                    counts[0] as i64,
+                    counts[1] as i64,
+                    counts[2] as i64,
+                    counts[3] as i64
+                ],
+            )?;
+            Ok(None)
+        });
+        if !enqueued && let Ok(mut pending) = requeue_reason.write() {
+            pending.remove(&requeue_uri);
+        }
+    }
+
+    /// Fills waiting for the writer right now; kept for tests and the timing
+    /// console to observe the fire-and-forget path.
+    pub fn pending_post_counts_fills(&self) -> usize {
+        self.pending_counts_fills
+            .read()
+            .map(|pending| pending.len())
+            .unwrap_or_default()
     }
 
     /// Head-of-line pressure on the read pool; the running service logs these
@@ -4510,6 +4685,73 @@ impl Storage for SqliteStorage {
         viewer_did: Option<&str>,
     ) -> Result<PostInteractionSummary, StorageError> {
         self.post_interaction_summary_with_work(uri, viewer_did, None)
+    }
+
+    fn page_post_interaction_summaries(
+        &self,
+        uris: &[String],
+        viewer_did: Option<&str>,
+    ) -> Result<HashMap<String, PostInteractionSummary>, StorageError> {
+        let mut summaries = uris
+            .iter()
+            .map(|uri| (uri.clone(), PostInteractionSummary::default()))
+            .collect::<HashMap<_, _>>();
+        let mut missing = Vec::new();
+        {
+            let conn = self.read_conn()?;
+            {
+                let mut statement = conn.prepare(
+                    "SELECT like_count,repost_count,reply_count,quote_count
+                     FROM post_counts WHERE uri=?1",
+                )?;
+                for uri in uris {
+                    let cached = statement
+                        .query_row([uri], |row| {
+                            Ok([row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?])
+                        })
+                        .optional()?;
+                    match cached {
+                        Some(counts) => {
+                            if let Some(summary) = summaries.get_mut(uri) {
+                                summary.like_count = counts[0];
+                                summary.repost_count = counts[1];
+                                summary.reply_count = counts[2];
+                                summary.quote_count = counts[3];
+                            }
+                        }
+                        None => missing.push(uri.clone()),
+                    }
+                }
+            }
+            if !missing.is_empty() {
+                let (computed, _work) = compute_post_counts(&conn, &missing)?;
+                for uri in &missing {
+                    if let Some(counts) = computed.get(uri)
+                        && let Some(summary) = summaries.get_mut(uri)
+                    {
+                        summary.like_count = counts[0];
+                        summary.repost_count = counts[1];
+                        summary.reply_count = counts[2];
+                        summary.quote_count = counts[3];
+                    }
+                }
+            }
+            if let Some(viewer_did) = viewer_did {
+                let likes = viewer_interaction_uris(&conn, uris, viewer_did, "app.bsky.feed.like")?;
+                let reposts =
+                    viewer_interaction_uris(&conn, uris, viewer_did, "app.bsky.feed.repost")?;
+                for uri in uris {
+                    if let Some(summary) = summaries.get_mut(uri) {
+                        summary.viewer_like = likes.get(uri).cloned();
+                        summary.viewer_repost = reposts.get(uri).cloned();
+                    }
+                }
+            }
+        }
+        for uri in &missing {
+            self.queue_post_counts_fill(uri);
+        }
+        Ok(summaries)
     }
 
     fn records(&self) -> Result<Vec<IndexedRecord>, StorageError> {

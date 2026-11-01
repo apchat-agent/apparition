@@ -5674,6 +5674,48 @@ impl std::ops::Deref for QuoteRenderIndex {
     }
 }
 
+/// Interaction summaries for one page of posts, keyed by post uri.
+type PageInteractionIndex = HashMap<String, crate::ingest::PostInteractionSummary>;
+
+/// Loads interaction summaries for a whole page in one batched pass on the
+/// read pool and queues any cache fills without waiting. A page of uncounted
+/// posts used to pay one writer round trip per post here (live 2026-11-01:
+/// render_ms 26510); it must never wait for the SQLite writer. A failed load
+/// renders as an empty index — posts fall back to their own read-connection
+/// lookups — so it cannot fail the page.
+async fn load_page_interactions<S: Storage + 'static>(
+    storage: &Arc<S>,
+    uris: &[String],
+    viewer_did: Option<&str>,
+) -> PageInteractionIndex {
+    if uris.is_empty() {
+        return PageInteractionIndex::new();
+    }
+    let storage = Arc::clone(storage);
+    let uris = uris.to_owned();
+    let viewer_did = viewer_did.map(str::to_owned);
+    let batch_len = uris.len();
+    match tokio::task::spawn_blocking(move || {
+        storage.page_post_interaction_summaries(&uris, viewer_did.as_deref())
+    })
+    .await
+    {
+        Ok(Ok(index)) => index,
+        Ok(Err(error)) => {
+            tracing::warn!(
+                %error,
+                batch_len,
+                "page interaction batch failed; posts fall back to per-post lookups"
+            );
+            PageInteractionIndex::new()
+        }
+        Err(error) => {
+            tracing::error!(%error, "blocking page interaction batch task failed");
+            PageInteractionIndex::new()
+        }
+    }
+}
+
 impl std::ops::DerefMut for QuoteRenderIndex {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.quotes
@@ -7992,6 +8034,12 @@ where
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
     let rights = verified_cookie_form_rights(&state.public, &headers, state.storage.as_ref());
+    let interaction_uris = quote_records
+        .iter()
+        .map(|record| record.uri.clone())
+        .collect::<Vec<_>>();
+    let page_interactions =
+        load_page_interactions(&state.storage, &interaction_uris, Some(&did)).await;
     let render_started = std::time::Instant::now();
     let posts = render_timeline_post_items(
         state.storage.as_ref(),
@@ -8002,6 +8050,7 @@ where
             viewer_did: &did,
             rights,
             quote_index: &quote_index,
+            page_interactions: &page_interactions,
             list_blocks: &list_blocks,
         },
     );
@@ -8343,6 +8392,12 @@ where
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
     let rights = verified_cookie_form_rights(&state.public, &headers, state.storage.as_ref());
+    let interaction_uris = quote_records
+        .iter()
+        .map(|record| record.uri.clone())
+        .collect::<Vec<_>>();
+    let page_interactions =
+        load_page_interactions(&state.storage, &interaction_uris, Some(&did)).await;
     let posts = render_timeline_post_items(
         state.storage.as_ref(),
         &visible,
@@ -8352,6 +8407,7 @@ where
             viewer_did: &did,
             rights,
             quote_index: &hydration.quote_index,
+            page_interactions: &page_interactions,
             list_blocks: &HashMap::new(),
         },
     );
@@ -8833,6 +8889,12 @@ where
                 .unwrap_or_default()
         })
         .collect::<Vec<_>>();
+    let interaction_uris = quote_records
+        .iter()
+        .map(|record| record.uri.clone())
+        .collect::<Vec<_>>();
+    let page_interactions =
+        load_page_interactions(&state.storage, &interaction_uris, Some(&did)).await;
     let posts = render_timeline_post_items(
         state.storage.as_ref(),
         &feed_records,
@@ -8842,6 +8904,7 @@ where
             viewer_did: &did,
             rights,
             quote_index: &quote_index,
+            page_interactions: &page_interactions,
             list_blocks: &list_blocks,
         },
     );
@@ -10208,6 +10271,12 @@ where
     let rights = verified_cookie_form_rights(&state.public, &headers, state.storage.as_ref());
     let render_started = std::time::Instant::now();
     let no_list_blocks = HashMap::new();
+    let interaction_uris = quote_records
+        .iter()
+        .map(|record| record.uri.clone())
+        .collect::<Vec<_>>();
+    let page_interactions =
+        load_page_interactions(&state.storage, &interaction_uris, Some(&did)).await;
     let posts = render_timeline_post_items(
         state.storage.as_ref(),
         &records,
@@ -10217,6 +10286,7 @@ where
             viewer_did: &did,
             rights,
             quote_index: &quote_index,
+            page_interactions: &page_interactions,
             list_blocks: &no_list_blocks,
         },
     );
@@ -11006,6 +11076,12 @@ where
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
     let render_started = std::time::Instant::now();
+    let interaction_uris = page_records
+        .iter()
+        .map(|record| record.uri.clone())
+        .collect::<Vec<_>>();
+    let page_interactions =
+        load_page_interactions(&state.storage, &interaction_uris, Some(&viewer_did)).await;
     let ancestors_html = ancestors
         .iter()
         .enumerate()
@@ -11015,11 +11091,14 @@ where
                 render_web_post(
                     state.storage.as_ref(),
                     ancestor,
-                    &viewer_did,
-                    rights,
-                    false,
-                    index < 6,
-                    &quote_index,
+                    WebPostRenderOptions {
+                        viewer_did: &viewer_did,
+                        rights,
+                        link_text_to_thread: false,
+                        eager_avatar: index < 6,
+                        quote_index: &quote_index,
+                        page_interactions: &page_interactions,
+                    },
                 )
             )
         })
@@ -11035,6 +11114,7 @@ where
         rights,
         thread_continuations: &thread_continuations,
         quote_index: &quote_index,
+        page_interactions: &page_interactions,
     };
     let replies_html = match render_thread_replies(
         state.storage.as_ref(),
@@ -11844,6 +11924,7 @@ struct ThreadReplyRenderOptions<'a> {
     rights: FormRights,
     thread_continuations: &'a HashSet<String>,
     quote_index: &'a QuoteRenderIndex,
+    page_interactions: &'a PageInteractionIndex,
 }
 
 fn render_thread_replies<S: Storage>(
@@ -11874,11 +11955,14 @@ fn render_thread_replies<S: Storage>(
             render_web_post(
                 storage,
                 reply,
-                options.viewer_did,
-                options.rights,
-                false,
-                false,
-                options.quote_index
+                WebPostRenderOptions {
+                    viewer_did: options.viewer_did,
+                    rights: options.rights,
+                    link_text_to_thread: false,
+                    eager_avatar: false,
+                    quote_index: options.quote_index,
+                    page_interactions: options.page_interactions,
+                },
             )
         ));
     }
@@ -14247,15 +14331,28 @@ fn action_count_markup(count: usize) -> String {
     }
 }
 
-fn render_web_post<S: Storage>(
-    storage: &S,
-    record: &IndexedRecord,
-    viewer_did: &str,
+struct WebPostRenderOptions<'a> {
+    viewer_did: &'a str,
     rights: FormRights,
     link_text_to_thread: bool,
     eager_avatar: bool,
-    quote_index: &QuoteRenderIndex,
+    quote_index: &'a QuoteRenderIndex,
+    page_interactions: &'a PageInteractionIndex,
+}
+
+fn render_web_post<S: Storage>(
+    storage: &S,
+    record: &IndexedRecord,
+    options: WebPostRenderOptions<'_>,
 ) -> String {
+    let WebPostRenderOptions {
+        viewer_did,
+        rights,
+        link_text_to_thread,
+        eager_avatar,
+        quote_index,
+        page_interactions,
+    } = options;
     let profile = profile_view_from_storage(storage, &record.did)
         .unwrap_or_else(|_| json!({"did":record.did,"handle":record.did}));
     let handle = profile_handle(&profile, &record.did);
@@ -14313,9 +14410,12 @@ fn render_web_post<S: Storage>(
     } else {
         text
     };
-    let interactions = storage
-        .post_interaction_summary(&record.uri, Some(viewer_did))
-        .unwrap_or_default();
+    let interactions = match page_interactions.get(&record.uri) {
+        Some(interactions) => interactions.clone(),
+        None => storage
+            .post_interaction_summary(&record.uri, Some(viewer_did))
+            .unwrap_or_default(),
+    };
     let thread_uri = format!(
         "/app/thread?uri={}",
         url::form_urlencoded::byte_serialize(record.uri.as_bytes()).collect::<String>()
@@ -14485,6 +14585,7 @@ struct TimelinePostItemOptions<'a> {
     rights: FormRights,
     eager_avatar: bool,
     quote_index: &'a QuoteRenderIndex,
+    page_interactions: &'a PageInteractionIndex,
     list_block_attrs: String,
 }
 
@@ -14613,6 +14714,7 @@ struct TimelineRenderContext<'a> {
     viewer_did: &'a str,
     rights: FormRights,
     quote_index: &'a QuoteRenderIndex,
+    page_interactions: &'a PageInteractionIndex,
     list_blocks: &'a HashMap<String, ListBlockMark>,
 }
 
@@ -14674,11 +14776,14 @@ fn render_timeline_post_items<S: Storage>(
                 html.push_str(&render_web_post(
                     storage,
                     member,
-                    context.viewer_did,
-                    context.rights,
-                    true,
-                    page_index.is_none_or(|page_index| page_index < 6),
-                    context.quote_index,
+                    WebPostRenderOptions {
+                        viewer_did: context.viewer_did,
+                        rights: context.rights,
+                        link_text_to_thread: true,
+                        eager_avatar: page_index.is_none_or(|page_index| page_index < 6),
+                        quote_index: context.quote_index,
+                        page_interactions: context.page_interactions,
+                    },
                 ));
             }
             let skipped = members.len().saturating_sub(visible.len());
@@ -14712,6 +14817,7 @@ fn render_timeline_post_items<S: Storage>(
                     rights: context.rights,
                     eager_avatar: index < 6,
                     quote_index: context.quote_index,
+                    page_interactions: context.page_interactions,
                     list_block_attrs: timeline_list_block_attrs(
                         context.list_blocks,
                         [record.did.as_str()],
@@ -14731,11 +14837,14 @@ fn render_timeline_post_item<S: Storage>(
     let article = render_web_post(
         storage,
         record,
-        options.viewer_did,
-        options.rights,
-        true,
-        options.eager_avatar,
-        options.quote_index,
+        WebPostRenderOptions {
+            viewer_did: options.viewer_did,
+            rights: options.rights,
+            link_text_to_thread: true,
+            eager_avatar: options.eager_avatar,
+            quote_index: options.quote_index,
+            page_interactions: options.page_interactions,
+        },
     );
     let Some(parent_uri) = record
         .record
@@ -18373,6 +18482,7 @@ mod tests {
                     viewer_did,
                     rights: FormRights::default(),
                     quote_index: &quote_index,
+                    page_interactions: &HashMap::new(),
                     list_blocks: &list_blocks,
                 },
             )
@@ -19913,7 +20023,13 @@ mod tests {
             .into_iter()
             .enumerate()
         {
-            let post = test_web_post(author, &format!("p{index}"), 10 + index as u64, "held page post", None);
+            let post = test_web_post(
+                author,
+                &format!("p{index}"),
+                10 + index as u64,
+                "held page post",
+                None,
+            );
             storage.put_record(&post).unwrap();
             posts.push(post);
         }
@@ -19928,7 +20044,11 @@ mod tests {
         }
         for (repost_index, reposter) in ["did:plc:r1", "did:plc:r2"].into_iter().enumerate() {
             storage
-                .put_record(&web_notice_repost(reposter, &posts[0].uri, repost_index as u64))
+                .put_record(&web_notice_repost(
+                    reposter,
+                    &posts[0].uri,
+                    repost_index as u64,
+                ))
                 .unwrap();
         }
         storage
@@ -19978,6 +20098,7 @@ mod tests {
                 viewer_did: viewer,
                 rights: FormRights::default(),
                 quote_index: &hydration.quote_index,
+                page_interactions: &HashMap::new(),
                 list_blocks: &HashMap::new(),
             },
         );
@@ -20017,7 +20138,11 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!(counts, (3, 2, 1), "the cache fill must land after the writer drains");
+        assert_eq!(
+            counts,
+            (3, 2, 1),
+            "the cache fill must land after the writer drains"
+        );
         drop(storage);
         remove_held_writer_database(&path);
     }
@@ -20445,11 +20570,14 @@ mod tests {
         let rendered = render_web_post(
             &storage,
             &post,
-            "did:plc:viewer",
-            FormRights::default(),
-            false,
-            false,
-            &index,
+            WebPostRenderOptions {
+                viewer_did: "did:plc:viewer",
+                rights: FormRights::default(),
+                link_text_to_thread: false,
+                eager_avatar: false,
+                quote_index: &index,
+                page_interactions: &HashMap::new(),
+            },
         );
 
         assert!(
@@ -20994,11 +21122,14 @@ mod tests {
         let rendered = render_web_post(
             &storage,
             &record,
-            "did:plc:viewer",
-            FormRights::default(),
-            true,
-            false,
-            &index,
+            WebPostRenderOptions {
+                viewer_did: "did:plc:viewer",
+                rights: FormRights::default(),
+                link_text_to_thread: true,
+                eager_avatar: false,
+                quote_index: &index,
+                page_interactions: &HashMap::new(),
+            },
         );
 
         assert!(

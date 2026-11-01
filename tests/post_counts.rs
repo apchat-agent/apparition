@@ -190,6 +190,11 @@ fn a_page_of_post_summaries_has_bounded_work_after_the_counts_are_warm() {
         assert_eq!(summary.reply_count, 100);
         assert_eq!(summary.quote_count, 100);
     }
+    // The lazy fills are fire-and-forget; drain the writer before measuring
+    // the page that should read only cached rows.
+    storage
+        .writer_barrier()
+        .expect("writer barrier must reach the SQLite writer");
     let mut page_work = StatementWork::default();
     for post in 0..PAGE_SIZE {
         let (_, work) = storage
@@ -233,6 +238,9 @@ fn cached_counts_track_record_writes_and_lazy_reads_match_the_count_queries() {
     // A's count row exists before the following writes. B and C are first read
     // after all changes, exercising the lazy existing-database path.
     storage.post_interaction_summary(&a, None).unwrap();
+    storage
+        .writer_barrier()
+        .expect("writer barrier must reach the SQLite writer");
     assert_eq!(
         cached_counts(&Connection::open(&path).unwrap(), &a),
         (0, 0, 0, 0)
@@ -292,6 +300,14 @@ fn cached_counts_track_record_writes_and_lazy_reads_match_the_count_queries() {
         .replace_repo_snapshot("did:plc:snapshot", &replacement, &[])
         .unwrap();
 
+    // The lazy fills are fire-and-forget: queue them all, drain the writer,
+    // then compare the cached rows with the SQL ground truth.
+    for uri in [&a, &b, &c] {
+        storage.post_interaction_summary(uri, None).unwrap();
+    }
+    storage
+        .writer_barrier()
+        .expect("writer barrier must reach the SQLite writer");
     let connection = Connection::open(&path).unwrap();
     for uri in [&a, &b, &c] {
         let summary = storage.post_interaction_summary(uri, None).unwrap();
@@ -336,6 +352,11 @@ fn moving_an_interaction_into_a_warm_post_updates_both_cached_rows() {
         // Both rows exist before the moves, so only the UPDATE trigger can keep them right.
         storage.post_interaction_summary(uri, None).unwrap();
     }
+    // The fills are fire-and-forget; they must land before the moves only
+    // update existing rows via the triggers.
+    storage
+        .writer_barrier()
+        .expect("writer barrier must reach the SQLite writer");
     let mut like = record("did:plc:mover", "app.bsky.feed.like", "like", &from);
     let mut repost = record("did:plc:mover", "app.bsky.feed.repost", "repost", &from);
     let mut reply = record("did:plc:mover", "app.bsky.feed.post", "reply", &from);
@@ -393,6 +414,9 @@ fn a_viewer_lookup_on_a_popular_post_walks_only_the_viewers_own_rows() {
         ))
         .unwrap();
     storage.post_interaction_summary(&popular, None).unwrap(); // warm the count row
+    storage
+        .writer_barrier()
+        .expect("writer barrier must reach the SQLite writer");
 
     let (summary, work) = storage
         .post_interaction_summary_counted(&popular, Some("did:plc:viewer"))
@@ -407,6 +431,126 @@ fn a_viewer_lookup_on_a_popular_post_walks_only_the_viewers_own_rows() {
         "viewer lookup did {} VM steps on a post with 2,001 likes",
         work.vm_steps
     );
+    drop(storage);
+    remove_database(&path);
+}
+
+#[test]
+fn an_interaction_committed_between_the_page_read_and_the_fill_is_not_lost() {
+    let path = database_path("fill-race");
+    remove_database(&path);
+    let storage = SqliteStorage::open(&path).unwrap();
+    let post = post_uri(900);
+    storage
+        .put_record(&record(
+            "did:plc:post-90",
+            "app.bsky.feed.post",
+            "post",
+            &post,
+        ))
+        .unwrap();
+
+    let hold = storage.hold_writer(std::time::Duration::from_millis(300));
+    hold.recv().expect("the writer hold should have started");
+    let like = record("did:plc:racer", "app.bsky.feed.like", "race", &post);
+    std::thread::scope(|scope| {
+        // The like queues behind the hold, so it commits after the page read
+        // below has already computed its counts on a read connection.
+        scope.spawn(|| storage.put_record(&like).unwrap());
+        let summary = storage.post_interaction_summary(&post, None).unwrap();
+        assert_eq!(
+            summary.like_count, 0,
+            "the page read must see the state before the queued like"
+        );
+    });
+
+    storage
+        .writer_barrier()
+        .expect("writer barrier must reach the SQLite writer");
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(
+        cached_counts(&connection, &post),
+        sql_counts(&connection, &post),
+        "a like landing between the page read and the fill must end up in the cache"
+    );
+    assert_eq!(cached_counts(&connection, &post), (1, 0, 0, 0));
+    drop(connection);
+
+    let summary = storage.post_interaction_summary(&post, None).unwrap();
+    assert_eq!(summary.like_count, 1, "the next render sees the like");
+
+    drop(storage);
+    remove_database(&path);
+}
+
+#[test]
+fn fill_queue_dedups_per_post_and_stays_bounded() {
+    let path = database_path("fill-queue");
+    remove_database(&path);
+    let storage = SqliteStorage::open(&path).unwrap();
+    let uris = (0..2_548).map(post_uri).collect::<Vec<_>>();
+    let mut updates = uris
+        .iter()
+        .enumerate()
+        .map(|(index, uri)| JetstreamStorageUpdate {
+            upsert: Some(record(
+                &format!("did:plc:post-{index:02}"),
+                "app.bsky.feed.post",
+                "post",
+                uri,
+            )),
+            ..JetstreamStorageUpdate::default()
+        })
+        .collect::<Vec<_>>();
+    updates.push(JetstreamStorageUpdate {
+        upsert: Some(record(
+            "did:plc:early",
+            "app.bsky.feed.like",
+            "early",
+            &uris[0],
+        )),
+        ..JetstreamStorageUpdate::default()
+    });
+    storage.apply_jetstream_batch(&updates).unwrap();
+
+    let hold = storage.hold_writer(std::time::Duration::from_millis(300));
+    hold.recv().expect("the writer hold should have started");
+    let repeated = vec![uris[0].clone(); 5];
+    let summaries = storage
+        .page_post_interaction_summaries(&repeated, None)
+        .unwrap();
+    assert_eq!(summaries[&uris[0]].like_count, 1);
+    assert_eq!(
+        storage.pending_post_counts_fills(),
+        1,
+        "one post must not queue the same fill twice"
+    );
+
+    let summaries = storage
+        .page_post_interaction_summaries(&uris, None)
+        .unwrap();
+    assert_eq!(summaries[&uris[0]].like_count, 1);
+    assert_eq!(summaries[&uris[1]].like_count, 0);
+    storage
+        .page_post_interaction_summaries(&uris, None)
+        .unwrap();
+    assert_eq!(
+        storage.pending_post_counts_fills(),
+        256,
+        "fills stop at the SQLite writer queue capacity and a second page adds none"
+    );
+
+    storage
+        .writer_barrier()
+        .expect("writer barrier must reach the SQLite writer");
+    assert_eq!(storage.pending_post_counts_fills(), 0);
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(
+        cached_counts(&connection, &uris[0]),
+        sql_counts(&connection, &uris[0])
+    );
+    drop(connection);
+
     drop(storage);
     remove_database(&path);
 }
