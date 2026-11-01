@@ -353,7 +353,11 @@ pub(crate) fn persist_public_profiles(
         if !seen.insert(profile.did.clone()) {
             continue;
         }
-        storage.put_record(&merged_public_profile(storage, &profile)?)?;
+        let existing = storage.get_record(&profile.did, "app.bsky.actor.profile", "self")?;
+        let merged = merge_public_profile(existing.clone(), &profile);
+        if !public_profile_write_is_redundant(existing.as_ref(), &merged) {
+            storage.put_record(&merged)?;
+        }
         if profile.handle.is_some()
             && storage.verified_handle(&profile.did)?.is_none()
             && !storage.handle_is_invalid(&profile.did)?
@@ -371,8 +375,29 @@ pub(crate) fn merged_public_profile(
     storage: &dyn Storage,
     profile: &PublicProfileView,
 ) -> Result<IndexedRecord, crate::ingest::StorageError> {
-    let uri = format!("at://{}/app.bsky.actor.profile/self", profile.did);
     let existing = storage.get_record(&profile.did, "app.bsky.actor.profile", "self")?;
+    Ok(merge_public_profile(existing, profile))
+}
+
+/// The same content seen again within PUBLIC_PROFILE_REWRITE_AFTER needs no write: each one is
+/// a records row update on the shared writer, and page hydration persists every author it sees.
+fn public_profile_write_is_redundant(
+    existing: Option<&IndexedRecord>,
+    merged: &IndexedRecord,
+) -> bool {
+    existing.is_some_and(|existing| {
+        existing.record == merged.record
+            && existing.cid == merged.cid
+            && merged.time_us.saturating_sub(existing.time_us)
+                < PUBLIC_PROFILE_REWRITE_AFTER.as_micros() as u64
+    })
+}
+
+fn merge_public_profile(
+    existing: Option<IndexedRecord>,
+    profile: &PublicProfileView,
+) -> IndexedRecord {
+    let uri = format!("at://{}/app.bsky.actor.profile/self", profile.did);
     let mut indexed = existing.unwrap_or_else(|| profile.indexed_record());
     indexed.did = profile.did.clone();
     indexed.collection = "app.bsky.actor.profile".to_owned();
@@ -392,7 +417,7 @@ pub(crate) fn merged_public_profile(
     }
     indexed.record["labels"] = Value::Array(profile.labels.clone());
     indexed.time_us = unix_time_us();
-    Ok(indexed)
+    indexed
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2163,7 +2188,11 @@ mod tests {
         let first = stored_time(&storage);
         std::thread::sleep(Duration::from_millis(5));
         super::persist_public_profiles(&storage, [profile.clone()]).unwrap();
-        assert_eq!(stored_time(&storage), first, "same content seen again soon: no write");
+        assert_eq!(
+            stored_time(&storage),
+            first,
+            "same content seen again soon: no write"
+        );
 
         let mut renamed = profile.clone();
         renamed.display_name = Some("Renamed".to_owned());
@@ -2177,6 +2206,9 @@ mod tests {
         old.time_us -= super::PUBLIC_PROFILE_REWRITE_AFTER.as_micros() as u64 + 1;
         storage.put_record(&old).unwrap();
         super::persist_public_profiles(&storage, [renamed]).unwrap();
-        assert!(stored_time(&storage) > old.time_us, "an old copy is refreshed so it stays fresh");
+        assert!(
+            stored_time(&storage) > old.time_us,
+            "an old copy is refreshed so it stays fresh"
+        );
     }
 }
