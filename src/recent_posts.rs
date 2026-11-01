@@ -28,23 +28,121 @@ pub const RECENT_POSTS_TTL: Duration = Duration::from_secs(15 * 60);
 /// A failed fetch is recorded and retried only after this shorter backoff,
 /// not on every visit and not waiting out the whole TTL.
 pub const RECENT_POSTS_RETRY_BACKOFF: Duration = Duration::from_secs(60);
-/// How many newest posts one fetch asks for — the owner's "newest ~50-100
-/// posts" as one page: a single `com.atproto.repo.listRecords` request with
-/// `limit=100` and NO `reverse` (see [`list_records_url`]).
+/// How many posts one `listRecords` page asks for — the recent-posts fetch
+/// and the older-on-scroll walk share it: one `com.atproto.repo.listRecords`
+/// request with this `limit` and NO `reverse` (see [`list_records_url`]).
+/// Lane av75q step 4 sets it to the owner's page of 25; the local profile
+/// page size (50) is unchanged.
 pub const RECENT_POSTS_FETCH_LIMIT: usize = 100;
+
+fn list_records_page_url(
+    pds_endpoint: &str,
+    did: &str,
+    cursor: Option<&str>,
+    limit: usize,
+) -> Result<reqwest::Url, String> {
+    let mut url = reqwest::Url::parse(&format!("{pds_endpoint}/xrpc/com.atproto.repo.listRecords"))
+        .map_err(|_| "author PDS URL is invalid".to_owned())?;
+    let mut pairs = url.query_pairs_mut();
+    pairs
+        .append_pair("repo", did)
+        .append_pair("collection", "app.bsky.feed.post")
+        .append_pair("limit", &limit.to_string());
+    if let Some(cursor) = cursor {
+        pairs.append_pair("cursor", cursor);
+    }
+    drop(pairs);
+    Ok(url)
+}
 
 /// The one `listRecords` page a recent-posts fetch asks the author's PDS for.
 /// listRecords is newest-first by default; `reverse=true` turns it into
 /// OLDEST-first (measured on a bsky.network PDS 2026-11-01: reverse=true gave
 /// Oct 2023 posts, the default gave today's), so the flag must stay off.
 pub(crate) fn list_records_url(pds_endpoint: &str, did: &str) -> Result<reqwest::Url, String> {
-    let mut url = reqwest::Url::parse(&format!("{pds_endpoint}/xrpc/com.atproto.repo.listRecords"))
-        .map_err(|_| "author PDS URL is invalid".to_owned())?;
-    url.query_pairs_mut()
-        .append_pair("repo", did)
-        .append_pair("collection", "app.bsky.feed.post")
-        .append_pair("limit", &RECENT_POSTS_FETCH_LIMIT.to_string());
-    Ok(url)
+    list_records_page_url(pds_endpoint, did, None, RECENT_POSTS_FETCH_LIMIT)
+}
+
+/// The `listRecords` page an older-posts fetch asks for: the same newest-first
+/// page, one page past `cursor` — the PDS cursor saved by the previous older
+/// page, or (for the first one) the oldest rkey this account's posts we hold.
+/// A PDS that runs out of older history answers with no cursor (step 3).
+pub(crate) fn older_posts_url(
+    pds_endpoint: &str,
+    did: &str,
+    cursor: Option<&str>,
+) -> Result<reqwest::Url, String> {
+    list_records_page_url(pds_endpoint, did, cursor, RECENT_POSTS_FETCH_LIMIT)
+}
+
+/// One page of the older-posts walk: the posts (newest first) and the PDS's
+/// next-page cursor. `cursor == None` means the PDS has no older history:
+/// from here on the account is complete locally and never fetched again.
+#[derive(Clone, Debug, Default)]
+pub struct OlderPostsPage {
+    pub records: Vec<crate::ingest::IndexedRecord>,
+    pub cursor: Option<String>,
+}
+
+/// Parse one `com.atproto.repo.listRecords` response of post records for one
+/// account, keeping only records inside that account's post collection and
+/// carrying the response's next-page cursor through. Shared by the recent-
+/// posts fetch and the older-on-scroll fetch.
+pub(crate) fn parse_list_records_posts(
+    value: &serde_json::Value,
+    did: &str,
+    limit: usize,
+) -> (Vec<crate::ingest::IndexedRecord>, Option<String>) {
+    let records = value.get("records").and_then(serde_json::Value::as_array);
+    let Some(records) = records else {
+        return (Vec::new(), None);
+    };
+    let expected_prefix = format!("at://{did}/app.bsky.feed.post/");
+    let mut posts = Vec::new();
+    for entry in records.iter().take(limit) {
+        let Some(uri) = entry.get("uri").and_then(serde_json::Value::as_str) else {
+            tracing::debug!("skipping an author PDS recent-posts record without a uri");
+            continue;
+        };
+        let Some(rkey) = uri.strip_prefix(expected_prefix.as_str()) else {
+            tracing::debug!(
+                uri,
+                "skipping an author PDS record outside the requested post collection"
+            );
+            continue;
+        };
+        if rkey.is_empty() || rkey.contains('/') {
+            tracing::debug!(uri, "skipping an author PDS record with an invalid rkey");
+            continue;
+        }
+        let Some(record) = entry.get("value") else {
+            tracing::debug!(uri, "skipping an author PDS record without a value");
+            continue;
+        };
+        let time_us = record
+            .get("createdAt")
+            .and_then(serde_json::Value::as_str)
+            .and_then(parse_created_at_micros)
+            .unwrap_or_default();
+        posts.push(crate::ingest::IndexedRecord {
+            did: did.to_owned(),
+            collection: "app.bsky.feed.post".to_owned(),
+            rkey: rkey.to_owned(),
+            uri: uri.to_owned(),
+            cid: entry
+                .get("cid")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            time_us,
+            record: record.clone(),
+        });
+    }
+    let cursor = value
+        .get("cursor")
+        .and_then(serde_json::Value::as_str)
+        .filter(|cursor| !cursor.is_empty())
+        .map(str::to_owned);
+    (posts, cursor)
 }
 /// Queued jobs one worker poll processes before it sleeps again.
 pub const RECENT_POSTS_WORKER_BATCH: usize = 8;
@@ -150,6 +248,120 @@ pub fn on_profile_visit<S: Storage>(
     RecentPostsVisit {
         label: "cached",
         show_loading_note: false,
+    }
+}
+
+/// What the profile page did about older posts on this request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OlderFetch {
+    /// No fetch was due: this request has no cursor, the local store still
+    /// had a full page, or the account's history is already complete.
+    Skipped,
+    /// One fetch was attempted and the author PDS failed; the page renders
+    /// what is local and the real error was logged.
+    Failed,
+    /// One page arrived, was stored through the normal writer, and the page
+    /// must be re-read from storage so the new posts render in this request.
+    Fetched { stored: usize },
+}
+
+/// The bounded older-posts fetch a profile page makes while someone scrolls
+/// an account (owner 2026-11-01, lane av75q step 3): at most one
+/// `com.atproto.repo.listRecords` call per page request, newest first, one
+/// page past the saved PDS cursor (or, for the first older request, past the
+/// oldest rkey we hold). Records land through [`Storage::put_record`], the
+/// same idempotent (did, collection, rkey) upsert the Jetstream writer uses,
+/// so no duplicates are possible. The cursor the PDS returns is saved for the
+/// next request; a response without a cursor marks the account complete, and
+/// those accounts are never fetched again. A failed fetch is logged with its
+/// real cause and changes nothing else: the page still renders what is local.
+pub async fn older_posts_while_scrolling<F, S>(
+    flow: &F,
+    storage: &S,
+    subject: &str,
+    oldest_local_rkey: Option<&str>,
+) -> OlderFetch
+where
+    F: crate::oauth::OAuthFlow,
+    S: Storage,
+{
+    let state = match storage.older_posts_state(subject) {
+        Ok(state) => state,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                subject = %subject,
+                "could not read the older-posts state; serving the local page"
+            );
+            return OlderFetch::Skipped;
+        }
+    };
+    if state.as_ref().is_some_and(|state| state.exhausted) {
+        return OlderFetch::Skipped;
+    }
+    let saved_cursor = state.and_then(|state| state.cursor);
+    let cursor = match saved_cursor.or_else(|| oldest_local_rkey.map(str::to_owned)) {
+        Some(cursor) => Some(cursor),
+        // No saved cursor and no local posts at all: nothing safely marks
+        // where "older" begins, and a fresh newest-first page would only
+        // refetch what the visitor has already seen.
+        None => return OlderFetch::Skipped,
+    };
+    match flow.fetch_older_posts(subject, cursor.as_deref()).await {
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                subject = %subject,
+                "the older-posts fetch from the author PDS failed; serving the local page"
+            );
+            OlderFetch::Failed
+        }
+        Ok(page) => {
+            let expected_prefix = format!("at://{subject}/app.bsky.feed.post/");
+            let mut stored = 0_usize;
+            for record in page.records.iter().take(RECENT_POSTS_FETCH_LIMIT) {
+                if record.did != subject
+                    || record.collection != "app.bsky.feed.post"
+                    || !record.uri.starts_with(expected_prefix.as_str())
+                {
+                    tracing::warn!(
+                        did = %subject,
+                        uri = %record.uri,
+                        "the older-posts fetch returned a record outside this account's post collection; skipped it"
+                    );
+                    continue;
+                }
+                // The normal writer path, idempotent on (did, collection,
+                // rkey) exactly like a Jetstream create for the same record.
+                if let Err(error) = storage.put_record(record) {
+                    tracing::warn!(
+                        %error,
+                        did = %subject,
+                        uri = %record.uri,
+                        "a fetched older post could not be stored; the page continues with what we have"
+                    );
+                    continue;
+                }
+                stored += 1;
+            }
+            let exhausted = page.cursor.is_none();
+            if let Err(error) =
+                storage.record_older_posts_page(subject, page.cursor.as_deref(), exhausted)
+            {
+                tracing::warn!(
+                    %error,
+                    subject = %subject,
+                    "the older-posts cursor could not be saved; the next Older request restarts from the oldest local rkey"
+                );
+            }
+            tracing::debug!(
+                did = %subject,
+                stored,
+                exhausted,
+                "stored an older-posts page for one account"
+            );
+            OlderFetch::Fetched { stored }
+        }
     }
 }
 

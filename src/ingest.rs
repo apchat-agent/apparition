@@ -175,6 +175,18 @@ pub struct RecentPostsFetchStatus {
     pub queued: bool,
 }
 
+/// Per-account state of the "older posts" walk through the account's own PDS
+/// (profile scrolling, lane av75q 2026-11-01): the next PDS cursor to continue
+/// from (`None` until the first older page ran), and whether the account's
+/// whole post history is local (`exhausted`: the PDS stopped returning a
+/// cursor, or a repository was backfilled with `backfill_max_age_days = 0`).
+/// An exhausted account never triggers another older-posts fetch.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OlderPostsState {
+    pub cursor: Option<String>,
+    pub exhausted: bool,
+}
+
 /// Cumulative recent-posts counters a running service exposes: jobs queued,
 /// fetches done, fetches failed, and jobs dropped at the queue bound. The
 /// `SQLite writer minute metrics` line reports these counts.
@@ -674,6 +686,22 @@ pub trait Storage: Send + Sync {
     fn recent_posts_counters(&self) -> (u64, u64, u64, u64) {
         (0, 0, 0, 0)
     }
+    /// Where the older-posts walk through one account's PDS stands. `None`
+    /// means no older page has been fetched for it yet.
+    fn older_posts_state(&self, _did: &str) -> Result<Option<OlderPostsState>, StorageError> {
+        Ok(None)
+    }
+    /// Store the outcome of one older-posts page: the PDS cursor to continue
+    /// from (a `None` cursor means the history is exhausted) and whether the
+    /// account's history is now complete locally.
+    fn record_older_posts_page(
+        &self,
+        _did: &str,
+        _cursor: Option<&str>,
+        _exhausted: bool,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
     fn notifications_for(
         &self,
         did: &str,
@@ -1070,6 +1098,7 @@ struct MemoryState {
     recent_posts_queue: VecDeque<String>,
     recent_posts_queued: HashSet<String>,
     recent_posts_status: HashMap<String, (i64, i64)>,
+    older_posts: HashMap<String, OlderPostsState>,
     notification_last_seen: HashMap<String, u64>,
 }
 
@@ -1676,6 +1705,36 @@ impl Storage for MemoryStorage {
 
     fn recent_posts_counters(&self) -> (u64, u64, u64, u64) {
         self.recent_posts_counters.snapshot()
+    }
+
+    fn older_posts_state(&self, did: &str) -> Result<Option<OlderPostsState>, StorageError> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .older_posts
+            .get(did)
+            .cloned())
+    }
+
+    fn record_older_posts_page(
+        &self,
+        did: &str,
+        cursor: Option<&str>,
+        exhausted: bool,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .lock()
+            .map_err(|_| StorageError::Poisoned)?
+            .older_posts
+            .insert(
+                did.to_owned(),
+                OlderPostsState {
+                    cursor: cursor.map(str::to_owned),
+                    exhausted,
+                },
+            );
+        Ok(())
     }
 
     fn notifications_for(
@@ -3667,6 +3726,12 @@ impl SqliteStorage {
               CREATE TABLE IF NOT EXISTS recent_posts_queue (
                   seq INTEGER PRIMARY KEY AUTOINCREMENT,
                   did TEXT NOT NULL UNIQUE
+              );
+              CREATE TABLE IF NOT EXISTS older_posts_state (
+                  did TEXT PRIMARY KEY,
+                  pds_cursor TEXT,
+                  exhausted INTEGER NOT NULL DEFAULT 0,
+                  updated_at_ms INTEGER NOT NULL DEFAULT 0
               );",
         )?;
         connection.execute_batch(
@@ -5553,6 +5618,50 @@ impl Storage for SqliteStorage {
 
     fn recent_posts_counters(&self) -> (u64, u64, u64, u64) {
         self.recent_posts_counters.snapshot()
+    }
+
+    fn older_posts_state(&self, did: &str) -> Result<Option<OlderPostsState>, StorageError> {
+        Ok(self
+            .read_conn()?
+            .query_row(
+                "SELECT pds_cursor, exhausted FROM older_posts_state WHERE did=?1",
+                [did],
+                |row| {
+                    Ok(OlderPostsState {
+                        cursor: row.get::<_, Option<String>>(0)?,
+                        exhausted: row.get::<_, i64>(1)? != 0,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    fn record_older_posts_page(
+        &self,
+        did: &str,
+        cursor: Option<&str>,
+        exhausted: bool,
+    ) -> Result<(), StorageError> {
+        let writer_did = did.to_owned();
+        let writer_cursor = cursor.map(str::to_owned);
+        self.writer.call(move |connection| {
+            connection.execute(
+                "INSERT INTO older_posts_state(did,pds_cursor,exhausted,updated_at_ms)
+                 VALUES(?1,?2,?3,?4)
+                 ON CONFLICT(did) DO UPDATE SET
+                     pds_cursor=excluded.pds_cursor,
+                     exhausted=excluded.exhausted,
+                     updated_at_ms=excluded.updated_at_ms",
+                params![
+                    writer_did,
+                    writer_cursor,
+                    i64::from(exhausted),
+                    epoch_millis()
+                ],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
     }
 
     fn notifications_for(

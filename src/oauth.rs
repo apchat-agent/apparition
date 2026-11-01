@@ -755,6 +755,21 @@ pub trait OAuthFlow: Clone + Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<IndexedRecord>, String>> + Send + 'a>> {
         Box::pin(async { Err("recent posts fetch is not available".to_owned()) })
     }
+    /// One page of one account's OLDER posts for profile scrolling (owner
+    /// 2026-11-01, lane av75q step 3): an unauthenticated
+    /// `com.atproto.repo.listRecords` call against the account's own PDS,
+    /// newest first, one page past `cursor` (the saved PDS cursor, or the
+    /// oldest rkey we hold for the first page). The page carries the PDS's
+    /// next cursor; no cursor means the account's history is exhausted.
+    fn fetch_older_posts<'a>(
+        &'a self,
+        _did: &'a str,
+        _cursor: Option<&'a str>,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<crate::recent_posts::OlderPostsPage, String>> + Send + 'a>,
+    > {
+        Box::pin(async { Err("older posts fetch is not available".to_owned()) })
+    }
     fn resolve_author_handle<'a>(
         &'a self,
         _did: &'a str,
@@ -4936,53 +4951,66 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
             let value: Value = serde_json::from_slice(response.body()).map_err(|error| {
                 format!("author PDS returned invalid recent-posts JSON: {error}")
             })?;
-            let records = value
+            if !value
                 .get("records")
-                .and_then(Value::as_array)
-                .ok_or_else(|| {
-                    "author PDS recent posts response has no records array".to_owned()
-                })?;
-            let expected_prefix = format!("at://{did}/app.bsky.feed.post/");
-            let mut posts = Vec::new();
-            for entry in records
-                .iter()
-                .take(crate::recent_posts::RECENT_POSTS_FETCH_LIMIT)
+                .is_some_and(|records| records.is_array())
             {
-                let Some(uri) = entry.get("uri").and_then(Value::as_str) else {
-                    tracing::debug!("skipping an author PDS recent-posts record without a uri");
-                    continue;
-                };
-                let Some(rkey) = uri.strip_prefix(expected_prefix.as_str()) else {
-                    tracing::debug!(
-                        uri,
-                        "skipping an author PDS record outside the requested post collection"
-                    );
-                    continue;
-                };
-                if rkey.is_empty() || rkey.contains('/') {
-                    tracing::debug!(uri, "skipping an author PDS record with an invalid rkey");
-                    continue;
-                }
-                let Some(record) = entry.get("value") else {
-                    tracing::debug!(uri, "skipping an author PDS record without a value");
-                    continue;
-                };
-                let time_us = record
-                    .get("createdAt")
-                    .and_then(Value::as_str)
-                    .and_then(crate::recent_posts::parse_created_at_micros)
-                    .unwrap_or_default();
-                posts.push(IndexedRecord {
-                    did: did.to_owned(),
-                    collection: "app.bsky.feed.post".to_owned(),
-                    rkey: rkey.to_owned(),
-                    uri: uri.to_owned(),
-                    cid: entry.get("cid").and_then(Value::as_str).map(str::to_owned),
-                    time_us,
-                    record: record.clone(),
-                });
+                return Err("author PDS recent posts response has no records array".to_owned());
             }
+            let (posts, _) = crate::recent_posts::parse_list_records_posts(
+                &value,
+                did,
+                crate::recent_posts::RECENT_POSTS_FETCH_LIMIT,
+            );
             Ok(posts)
+        })
+    }
+
+    fn fetch_older_posts<'a>(
+        &'a self,
+        did: &'a str,
+        cursor: Option<&'a str>,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<crate::recent_posts::OlderPostsPage, String>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let document = self
+                .identity_resolver
+                .resolve_did_document(did)
+                .await
+                .map_err(|error| format!("author identity resolution failed: {error}"))?;
+            let pds_endpoint = document
+                .pds_endpoint()
+                .ok_or_else(|| "author DID document has no valid PDS endpoint".to_owned())?;
+            let url = crate::recent_posts::older_posts_url(&pds_endpoint, did, cursor)?;
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                http::header::ACCEPT,
+                http::HeaderValue::from_static("application/json"),
+            );
+            let response = self
+                .http_client
+                .get(&url, headers, 1024 * 1024)
+                .await
+                .map_err(|error| format!("author PDS older posts request failed: {error}"))?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(format!(
+                    "author PDS older posts request returned HTTP {status}"
+                ));
+            }
+            let value: Value = serde_json::from_slice(response.body()).map_err(|error| {
+                format!("author PDS returned invalid older-posts JSON: {error}")
+            })?;
+            let (records, next_cursor) = crate::recent_posts::parse_list_records_posts(
+                &value,
+                did,
+                crate::recent_posts::RECENT_POSTS_FETCH_LIMIT,
+            );
+            Ok(crate::recent_posts::OlderPostsPage {
+                records,
+                cursor: next_cursor,
+            })
         })
     }
 
@@ -6171,6 +6199,14 @@ struct WebPageTiming {
     /// 2026-11-01); `none` on pages without a recent-posts decision. Not a
     /// duration: it renders and logs without an ms suffix.
     profile_recent_posts: &'static str,
+    /// `ok` | `failed` from the older-on-scroll PDS fetch (owner 2026-11-01,
+    /// lane av75q step 3); `none` when no fetch was due. Not a duration.
+    profile_older_posts: &'static str,
+    /// Posts the older-on-scroll page stored, so the phases line shows how
+    /// much history one fetch brought in.
+    profile_older_posts_fetched: u64,
+    /// How long the older-on-scroll PDS fetch took (ms); 0 when none ran.
+    profile_older_posts_ms: u64,
     feed_timeline_ms: u64,
     mutes_ms: u64,
     list_blocks_ms: u64,
@@ -6220,6 +6256,9 @@ impl WebPageTiming {
             timeline_fetch_index_ms: 0,
             timeline_fetch_live_ms: 0,
             profile_recent_posts: "none",
+            profile_older_posts: "none",
+            profile_older_posts_fetched: 0,
+            profile_older_posts_ms: 0,
             feed_timeline_ms: 0,
             mutes_ms: 0,
             list_blocks_ms: 0,
@@ -6433,6 +6472,9 @@ impl Drop for WebPageTiming {
             timeline_fetch_index_ms = self.timeline_fetch_index_ms,
             timeline_fetch_live_ms = self.timeline_fetch_live_ms,
             profile_recent_posts = self.profile_recent_posts,
+            profile_older_posts = self.profile_older_posts,
+            profile_older_posts_fetched = self.profile_older_posts_fetched,
+            profile_older_posts_ms = self.profile_older_posts_ms,
             feed_timeline_ms = self.feed_timeline_ms,
             mutes_ms = self.mutes_ms,
             list_blocks_ms = self.list_blocks_ms,
@@ -6548,6 +6590,18 @@ impl Drop for WebPageTiming {
                 fields.insert(
                     "profile_recent_posts".to_owned(),
                     json!(self.profile_recent_posts),
+                );
+            }
+            if self.profile_older_posts != "none" {
+                fields.insert(
+                    "profile_older_posts".to_owned(),
+                    json!(self.profile_older_posts),
+                );
+            }
+            if self.profile_older_posts_fetched > 0 {
+                fields.insert(
+                    "profile_older_posts_fetched".to_owned(),
+                    json!(self.profile_older_posts_fetched),
                 );
             }
             detail.set(self.page, Value::Object(fields));
@@ -10852,16 +10906,19 @@ where
         .get("cursor")
         .and_then(|cursor| RecordCursor::parse(cursor));
     let timeline_started = std::time::Instant::now();
-    let records = match state
-        .storage
-        .author_posts(subject, cursor.as_ref(), limit + 1, true)
-    {
-        Ok(records) => records,
-        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
-    };
+    let mut page_records =
+        match state
+            .storage
+            .author_posts(subject, cursor.as_ref(), limit + 1, true)
+        {
+            Ok(records) => records,
+            Err(error) => {
+                return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+            }
+        };
     page_timing.timeline_fetch_index_ms = timeline_started.elapsed().as_millis() as u64;
-    let has_more = records.len() > limit;
-    let records = records.iter().take(limit).collect::<Vec<_>>();
+    let mut has_more = page_records.len() > limit;
+    let mut records = page_records.iter().take(limit).collect::<Vec<_>>();
     // Queue one deduplicated, bounded "recent posts" job unless this account's
     // cache is fresh or its last fetch is inside the retry backoff (owner
     // 2026-11-01: "should load their posts ... in a worker" / "And cache").
@@ -10869,6 +10926,53 @@ where
     let recent_posts_visit =
         crate::recent_posts::on_profile_visit(state.storage.as_ref(), subject, records.len());
     page_timing.profile_recent_posts = recent_posts_visit.label;
+    // Older posts while scrolling (owner 2026-11-01, lane av75q step 3): when
+    // the visitor paged to an OLDER page and the local store could not even
+    // fill it, one page comes from the account's own PDS for this request —
+    // one call, newest first, continuing from the saved cursor or this page's
+    // oldest rkey. Newly stored posts are re-read so they render in THIS page;
+    // a failed call logs its real cause and the page still shows local posts.
+    if cursor.is_some() && !has_more {
+        let oldest_local_rkey = records.last().and_then(|last| {
+            let prefix = format!("at://{subject}/app.bsky.feed.post/");
+            last.uri.strip_prefix(prefix.as_str()).map(str::to_owned)
+        });
+        let older_started = std::time::Instant::now();
+        match crate::recent_posts::older_posts_while_scrolling(
+            &state.flow,
+            state.storage.as_ref(),
+            subject,
+            oldest_local_rkey.as_deref(),
+        )
+        .await
+        {
+            crate::recent_posts::OlderFetch::Skipped => {}
+            crate::recent_posts::OlderFetch::Failed => {
+                page_timing.profile_older_posts = "failed";
+                page_timing.profile_older_posts_ms = older_started.elapsed().as_millis() as u64;
+            }
+            crate::recent_posts::OlderFetch::Fetched { stored } => {
+                page_timing.profile_older_posts = "ok";
+                page_timing.profile_older_posts_fetched = stored as u64;
+                page_timing.profile_older_posts_ms = older_started.elapsed().as_millis() as u64;
+                page_records =
+                    match state
+                        .storage
+                        .author_posts(subject, cursor.as_ref(), limit + 1, true)
+                    {
+                        Ok(records) => records,
+                        Err(error) => {
+                            return oauth_error(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                &error.to_string(),
+                            );
+                        }
+                    };
+                has_more = page_records.len() > limit;
+                records = page_records.iter().take(limit).collect::<Vec<_>>();
+            }
+        }
+    }
     let content_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
     let parent_started = std::time::Instant::now();
     let mut parent_stats = ParentHydrationStats::default();
@@ -24046,8 +24150,13 @@ mod tests {
             &'a self,
             _: &'a str,
             cursor: Option<&'a str>,
-        ) -> Pin<Box<dyn Future<Output = Result<crate::recent_posts::OlderPostsPage, String>> + Send + 'a>>
-        {
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<crate::recent_posts::OlderPostsPage, String>>
+                    + Send
+                    + 'a,
+            >,
+        > {
             let calls = Arc::clone(&self.calls);
             let posts = Arc::clone(&self.pds_posts);
             let failure = self.failure.clone();
@@ -24067,7 +24176,7 @@ mod tests {
                 let page = posts
                     .iter()
                     .skip(start)
-                    .take(crate::recent_posts::RECENT_POSTS_FETCH_LIMIT)
+                    .take(25)
                     .cloned()
                     .collect::<Vec<_>>();
                 let done = start + page.len() >= posts.len();
@@ -24089,7 +24198,7 @@ mod tests {
         Some(html[start..end].replace("&amp;", "&"))
     }
 
-    fn rendered_scroll_rkeys(html: &str) -> Vec<(usize, String)> {
+    fn rendered_scroll_rkeys(html: &str) -> Vec<String> {
         let mut found = Vec::new();
         for index in 0..90 {
             for (prefix, marker) in [
@@ -24097,7 +24206,17 @@ mod tests {
                 ("r", format!("scroll pds {index:02}")),
             ] {
                 if let Some(position) = html.find(&marker) {
-                    found.push((position, format!("{prefix}{}", if prefix == "a" { index.to_string() } else { format!("{index:02}") })));
+                    found.push((
+                        position,
+                        format!(
+                            "{prefix}{}",
+                            if prefix == "a" {
+                                index.to_string()
+                            } else {
+                                format!("{index:02}")
+                            }
+                        ),
+                    ));
                 }
             }
         }
@@ -24143,12 +24262,10 @@ mod tests {
 
         let mut rendered = Vec::new();
         let mut uri = format!("/profile?did={subject}&limit=3");
-        let mut pages = 0_usize;
-        for _ in 0..45 {
+        for pages in 1_usize..=45 {
             let calls_before = flow.cursors().len();
             let (status, html) = recent_posts_get(&app, uri.clone(), &cookie).await;
             assert_eq!(status, StatusCode::OK, "page {pages} renders");
-            pages += 1;
             let calls_after = flow.cursors().len();
             assert!(
                 calls_after - calls_before <= 1,
@@ -24181,7 +24298,10 @@ mod tests {
             "the first older fetch starts at the oldest rkey held locally, later ones continue from the PDS cursor"
         );
         assert_eq!(
-            storage.author_posts(subject, None, 200, true).unwrap().len(),
+            storage
+                .author_posts(subject, None, 200, true)
+                .unwrap()
+                .len(),
             90,
             "every scrolled page was stored through the normal writer"
         );
@@ -24212,7 +24332,8 @@ mod tests {
                 ))
                 .unwrap();
         }
-        let flow = OlderScrollFlow::failing("author PDS older posts request failed: connect error (fake)");
+        let flow =
+            OlderScrollFlow::failing("author PDS older posts request failed: connect error (fake)");
         let token = recent_posts_session(&storage, &public, viewer);
         let app = public.router_with_flow(flow.clone(), storage.clone());
         let cookie = format!("{SESSION_COOKIE}={token}");
@@ -24231,7 +24352,11 @@ mod tests {
             .with_subscriber(subscriber)
             .await;
         let output = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-        assert_eq!(status, StatusCode::OK, "a PDS failure must not break the page");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a PDS failure must not break the page"
+        );
         assert!(
             html.contains("scroll local 3") && html.contains("scroll local 5"),
             "the page still shows the local posts it has: {output}"
@@ -24241,9 +24366,10 @@ mod tests {
             "the real underlying error is logged, not just 'request failed': {output}"
         );
         assert_eq!(flow.cursors().len(), 1, "one fetch attempt was made");
-        assert!(
-            storage.author_posts(subject, None, 50, true).unwrap().len() == 4,
-            "a failed fetch stores nothing"
+        assert_eq!(
+            storage.author_posts(subject, None, 50, true).unwrap().len(),
+            6,
+            "a failed fetch stores nothing: the account still holds exactly its 6 local posts"
         );
     }
 
@@ -24255,12 +24381,7 @@ mod tests {
         let subject = "did:plc:older-exhausted-author";
         let base_us = 1_900_000_000_000_000_u64;
         storage
-            .put_record(&scroll_posts(
-                subject,
-                "a0",
-                base_us,
-                "scroll local 0",
-            ))
+            .put_record(&scroll_posts(subject, "a0", base_us, "scroll local 0"))
             .unwrap();
         // A two-post fake PDS: one page, no cursor, history complete.
         let pds_posts = (0..2)
@@ -24403,7 +24524,13 @@ mod tests {
         assert_eq!(url.path(), "/xrpc/com.atproto.repo.listRecords");
         assert!(pairs.contains(&("repo".into(), "did:plc:olderscroll".into())));
         assert!(pairs.contains(&("collection".into(), "app.bsky.feed.post".into())));
-        assert!(pairs.contains(&("limit".into(), "25".into())));
+        assert!(
+            pairs.contains(&(
+                "limit".into(),
+                crate::recent_posts::RECENT_POSTS_FETCH_LIMIT.to_string()
+            )),
+            "an older-posts page asks for the same page size as a recent-posts page"
+        );
         assert!(pairs.contains(&("cursor".into(), "ba44tczzcgc2e".into())));
         assert!(
             pairs.iter().all(|(key, _)| key != "reverse"),
@@ -24416,7 +24543,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            first.query_pairs().into_owned().iter().all(|(key, _)| key != "cursor"),
+            first.query_pairs().all(|(key, _)| key != "cursor"),
             "the first older page carries no PDS cursor: {first}"
         );
     }

@@ -470,6 +470,10 @@ where
         // outside the delete below, or a re-backfill would wipe the old
         // history that older-on-scroll and the firehose had already stored.
         let snapshot_window_start_us = window_start_us;
+        // With the window disabled the snapshot IS the account's whole post
+        // history, so profile scrolling needs no older-posts walk: mark the
+        // history complete (lane av75q step 3's exhausted state).
+        let history_is_complete = window_start_us.is_none();
         tokio::task::spawn_blocking(move || {
             storage.replace_repo_snapshot_windowed(
                 &snapshot_did,
@@ -477,7 +481,11 @@ where
                 &following,
                 records_per_second,
                 snapshot_window_start_us,
-            )
+            )?;
+            if history_is_complete {
+                storage.record_older_posts_page(&snapshot_did, None, true)?;
+            }
+            Ok::<(), crate::ingest::StorageError>(())
         })
         .await??;
         tracing::info!(
