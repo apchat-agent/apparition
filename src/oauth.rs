@@ -6173,6 +6173,8 @@ struct WebPageTiming {
     ancestors_from_index: usize,
     ancestors_live: usize,
     ancestors_timed_out: usize,
+    notification_events_read: u64,
+    notification_records_loaded: u64,
 }
 
 impl WebPageTiming {
@@ -6213,6 +6215,8 @@ impl WebPageTiming {
             ancestors_from_index: 0,
             ancestors_live: 0,
             ancestors_timed_out: 0,
+            notification_events_read: 0,
+            notification_records_loaded: 0,
         }
     }
 
@@ -6290,6 +6294,8 @@ impl Drop for WebPageTiming {
             ancestors_from_index = self.ancestors_from_index,
             ancestors_live = self.ancestors_live,
             ancestors_timed_out = self.ancestors_timed_out,
+            notification_events_read = self.notification_events_read,
+            notification_records_loaded = self.notification_records_loaded,
             outbound_call_count = calls.total_calls,
             outbound_call_ms = calls.total_ms,
             outbound_calls = %format_outbound_calls(&calls),
@@ -6338,6 +6344,11 @@ impl Drop for WebPageTiming {
                 ("ancestors_from_index", self.ancestors_from_index as u64),
                 ("ancestors_live", self.ancestors_live as u64),
                 ("ancestors_timed_out", self.ancestors_timed_out as u64),
+                ("notification_events_read", self.notification_events_read),
+                (
+                    "notification_records_loaded",
+                    self.notification_records_loaded,
+                ),
             ];
             let mut fields = serde_json::Map::new();
             for (name, value) in named {
@@ -9801,6 +9812,8 @@ where
         }
     };
     page_timing.timeline_fetch_index_ms = timeline_started.elapsed().as_millis() as u64;
+    page_timing.notification_events_read = notification_page.events_read;
+    page_timing.notification_records_loaded = notification_page.records_loaded;
     let has_more = notification_page.has_more;
     let notification_records = notification_page
         .groups
