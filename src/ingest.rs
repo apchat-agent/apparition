@@ -2,8 +2,6 @@ use futures_util::StreamExt;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
 use std::{
     cell::RefCell,
     cmp::Reverse,
@@ -12,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicUsize, AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -950,6 +948,7 @@ pub struct MemoryStorage {
     put_record_delay_ms: AtomicU64,
     #[cfg(test)]
     notification_window_read_delay_ms: AtomicU64,
+    cursor_lock_failures: AtomicUsize,
 }
 
 impl MemoryStorage {
@@ -1041,6 +1040,10 @@ impl MemoryStorage {
         drop(inner);
         publish_notification_counts(self, &self.notification_hub, affected);
         Ok(())
+    }
+
+    pub fn set_cursor_lock_failures(&self, failures: usize) {
+        self.cursor_lock_failures.store(failures, Ordering::SeqCst);
     }
 }
 
@@ -2025,6 +2028,15 @@ impl Storage for MemoryStorage {
     }
 
     fn cursor(&self) -> Result<Option<u64>, StorageError> {
+        if self.cursor_lock_failures.load(Ordering::SeqCst) > 0 {
+            self.cursor_lock_failures.fetch_sub(1, Ordering::SeqCst);
+            return Err(StorageError::Sqlite(
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    Some("database is locked".to_string()),
+                ),
+            ));
+        }
         Ok(self
             .inner
             .lock()

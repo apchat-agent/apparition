@@ -1198,6 +1198,56 @@ async fn event_processing_timeout_releases_connection_and_logs_event_identity() 
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transient_locked_cursor_read_is_retried_and_the_event_is_applied() {
+    let storage = Arc::new(MemoryStorage::default());
+    let ingestor = Ingestor::new(storage.clone(), ScopeMode::Full);
+    storage.as_ref().set_cursor_lock_failures(1);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut websocket = accept_async(stream).await.unwrap();
+        websocket
+            .send(Message::Text(
+                event(
+                    "did:plc:locked-cursor",
+                    1234,
+                    "create",
+                    "app.bsky.feed.post",
+                    "after-lock",
+                    Some(post("after the lock clears")),
+                )
+                .into(),
+            ))
+            .await
+            .unwrap();
+        websocket.close(None).await.unwrap();
+    });
+
+    let consumer = JetstreamConsumer::new(ingestor, Duration::from_millis(1));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let urls = vec![format!("ws://{address}/subscribe")];
+    let run = consumer.run(&urls, shutdown_rx);
+    tokio::pin!(run);
+    tokio::select! {
+        result = &mut run => panic!("consumer stopped before shutdown: {result:?}"),
+        _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+    }
+    shutdown_tx.send(true).unwrap();
+    run.await.unwrap();
+    server.await.unwrap();
+
+    assert_eq!(storage.cursor().unwrap(), Some(1234));
+    assert!(
+        storage
+            .get_record("did:plc:locked-cursor", "app.bsky.feed.post", "after-lock")
+            .unwrap()
+            .is_some()
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn metrics_are_emitted_during_idle_periods_with_zero_events_and_cursor_lag() {
     let _tracing_test_guard = TRACING_TEST_LOCK.lock().await;
