@@ -848,6 +848,13 @@ pub trait Storage: Send + Sync {
     fn backfill_post_sort_batch(&self, _limit: usize) -> Result<u64, StorageError> {
         Ok(0)
     }
+    /// Cumulative failed post-sort backfill attempts, exposed in /healthz.
+    fn post_sort_backfill_failures(&self) -> u64 {
+        0
+    }
+    /// Counts one failed post-sort backfill attempt. A running service exposes
+    /// the total through [`post_sort_backfill_failures`].
+    fn record_post_sort_backfill_failure(&self) {}
     /// The sort key the timeline query uses for this record: the stored sort time
     /// when the row has been filled, otherwise its arrival time.
     fn sort_us_for_record(&self, record: &IndexedRecord) -> Result<u64, StorageError> {
@@ -914,6 +921,70 @@ pub trait Storage: Send + Sync {
     fn pending_handle_refreshes(&self, limit: usize) -> Result<Vec<String>, StorageError>;
     fn complete_handle_refresh(&self, did: &str) -> Result<(), StorageError>;
     fn bytes_on_disk(&self) -> u64;
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PostSortBackfillRun {
+    pub failures: u64,
+    pub batches: u64,
+    pub backoff: Duration,
+}
+
+/// Drives the post-sort backfill to completion. A transient error (a locked
+/// database, a failed read, a failed batch) is logged, counted, slept on with
+/// a doubling backoff, and retried; it never ends the walk. The backoff resets
+/// after every successful batch. The walk ends only when the remaining count
+/// is zero or the batch reports rowid 0.
+pub async fn post_sort_backfill<S: Storage>(
+    storage: &S,
+    batch_size: usize,
+    pause: Duration,
+    retry_base: Duration,
+    retry_max: Duration,
+) -> Result<PostSortBackfillRun, StorageError> {
+    let mut failures = 0_u64;
+    let mut batches = 0_u64;
+    let mut backoff = retry_base;
+    loop {
+        let remaining_result = storage.post_sort_backfill_remaining();
+        if let Err(error) = remaining_result {
+            failures = failures.saturating_add(1);
+            storage.record_post_sort_backfill_failure();
+            tracing::warn!(%error, "post-sort backfill could not read its remaining row count");
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(retry_max);
+            continue;
+        }
+        let Ok(remaining) = remaining_result else {
+            continue;
+        };
+        if remaining == 0 {
+            break;
+        }
+        let batch_result = storage.backfill_post_sort_batch(batch_size);
+        if let Err(error) = batch_result {
+            failures = failures.saturating_add(1);
+            storage.record_post_sort_backfill_failure();
+            tracing::warn!(%error, "post-sort backfill batch failed");
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(retry_max);
+            continue;
+        }
+        let Ok(last_rowid) = batch_result else {
+            continue;
+        };
+        if last_rowid == 0 {
+            break;
+        }
+        batches = batches.saturating_add(1);
+        backoff = retry_base;
+        tokio::time::sleep(pause).await;
+    }
+    Ok(PostSortBackfillRun {
+        failures,
+        batches,
+        backoff,
+    })
 }
 
 #[derive(Clone, Default)]
@@ -3300,6 +3371,7 @@ pub struct SqliteStorage {
     pending_record_writes: Arc<RwLock<HashMap<PendingRecordKey, IndexedRecord>>>,
     post_sort_remaining: Arc<AtomicU64>,
     post_sort_backfill_rowid: Arc<AtomicU64>,
+    post_sort_backfill_failures: Arc<AtomicU64>,
     _ephemeral_database: Option<EphemeralDatabase>,
 }
 
@@ -4034,6 +4106,7 @@ impl SqliteStorage {
             pending_record_writes: Arc::new(RwLock::new(HashMap::new())),
             post_sort_remaining: Arc::new(AtomicU64::new(POST_SORT_REMAINING_UNKNOWN)),
             post_sort_backfill_rowid: Arc::new(AtomicU64::new(0)),
+            post_sort_backfill_failures: Arc::new(AtomicU64::new(0)),
             _ephemeral_database: ephemeral_database,
         })
     }
@@ -6305,6 +6378,15 @@ impl Storage for SqliteStorage {
         let remaining = (posts - filled).max(0) as u64;
         self.post_sort_remaining.store(remaining, Ordering::Relaxed);
         Ok(remaining)
+    }
+
+    fn post_sort_backfill_failures(&self) -> u64 {
+        self.post_sort_backfill_failures.load(Ordering::Relaxed)
+    }
+
+    fn record_post_sort_backfill_failure(&self) {
+        self.post_sort_backfill_failures
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Returns the last `records.rowid` examined (0 when the walk is done), not a count.

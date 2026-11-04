@@ -109,6 +109,7 @@ pub struct JetstreamStorageHealthResponse {
     supervisor_restarts: u64,
     last_event_us: Option<u64>,
     post_sort_backfill_remaining: Option<u64>,
+    post_sort_backfill_failures: u64,
 }
 
 pub struct HealthState<S: ingest::Storage> {
@@ -133,6 +134,7 @@ pub async fn health_with_storage_and_status<S: ingest::Storage>(
         .last_event_us
         .load(std::sync::atomic::Ordering::Relaxed);
     let remaining = state.storage.post_sort_backfill_remaining().ok();
+    let failures = state.storage.post_sort_backfill_failures();
     Json(JetstreamStorageHealthResponse {
         status: "ok",
         jetstream_state: state.status.state_name().to_owned(),
@@ -146,6 +148,7 @@ pub async fn health_with_storage_and_status<S: ingest::Storage>(
             Some(last_event_us)
         },
         post_sort_backfill_remaining: remaining,
+        post_sort_backfill_failures: failures,
     })
 }
 

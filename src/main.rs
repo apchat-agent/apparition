@@ -12,7 +12,7 @@ use appview_rs::{
     },
     ingest::{
         Ingestor, JetstreamConsumer, JetstreamSupervisor, POST_SORT_BACKFILL_BATCH, SqliteStorage,
-        Storage,
+        post_sort_backfill,
     },
     init_tracing,
     jwt::ServiceJwtVerifier,
@@ -38,33 +38,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let storage = Arc::new(SqliteStorage::open(&database_path)?);
     let backfill_storage = Arc::clone(&storage);
     let _post_sort_backfill = tokio::spawn(async move {
-        loop {
-            let remaining_result = backfill_storage.as_ref().post_sort_backfill_remaining();
-            if let Err(error) = remaining_result {
-                tracing::warn!(%error, "post-sort backfill could not read its remaining row count");
-                break;
-            }
-            let Ok(remaining) = remaining_result else {
-                break;
-            };
-            if remaining == 0 {
-                break;
-            }
-            let batch_result = backfill_storage
-                .as_ref()
-                .backfill_post_sort_batch(POST_SORT_BACKFILL_BATCH);
-            if let Err(error) = batch_result {
-                tracing::warn!(%error, "post-sort backfill batch failed");
-                break;
-            }
-            let Ok(last_rowid) = batch_result else {
-                break;
-            };
-            if last_rowid == 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        let result = post_sort_backfill(
+            backfill_storage.as_ref(),
+            POST_SORT_BACKFILL_BATCH,
+            Duration::from_millis(50),
+            Duration::from_secs(1),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        let failures = result.failures;
+        let batches = result.batches;
+        info!(%failures, %batches, "post-sort backfill finished");
     });
     let identity_cache = Arc::new(SqliteIdentityCache::open(identity_cache_path(
         &config.data_dir,
