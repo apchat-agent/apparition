@@ -179,7 +179,7 @@ async fn health_endpoint_reports_post_sort_backfill_remaining() {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(
             &body[..],
-            br#"{"status":"ok","jetstream_state":"waiting to reconnect","supervisor_restarts":0,"last_event_us":1234,"post_sort_backfill_remaining":0}"#,
+            br#"{"status":"ok","jetstream_state":"waiting to reconnect","supervisor_restarts":0,"last_event_us":1234,"post_sort_backfill_remaining":0,"post_sort_backfill_failures":0}"#,
             "{path}"
         );
     }
