@@ -129,3 +129,35 @@ fn post_sort_backfill_resumes_after_the_previous_batch_last_rowid() {
     drop(storage);
     remove_database(&path);
 }
+
+#[test]
+fn post_sort_backfill_remaining_is_computed_once_and_decremented() {
+    let path = database_path("remaining");
+    seed(&path);
+    let storage = SqliteStorage::open(&path).unwrap();
+    let trace = storage.trace_statements();
+
+    trace.clear();
+    let first = storage.post_sort_backfill_remaining().unwrap();
+    let first_statements = trace.statements();
+    assert!(
+        first_statements.iter().any(|sql| sql.contains("COUNT(*) FROM records")),
+        "the first remaining query must count post rows: {first_statements:?}"
+    );
+    assert!(
+        first_statements.iter().any(|sql| sql.contains("COUNT(*) FROM post_sort")),
+        "the first remaining query must count filled rows: {first_statements:?}"
+    );
+
+    trace.clear();
+    let second = storage.post_sort_backfill_remaining().unwrap();
+    let second_statements = trace.statements();
+    assert_eq!(second, first, "the remaining count must be cached after the first call");
+    assert!(
+        !second_statements.iter().any(|sql| sql.contains("COUNT(*)")),
+        "a cached health call must not recount records or post_sort: {second_statements:?}"
+    );
+
+    drop(storage);
+    remove_database(&path);
+}

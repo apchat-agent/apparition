@@ -3299,6 +3299,7 @@ pub struct SqliteStorage {
     pending_counts_fills: Arc<RwLock<HashSet<String>>>,
     pending_record_writes: Arc<RwLock<HashMap<PendingRecordKey, IndexedRecord>>>,
     post_sort_remaining: Arc<AtomicU64>,
+    post_sort_backfill_rowid: Arc<AtomicU64>,
     _ephemeral_database: Option<EphemeralDatabase>,
 }
 
@@ -4032,6 +4033,7 @@ impl SqliteStorage {
             pending_counts_fills: Arc::new(RwLock::new(HashSet::new())),
             pending_record_writes: Arc::new(RwLock::new(HashMap::new())),
             post_sort_remaining: Arc::new(AtomicU64::new(POST_SORT_REMAINING_UNKNOWN)),
+            post_sort_backfill_rowid: Arc::new(AtomicU64::new(0)),
             _ephemeral_database: ephemeral_database,
         })
     }
@@ -6311,21 +6313,24 @@ impl Storage for SqliteStorage {
         if remaining == 0 {
             return Ok(0);
         }
+        let last_rowid = self.post_sort_backfill_rowid.load(Ordering::Relaxed);
         let conn = self.read_conn()?;
         let mut rows = conn.prepare(
-            "SELECT did, uri, time_us, record_json FROM records AS r
-             WHERE r.collection='app.bsky.feed.post'
+            "SELECT r.rowid, r.did, r.uri, r.time_us, r.record_json FROM records AS r NOT INDEXED
+             WHERE r.rowid > ?1
+               AND r.collection='app.bsky.feed.post'
                AND NOT EXISTS (SELECT 1 FROM post_sort AS p WHERE p.uri = r.uri)
              ORDER BY r.rowid
-             LIMIT ?1",
+             LIMIT ?2",
         )?;
         let batch = rows
-            .query_map(params![limit as i64], |row| {
+            .query_map(params![last_rowid as i64, limit as i64], |row| {
                 Ok((
-                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -6335,9 +6340,10 @@ impl Storage for SqliteStorage {
             self.post_sort_remaining.store(0, Ordering::Relaxed);
             return Ok(0);
         }
+        let last_seen = batch.last().unwrap().0.max(0) as u64;
         let prepared = batch
             .iter()
-            .map(|(did, uri, time_us, json)| {
+            .map(|(_, did, uri, time_us, json)| {
                 let time_us = *time_us.max(&0) as u64;
                 let sort_us = post_sort_us_from_json(json, time_us);
                 (
@@ -6348,7 +6354,7 @@ impl Storage for SqliteStorage {
                 )
             })
             .collect::<Vec<_>>();
-        let filled = self.writer.call(move |connection| {
+        let _filled = self.writer.call(move |connection| {
             let transaction = connection.transaction()?;
             let mut filled = 0_u64;
             {
@@ -6364,11 +6370,14 @@ impl Storage for SqliteStorage {
             transaction.commit()?;
             Ok(filled)
         })?;
-        if filled > 0 {
-            self.post_sort_remaining
-                .fetch_sub(filled, Ordering::Relaxed);
-        }
-        Ok(filled)
+        let resolved = batch.len() as u64;
+        let before = self.post_sort_remaining.load(Ordering::Relaxed);
+        self.post_sort_remaining.store(
+            if before > resolved { before - resolved } else { 0 },
+            Ordering::Relaxed,
+        );
+        self.post_sort_backfill_rowid.store(last_seen, Ordering::Relaxed);
+        Ok(last_seen)
     }
 
     fn post_interaction_summary(

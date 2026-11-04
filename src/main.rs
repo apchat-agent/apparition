@@ -11,8 +11,7 @@ use appview_rs::{
         resolve_login_allowlist,
     },
     ingest::{
-        Ingestor, JetstreamConsumer, JetstreamSupervisor, POST_SORT_BACKFILL_BATCH, SqliteStorage,
-        Storage,
+        Ingestor, JetstreamConsumer, JetstreamSupervisor, POST_SORT_BACKFILL_BATCH, SqliteStorage, Storage,
     },
     init_tracing,
     jwt::ServiceJwtVerifier,
@@ -39,21 +38,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let backfill_storage = Arc::clone(&storage);
     let _post_sort_backfill = tokio::spawn(async move {
         loop {
-            let Ok(remaining) = backfill_storage.as_ref().post_sort_backfill_remaining() else {
-                tracing::warn!("post-sort backfill could not read its remaining row count");
+            let remaining_result = backfill_storage.as_ref().post_sort_backfill_remaining();
+            if let Err(error) = remaining_result {
+                tracing::warn!(%error, "post-sort backfill could not read its remaining row count");
+                break;
+            }
+            let Ok(remaining) = remaining_result else {
                 break;
             };
             if remaining == 0 {
                 break;
             }
-            let Ok(filled) = backfill_storage
+            let batch_result = backfill_storage
                 .as_ref()
-                .backfill_post_sort_batch(POST_SORT_BACKFILL_BATCH)
-            else {
-                tracing::warn!("post-sort backfill batch failed");
+                .backfill_post_sort_batch(POST_SORT_BACKFILL_BATCH);
+            if let Err(error) = batch_result {
+                tracing::warn!(%error, "post-sort backfill batch failed");
+                break;
+            }
+            let Ok(progress) = batch_result else {
                 break;
             };
-            if filled == 0 {
+            if progress == 0 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
