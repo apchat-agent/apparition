@@ -308,6 +308,43 @@ impl RecordCursor {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PostTimeCursor {
+    pub created_at: String,
+    pub time_us: u64,
+    pub uri: String,
+}
+
+impl PostTimeCursor {
+    pub fn parse(value: &str) -> Option<Self> {
+        if let Some((created_at, rest)) = value.split_once('|') {
+            if let Some((time, uri)) = rest.split_once('|') {
+                Some(Self {
+                    created_at: created_at.to_owned(),
+                    time_us: time.parse().ok()?,
+                    uri: uri.to_owned(),
+                })
+            } else {
+                Some(Self {
+                    created_at: created_at.to_owned(),
+                    time_us: rest.parse().ok()?,
+                    uri: String::new(),
+                })
+            }
+        } else {
+            Some(Self {
+                created_at: String::new(),
+                time_us: value.parse().ok()?,
+                uri: String::new(),
+            })
+        }
+    }
+
+    pub fn encode(&self) -> String {
+        format!("{}|{}|{}", self.created_at, self.time_us, self.uri)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NotificationCursor {
     pub time_us: u64,
     pub uri: String,
@@ -473,6 +510,25 @@ fn record_matches_cursor(record: &IndexedRecord, cursor: Option<&RecordCursor>) 
     cursor.is_none_or(|cursor| {
         record.time_us < cursor.time_us
             || (record.time_us == cursor.time_us && record.uri < cursor.uri)
+    })
+}
+
+pub fn post_created_at(record: &IndexedRecord) -> String {
+    record
+        .record
+        .get("createdAt")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+fn post_time_matches_cursor(record: &IndexedRecord, cursor: Option<&PostTimeCursor>) -> bool {
+    let created_at = post_created_at(record);
+    cursor.is_none_or(|cursor| {
+        created_at < cursor.created_at
+            || (created_at == cursor.created_at
+                && (record.time_us < cursor.time_us
+                    || (record.time_us == cursor.time_us && record.uri < cursor.uri)))
     })
 }
 
@@ -756,6 +812,14 @@ pub trait Storage: Send + Sync {
         &self,
         actor: &str,
         cursor: Option<&RecordCursor>,
+        limit: usize,
+    ) -> Result<Vec<IndexedRecord>, StorageError>;
+    /// One page of the home timeline ordered by the post time shown on the card
+    /// (`createdAt`), not by the Jetstream arrival time in `time_us`.
+    fn timeline_posts_by_post_time(
+        &self,
+        actor: &str,
+        cursor: Option<&PostTimeCursor>,
         limit: usize,
     ) -> Result<Vec<IndexedRecord>, StorageError>;
     fn post_interaction_summary(
@@ -1959,6 +2023,45 @@ impl Storage for MemoryStorage {
             right
                 .time_us
                 .cmp(&left.time_us)
+                .then_with(|| right.uri.cmp(&left.uri))
+        });
+        posts.truncate(limit.clamp(1, 101));
+        Ok(posts)
+    }
+
+    fn timeline_posts_by_post_time(
+        &self,
+        actor: &str,
+        cursor: Option<&PostTimeCursor>,
+        limit: usize,
+    ) -> Result<Vec<IndexedRecord>, StorageError> {
+        let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
+        let mut followed = inner
+            .follows
+            .iter()
+            .filter(|(follow_actor, _)| follow_actor == actor)
+            .map(|(_, subject)| subject.clone())
+            .collect::<HashSet<_>>();
+        followed.extend(inner.records.values().filter_map(|record| {
+            (record.collection == "app.bsky.graph.follow" && record.did == actor)
+                .then(|| record.record.get("subject").and_then(Value::as_str))
+                .flatten()
+                .map(str::to_owned)
+        }));
+        let mut posts = inner
+            .records
+            .values()
+            .filter(|record| {
+                record.collection == "app.bsky.feed.post"
+                    && (record.did == actor || followed.contains(&record.did))
+                    && post_time_matches_cursor(record, cursor)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        posts.sort_by(|left, right| {
+            post_created_at(right)
+                .cmp(&post_created_at(left))
+                .then_with(|| right.time_us.cmp(&left.time_us))
                 .then_with(|| right.uri.cmp(&left.uri))
         });
         posts.truncate(limit.clamp(1, 101));
@@ -3625,6 +3728,8 @@ impl SqliteStorage {
              CREATE INDEX IF NOT EXISTS records_collection_time ON records(collection, time_us DESC);
              CREATE INDEX IF NOT EXISTS records_collection_uri ON records(collection, uri);
              CREATE INDEX IF NOT EXISTS records_author_time ON records(collection, did, time_us DESC, uri DESC);
+             CREATE INDEX IF NOT EXISTS records_author_created_at
+                 ON records(collection, did, coalesce(json_extract(record_json, '$.createdAt'), '') DESC, time_us DESC, uri DESC);
              CREATE INDEX IF NOT EXISTS records_author_reply_time
                  ON records(collection, did, json_type(record_json, '$.reply'), time_us DESC, uri DESC);
              CREATE INDEX IF NOT EXISTS records_follow_actor_subject
@@ -4362,6 +4467,67 @@ impl SqliteStorage {
             right
                 .time_us
                 .cmp(&left.time_us)
+                .then_with(|| right.uri.cmp(&left.uri))
+        });
+        page.truncate(limit);
+        Ok(page)
+    }
+
+    fn timeline_posts_by_post_time_page(
+        &self,
+        actor: &str,
+        cursor: Option<&PostTimeCursor>,
+        limit: usize,
+    ) -> Result<Vec<IndexedRecord>, StorageError> {
+        let limit = limit.clamp(1, 101);
+        let conn = self.read_conn()?;
+        let mut followed = conn.prepare(
+            "SELECT DISTINCT json_extract(record_json, '$.subject') FROM records
+             WHERE collection='app.bsky.graph.follow' AND did=?1
+               AND json_extract(record_json, '$.subject') IS NOT NULL",
+        )?;
+        let mut authors = followed
+            .query_map([actor], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(followed);
+        authors.sort_unstable();
+        authors.dedup();
+        authors.retain(|subject| subject != actor);
+        let mut statement = conn.prepare(
+            "SELECT did, collection, rkey, uri, cid, time_us, record_json FROM records
+             INDEXED BY records_author_created_at
+             WHERE collection='app.bsky.feed.post' AND did=?1
+               AND (?2 IS NULL
+                    OR coalesce(json_extract(record_json, '$.createdAt'), '') < ?2
+                    OR (coalesce(json_extract(record_json, '$.createdAt'), '') = ?2
+                        AND (time_us < ?3 OR (time_us=?3 AND uri < ?4))))
+             ORDER BY coalesce(json_extract(record_json, '$.createdAt'), '') DESC,
+                  time_us DESC, uri DESC
+             LIMIT ?5",
+        )?;
+        let mut page = Vec::new();
+        for author in std::iter::once(actor).chain(authors.iter().map(String::as_str)) {
+            page.extend(
+                statement
+                    .query_map(
+                        params![
+                            author,
+                            cursor.map(|cursor| cursor.created_at.clone()),
+                            cursor.map(|cursor| cursor.time_us.min(i64::MAX as u64) as i64),
+                            cursor.map(|cursor| cursor.uri.as_str()).unwrap_or(""),
+                            limit as i64,
+                        ],
+                        row_to_record,
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        drop(statement);
+        drop(conn);
+        page.sort_by(|left, right| {
+            post_created_at(right)
+                .cmp(&post_created_at(left))
+                .then_with(|| right.time_us.cmp(&left.time_us))
                 .then_with(|| right.uri.cmp(&left.uri))
         });
         page.truncate(limit);
@@ -5968,6 +6134,15 @@ impl Storage for SqliteStorage {
         limit: usize,
     ) -> Result<Vec<IndexedRecord>, StorageError> {
         self.timeline_posts_page(actor, cursor, limit, None)
+    }
+
+    fn timeline_posts_by_post_time(
+        &self,
+        actor: &str,
+        cursor: Option<&PostTimeCursor>,
+        limit: usize,
+    ) -> Result<Vec<IndexedRecord>, StorageError> {
+        self.timeline_posts_by_post_time_page(actor, cursor, limit)
     }
 
     fn post_interaction_summary(

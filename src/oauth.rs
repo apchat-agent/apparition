@@ -7,8 +7,8 @@ use crate::{
     },
     ingest::{
         IndexedNotification, IndexedRecord, MemoryStorage, NotificationCursor,
-        NotificationEventRow, NotificationGroupSkip, NotificationKeyWindow, ProfileIndexEntry,
-        RecordCursor, Storage, StorageError,
+        NotificationEventRow, NotificationGroupSkip, NotificationKeyWindow, PostTimeCursor,
+        ProfileIndexEntry, RecordCursor, Storage, StorageError,
     },
     link_card::{LinkCard, LinkCardFetcher, LinkThumbnail},
     net::{
@@ -8977,15 +8977,18 @@ where
         .clamp(1, 100);
     let cursor = query
         .get("cursor")
-        .and_then(|cursor| RecordCursor::parse(cursor));
+        .and_then(|cursor| PostTimeCursor::parse(cursor));
     let timeline_started = std::time::Instant::now();
-    let timeline_page = match state
-        .storage
-        .timeline_posts(&did, cursor.as_ref(), limit + 1)
-    {
-        Ok(records) => records,
-        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
-    };
+    let timeline_page =
+        match state
+            .storage
+            .timeline_posts_by_post_time(&did, cursor.as_ref(), limit + 1)
+        {
+            Ok(records) => records,
+            Err(error) => {
+                return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+            }
+        };
     page_timing.timeline_fetch_index_ms = timeline_started.elapsed().as_millis() as u64;
     let has_more = timeline_page.len() > limit;
     let next_cursor_record = timeline_page.get(limit.saturating_sub(1)).cloned();
@@ -9153,7 +9156,8 @@ where
         next_cursor_record
             .as_ref()
             .map(|last| {
-                let cursor = RecordCursor {
+                let cursor = PostTimeCursor {
+                    created_at: crate::ingest::post_created_at(last),
                     time_us: last.time_us,
                     uri: last.uri.clone(),
                 }
@@ -27472,6 +27476,15 @@ mod tests {
             limit: usize,
         ) -> Result<Vec<IndexedRecord>, StorageError> {
             self.inner.timeline_posts(actor, cursor, limit)
+        }
+
+        fn timeline_posts_by_post_time(
+            &self,
+            actor: &str,
+            cursor: Option<&PostTimeCursor>,
+            limit: usize,
+        ) -> Result<Vec<IndexedRecord>, StorageError> {
+            self.inner.timeline_posts_by_post_time(actor, cursor, limit)
         }
 
         fn post_interaction_summary(
