@@ -246,8 +246,7 @@ fn backfilled_future_created_at_sorts_at_arrival_below_newer_post() {
 
     let remaining = storage.post_sort_backfill_remaining().unwrap();
     assert_eq!(
-        remaining,
-        2,
+        remaining, 2,
         "both seeded posts must start without a post_sort row: {remaining:?}"
     );
 
@@ -285,8 +284,7 @@ fn backfilled_unparseable_created_at_falls_back_to_arrival() {
 
     let remaining = storage.post_sort_backfill_remaining().unwrap();
     assert_eq!(
-        remaining,
-        2,
+        remaining, 2,
         "both seeded posts must start without a post_sort row: {remaining:?}"
     );
 
