@@ -1,0 +1,169 @@
+use appview_rs::ingest::{
+    IndexedRecord, JetstreamStorageUpdate, SortTimeCursor, SqliteStorage, Storage,
+};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+const VIEWER: &str = "did:plc:viewer";
+const FOLLOWED_A: &str = "did:plc:followed-a";
+
+fn post_uri(did: &str, rkey: &str) -> String {
+    format!("at://{did}/app.bsky.feed.post/{rkey}")
+}
+
+fn database_path(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+        "target/timeline-sort-page-av80d-{}-{name}.sqlite3",
+        std::process::id()
+    ))
+}
+
+fn remove_database(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+    let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+}
+
+fn post_record(did: &str, rkey: &str, time_us: u64, created_at: &str, text: &str) -> IndexedRecord {
+    IndexedRecord {
+        did: did.into(),
+        collection: "app.bsky.feed.post".into(),
+        rkey: rkey.into(),
+        uri: post_uri(did, rkey),
+        cid: format!("cid-{rkey}").into(),
+        time_us,
+        record: serde_json::json!({
+            "$type": "app.bsky.feed.post",
+            "text": text,
+            "createdAt": created_at,
+        }),
+    }
+}
+
+fn follow_record(did: &str, subject: &str) -> IndexedRecord {
+    IndexedRecord {
+        did: did.into(),
+        collection: "app.bsky.graph.follow".into(),
+        rkey: format!("f-{}", subject),
+        uri: format!("at://{did}/app.bsky.graph.follow/f-{}", subject),
+        cid: format!("cid-f-{}", subject).into(),
+        time_us: 10,
+        record: serde_json::json!({ "subject": subject }),
+    }
+}
+
+fn seed(path: &Path) {
+    remove_database(path);
+    let storage = SqliteStorage::open(path).unwrap();
+    storage
+        .apply_jetstream_batch(&[
+            JetstreamStorageUpdate {
+                time_us: 10,
+                upsert: Some(follow_record(VIEWER, FOLLOWED_A)),
+                ..JetstreamStorageUpdate::default()
+            },
+            JetstreamStorageUpdate {
+                time_us: 1_793_800_000_000_003,
+                upsert: Some(post_record(
+                    FOLLOWED_A,
+                    "p1",
+                    1_793_800_000_000_003,
+                    "2026-11-04T06:42:08Z",
+                    "p1",
+                )),
+                ..JetstreamStorageUpdate::default()
+            },
+            JetstreamStorageUpdate {
+                time_us: 1_793_800_000_000_002,
+                upsert: Some(post_record(
+                    FOLLOWED_A,
+                    "p2",
+                    1_793_800_000_000_002,
+                    "2026-11-04T06:42:08Z",
+                    "p2",
+                )),
+                ..JetstreamStorageUpdate::default()
+            },
+            JetstreamStorageUpdate {
+                time_us: 1_793_800_000_000_001,
+                upsert: Some(post_record(
+                    FOLLOWED_A,
+                    "p3",
+                    1_793_800_000_000_001,
+                    "2026-11-04T06:42:08Z",
+                    "p3",
+                )),
+                ..JetstreamStorageUpdate::default()
+            },
+        ])
+        .unwrap();
+    drop(storage);
+}
+
+#[test]
+fn post_sort_timeline_pages_across_equal_sort_times_without_duplicates_or_gaps() {
+    let path = database_path("equal");
+    seed(&path);
+    let storage = SqliteStorage::open(&path).unwrap();
+
+    let first = storage
+        .timeline_posts_by_post_time(VIEWER, None, 1)
+        .unwrap();
+    assert_eq!(
+        first
+            .iter()
+            .map(|record| record.uri.as_str())
+            .collect::<Vec<_>>(),
+        vec![post_uri(FOLLOWED_A, "p1")],
+        "the first page must start at the newest equal-sort-time post"
+    );
+
+    let last = first[0].clone();
+    let cursor = SortTimeCursor {
+        sort_us: storage.sort_us_for_record(&last).unwrap(),
+        time_us: last.time_us,
+        uri: last.uri.clone(),
+    };
+    let second = storage
+        .timeline_posts_by_post_time(VIEWER, Some(&cursor), 10)
+        .unwrap();
+    assert_eq!(
+        second
+            .iter()
+            .map(|record| record.uri.as_str())
+            .collect::<Vec<_>>(),
+        vec![post_uri(FOLLOWED_A, "p2"), post_uri(FOLLOWED_A, "p3")],
+        "equal sort times must resume by time_us then uri with no gaps"
+    );
+
+    let mut all = first
+        .iter()
+        .map(|record| record.uri.as_str())
+        .collect::<Vec<_>>();
+    all.extend(second.iter().map(|record| record.uri.as_str()));
+    assert_eq!(
+        all.len(),
+        all.iter().collect::<HashSet<_>>().len(),
+        "pages must not repeat a post"
+    );
+    assert_eq!(all.len(), 3, "the two pages must cover all three posts");
+
+    drop(storage);
+    remove_database(&path);
+}
+
+#[test]
+fn old_time_us_uri_cursor_does_not_parse_as_a_sort_cursor() {
+    assert!(
+        SortTimeCursor::parse("1793800000000000:at://did:plc:example/app.bsky.feed.post/p1",)
+            .is_none(),
+        "an old time_us:uri cursor must not be parsed as a sort cursor"
+    );
+    assert!(
+        SortTimeCursor::parse(
+            "1793800000000000|1793800000000000|at://did:plc:example/app.bsky.feed.post/p1",
+        )
+        .is_some(),
+        "the new sort_us|time_us|uri cursor must parse"
+    );
+}

@@ -507,7 +507,7 @@ fn now_micros() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
-fn parse_rfc3339_micros(value: &str) -> Option<u64> {
+pub(crate) fn parse_rfc3339_micros(value: &str) -> Option<u64> {
     let parsed =
         time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()?;
     u64::try_from(parsed.unix_timestamp_nanos() / 1_000).ok()

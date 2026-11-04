@@ -102,6 +102,53 @@ pub async fn health_with_status(
     })
 }
 
+#[derive(Serialize)]
+pub struct JetstreamStorageHealthResponse {
+    status: &'static str,
+    jetstream_state: String,
+    supervisor_restarts: u64,
+    last_event_us: Option<u64>,
+    post_sort_backfill_remaining: Option<u64>,
+}
+
+pub struct HealthState<S: ingest::Storage> {
+    pub storage: std::sync::Arc<S>,
+    pub status: std::sync::Arc<ingest::JetstreamStatus>,
+}
+
+impl<S: ingest::Storage> Clone for HealthState<S> {
+    fn clone(&self) -> Self {
+        Self {
+            storage: self.storage.clone(),
+            status: self.status.clone(),
+        }
+    }
+}
+
+pub async fn health_with_storage_and_status<S: ingest::Storage>(
+    State(state): State<HealthState<S>>,
+) -> Json<JetstreamStorageHealthResponse> {
+    let last_event_us = state
+        .status
+        .last_event_us
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let remaining = state.storage.post_sort_backfill_remaining().ok();
+    Json(JetstreamStorageHealthResponse {
+        status: "ok",
+        jetstream_state: state.status.state_name().to_owned(),
+        supervisor_restarts: state
+            .status
+            .restarts
+            .load(std::sync::atomic::Ordering::Relaxed),
+        last_event_us: if last_event_us == 0 {
+            None
+        } else {
+            Some(last_event_us)
+        },
+        post_sort_backfill_remaining: remaining,
+    })
+}
+
 pub fn init_tracing(filter: &str) -> Result<(), tracing_subscriber::util::TryInitError> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter));
     tracing_subscriber::registry()

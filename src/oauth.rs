@@ -7,8 +7,8 @@ use crate::{
     },
     ingest::{
         IndexedNotification, IndexedRecord, MemoryStorage, NotificationCursor,
-        NotificationEventRow, NotificationGroupSkip, NotificationKeyWindow, PostTimeCursor,
-        ProfileIndexEntry, RecordCursor, Storage, StorageError,
+        NotificationEventRow, NotificationGroupSkip, NotificationKeyWindow, ProfileIndexEntry,
+        RecordCursor, SortTimeCursor, Storage, StorageError,
     },
     link_card::{LinkCard, LinkCardFetcher, LinkThumbnail},
     net::{
@@ -43,6 +43,13 @@ use atrium_oauth::{
         state::{InternalStateData, StateStore},
     },
 };
+
+fn sort_us_for<S: Storage>(storage: &S, record: &IndexedRecord) -> u64 {
+    let Ok(sort_us) = storage.sort_us_for_record(record) else {
+        return crate::ingest::post_sort_us(record);
+    };
+    sort_us
+}
 use atrium_xrpc::error::XrpcErrorKind;
 use atrium_xrpc::{
     Error as XrpcClientError, HttpClient, InputDataOrBytes, OutputDataOrBytes, XrpcClient,
@@ -8977,7 +8984,7 @@ where
         .clamp(1, 100);
     let cursor = query
         .get("cursor")
-        .and_then(|cursor| PostTimeCursor::parse(cursor));
+        .and_then(|cursor| SortTimeCursor::parse(cursor));
     let timeline_started = std::time::Instant::now();
     let timeline_page =
         match state
@@ -9156,8 +9163,8 @@ where
         next_cursor_record
             .as_ref()
             .map(|last| {
-                let cursor = PostTimeCursor {
-                    created_at: crate::ingest::post_created_at(last),
+                let cursor = SortTimeCursor {
+                    sort_us: sort_us_for(state.storage.as_ref(), last),
                     time_us: last.time_us,
                     uri: last.uri.clone(),
                 }
@@ -16780,7 +16787,8 @@ impl TimelineGroupRenderMember<'_> {
     }
 }
 
-fn timeline_post_grouping(
+fn timeline_post_grouping<S: Storage>(
+    storage: &S,
     records: &[&IndexedRecord],
     parents: &PageParentIndex,
 ) -> TimelinePostGrouping {
@@ -16824,7 +16832,7 @@ fn timeline_post_grouping(
         }
         let oldest = chain
             .iter()
-            .map(|index| records[*index].time_us)
+            .map(|index| sort_us_for(storage, records[*index]))
             .min()
             .unwrap_or_default();
         let mut oldest = oldest;
@@ -16842,7 +16850,7 @@ fn timeline_post_grouping(
             }
             match parents.get(uri) {
                 Some(Some(parent)) => {
-                    oldest = oldest.min(parent.time_us);
+                    oldest = oldest.min(sort_us_for(storage, parent));
                     ancestors_near_to_far.push(TimelineGroupAncestor::Found(parent.clone()));
                     parent_uri = parent
                         .record
@@ -16865,12 +16873,12 @@ fn timeline_post_grouping(
         }
         let newest = chain
             .iter()
-            .map(|index| records[*index].time_us)
+            .map(|index| sort_us_for(storage, records[*index]))
             .chain(
                 ancestors_near_to_far
                     .iter()
                     .filter_map(|ancestor| match ancestor {
-                        TimelineGroupAncestor::Found(record) => Some(record.time_us),
+                        TimelineGroupAncestor::Found(record) => Some(sort_us_for(storage, record)),
                         TimelineGroupAncestor::Deferred(_) => None,
                     }),
             )
@@ -16882,7 +16890,12 @@ fn timeline_post_grouping(
         let newest_index = chain
             .iter()
             .copied()
-            .max_by_key(|index| (records[*index].time_us, std::cmp::Reverse(*index)))
+            .max_by_key(|index| {
+                (
+                    sort_us_for(storage, records[*index]),
+                    std::cmp::Reverse(*index),
+                )
+            })
             .unwrap_or(root);
         grouping.grouped_indices.extend(chain.iter().copied());
         grouping.groups_by_newest.insert(
@@ -16912,7 +16925,7 @@ fn render_timeline_post_items<S: Storage>(
     parents: &PageParentIndex,
     context: &TimelineRenderContext<'_>,
 ) -> String {
-    let grouping = timeline_post_grouping(records, parents);
+    let grouping = timeline_post_grouping(storage, records, parents);
     let mut html = String::new();
     for (index, record) in records.iter().enumerate() {
         if let Some(group) = grouping.groups_by_newest.get(&index) {
@@ -27481,10 +27494,22 @@ mod tests {
         fn timeline_posts_by_post_time(
             &self,
             actor: &str,
-            cursor: Option<&PostTimeCursor>,
+            cursor: Option<&SortTimeCursor>,
             limit: usize,
         ) -> Result<Vec<IndexedRecord>, StorageError> {
             self.inner.timeline_posts_by_post_time(actor, cursor, limit)
+        }
+
+        fn post_sort_backfill_remaining(&self) -> Result<u64, StorageError> {
+            self.inner.post_sort_backfill_remaining()
+        }
+
+        fn backfill_post_sort_batch(&self, limit: usize) -> Result<u64, StorageError> {
+            self.inner.backfill_post_sort_batch(limit)
+        }
+
+        fn sort_us_for_record(&self, record: &IndexedRecord) -> Result<u64, StorageError> {
+            self.inner.sort_us_for_record(record)
         }
 
         fn post_interaction_summary(

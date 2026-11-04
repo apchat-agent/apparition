@@ -1,5 +1,4 @@
-use appview_rs::ingest::{PostTimeCursor, SqliteStorage, Storage, post_created_at};
-use rusqlite::{Connection, params};
+use appview_rs::ingest::{IndexedRecord, SortTimeCursor, SqliteStorage, Storage};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -25,90 +24,80 @@ fn remove_database(path: &Path) {
     let _ = std::fs::remove_file(format!("{}-shm", path.display()));
 }
 
+fn post_record(did: &str, rkey: &str, time_us: u64, created_at: &str, text: &str) -> IndexedRecord {
+    IndexedRecord {
+        did: did.into(),
+        collection: "app.bsky.feed.post".into(),
+        rkey: rkey.into(),
+        uri: post_uri(did, rkey),
+        cid: format!("cid-{rkey}").into(),
+        time_us,
+        record: serde_json::json!({
+            "$type": "app.bsky.feed.post",
+            "text": text,
+            "createdAt": created_at,
+        }),
+    }
+}
+
+fn follow_record(did: &str, subject: &str) -> IndexedRecord {
+    IndexedRecord {
+        did: did.into(),
+        collection: "app.bsky.graph.follow".into(),
+        rkey: format!("f-{}", subject),
+        uri: format!("at://{did}/app.bsky.graph.follow/f-{}", subject),
+        cid: format!("cid-f-{}", subject).into(),
+        time_us: 10,
+        record: serde_json::json!({ "subject": subject }),
+    }
+}
+
 fn seed(path: &Path) {
     remove_database(path);
-    drop(SqliteStorage::open(path).unwrap());
-    let mut connection = Connection::open(path).unwrap();
-    let transaction = connection.transaction().unwrap();
-    {
-        let mut insert = transaction
-            .prepare_cached(
-                "INSERT INTO records(did,collection,rkey,uri,cid,time_us,record_json)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
-            )
-            .unwrap();
-        for (rkey, subject) in [
-            ("f-a", FOLLOWED_A),
-            ("f-b", FOLLOWED_B),
-            ("f-c", FOLLOWED_C),
-        ] {
-            insert
-                .execute(params![
-                    VIEWER,
-                    "app.bsky.graph.follow",
-                    rkey,
-                    format!("at://{VIEWER}/app.bsky.graph.follow/{rkey}"),
-                    format!("cid-{rkey}"),
-                    10,
-                    format!(r#"{{"subject":"{subject}"}}"#),
-                ])
-                .unwrap();
-        }
-        for (did, rkey, time_us, created_at, text) in [
-            (
-                FOLLOWED_A,
-                "old-reply",
-                100,
-                "2026-11-03T23:44:32Z",
-                "old reply",
-            ),
-            (
-                FOLLOWED_B,
-                "new-reply",
-                90,
-                "2026-11-04T06:42:08Z",
-                "new reply",
-            ),
-            (
-                FOLLOWED_C,
-                "parent-old",
-                80,
-                "2026-11-03T20:00:00Z",
-                "older parent",
-            ),
-            (
-                FOLLOWED_C,
-                "parent-new",
-                70,
-                "2026-11-04T06:42:08Z",
-                "newer parent",
-            ),
-            (
-                FOLLOWED_C,
-                "c-new",
-                60,
-                "2026-11-04T06:42:08Z",
-                "top-level post",
-            ),
-        ] {
-            insert
-                .execute(params![
-                    did,
-                    "app.bsky.feed.post",
-                    rkey,
-                    post_uri(did, rkey),
-                    format!("cid-{rkey}"),
-                    time_us,
-                    format!(
-                        r#"{{"$type":"app.bsky.feed.post","text":"{}","createdAt":"{}"}}"#,
-                        text, created_at
-                    ),
-                ])
-                .unwrap();
-        }
+    let storage = SqliteStorage::open(path).unwrap();
+    for subject in [FOLLOWED_A, FOLLOWED_B, FOLLOWED_C] {
+        storage.put_record(&follow_record(VIEWER, subject)).unwrap();
     }
-    transaction.commit().unwrap();
-    drop(connection);
+    for record in [
+        post_record(
+            FOLLOWED_A,
+            "old-reply",
+            1_793_800_000_000_000,
+            "2026-11-03T23:44:32Z",
+            "old reply",
+        ),
+        post_record(
+            FOLLOWED_B,
+            "new-reply",
+            1_793_776_000_000_000,
+            "2026-11-04T06:42:08Z",
+            "new reply",
+        ),
+        post_record(
+            FOLLOWED_C,
+            "parent-old",
+            1_793_760_000_000_000,
+            "2026-11-03T20:00:00Z",
+            "older parent",
+        ),
+        post_record(
+            FOLLOWED_C,
+            "parent-new",
+            1_793_775_000_000_000,
+            "2026-11-04T06:42:08Z",
+            "newer parent",
+        ),
+        post_record(
+            FOLLOWED_C,
+            "c-new",
+            1_793_774_600_000_000,
+            "2026-11-04T06:42:08Z",
+            "top-level post",
+        ),
+    ] {
+        storage.put_record(&record).unwrap();
+    }
+    drop(storage);
 }
 
 #[test]
@@ -129,12 +118,12 @@ fn post_time_timeline_pages_without_duplicates_or_gaps() {
             post_uri(FOLLOWED_B, "new-reply"),
             post_uri(FOLLOWED_C, "parent-new"),
         ],
-        "the first page must be newest by createdAt, not by arrival time_us"
+        "the first page must be newest by post sort time, not by arrival time_us"
     );
 
     let last = first[1].clone();
-    let cursor = PostTimeCursor {
-        created_at: post_created_at(&last),
+    let cursor = SortTimeCursor {
+        sort_us: storage.sort_us_for_record(&last).unwrap(),
         time_us: last.time_us,
         uri: last.uri.clone(),
     };
@@ -151,7 +140,7 @@ fn post_time_timeline_pages_without_duplicates_or_gaps() {
             post_uri(FOLLOWED_A, "old-reply"),
             post_uri(FOLLOWED_C, "parent-old"),
         ],
-        "the next page must resume after the createdAt/time_us/uri cursor with no gaps"
+        "the next page must resume after the sort-time/time_us/uri cursor with no gaps"
     );
 
     let mut all = first

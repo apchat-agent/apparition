@@ -1,15 +1,19 @@
 use appview_rs::{
+    HealthState,
     api::api_router_with_https_and_profile_counts,
     backfill::{
         AtriumRepoVerifier, BackfillWorker, HostRateLimiter, HttpRepoSource, RepoBackfiller,
     },
     config::{Config, OAuthMode, identity_cache_path},
-    health_with_status,
+    health_with_storage_and_status,
     identity::{
         HandleRefreshWorker, HttpIdentityBackend, IdentityResolver, SqliteIdentityCache,
         resolve_login_allowlist,
     },
-    ingest::{Ingestor, JetstreamConsumer, JetstreamSupervisor, SqliteStorage},
+    ingest::{
+        Ingestor, JetstreamConsumer, JetstreamSupervisor, POST_SORT_BACKFILL_BATCH, SqliteStorage,
+        Storage,
+    },
     init_tracing,
     jwt::ServiceJwtVerifier,
     net::SafeHttpClient,
@@ -32,6 +36,29 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let address = listener.local_addr()?;
     let (database_path, oauth_database_path) = appview_rs::config::database_paths(&config.data_dir);
     let storage = Arc::new(SqliteStorage::open(&database_path)?);
+    let backfill_storage = Arc::clone(&storage);
+    let _post_sort_backfill = tokio::spawn(async move {
+        loop {
+            let Ok(remaining) = backfill_storage.as_ref().post_sort_backfill_remaining() else {
+                tracing::warn!("post-sort backfill could not read its remaining row count");
+                break;
+            };
+            if remaining == 0 {
+                break;
+            }
+            let Ok(filled) = backfill_storage
+                .as_ref()
+                .backfill_post_sort_batch(POST_SORT_BACKFILL_BATCH)
+            else {
+                tracing::warn!("post-sort backfill batch failed");
+                break;
+            };
+            if filled == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
     let identity_cache = Arc::new(SqliteIdentityCache::open(identity_cache_path(
         &config.data_dir,
     ))?);
@@ -88,10 +115,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     let relationships =
         RelationshipClient::new(SafeHttpClient::new(), PUBLIC_APPVIEW_BASE).with_store(oauth_store);
+    let health_state = HealthState {
+        storage: storage.clone(),
+        status: consumer.status(),
+    };
     let health_router = axum::Router::new()
-        .route("/xrpc/_health", axum::routing::get(health_with_status))
-        .route("/healthz", axum::routing::get(health_with_status))
-        .with_state(consumer.status());
+        .route(
+            "/xrpc/_health",
+            axum::routing::get(health_with_storage_and_status),
+        )
+        .route(
+            "/healthz",
+            axum::routing::get(health_with_storage_and_status),
+        )
+        .with_state(health_state);
     let app_router = oauth
         .router_with_flow_and_shutdown_and_profile_counts_and_relationships(
             oauth_flow.clone(),

@@ -43,6 +43,8 @@ const SQLITE_WRITER_QUEUE: usize = 256;
 /// is a warm-cache optimization, so dropping one only means the next page
 /// recomputes the counts on a read connection.
 const MAX_PENDING_POST_COUNTS_FILLS: usize = 2_048;
+pub const POST_SORT_REMAINING_UNKNOWN: u64 = u64::MAX;
+pub const POST_SORT_BACKFILL_BATCH: usize = 2_000;
 const SQLITE_WRITER_BATCH_SIZE: usize = 64;
 const SQLITE_WRITER_BATCH_DELAY: Duration = Duration::from_millis(5);
 const WAL_JOURNAL_SIZE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
@@ -308,39 +310,27 @@ impl RecordCursor {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PostTimeCursor {
-    pub created_at: String,
+pub struct SortTimeCursor {
+    pub sort_us: u64,
     pub time_us: u64,
     pub uri: String,
 }
 
-impl PostTimeCursor {
+impl SortTimeCursor {
     pub fn parse(value: &str) -> Option<Self> {
-        if let Some((created_at, rest)) = value.split_once('|') {
-            if let Some((time, uri)) = rest.split_once('|') {
-                Some(Self {
-                    created_at: created_at.to_owned(),
-                    time_us: time.parse().ok()?,
-                    uri: uri.to_owned(),
-                })
-            } else {
-                Some(Self {
-                    created_at: created_at.to_owned(),
-                    time_us: rest.parse().ok()?,
-                    uri: String::new(),
-                })
-            }
-        } else {
-            Some(Self {
-                created_at: String::new(),
-                time_us: value.parse().ok()?,
-                uri: String::new(),
-            })
+        let parts = value.split('|').collect::<Vec<_>>();
+        if parts.len() != 3 {
+            return None;
         }
+        Some(Self {
+            sort_us: parts[0].parse().ok()?,
+            time_us: parts[1].parse().ok()?,
+            uri: parts[2].to_owned(),
+        })
     }
 
     pub fn encode(&self) -> String {
-        format!("{}|{}|{}", self.created_at, self.time_us, self.uri)
+        format!("{}|{}|{}", self.sort_us, self.time_us, self.uri)
     }
 }
 
@@ -522,11 +512,39 @@ pub fn post_created_at(record: &IndexedRecord) -> String {
         .to_string()
 }
 
-fn post_time_matches_cursor(record: &IndexedRecord, cursor: Option<&PostTimeCursor>) -> bool {
-    let created_at = post_created_at(record);
+/// The sort time Bluesky uses for a post: the earlier of the author's
+/// `createdAt` and the arrival time, so a future-dated post cannot pin itself
+/// above real new posts forever. Unparseable or missing `createdAt` uses the
+/// arrival time.
+pub fn post_sort_us(record: &IndexedRecord) -> u64 {
+    let created_at = record.record.get("createdAt").and_then(Value::as_str);
+    let mut created_us = record.time_us;
+    if let Some(parsed) = created_at.and_then(crate::backfill::parse_rfc3339_micros) {
+        created_us = parsed;
+    }
+    created_us.min(record.time_us)
+}
+
+fn post_sort_us_from_json(json: &str, time_us: u64) -> u64 {
+    let Ok(record) = serde_json::from_str::<Value>(json) else {
+        return time_us;
+    };
+    let created_at = record.get("createdAt").and_then(Value::as_str);
+    let mut created_us = time_us;
+    if let Some(parsed) = created_at.and_then(crate::backfill::parse_rfc3339_micros) {
+        created_us = parsed;
+    }
+    created_us.min(time_us)
+}
+
+fn sort_time_matches_cursor(
+    record: &IndexedRecord,
+    sort_us: u64,
+    cursor: Option<&SortTimeCursor>,
+) -> bool {
     cursor.is_none_or(|cursor| {
-        created_at < cursor.created_at
-            || (created_at == cursor.created_at
+        sort_us < cursor.sort_us
+            || (sort_us == cursor.sort_us
                 && (record.time_us < cursor.time_us
                     || (record.time_us == cursor.time_us && record.uri < cursor.uri)))
     })
@@ -814,14 +832,27 @@ pub trait Storage: Send + Sync {
         cursor: Option<&RecordCursor>,
         limit: usize,
     ) -> Result<Vec<IndexedRecord>, StorageError>;
-    /// One page of the home timeline ordered by the post time shown on the card
-    /// (`createdAt`), not by the Jetstream arrival time in `time_us`.
+    /// One page of the home timeline ordered by the post sort time
+    /// (`min(createdAt, arrival)`), not by the Jetstream arrival time in `time_us`.
     fn timeline_posts_by_post_time(
         &self,
         actor: &str,
-        cursor: Option<&PostTimeCursor>,
+        cursor: Option<&SortTimeCursor>,
         limit: usize,
     ) -> Result<Vec<IndexedRecord>, StorageError>;
+    /// Rows still waiting for the bounded post-sort backfill.
+    fn post_sort_backfill_remaining(&self) -> Result<u64, StorageError> {
+        Ok(0)
+    }
+    /// Fills one bounded batch of old post rows into the post-sort side table.
+    fn backfill_post_sort_batch(&self, _limit: usize) -> Result<u64, StorageError> {
+        Ok(0)
+    }
+    /// The sort key the timeline query uses for this record: the stored sort time
+    /// when the row has been filled, otherwise its arrival time.
+    fn sort_us_for_record(&self, record: &IndexedRecord) -> Result<u64, StorageError> {
+        Ok(post_sort_us(record))
+    }
     fn post_interaction_summary(
         &self,
         uri: &str,
@@ -2032,7 +2063,7 @@ impl Storage for MemoryStorage {
     fn timeline_posts_by_post_time(
         &self,
         actor: &str,
-        cursor: Option<&PostTimeCursor>,
+        cursor: Option<&SortTimeCursor>,
         limit: usize,
     ) -> Result<Vec<IndexedRecord>, StorageError> {
         let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
@@ -2054,13 +2085,15 @@ impl Storage for MemoryStorage {
             .filter(|record| {
                 record.collection == "app.bsky.feed.post"
                     && (record.did == actor || followed.contains(&record.did))
-                    && post_time_matches_cursor(record, cursor)
+                    && sort_time_matches_cursor(record, post_sort_us(record), cursor)
             })
             .cloned()
             .collect::<Vec<_>>();
         posts.sort_by(|left, right| {
-            post_created_at(right)
-                .cmp(&post_created_at(left))
+            let left_sort = post_sort_us(left);
+            let right_sort = post_sort_us(right);
+            right_sort
+                .cmp(&left_sort)
                 .then_with(|| right.time_us.cmp(&left.time_us))
                 .then_with(|| right.uri.cmp(&left.uri))
         });
@@ -3265,6 +3298,7 @@ pub struct SqliteStorage {
     notification_hub: NotificationHub,
     pending_counts_fills: Arc<RwLock<HashSet<String>>>,
     pending_record_writes: Arc<RwLock<HashMap<PendingRecordKey, IndexedRecord>>>,
+    post_sort_remaining: Arc<AtomicU64>,
     _ephemeral_database: Option<EphemeralDatabase>,
 }
 
@@ -3617,14 +3651,34 @@ impl SqliteStorage {
                  record_json TEXT NOT NULL,
                  PRIMARY KEY (did, collection, rkey)
              );
-             CREATE TABLE IF NOT EXISTS post_counts (
-                 uri TEXT PRIMARY KEY,
-                 like_count INTEGER NOT NULL DEFAULT 0,
-                 repost_count INTEGER NOT NULL DEFAULT 0,
-                 reply_count INTEGER NOT NULL DEFAULT 0,
-                 quote_count INTEGER NOT NULL DEFAULT 0
-             );
-             CREATE TRIGGER IF NOT EXISTS records_post_counts_insert
+              CREATE TABLE IF NOT EXISTS post_counts (
+                  uri TEXT PRIMARY KEY,
+                  like_count INTEGER NOT NULL DEFAULT 0,
+                  repost_count INTEGER NOT NULL DEFAULT 0,
+                  reply_count INTEGER NOT NULL DEFAULT 0,
+                  quote_count INTEGER NOT NULL DEFAULT 0
+              );
+              CREATE TABLE IF NOT EXISTS post_sort (
+                  uri TEXT PRIMARY KEY,
+                  did TEXT NOT NULL,
+                  sort_us INTEGER NOT NULL,
+                  time_us INTEGER NOT NULL
+              );
+              CREATE INDEX IF NOT EXISTS post_sort_author_order
+                  ON post_sort(did, sort_us DESC, time_us DESC, uri DESC);
+              CREATE TRIGGER IF NOT EXISTS records_post_sort_delete
+              AFTER DELETE ON records
+              WHEN OLD.collection='app.bsky.feed.post'
+              BEGIN
+                  DELETE FROM post_sort WHERE uri=OLD.uri;
+              END;
+              CREATE TRIGGER IF NOT EXISTS records_post_sort_update
+              AFTER UPDATE ON records
+              WHEN OLD.collection='app.bsky.feed.post'
+              BEGIN
+                  DELETE FROM post_sort WHERE uri=OLD.uri;
+              END;
+              CREATE TRIGGER IF NOT EXISTS records_post_counts_insert
              AFTER INSERT ON records
              WHEN (NEW.collection IN ('app.bsky.feed.like','app.bsky.feed.repost')
                        AND instr(NEW.record_json, char(34) || 'subject' || char(34)) > 0)
@@ -3728,8 +3782,6 @@ impl SqliteStorage {
              CREATE INDEX IF NOT EXISTS records_collection_time ON records(collection, time_us DESC);
              CREATE INDEX IF NOT EXISTS records_collection_uri ON records(collection, uri);
              CREATE INDEX IF NOT EXISTS records_author_time ON records(collection, did, time_us DESC, uri DESC);
-             CREATE INDEX IF NOT EXISTS records_author_created_at
-                 ON records(collection, did, coalesce(json_extract(record_json, '$.createdAt'), '') DESC, time_us DESC, uri DESC);
              CREATE INDEX IF NOT EXISTS records_author_reply_time
                  ON records(collection, did, json_type(record_json, '$.reply'), time_us DESC, uri DESC);
              CREATE INDEX IF NOT EXISTS records_follow_actor_subject
@@ -3979,6 +4031,7 @@ impl SqliteStorage {
             notification_hub: NotificationHub::default(),
             pending_counts_fills: Arc::new(RwLock::new(HashSet::new())),
             pending_record_writes: Arc::new(RwLock::new(HashMap::new())),
+            post_sort_remaining: Arc::new(AtomicU64::new(POST_SORT_REMAINING_UNKNOWN)),
             _ephemeral_database: ephemeral_database,
         })
     }
@@ -4476,7 +4529,7 @@ impl SqliteStorage {
     fn timeline_posts_by_post_time_page(
         &self,
         actor: &str,
-        cursor: Option<&PostTimeCursor>,
+        cursor: Option<&SortTimeCursor>,
         limit: usize,
     ) -> Result<Vec<IndexedRecord>, StorageError> {
         let limit = limit.clamp(1, 101);
@@ -4493,45 +4546,75 @@ impl SqliteStorage {
         authors.sort_unstable();
         authors.dedup();
         authors.retain(|subject| subject != actor);
-        let mut statement = conn.prepare(
-            "SELECT did, collection, rkey, uri, cid, time_us, record_json FROM records
-             INDEXED BY records_author_created_at
-             WHERE collection='app.bsky.feed.post' AND did=?1
+
+        let mut filled = conn.prepare(
+            "SELECT r.did, r.collection, r.rkey, r.uri, r.cid, r.time_us, r.record_json, p.sort_us
+             FROM post_sort AS p
+             INDEXED BY post_sort_author_order
+             JOIN records AS r ON r.uri = p.uri
+             WHERE p.did=?1
                AND (?2 IS NULL
-                    OR coalesce(json_extract(record_json, '$.createdAt'), '') < ?2
-                    OR (coalesce(json_extract(record_json, '$.createdAt'), '') = ?2
-                        AND (time_us < ?3 OR (time_us=?3 AND uri < ?4))))
-             ORDER BY coalesce(json_extract(record_json, '$.createdAt'), '') DESC,
-                  time_us DESC, uri DESC
+                    OR p.sort_us < ?2
+                    OR (p.sort_us = ?2
+                        AND (p.time_us < ?3 OR (p.time_us = ?3 AND p.uri < ?4))))
+             ORDER BY p.sort_us DESC, p.time_us DESC, p.uri DESC
              LIMIT ?5",
         )?;
+        let mut unfilled = conn.prepare(
+            "SELECT r.did, r.collection, r.rkey, r.uri, r.cid, r.time_us, r.record_json
+             FROM records AS r
+             INDEXED BY records_author_time
+             WHERE r.collection='app.bsky.feed.post' AND r.did=?1
+               AND NOT EXISTS (SELECT 1 FROM post_sort AS p WHERE p.uri = r.uri)
+               AND (?2 IS NULL
+                    OR r.time_us < ?2
+                    OR (r.time_us = ?2
+                        AND (r.time_us < ?3 OR (r.time_us = ?3 AND r.uri < ?4))))
+             ORDER BY r.time_us DESC, r.uri DESC
+             LIMIT ?5",
+        )?;
+
         let mut page = Vec::new();
         for author in std::iter::once(actor).chain(authors.iter().map(String::as_str)) {
+            let cursor_sort = cursor.map(|cursor| cursor.sort_us.min(i64::MAX as u64) as i64);
+            let cursor_time = cursor.map(|cursor| cursor.time_us.min(i64::MAX as u64) as i64);
+            let cursor_uri = cursor.map(|cursor| cursor.uri.as_str()).unwrap_or("");
             page.extend(
-                statement
+                filled
                     .query_map(
-                        params![
-                            author,
-                            cursor.map(|cursor| cursor.created_at.clone()),
-                            cursor.map(|cursor| cursor.time_us.min(i64::MAX as u64) as i64),
-                            cursor.map(|cursor| cursor.uri.as_str()).unwrap_or(""),
-                            limit as i64,
-                        ],
-                        row_to_record,
+                        params![author, cursor_sort, cursor_time, cursor_uri, limit as i64],
+                        |row| {
+                            let record = row_to_record(row)?;
+                            let sort_us = row.get::<_, i64>(7)?;
+                            Ok((sort_us.max(0) as u64, record))
+                        },
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            page.extend(
+                unfilled
+                    .query_map(
+                        params![author, cursor_sort, cursor_time, cursor_uri, limit as i64],
+                        |row| {
+                            let record = row_to_record(row)?;
+                            Ok((record.time_us, record))
+                        },
                     )?
                     .collect::<Result<Vec<_>, _>>()?,
             );
         }
-        drop(statement);
+        drop(filled);
+        drop(unfilled);
         drop(conn);
         page.sort_by(|left, right| {
-            post_created_at(right)
-                .cmp(&post_created_at(left))
-                .then_with(|| right.time_us.cmp(&left.time_us))
-                .then_with(|| right.uri.cmp(&left.uri))
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| right.1.time_us.cmp(&left.1.time_us))
+                .then_with(|| right.1.uri.cmp(&left.1.uri))
         });
         page.truncate(limit);
-        Ok(page)
+        Ok(page.iter().map(|entry| entry.1.clone()).collect::<Vec<_>>())
     }
 
     fn pace_snapshot_writes(
@@ -4894,6 +4977,21 @@ impl SqliteStorage {
                         ])?;
                         if inserted > 0 {
                             inserted_records += inserted as u64;
+                            if record.collection == "app.bsky.feed.post" {
+                                let sort_us = post_sort_us(record);
+                                transaction.execute(
+                                    "INSERT INTO post_sort(uri,did,sort_us,time_us)
+                                     VALUES(?1,?2,?3,?4)
+                                     ON CONFLICT(uri) DO UPDATE SET
+                                         did=excluded.did, sort_us=excluded.sort_us, time_us=excluded.time_us",
+                                    params![
+                                        record.uri,
+                                        record.did,
+                                        sort_us.min(i64::MAX as u64) as i64,
+                                        record.time_us.min(i64::MAX as u64) as i64,
+                                    ],
+                                )?;
+                            }
                             write_notification_events(&transaction, record)?;
                         }
                     }
@@ -4945,6 +5043,21 @@ impl Storage for SqliteStorage {
                      uri=excluded.uri, cid=excluded.cid, time_us=excluded.time_us, record_json=excluded.record_json",
                 params![writer_record.did, writer_record.collection, writer_record.rkey, writer_record.uri, writer_record.cid, writer_record.time_us, record_json],
             )?;
+            if writer_record.collection == "app.bsky.feed.post" {
+                let sort_us = post_sort_us(&writer_record);
+                transaction.execute(
+                    "INSERT INTO post_sort(uri,did,sort_us,time_us)
+                     VALUES(?1,?2,?3,?4)
+                     ON CONFLICT(uri) DO UPDATE SET
+                         did=excluded.did, sort_us=excluded.sort_us, time_us=excluded.time_us",
+                    params![
+                        writer_record.uri,
+                        writer_record.did,
+                        sort_us.min(i64::MAX as u64) as i64,
+                        writer_record.time_us.min(i64::MAX as u64) as i64,
+                    ],
+                )?;
+            }
             write_notification_events(&transaction, &writer_record)?;
             transaction.commit()?;
             Ok(())
@@ -5100,6 +5213,21 @@ impl Storage for SqliteStorage {
                         record_json,
                     ],
                 )?;
+                if record.collection == "app.bsky.feed.post" {
+                    let sort_us = post_sort_us(record);
+                    transaction.execute(
+                        "INSERT INTO post_sort(uri,did,sort_us,time_us)
+                         VALUES(?1,?2,?3,?4)
+                         ON CONFLICT(uri) DO UPDATE SET
+                             did=excluded.did, sort_us=excluded.sort_us, time_us=excluded.time_us",
+                        params![
+                            record.uri,
+                            record.did,
+                            sort_us.min(i64::MAX as u64) as i64,
+                            record.time_us.min(i64::MAX as u64) as i64,
+                        ],
+                    )?;
+                }
                 write_notification_events(&transaction, record)?;
             }
             if let Some((did, collection, rkey)) = &update.delete {
@@ -6139,10 +6267,108 @@ impl Storage for SqliteStorage {
     fn timeline_posts_by_post_time(
         &self,
         actor: &str,
-        cursor: Option<&PostTimeCursor>,
+        cursor: Option<&SortTimeCursor>,
         limit: usize,
     ) -> Result<Vec<IndexedRecord>, StorageError> {
         self.timeline_posts_by_post_time_page(actor, cursor, limit)
+    }
+
+    fn sort_us_for_record(&self, record: &IndexedRecord) -> Result<u64, StorageError> {
+        let conn = self.read_conn()?;
+        let stored: Option<i64> = conn
+            .query_row(
+                "SELECT sort_us FROM post_sort WHERE uri=?1",
+                [&record.uri],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(stored
+            .map(|value| value.max(0) as u64)
+            .unwrap_or(record.time_us))
+    }
+
+    fn post_sort_backfill_remaining(&self) -> Result<u64, StorageError> {
+        let remaining = self.post_sort_remaining.load(Ordering::Relaxed);
+        if remaining != POST_SORT_REMAINING_UNKNOWN {
+            return Ok(remaining);
+        }
+        let conn = self.read_conn()?;
+        let posts: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM records INDEXED BY records_collection_time
+             WHERE collection='app.bsky.feed.post'",
+            [],
+            |row| row.get(0),
+        )?;
+        let filled: i64 = conn.query_row("SELECT COUNT(*) FROM post_sort", [], |row| row.get(0))?;
+        let remaining = (posts - filled).max(0) as u64;
+        self.post_sort_remaining.store(remaining, Ordering::Relaxed);
+        Ok(remaining)
+    }
+
+    fn backfill_post_sort_batch(&self, limit: usize) -> Result<u64, StorageError> {
+        let limit = limit.clamp(1, 10_000);
+        let remaining = self.post_sort_backfill_remaining()?;
+        if remaining == 0 {
+            return Ok(0);
+        }
+        let conn = self.read_conn()?;
+        let mut rows = conn.prepare(
+            "SELECT did, uri, time_us, record_json FROM records AS r
+             WHERE r.collection='app.bsky.feed.post'
+               AND NOT EXISTS (SELECT 1 FROM post_sort AS p WHERE p.uri = r.uri)
+             ORDER BY r.rowid
+             LIMIT ?1",
+        )?;
+        let batch = rows
+            .query_map(params![limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(rows);
+        drop(conn);
+        if batch.is_empty() {
+            self.post_sort_remaining.store(0, Ordering::Relaxed);
+            return Ok(0);
+        }
+        let prepared = batch
+            .iter()
+            .map(|(did, uri, time_us, json)| {
+                let time_us = *time_us.max(&0) as u64;
+                let sort_us = post_sort_us_from_json(json, time_us);
+                (
+                    did.clone(),
+                    uri.clone(),
+                    sort_us.min(i64::MAX as u64) as i64,
+                    time_us.min(i64::MAX as u64) as i64,
+                )
+            })
+            .collect::<Vec<_>>();
+        let filled = self.writer.call(move |connection| {
+            let transaction = connection.transaction()?;
+            let mut filled = 0_u64;
+            {
+                let mut insert = transaction.prepare(
+                    "INSERT INTO post_sort(uri,did,sort_us,time_us)
+                     VALUES(?1,?2,?3,?4)
+                     ON CONFLICT(uri) DO NOTHING",
+                )?;
+                for (did, uri, sort_us, time_us) in prepared {
+                    filled += insert.execute(params![uri, did, sort_us, time_us])? as u64;
+                }
+            }
+            transaction.commit()?;
+            Ok(filled)
+        })?;
+        if filled > 0 {
+            self.post_sort_remaining
+                .fetch_sub(filled, Ordering::Relaxed);
+        }
+        Ok(filled)
     }
 
     fn post_interaction_summary(

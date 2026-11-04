@@ -9196,7 +9196,7 @@ async fn following_tab_orders_replies_by_the_time_on_their_cards_not_by_ingest_a
             rkey: "old-reply".into(),
             uri: old_reply_uri.into(),
             cid: Some("cid-old-reply".into()),
-            time_us: 100,
+            time_us: 1_793_800_000_000_000,
             record: serde_json::json!({
                 "$type": "app.bsky.feed.post",
                 "text": "old reply",
@@ -9212,7 +9212,7 @@ async fn following_tab_orders_replies_by_the_time_on_their_cards_not_by_ingest_a
             rkey: "new-reply".into(),
             uri: new_reply_uri.into(),
             cid: Some("cid-new-reply".into()),
-            time_us: 90,
+            time_us: 1_793_776_000_000_000,
             record: serde_json::json!({
                 "$type": "app.bsky.feed.post",
                 "text": "new reply",
@@ -9228,7 +9228,7 @@ async fn following_tab_orders_replies_by_the_time_on_their_cards_not_by_ingest_a
             rkey: "parent-old".into(),
             uri: old_parent_uri.into(),
             cid: Some("cid-parent-old".into()),
-            time_us: 80,
+            time_us: 1_793_760_000_000_000,
             record: serde_json::json!({
                 "$type": "app.bsky.feed.post",
                 "text": "older parent",
@@ -9243,7 +9243,7 @@ async fn following_tab_orders_replies_by_the_time_on_their_cards_not_by_ingest_a
             rkey: "parent-new".into(),
             uri: new_parent_uri.into(),
             cid: Some("cid-parent-new".into()),
-            time_us: 70,
+            time_us: 1_793_775_000_000_000,
             record: serde_json::json!({
                 "$type": "app.bsky.feed.post",
                 "text": "newer parent",
@@ -9258,7 +9258,7 @@ async fn following_tab_orders_replies_by_the_time_on_their_cards_not_by_ingest_a
             rkey: "c-new".into(),
             uri: c_post_uri.into(),
             cid: Some("cid-c-new".into()),
-            time_us: 60,
+            time_us: 1_793_774_600_000_000,
             record: serde_json::json!({
                 "$type": "app.bsky.feed.post",
                 "text": "top-level post",
@@ -9277,5 +9277,53 @@ async fn following_tab_orders_replies_by_the_time_on_their_cards_not_by_ingest_a
     assert!(
         new_index < old_index,
         "the newer reply must be above the older one: {html}"
+    );
+}
+
+#[tokio::test]
+async fn following_tab_old_time_us_uri_cursor_falls_back_to_first_page() {
+    let storage = Arc::new(MemoryStorage::default());
+    let viewer = "did:plc:viewer";
+    let followed = "did:plc:followed-a";
+    storage.set_follow(viewer, followed, true).unwrap();
+    let uri = "at://did:plc:followed-a/app.bsky.feed.post/post";
+    storage
+        .put_record(&IndexedRecord {
+            did: followed.into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "post".into(),
+            uri: uri.into(),
+            cid: Some("cid-post".into()),
+            time_us: 1_793_800_000_000_000,
+            record: serde_json::json!({
+                "$type": "app.bsky.feed.post",
+                "text": "post",
+                "createdAt": "2026-11-04T06:42:08Z"
+            }),
+        })
+        .unwrap();
+
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default().with_callback_did(viewer), storage);
+    let cookie = finish_login(&app).await;
+    let first = get_html(&app, "/app?tab=following", &cookie).await;
+    let old = get_html(
+        &app,
+        "/app?tab=following&cursor=100:at://did:plc:followed-a/app.bsky.feed.post/post",
+        &cookie,
+    )
+    .await;
+    assert!(
+        old.find(uri).is_some(),
+        "an old cursor page must contain the post"
+    );
+    assert!(
+        old.find("pagination-link").is_none(),
+        "an old time_us:uri cursor must fall back to the first page, not an older page"
+    );
+    assert!(
+        first.find(uri).is_some(),
+        "the first page must contain the post"
     );
 }
