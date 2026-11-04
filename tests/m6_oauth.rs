@@ -9168,3 +9168,114 @@ fn sqlite_recent_profiles_prune_the_table_to_ten_rows() {
     assert_eq!(rows, 10);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn following_tab_orders_replies_by_the_time_on_their_cards_not_by_ingest_arrival() {
+    // Production 2026-11-04 06:47Z: a reply created 2026-11-03T23:44:32Z arrived
+    // late at the server and was listed above a reply created 2026-11-04T06:42:08Z.
+    // The cards show createdAt, but the page order must follow the same time.
+    let storage = Arc::new(MemoryStorage::default());
+    let viewer = "did:plc:viewer";
+    let followed_a = "did:plc:followed-a";
+    let followed_b = "did:plc:followed-b";
+    let followed_c = "did:plc:followed-c";
+    storage.set_follow(viewer, followed_a, true).unwrap();
+    storage.set_follow(viewer, followed_b, true).unwrap();
+    storage.set_follow(viewer, followed_c, true).unwrap();
+
+    let old_reply_uri = "at://did:plc:followed-a/app.bsky.feed.post/old-reply";
+    let new_reply_uri = "at://did:plc:followed-b/app.bsky.feed.post/new-reply";
+    let old_parent_uri = "at://did:plc:followed-c/app.bsky.feed.post/parent-old";
+    let new_parent_uri = "at://did:plc:followed-c/app.bsky.feed.post/parent-new";
+    let c_post_uri = "at://did:plc:followed-c/app.bsky.feed.post/c-new";
+
+    storage
+        .put_record(&IndexedRecord {
+            did: followed_a.into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "old-reply".into(),
+            uri: old_reply_uri.into(),
+            cid: Some("cid-old-reply".into()),
+            time_us: 100,
+            record: serde_json::json!({
+                "$type": "app.bsky.feed.post",
+                "text": "old reply",
+                "createdAt": "2026-11-03T23:44:32Z",
+                "reply": {"parent": {"uri": old_parent_uri, "cid": "cid-parent-old"}}
+            }),
+        })
+        .unwrap();
+    storage
+        .put_record(&IndexedRecord {
+            did: followed_b.into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "new-reply".into(),
+            uri: new_reply_uri.into(),
+            cid: Some("cid-new-reply".into()),
+            time_us: 90,
+            record: serde_json::json!({
+                "$type": "app.bsky.feed.post",
+                "text": "new reply",
+                "createdAt": "2026-11-04T06:42:08Z",
+                "reply": {"parent": {"uri": new_parent_uri, "cid": "cid-parent-new"}}
+            }),
+        })
+        .unwrap();
+    storage
+        .put_record(&IndexedRecord {
+            did: followed_c.into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "parent-old".into(),
+            uri: old_parent_uri.into(),
+            cid: Some("cid-parent-old".into()),
+            time_us: 80,
+            record: serde_json::json!({
+                "$type": "app.bsky.feed.post",
+                "text": "older parent",
+                "createdAt": "2026-11-03T20:00:00Z"
+            }),
+        })
+        .unwrap();
+    storage
+        .put_record(&IndexedRecord {
+            did: followed_c.into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "parent-new".into(),
+            uri: new_parent_uri.into(),
+            cid: Some("cid-parent-new".into()),
+            time_us: 70,
+            record: serde_json::json!({
+                "$type": "app.bsky.feed.post",
+                "text": "newer parent",
+                "createdAt": "2026-11-04T06:42:08Z"
+            }),
+        })
+        .unwrap();
+    storage
+        .put_record(&IndexedRecord {
+            did: followed_c.into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "c-new".into(),
+            uri: c_post_uri.into(),
+            cid: Some("cid-c-new".into()),
+            time_us: 60,
+            record: serde_json::json!({
+                "$type": "app.bsky.feed.post",
+                "text": "top-level post",
+                "createdAt": "2026-11-04T06:42:08Z"
+            }),
+        })
+        .unwrap();
+
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default().with_callback_did(viewer), storage);
+    let cookie = finish_login(&app).await;
+    let html = get_html(&app, "/app?tab=following", &cookie).await;
+    let old_index = html.find(old_reply_uri).unwrap();
+    let new_index = html.find(new_reply_uri).unwrap();
+    assert!(
+        new_index < old_index,
+        "the newer reply must be above the older one: {html}"
+    );
+}
