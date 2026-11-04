@@ -516,13 +516,16 @@ pub fn post_created_at(record: &IndexedRecord) -> String {
 /// `createdAt` and the arrival time, so a future-dated post cannot pin itself
 /// above real new posts forever. Unparseable or missing `createdAt` uses the
 /// arrival time.
+fn sort_us(created_at: Option<&str>, arrival_us: u64) -> u64 {
+    let created_us = created_at
+        .and_then(crate::backfill::parse_rfc3339_micros)
+        .unwrap_or(arrival_us);
+    created_us.min(arrival_us)
+}
+
 pub fn post_sort_us(record: &IndexedRecord) -> u64 {
     let created_at = record.record.get("createdAt").and_then(Value::as_str);
-    let mut created_us = record.time_us;
-    if let Some(parsed) = created_at.and_then(crate::backfill::parse_rfc3339_micros) {
-        created_us = parsed;
-    }
-    created_us.min(record.time_us)
+    sort_us(created_at, record.time_us)
 }
 
 fn post_sort_us_from_json(json: &str, time_us: u64) -> u64 {
@@ -530,11 +533,7 @@ fn post_sort_us_from_json(json: &str, time_us: u64) -> u64 {
         return time_us;
     };
     let created_at = record.get("createdAt").and_then(Value::as_str);
-    let mut created_us = time_us;
-    if let Some(parsed) = created_at.and_then(crate::backfill::parse_rfc3339_micros) {
-        created_us = parsed;
-    }
-    created_us.min(time_us)
+    sort_us(created_at, time_us)
 }
 
 fn sort_time_matches_cursor(
@@ -845,6 +844,7 @@ pub trait Storage: Send + Sync {
         Ok(0)
     }
     /// Fills one bounded batch of old post rows into the post-sort side table.
+    /// Returns the last `records.rowid` examined (0 when the walk is done), not a count.
     fn backfill_post_sort_batch(&self, _limit: usize) -> Result<u64, StorageError> {
         Ok(0)
     }
@@ -6307,6 +6307,7 @@ impl Storage for SqliteStorage {
         Ok(remaining)
     }
 
+    /// Returns the last `records.rowid` examined (0 when the walk is done), not a count.
     fn backfill_post_sort_batch(&self, limit: usize) -> Result<u64, StorageError> {
         let limit = limit.clamp(1, 10_000);
         let remaining = self.post_sort_backfill_remaining()?;

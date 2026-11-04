@@ -57,10 +57,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 tracing::warn!(%error, "post-sort backfill batch failed");
                 break;
             }
-            let Ok(progress) = batch_result else {
+            let Ok(last_rowid) = batch_result else {
                 break;
             };
-            if progress == 0 {
+            if last_rowid == 0 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
