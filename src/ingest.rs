@@ -6372,11 +6372,10 @@ impl Storage for SqliteStorage {
         })?;
         let resolved = batch.len() as u64;
         let before = self.post_sort_remaining.load(Ordering::Relaxed);
-        self.post_sort_remaining.store(
-            if before > resolved { before - resolved } else { 0 },
-            Ordering::Relaxed,
-        );
-        self.post_sort_backfill_rowid.store(last_seen, Ordering::Relaxed);
+        self.post_sort_remaining
+            .store(before.saturating_sub(resolved), Ordering::Relaxed);
+        self.post_sort_backfill_rowid
+            .store(last_seen, Ordering::Relaxed);
         Ok(last_seen)
     }
 

@@ -52,9 +52,7 @@ fn seed(path: &Path) {
 
     {
         let mut insert = transaction
-            .prepare_cached(
-                "INSERT INTO post_sort(uri,did,sort_us,time_us) VALUES(?1,?2,?3,?4)",
-            )
+            .prepare_cached("INSERT INTO post_sort(uri,did,sort_us,time_us) VALUES(?1,?2,?3,?4)")
             .unwrap();
         for index in 0..4 {
             insert
@@ -121,7 +119,8 @@ fn post_sort_backfill_resumes_after_the_previous_batch_last_rowid() {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert!(
-            plan.iter().any(|line| line.contains("rowid") || line.contains("INTEGER PRIMARY KEY")),
+            plan.iter()
+                .any(|line| line.contains("rowid") || line.contains("INTEGER PRIMARY KEY")),
             "the batch plan must search a rowid range: {plan:?}"
         );
     }
@@ -141,18 +140,25 @@ fn post_sort_backfill_remaining_is_computed_once_and_decremented() {
     let first = storage.post_sort_backfill_remaining().unwrap();
     let first_statements = trace.statements();
     assert!(
-        first_statements.iter().any(|sql| sql.contains("COUNT(*) FROM records")),
+        first_statements
+            .iter()
+            .any(|sql| sql.contains("COUNT(*) FROM records")),
         "the first remaining query must count post rows: {first_statements:?}"
     );
     assert!(
-        first_statements.iter().any(|sql| sql.contains("COUNT(*) FROM post_sort")),
+        first_statements
+            .iter()
+            .any(|sql| sql.contains("COUNT(*) FROM post_sort")),
         "the first remaining query must count filled rows: {first_statements:?}"
     );
 
     trace.clear();
     let second = storage.post_sort_backfill_remaining().unwrap();
     let second_statements = trace.statements();
-    assert_eq!(second, first, "the remaining count must be cached after the first call");
+    assert_eq!(
+        second, first,
+        "the remaining count must be cached after the first call"
+    );
     assert!(
         !second_statements.iter().any(|sql| sql.contains("COUNT(*)")),
         "a cached health call must not recount records or post_sort: {second_statements:?}"

@@ -11,7 +11,8 @@ use appview_rs::{
         resolve_login_allowlist,
     },
     ingest::{
-        Ingestor, JetstreamConsumer, JetstreamSupervisor, POST_SORT_BACKFILL_BATCH, SqliteStorage, Storage,
+        Ingestor, JetstreamConsumer, JetstreamSupervisor, POST_SORT_BACKFILL_BATCH, SqliteStorage,
+        Storage,
     },
     init_tracing,
     jwt::ServiceJwtVerifier,
