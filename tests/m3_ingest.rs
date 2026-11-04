@@ -1,6 +1,6 @@
 use appview_rs::ingest::{
     FollowUpdate, IndexedRecord, Ingestor, JetstreamConsumer, JetstreamStorageUpdate,
-    MemoryStorage, ProfileIndexEntry, ScopeMode, SqliteStorage, Storage,
+    JetstreamSupervisor, MemoryStorage, ProfileIndexEntry, ScopeMode, SqliteStorage, Storage,
 };
 use futures_util::{SinkExt, StreamExt};
 use rusqlite::Connection;
@@ -1204,6 +1204,10 @@ async fn a_transient_locked_cursor_read_is_retried_and_the_event_is_applied() {
     let ingestor = Ingestor::new(storage.clone(), ScopeMode::Full);
     storage.as_ref().set_cursor_lock_failures(1);
 
+    let live_cursor = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -1213,7 +1217,7 @@ async fn a_transient_locked_cursor_read_is_retried_and_the_event_is_applied() {
             .send(Message::Text(
                 event(
                     "did:plc:locked-cursor",
-                    1234,
+                    live_cursor,
                     "create",
                     "app.bsky.feed.post",
                     "after-lock",
@@ -1239,13 +1243,73 @@ async fn a_transient_locked_cursor_read_is_retried_and_the_event_is_applied() {
     run.await.unwrap();
     server.await.unwrap();
 
-    assert_eq!(storage.cursor().unwrap(), Some(1234));
+    assert_eq!(storage.cursor().unwrap(), Some(live_cursor));
     assert!(
         storage
             .get_record("did:plc:locked-cursor", "app.bsky.feed.post", "after-lock")
             .unwrap()
             .is_some()
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn supervisor_shutdown_stops_before_restart() {
+    let storage = Arc::new(MemoryStorage::default());
+    let ingestor = Ingestor::new(storage.clone(), ScopeMode::Full);
+    storage.as_ref().set_cursor_lock_failures(1);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let consumer = JetstreamConsumer::new(ingestor, Duration::from_millis(1));
+    let supervisor = JetstreamSupervisor::new(consumer, Duration::from_millis(100))
+        .with_max_restart_delay(Duration::from_millis(100));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let urls = vec![format!("ws://{address}/subscribe")];
+    let run = supervisor.run(&urls, shutdown_rx);
+    tokio::pin!(run);
+    tokio::select! {
+        result = &mut run => panic!("supervisor stopped before shutdown: {result:?}"),
+        _ = tokio::time::sleep(Duration::from_millis(20)) => {},
+    }
+    shutdown_tx.send(true).unwrap();
+    run.await.unwrap();
+
+    assert_eq!(
+        supervisor
+            .status()
+            .restarts
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert!(storage.cursor().unwrap().is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn supervisor_restarts_after_a_consumer_error_with_bounded_backoff() {
+    let storage = Arc::new(MemoryStorage::default());
+    let ingestor = Ingestor::new(storage.clone(), ScopeMode::Full);
+    let consumer = JetstreamConsumer::new(ingestor, Duration::from_millis(1));
+    let supervisor = JetstreamSupervisor::new(consumer, Duration::from_millis(100))
+        .with_max_restart_delay(Duration::from_millis(200));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let urls = vec![];
+    let run = supervisor.run(&urls, shutdown_rx);
+    tokio::pin!(run);
+    tokio::select! {
+        result = &mut run => panic!("supervisor stopped before shutdown: {result:?}"),
+        _ = tokio::time::sleep(Duration::from_millis(150)) => {},
+    }
+    shutdown_tx.send(true).unwrap();
+    run.await.unwrap();
+
+    assert_eq!(
+        supervisor
+            .status()
+            .restarts
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert_eq!(supervisor.status().state_name(), "restarting");
 }
 
 #[tokio::test(flavor = "current_thread")]

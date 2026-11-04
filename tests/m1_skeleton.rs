@@ -1,6 +1,7 @@
 use appview_rs::{
     config::Config,
-    ingest::MemoryStorage,
+    health_with_status,
+    ingest::{Ingestor, JetstreamConsumer, MemoryStorage, ScopeMode},
     oauth::{DisabledOAuthFlow, OAuthPublic},
     router, router_with_oauth_flow,
 };
@@ -63,6 +64,35 @@ async fn health_endpoint_returns_json_ok() {
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], br#"{"status":"ok"}"#, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn health_endpoint_reports_consumer_state_and_counters() {
+    let storage = std::sync::Arc::new(MemoryStorage::default());
+    let ingestor = Ingestor::new(storage.clone(), ScopeMode::Full);
+    let consumer = JetstreamConsumer::new(ingestor, std::time::Duration::from_millis(1));
+    let status = consumer.status();
+    status.waiting_to_reconnect();
+    status.record_event(1234);
+
+    let app = axum::Router::new()
+        .route("/xrpc/_health", axum::routing::get(health_with_status))
+        .route("/healthz", axum::routing::get(health_with_status))
+        .with_state(status);
+    for path in ["/xrpc/_health", "/healthz"] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{path}");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            &body[..],
+            br#"{"status":"ok","jetstream_state":"waiting to reconnect","supervisor_restarts":0,"last_event_us":1234}"#,
+            "{path}"
+        );
     }
 }
 

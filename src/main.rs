@@ -4,11 +4,12 @@ use appview_rs::{
         AtriumRepoVerifier, BackfillWorker, HostRateLimiter, HttpRepoSource, RepoBackfiller,
     },
     config::{Config, OAuthMode, identity_cache_path},
+    health_with_status,
     identity::{
         HandleRefreshWorker, HttpIdentityBackend, IdentityResolver, SqliteIdentityCache,
         resolve_login_allowlist,
     },
-    ingest::{Ingestor, JetstreamConsumer, SqliteStorage},
+    ingest::{Ingestor, JetstreamConsumer, JetstreamSupervisor, SqliteStorage},
     init_tracing,
     jwt::ServiceJwtVerifier,
     net::SafeHttpClient,
@@ -87,6 +88,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
     let relationships =
         RelationshipClient::new(SafeHttpClient::new(), PUBLIC_APPVIEW_BASE).with_store(oauth_store);
+    let health_router = axum::Router::new()
+        .route("/xrpc/_health", axum::routing::get(health_with_status))
+        .route("/healthz", axum::routing::get(health_with_status))
+        .with_state(consumer.status());
     let app_router = oauth
         .router_with_flow_and_shutdown_and_profile_counts_and_relationships(
             oauth_flow.clone(),
@@ -101,7 +106,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             config.appview_did.clone(),
             config.public_url.starts_with("https://"),
             profile_counts,
-        ));
+        ))
+        .merge(health_router);
     let backfiller = RepoBackfiller::new(
         storage.clone(),
         HttpRepoSource::default(),
@@ -129,9 +135,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let ingestion_shutdown = shutdown_rx.clone();
+    let supervisor = JetstreamSupervisor::new(consumer, Duration::from_secs(1))
+        .with_max_restart_delay(Duration::from_secs(30));
     let ingestion_task = tokio::spawn(async move {
-        if let Err(error) = consumer.run(&jetstream_urls, ingestion_shutdown).await {
-            error!(%error, "Jetstream consumer stopped");
+        if let Err(error) = supervisor.run(&jetstream_urls, ingestion_shutdown).await {
+            error!(%error, "Jetstream supervisor stopped");
         }
     });
     let backfill_shutdown = shutdown_rx.clone();

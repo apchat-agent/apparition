@@ -1,4 +1,4 @@
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicBool, AtomicUsize, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -2030,12 +2030,10 @@ impl Storage for MemoryStorage {
     fn cursor(&self) -> Result<Option<u64>, StorageError> {
         if self.cursor_lock_failures.load(Ordering::SeqCst) > 0 {
             self.cursor_lock_failures.fetch_sub(1, Ordering::SeqCst);
-            return Err(StorageError::Sqlite(
-                rusqlite::Error::SqliteFailure(
-                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
-                    Some("database is locked".to_string()),
-                ),
-            ));
+            return Err(StorageError::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                Some("database is locked".to_string()),
+            )));
         }
         Ok(self
             .inner
@@ -6884,6 +6882,49 @@ struct JetstreamCommit {
     record: Option<Value>,
 }
 
+#[derive(Default)]
+pub struct JetstreamStatus {
+    pub state: AtomicU64,
+    pub restarts: AtomicU64,
+    pub last_event_us: AtomicU64,
+}
+
+impl JetstreamStatus {
+    pub fn state_name(&self) -> &'static str {
+        let state = self.state.load(Ordering::Relaxed);
+        if state == 0 {
+            return "running";
+        }
+        if state == 1 {
+            return "waiting to reconnect";
+        }
+        if state == 2 {
+            return "restarting";
+        }
+        "unknown"
+    }
+
+    pub fn running(&self) {
+        self.state.store(0, Ordering::Relaxed);
+    }
+
+    pub fn waiting_to_reconnect(&self) {
+        self.state.store(1, Ordering::Relaxed);
+    }
+
+    pub fn restarting(&self) {
+        self.state.store(2, Ordering::Relaxed);
+    }
+
+    pub fn restarted(&self) {
+        self.restarts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_event(&self, time_us: u64) {
+        self.last_event_us.store(time_us, Ordering::Relaxed);
+    }
+}
+
 pub struct Ingestor<S: Storage> {
     storage: Arc<S>,
     identity_cache: Option<Arc<crate::identity::SqliteIdentityCache>>,
@@ -6891,6 +6932,7 @@ pub struct Ingestor<S: Storage> {
     cursor: AtomicU64,
     processed: AtomicU64,
     batch_metrics: Mutex<IngestIntervalMetrics>,
+    status: Arc<JetstreamStatus>,
 }
 
 #[derive(Default)]
@@ -6971,6 +7013,7 @@ impl<S: Storage> Ingestor<S> {
             cursor: AtomicU64::new(cursor),
             processed: AtomicU64::new(0),
             batch_metrics: Mutex::new(IngestIntervalMetrics::default()),
+            status: Arc::new(JetstreamStatus::default()),
         }
     }
 
@@ -6979,6 +7022,11 @@ impl<S: Storage> Ingestor<S> {
         identity_cache: Arc<crate::identity::SqliteIdentityCache>,
     ) -> Self {
         self.identity_cache = Some(identity_cache);
+        self
+    }
+
+    pub fn with_status(mut self, status: Arc<JetstreamStatus>) -> Self {
+        self.status = status;
         self
     }
 
@@ -7040,6 +7088,7 @@ impl<S: Storage> Ingestor<S> {
         batch_state.phases.commit = storage_timing.commit;
         let last_cursor = updates.last().expect("nonempty batch").time_us;
         self.cursor.store(last_cursor, Ordering::Relaxed);
+        self.status.record_event(last_cursor);
         self.processed
             .fetch_add(updates.len() as u64, Ordering::Relaxed);
         batch_state.phases.total = batch_started.elapsed();
@@ -7278,6 +7327,9 @@ impl<S: Storage> Ingestor<S> {
             slowest_phase_ms,
             bytes_on_disk = self.storage.bytes_on_disk(),
             cursor_lag_seconds = ?cursor_lag_seconds,
+            consumer_state = self.status.state_name(),
+            supervisor_restarts = self.status.restarts.load(Ordering::Relaxed),
+            last_event_us = self.status.last_event_us.load(Ordering::Relaxed),
             "Jetstream ingestion metrics"
         );
     }
@@ -7537,6 +7589,10 @@ impl<S: Storage + 'static> JetstreamConsumer<S> {
         }
     }
 
+    pub fn status(&self) -> Arc<JetstreamStatus> {
+        self.ingestor.status.clone()
+    }
+
     pub async fn run(
         &self,
         urls: &[String],
@@ -7559,18 +7615,52 @@ impl<S: Storage + 'static> JetstreamConsumer<S> {
             if *shutdown.borrow() {
                 return Ok(());
             }
+            self.ingestor.status.running();
             let base_url = &urls[next_url % urls.len()];
             next_url += 1;
             let ingestor = self.ingestor.clone();
             let stale_threshold = self.stale_cursor_threshold;
             let base_url = base_url.clone();
-            let url = tokio::task::spawn_blocking(move || {
+            let url_result = tokio::task::spawn_blocking(move || {
                 prepare_jetstream_url(&ingestor, stale_threshold, &base_url)
             })
             .await
             .map_err(|error| {
                 IngestError::WebSocket(format!("Jetstream URL worker failed: {error}"))
-            })??;
+            });
+            let url = match url_result {
+                Ok(Ok(url)) => url,
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "Jetstream URL preparation failed");
+                    self.ingestor.status.waiting_to_reconnect();
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {},
+                        _ = metrics.tick() => self.ingestor.record_metrics(metrics_interval),
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Jetstream URL worker failed");
+                    self.ingestor.status.waiting_to_reconnect();
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {},
+                        _ = metrics.tick() => self.ingestor.record_metrics(metrics_interval),
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                    continue;
+                }
+            };
             let endpoint = safe_jetstream_endpoint(&url);
             let connection_result = {
                 let connection = self.consume_connection(&url);
@@ -7589,7 +7679,10 @@ impl<S: Storage + 'static> JetstreamConsumer<S> {
             };
             match connection_result {
                 Ok(()) => backoff = self.reconnect_delay,
-                Err(error) => tracing::warn!(%error, %endpoint, "Jetstream connection ended"),
+                Err(error) => {
+                    tracing::warn!(%error, %endpoint, "Jetstream connection ended");
+                    self.ingestor.status.waiting_to_reconnect();
+                }
             }
             tokio::select! {
                 _ = tokio::time::sleep(backoff) => {},
@@ -7601,6 +7694,77 @@ impl<S: Storage + 'static> JetstreamConsumer<S> {
                 }
             }
             backoff = (backoff * 2).min(Duration::from_secs(30));
+        }
+    }
+}
+
+pub struct JetstreamSupervisor<S: Storage> {
+    consumer: Arc<JetstreamConsumer<S>>,
+    restart_delay: Duration,
+    max_restart_delay: Duration,
+}
+
+impl<S: Storage + 'static> JetstreamSupervisor<S> {
+    pub fn new(consumer: JetstreamConsumer<S>, restart_delay: Duration) -> Self {
+        Self {
+            consumer: Arc::new(consumer),
+            restart_delay,
+            max_restart_delay: Duration::from_secs(30),
+        }
+    }
+
+    pub fn with_max_restart_delay(mut self, delay: Duration) -> Self {
+        self.max_restart_delay = delay.max(self.restart_delay);
+        self
+    }
+
+    pub fn status(&self) -> Arc<JetstreamStatus> {
+        self.consumer.status()
+    }
+
+    pub async fn run(
+        &self,
+        urls: &[String],
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<(), IngestError> {
+        let mut backoff = self.restart_delay;
+        loop {
+            if *shutdown.borrow() {
+                return Ok(());
+            }
+            let run_shutdown = shutdown.clone();
+            let run_result = std::panic::AssertUnwindSafe(self.consumer.run(urls, run_shutdown))
+                .catch_unwind()
+                .await;
+            match run_result {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(error)) => {
+                    tracing::error!(%error, "Jetstream consumer stopped; restarting");
+                    self.status().restarting();
+                }
+                Err(panic) => {
+                    let panic_text = format!("{panic:?}");
+                    tracing::error!(
+                        panic = panic_text,
+                        "Jetstream consumer panicked; restarting"
+                    );
+                    self.status().restarting();
+                }
+            }
+            let slept = tokio::select! {
+                _ = tokio::time::sleep(backoff) => true,
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return Ok(());
+                    }
+                    false
+                }
+            };
+            if !slept {
+                return Ok(());
+            }
+            self.status().restarted();
+            backoff = (backoff * 2).min(self.max_restart_delay);
         }
     }
 }

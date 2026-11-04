@@ -14,7 +14,7 @@ pub mod recent_posts;
 pub mod search;
 pub mod timing_console;
 
-use axum::{Json, Router, routing::get};
+use axum::{Json, Router, extract::State, routing::get};
 use serde::Serialize;
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -68,12 +68,38 @@ where
 }
 
 #[derive(Serialize)]
-struct HealthResponse {
+pub struct HealthResponse {
     status: &'static str,
+}
+
+#[derive(Serialize)]
+pub struct JetstreamHealthResponse {
+    status: &'static str,
+    jetstream_state: String,
+    supervisor_restarts: u64,
+    last_event_us: Option<u64>,
 }
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
+}
+
+pub async fn health_with_status(
+    State(status): State<std::sync::Arc<ingest::JetstreamStatus>>,
+) -> Json<JetstreamHealthResponse> {
+    let last_event_us = status
+        .last_event_us
+        .load(std::sync::atomic::Ordering::Relaxed);
+    Json(JetstreamHealthResponse {
+        status: "ok",
+        jetstream_state: status.state_name().to_owned(),
+        supervisor_restarts: status.restarts.load(std::sync::atomic::Ordering::Relaxed),
+        last_event_us: if last_event_us == 0 {
+            None
+        } else {
+            Some(last_event_us)
+        },
+    })
 }
 
 pub fn init_tracing(filter: &str) -> Result<(), tracing_subscriber::util::TryInitError> {
