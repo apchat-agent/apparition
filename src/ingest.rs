@@ -2977,6 +2977,7 @@ impl SqliteWriterMetrics {
     }
 
     fn report(&self, read_metrics: &ReadPoolMetrics, wal_metrics: &WalMetrics) {
+        let outbound_host_calls = crate::net::take_outbound_host_metrics();
         let count = self.transaction_count.swap(0, Ordering::Relaxed);
         let total_ns = self.transaction_total_ns.swap(0, Ordering::Relaxed);
         let max_ns = self.transaction_max_ns.swap(0, Ordering::Relaxed);
@@ -3012,6 +3013,7 @@ impl SqliteWriterMetrics {
             recent_posts_failed,
             recent_posts_dropped,
             web_read_timeout_count = WEB_READ_TIMEOUT_COUNT.load(Ordering::Relaxed),
+            outbound_host_calls = %outbound_host_calls,
             "SQLite writer minute metrics"
         );
     }
@@ -6715,33 +6717,37 @@ impl Storage for SqliteStorage {
             .iter()
             .map(|uri| (uri.clone(), PostInteractionSummary::default()))
             .collect::<HashMap<_, _>>();
-        let mut missing = Vec::new();
+        let mut cached_uris = HashSet::new();
+        let missing: Vec<String>;
         {
             let conn = self.read_conn()?;
-            {
-                let mut statement = conn.prepare(
-                    "SELECT like_count,repost_count,reply_count,quote_count
-                     FROM post_counts WHERE uri=?1",
-                )?;
-                for uri in uris {
-                    let cached = statement
-                        .query_row([uri], |row| {
-                            Ok([row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?])
-                        })
-                        .optional()?;
-                    match cached {
-                        Some(counts) => {
-                            if let Some(summary) = summaries.get_mut(uri) {
-                                summary.like_count = counts[0];
-                                summary.repost_count = counts[1];
-                                summary.reply_count = counts[2];
-                                summary.quote_count = counts[3];
-                            }
-                        }
-                        None => missing.push(uri.clone()),
-                    }
+            let batch = serde_json::to_string(uris)?;
+            let mut statement = conn.prepare(
+                "SELECT uri,like_count,repost_count,reply_count,quote_count FROM post_counts
+                 WHERE uri IN (SELECT value FROM json_each(?1))",
+            )?;
+            let rows = statement
+                .query_map([batch], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        [row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?],
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (uri, counts) in rows {
+                cached_uris.insert(uri.clone());
+                if let Some(summary) = summaries.get_mut(&uri) {
+                    summary.like_count = counts[0];
+                    summary.repost_count = counts[1];
+                    summary.reply_count = counts[2];
+                    summary.quote_count = counts[3];
                 }
             }
+            missing = uris
+                .iter()
+                .filter(|uri| !cached_uris.contains(*uri))
+                .cloned()
+                .collect::<Vec<_>>();
             if !missing.is_empty() {
                 let (computed, _work) = compute_post_counts(&conn, &missing)?;
                 for uri in &missing {
@@ -9631,6 +9637,7 @@ mod recent_posts_storage_tests {
         assert!(text.contains("recent_posts_done=4"), "{text}");
         assert!(text.contains("recent_posts_failed=2"), "{text}");
         assert!(text.contains("recent_posts_dropped=1"), "{text}");
+        assert!(text.contains("outbound_host_calls=\"none\""), "{text}");
     }
 
     #[test]

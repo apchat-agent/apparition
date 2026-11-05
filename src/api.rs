@@ -906,7 +906,8 @@ fn post_view<S: Storage>(
     viewer_did: Option<&str>,
 ) -> Result<Value, StorageError> {
     let interactions = storage.post_interaction_summary(&record.uri, viewer_did)?;
-    post_view_with_interactions(storage, record, viewer_did, &interactions)
+    let author_profile = post_author_profile(storage, &record.did);
+    post_view_with_interactions(record, viewer_did, &interactions, &author_profile)
 }
 
 fn post_views_for_page<S: Storage>(
@@ -919,23 +920,43 @@ fn post_views_for_page<S: Storage>(
         .map(|record| record.uri.clone())
         .collect::<Vec<_>>();
     let interactions = storage.page_post_interaction_summaries(&uris, viewer_did)?;
+    let mut author_profiles = HashMap::new();
+    for record in records {
+        author_profiles
+            .entry(record.did.clone())
+            .or_insert_with(|| post_author_profile(storage, &record.did));
+    }
     records
         .iter()
         .map(|record| {
             let summary = interactions.get(&record.uri).cloned().unwrap_or_default();
-            post_view_with_interactions(storage, record, viewer_did, &summary)
+            post_view_with_interactions(
+                record,
+                viewer_did,
+                &summary,
+                author_profiles
+                    .get(&record.did)
+                    .expect("the page preloads every post author's profile"),
+            )
         })
         .collect()
 }
 
-fn post_view_with_interactions<S: Storage>(
-    storage: &S,
+fn post_author_profile<S: Storage>(storage: &S, did: &str) -> Value {
+    profile_view_from_storage(storage, did).unwrap_or_else(|error| {
+        tracing::warn!(%error, did, "could not load a post author profile; using its DID");
+        json!({"did":did,"handle":"handle.invalid"})
+    })
+}
+
+fn post_view_with_interactions(
     record: &IndexedRecord,
     viewer_did: Option<&str>,
     interactions: &crate::ingest::PostInteractionSummary,
+    author_profile: &Value,
 ) -> Result<Value, StorageError> {
     let mut post = json!({
-        "uri":record.uri,"cid":record.cid,"author":profile_view_from_storage(storage, &record.did).unwrap_or_else(|_| json!({"did":record.did,"handle":"handle.invalid"})),
+        "uri":record.uri,"cid":record.cid,"author":author_profile,
         "record":record.record,
         "replyCount":interactions.reply_count,"repostCount":interactions.repost_count,"likeCount":interactions.like_count,"quoteCount":interactions.quote_count,"bookmarkCount":0,"labels":[]
     });

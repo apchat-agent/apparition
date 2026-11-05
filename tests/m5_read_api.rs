@@ -404,7 +404,14 @@ async fn get_posts_uses_one_sqlite_record_lookup_for_a_full_uri_batch() {
             ) && (statement.contains("AND uri IN") || statement.contains("AND uri='at://"))
         })
         .count();
-    let post_count_cache_lookup_count = trace.count_containing("FROM post_counts WHERE uri=");
+    let post_count_cache_lookup_count = trace
+        .statements()
+        .iter()
+        .filter(|statement| {
+            statement.contains("FROM post_counts")
+                && (statement.contains("WHERE uri=") || statement.contains("WHERE uri IN"))
+        })
+        .count();
     let author_count_query_count =
         trace.count_containing(appview_rs::ingest::StatementTrace::PROFILE_COUNTS_SQL);
     assert_eq!(
