@@ -5164,12 +5164,17 @@ impl<B: crate::identity::IdentityBackend + 'static> OAuthFlow for AtriumOAuthFlo
             let pds_endpoint = document
                 .pds_endpoint()
                 .ok_or_else(|| "author DID document has no valid PDS endpoint".to_owned())?;
-            let verified_handle = self
+            let verified_handle = match self
                 .identity_resolver
                 .verified_handle_for_document(&document)
                 .await
-                .ok()
-                .flatten();
+            {
+                Ok(handle) => handle,
+                Err(error) => {
+                    tracing::debug!(%did, %error, "could not verify the author handle during profile refresh");
+                    None
+                }
+            };
             let mut url =
                 reqwest::Url::parse(&format!("{pds_endpoint}/xrpc/com.atproto.repo.getRecord"))
                     .map_err(|_| "author PDS URL is invalid".to_owned())?;
@@ -7166,13 +7171,9 @@ impl<F: OAuthFlow, S: Storage + 'static> ProfileRefreshWorker<F, S> {
                     }
                     Err(error) => {
                         tracing::debug!(%did, %error, "background author profile fetch failed");
-                        self.storage.set_profile_index_entry(
-                            &did,
-                            ProfileIndexEntry {
-                                has_profile: false,
-                                fetched_at_ms: now_ms,
-                            },
-                        )?;
+                        // A remote error (including a host-backoff fast-fail) says nothing
+                        // about whether the author has a profile. Keep the previous cache
+                        // entry untouched so a later page visit can enqueue a retry.
                         self.storage.queue_handle_refresh(&did)?;
                     }
                 }

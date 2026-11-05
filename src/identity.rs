@@ -775,6 +775,11 @@ impl<B: IdentityBackend> IdentityResolver<B> {
     }
 
     fn persist_failure(&self, key: &str, did: &str, error: ResolutionError) {
+        // Backend errors include transport failures and host-backoff fast-fails. Keep those
+        // retryable; only cache authoritative identity/verification negatives.
+        if matches!(&error, ResolutionError::Backend(_)) {
+            return;
+        }
         let Some(cache) = &self.persistent_cache else {
             return;
         };

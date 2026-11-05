@@ -80,6 +80,22 @@ pub fn feed_is_gone(error: &str) -> bool {
     error.starts_with(FEED_GONE_PREFIX)
 }
 
+fn feed_resolution_failure_is_retryable(error: &str) -> bool {
+    if error.contains(" backing off for ") {
+        return true;
+    }
+    error
+        .split(" returned HTTP ")
+        .skip(1)
+        .filter_map(|status| {
+            status
+                .split(|character: char| !character.is_ascii_digit())
+                .next()
+        })
+        .filter_map(|status| status.parse::<u16>().ok())
+        .any(|status| status == 429 || status >= 500)
+}
+
 /// The reason a failed com.atproto.repo.getRecord answer means the record is definitely gone, or
 /// None when the failure may be transient. Only these two PDS answers count: RecordNotFound, and
 /// InvalidRequest "Could not find repo" (the account's repo was deleted, measured 2026-10-31 on
@@ -581,8 +597,9 @@ pub struct FeedClient<B: IdentityBackend> {
     live_post_cache: LivePostCache,
     in_flight_post_fetches: InFlightPostFetches,
     in_flight_page_post_fetches: InFlightPagePostFetches,
-    // Failed resolutions are remembered too: the layout resolves every pinned feed on every page,
-    // so an uncached failure would repeat its full network cost on each request.
+    // Nonretryable resolution failures are remembered because the layout resolves every pinned
+    // feed on each page. Host backoff and 429/5xx failures are left uncached so later visits can
+    // retry once the host recovers.
     generator_failures: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, String)>>,
     cache_store: Option<crate::oauth::SqliteOAuthStore>,
     background_resolutions: tokio::sync::Mutex<HashSet<String>>,
@@ -725,18 +742,23 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
                         duration_ms = started.elapsed().as_millis() as u64,
                         "feed generator resolution failed"
                     );
-                    let mut failures = self.generator_failures.lock().await;
-                    failures.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
-                    if failures.len() < 1024 {
-                        failures.insert(
-                            key.clone(),
-                            (
-                                tokio::time::Instant::now() + Duration::from_secs(10 * 60),
-                                error.clone(),
-                            ),
+                    if !feed_resolution_failure_is_retryable(error) {
+                        let mut failures = self.generator_failures.lock().await;
+                        failures.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
+                        if failures.len() < 1024 {
+                            failures.insert(
+                                key.clone(),
+                                (
+                                    tokio::time::Instant::now() + Duration::from_secs(10 * 60),
+                                    error.clone(),
+                                ),
+                            );
+                        }
+                        self.save_resolution(
+                            &key,
+                            &CachedGeneratorResolution::Failure(error.clone()),
                         );
                     }
-                    self.save_resolution(&key, &CachedGeneratorResolution::Failure(error.clone()));
                 }
                 result
             })
@@ -782,7 +804,14 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
             if let Some(reason) = gone_reason(response.status().as_u16(), response.body()) {
                 return Err(reason);
             }
-            return Err("feed generator record could not be fetched".to_owned());
+            let excerpt: String = String::from_utf8_lossy(response.body())
+                .chars()
+                .take(240)
+                .collect();
+            return Err(format!(
+                "feed generator record returned HTTP {}: {excerpt}",
+                response.status()
+            ));
         }
         let record: Value = serde_json::from_slice(response.body())
             .map_err(|_| "feed generator record was invalid JSON".to_owned())?;

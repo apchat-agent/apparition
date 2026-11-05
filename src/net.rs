@@ -25,9 +25,13 @@ static OUTBOUND_REQUESTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static BACKGROUND_REQUESTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 const PER_HOST_REQUESTS: usize = 4;
 const MAX_HOST_BACKOFF: Duration = Duration::from_secs(60 * 60);
+// Keep ordinary Retry-After delays useful while returning immediately for long outages, so
+// a remote host cannot make requests hold shared capacity while waiting on its cooldown.
+const MAX_HOST_BACKOFF_WAIT: Duration = Duration::from_secs(2);
 static OUTBOUND_HOST_GATES: OnceLock<Mutex<HashMap<String, Arc<OutboundHostGate>>>> =
     OnceLock::new();
-static OUTBOUND_HOST_METRICS: OnceLock<Mutex<BTreeMap<String, (u64, u64)>>> = OnceLock::new();
+type OutboundHostMetrics = BTreeMap<String, (u64, u64, u64)>;
+static OUTBOUND_HOST_METRICS: OnceLock<Mutex<OutboundHostMetrics>> = OnceLock::new();
 
 struct OutboundHostGate {
     requests: Arc<Semaphore>,
@@ -38,6 +42,7 @@ struct OutboundHostGate {
 struct HostBackoff {
     retry_at: Option<tokio::time::Instant>,
     consecutive_failures: u32,
+    last_failure_status: Option<u16>,
 }
 
 impl OutboundHostGate {
@@ -48,22 +53,36 @@ impl OutboundHostGate {
         }
     }
 
-    async fn wait_for_backoff(&self) {
+    async fn acquire_request_permit(
+        &self,
+        host_label: &str,
+        metrics_host: &str,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
         loop {
-            let retry_at = self.backoff.lock().ok().and_then(|state| state.retry_at);
-            let Some(retry_at) = retry_at else {
-                return;
-            };
-            if retry_at <= tokio::time::Instant::now() {
-                return;
+            if let Some((retry_at, last_failure_status)) =
+                self.backoff.lock().ok().and_then(|state| {
+                    state
+                        .retry_at
+                        .map(|retry_at| (retry_at, state.last_failure_status))
+                })
+            {
+                let now = tokio::time::Instant::now();
+                if retry_at > now {
+                    let remaining = retry_at.duration_since(now);
+                    if remaining > MAX_HOST_BACKOFF_WAIT {
+                        record_outbound_host_skipped(metrics_host);
+                        let seconds = remaining
+                            .as_secs()
+                            .saturating_add(u64::from(remaining.subsec_nanos() > 0));
+                        let status = last_failure_status.unwrap_or(503);
+                        return Err(format!(
+                            "host {host_label} backing off for {seconds} s after {status}"
+                        ));
+                    }
+                    tokio::time::sleep_until(retry_at).await;
+                    continue;
+                }
             }
-            tokio::time::sleep_until(retry_at).await;
-        }
-    }
-
-    async fn acquire_request_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
-        loop {
-            self.wait_for_backoff().await;
             let permit = self
                 .requests
                 .clone()
@@ -82,6 +101,7 @@ impl OutboundHostGate {
         if let Ok(mut backoff) = self.backoff.lock() {
             if status == http::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
                 backoff.consecutive_failures = backoff.consecutive_failures.saturating_add(1);
+                backoff.last_failure_status = Some(status.as_u16());
                 let default_delay = Duration::from_secs(
                     1_u64
                         .checked_shl(backoff.consecutive_failures.saturating_sub(1).min(6))
@@ -97,6 +117,7 @@ impl OutboundHostGate {
             } else if status.is_success() {
                 backoff.consecutive_failures = 0;
                 backoff.retry_at = None;
+                backoff.last_failure_status = None;
             }
         }
     }
@@ -135,6 +156,14 @@ fn record_outbound_host_call(host: &str, status: Option<u16>) {
     }
 }
 
+fn record_outbound_host_skipped(host: &str) {
+    let counts = OUTBOUND_HOST_METRICS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Ok(mut counts) = counts.lock() {
+        let count = counts.entry(host.to_owned()).or_default();
+        count.2 = count.2.saturating_add(1);
+    }
+}
+
 /// Consume per-host outbound request totals for the shared minute metrics line.
 pub(crate) fn take_outbound_host_metrics() -> String {
     let counts = OUTBOUND_HOST_METRICS.get_or_init(|| Mutex::new(BTreeMap::new()));
@@ -146,8 +175,8 @@ pub(crate) fn take_outbound_host_metrics() -> String {
     }
     let report = counts
         .iter()
-        .map(|(host, (calls, too_many_requests))| {
-            format!("{host}:calls={calls},429={too_many_requests}")
+        .map(|(host, (calls, too_many_requests, skipped))| {
+            format!("{host}:calls={calls},429={too_many_requests},skipped={skipped}")
         })
         .collect::<Vec<_>>()
         .join(";");
@@ -621,11 +650,12 @@ impl SafeHttpClient {
             .ok_or_else(|| "URL has no port".to_owned())?;
         let host_gate = outbound_host_gate(host, port);
         let result = async {
+            let host_label = format!("{host}:{port}");
+            let _host_permit = host_gate.acquire_request_permit(&host_label, host).await?;
             let _request_permit = request_pool(self.background)
                 .acquire_owned()
                 .await
                 .map_err(|_| "outbound request capacity is unavailable".to_owned())?;
-            let _host_permit = host_gate.acquire_request_permit().await?;
             let addresses = self.resolve_safe(url).await?;
             let client = self.client_for(host, &addresses)?;
             timeout(REQUEST_TIMEOUT, async {
@@ -718,18 +748,12 @@ impl SafeHttpClient {
         if request.body().len() > MAX_REQUEST_BYTES {
             return Err("outbound request body is too large".to_owned());
         }
-        let permit = request_pool(self.background)
-            .acquire_owned()
-            .await
-            .map_err(|_| "outbound request capacity is unavailable".to_owned())?;
-        let result = timeout(
+        timeout(
             request_timeout,
             self.send_inner(request, max_bytes, max_redirects),
         )
         .await
-        .map_err(|_| "outbound request timed out".to_owned())?;
-        drop(permit);
-        result
+        .map_err(|_| "outbound request timed out".to_owned())?
     }
 
     pub async fn get(
@@ -764,10 +788,21 @@ impl SafeHttpClient {
                 .port_or_known_default()
                 .ok_or_else(|| "URL has no port".to_owned())?;
             let host_gate = outbound_host_gate(host, port);
-            let _host_permit = host_gate.acquire_request_permit().await?;
+            let mut call_timer = OutboundCallTimer::new(request.method(), &url, call_started);
+            let host_label = format!("{host}:{port}");
+            let _host_permit = match host_gate.acquire_request_permit(&host_label, host).await {
+                Ok(permit) => permit,
+                Err(error) => {
+                    call_timer.error = Some(error.clone());
+                    return Err(error);
+                }
+            };
+            let _request_permit = request_pool(self.background)
+                .acquire_owned()
+                .await
+                .map_err(|_| "outbound request capacity is unavailable".to_owned())?;
             let addresses = self.resolve_safe(&url).await?;
             let client = self.client_for(host, &addresses)?;
-            let mut call_timer = OutboundCallTimer::new(request.method(), &url, call_started);
             if request.headers().contains_key("atproto-proxy") {
                 // A call the signed-in viewer's own PDS forwards to a service AppView
                 // (`atproto-proxy: did:web:api.bsky.app#bsky_appview`): the timing list shows
@@ -976,6 +1011,8 @@ mod tests {
         net::TcpListener,
     };
     use url::Url;
+
+    static OUTBOUND_METRICS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[tokio::test]
     async fn a_full_background_pool_does_not_block_interactive_requests() {
@@ -1200,6 +1237,7 @@ mod tests {
 
     #[tokio::test]
     async fn same_host_requests_honor_retry_after_after_a_429() {
+        let _metrics_guard = OUTBOUND_METRICS_TEST_LOCK.lock().await;
         use axum::http::StatusCode;
         use std::sync::atomic::AtomicUsize;
 
@@ -1462,6 +1500,7 @@ mod tests {
 
     #[tokio::test]
     async fn long_host_backoff_returns_a_descriptive_error_promptly() {
+        let _metrics_guard = OUTBOUND_METRICS_TEST_LOCK.lock().await;
         use axum::http::StatusCode;
 
         // Two seconds preserves short Retry-After cooldowns while bounding any gate wait.
@@ -1510,6 +1549,11 @@ mod tests {
             error.contains(&format!("host {host}:{port} backing off for "))
                 && error.contains(" s after 503"),
             "error must name the host, remaining seconds, and cause: {error}"
+        );
+        assert!(
+            super::take_outbound_host_metrics()
+                .contains(&format!("{host}:calls=2,429=0,skipped=1")),
+            "the minute metrics must count the fast-fail by host"
         );
 
         server.abort();

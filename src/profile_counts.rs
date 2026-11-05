@@ -173,7 +173,13 @@ impl ProfileCountsClient {
         } else {
             "app.bsky.actor.getProfiles"
         };
-        let mut url = url::Url::parse(&format!("{}{method}", self.public_appview_base)).ok()?;
+        let mut url = match url::Url::parse(&format!("{}{method}", self.public_appview_base)) {
+            Ok(url) => url,
+            Err(error) => {
+                tracing::warn!(method, %error, "profile counts request URL was invalid");
+                return None;
+            }
+        };
         {
             let mut query = url.query_pairs_mut();
             if is_single {
@@ -185,9 +191,9 @@ impl ProfileCountsClient {
             }
         }
 
-        // SafeHttpClient's own request timeout starts after an outbound permit is acquired, so
-        // keep an outer deadline around permit acquisition and DNS resolution too.
-        let response = tokio::time::timeout(
+        // Keep this client-specific deadline around the full request, including shared-capacity
+        // queueing and DNS resolution.
+        let response = match tokio::time::timeout(
             self.timeout,
             self.http.get_with_limits(
                 &url,
@@ -198,17 +204,51 @@ impl ProfileCountsClient {
             ),
         )
         .await
-        .ok()?
-        .ok()?
-        .0;
+        {
+            Err(_) => {
+                tracing::warn!(
+                    method,
+                    url = %url,
+                    timeout_ms = self.timeout.as_millis() as u64,
+                    "profile counts request timed out"
+                );
+                return None;
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(method, url = %url, %error, "profile counts request failed");
+                return None;
+            }
+            Ok(Ok((response, _))) => response,
+        };
         if !response.status().is_success() {
+            let excerpt: String = String::from_utf8_lossy(response.body())
+                .chars()
+                .take(200)
+                .collect();
+            tracing::warn!(
+                method,
+                status = response.status().as_u16(),
+                url = %url,
+                body = %excerpt,
+                "profile counts request returned an error status"
+            );
             return None;
         }
-        let body: Value = serde_json::from_slice(response.body()).ok()?;
+        let body: Value = match serde_json::from_slice(response.body()) {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::warn!(method, url = %url, %error, "profile counts response was invalid JSON");
+                return None;
+            }
+        };
         let profiles = if is_single {
             std::slice::from_ref(&body)
         } else {
-            body.get("profiles")?.as_array()?.as_slice()
+            let Some(profiles) = body.get("profiles").and_then(Value::as_array) else {
+                tracing::warn!(method, url = %url, "profile counts response had no profiles array");
+                return None;
+            };
+            profiles.as_slice()
         };
         let requested = dids.iter().map(String::as_str).collect::<HashSet<_>>();
         let mut counts = HashMap::new();

@@ -194,9 +194,8 @@ impl SearchClient {
                 pairs.append_pair("cursor", cursor);
             }
         }
-        // SafeHttpClient's own timeout starts after an outbound permit is acquired, so keep
-        // an outer deadline around permit acquisition and DNS too (same shape as the
-        // profile-counts client).
+        // Keep the page search budget around the full request, including shared-capacity
+        // queueing and DNS resolution (same shape as the profile-counts client).
         let transport = tokio::time::timeout(
             SEARCH_REQUEST_TIMEOUT,
             self.http.get_with_limits(
