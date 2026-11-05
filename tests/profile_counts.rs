@@ -5,7 +5,7 @@ use appview_rs::{
     },
     ingest::{IndexedRecord, MemoryStorage, Storage},
     jwt::ServiceJwtVerifier,
-    net::SafeHttpClient,
+    net::{HostResolver, SafeHttpClient},
     oauth::{OAuthAccount, OAuthCallback, OAuthFlow, OAuthPublic, WebShutdown},
     profile_counts::{PUBLIC_APPVIEW_BASE, ProfileCounts, ProfileCountsClient},
 };
@@ -23,6 +23,7 @@ use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     future::Future,
+    net::{IpAddr, Ipv4Addr},
     pin::Pin,
     sync::{
         Arc, Mutex,
@@ -120,16 +121,38 @@ async fn start_fake_appview() -> (String, FakeAppview, tokio::task::JoinHandle<(
         .route("/xrpc/app.bsky.actor.getProfiles", get(fake_get_profiles))
         .with_state(fake.clone());
     let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (format!("http://{address}/xrpc/"), fake, task)
+    let port = address.port();
+    (
+        format!("http://profile-counts-{port}.example.test:{port}/xrpc/"),
+        fake,
+        task,
+    )
 }
 
 fn counts_client(base: &str, ttl: Duration, timeout: Duration) -> ProfileCountsClient {
+    let host = url::Url::parse(base)
+        .unwrap()
+        .host_str()
+        .unwrap()
+        .to_owned();
     ProfileCountsClient::new(
-        SafeHttpClient::new().with_http_test_hosts(["127.0.0.1".to_owned()]),
+        SafeHttpClient::with_resolver(ProfileTestResolver).with_http_test_hosts([host]),
         base,
         ttl,
     )
     .with_timeout(timeout)
+}
+
+struct ProfileTestResolver;
+
+impl HostResolver for ProfileTestResolver {
+    fn resolve<'a>(
+        &'a self,
+        _: &'a str,
+        _: u16,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, String>> + Send + 'a>> {
+        Box::pin(async { Ok(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]) })
+    }
 }
 
 #[tokio::test]
@@ -247,9 +270,13 @@ async fn xrpc_profile_falls_back_to_local_counts_for_errors_garbage_and_timeout(
 
     *fake.reply.lock().unwrap() = FakeReply::Delay(Duration::from_millis(250));
     fake.calls.store(0, Ordering::SeqCst);
-    let outgoing = SafeHttpClient::new().with_http_test_hosts(["127.0.0.1".to_owned()]);
-    let url = url::Url::parse(&format!("{}app.bsky.actor.getProfile?actor={ALICE}", base)).unwrap();
-    let holders = (0..8)
+    let mut url =
+        url::Url::parse(&format!("{}app.bsky.actor.getProfile?actor={ALICE}", base)).unwrap();
+    let port = url.port().unwrap();
+    let host = format!("profile-counts-holders-{port}.example.test");
+    url.set_host(Some(&host)).unwrap();
+    let outgoing = SafeHttpClient::with_resolver(ProfileTestResolver).with_http_test_hosts([host]);
+    let holders = (0..4)
         .map(|_| {
             let outgoing = outgoing.clone();
             let url = url.clone();
@@ -261,12 +288,12 @@ async fn xrpc_profile_falls_back_to_local_counts_for_errors_garbage_and_timeout(
         })
         .collect::<Vec<_>>();
     tokio::time::timeout(Duration::from_secs(1), async {
-        while fake.calls.load(Ordering::SeqCst) < 8 {
+        while fake.calls.load(Ordering::SeqCst) < 4 {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("fake requests should hold every interactive outbound permit");
+    .expect("fake requests should fill this test host's outbound concurrency cap");
     let started = tokio::time::Instant::now();
     let (status, profile) = request_json(
         &router,
