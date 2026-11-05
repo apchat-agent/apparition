@@ -1113,6 +1113,8 @@ pub struct MemoryStorage {
     #[cfg(test)]
     put_record_delay_ms: AtomicU64,
     #[cfg(test)]
+    timeline_post_time_delay_ms: AtomicU64,
+    #[cfg(test)]
     notification_window_read_delay_ms: AtomicU64,
     cursor_lock_failures: AtomicUsize,
 }
@@ -1224,6 +1226,13 @@ impl MemoryStorage {
 
     pub(crate) fn set_put_record_delay(&self, delay: Duration) {
         self.put_record_delay_ms.store(
+            delay.as_millis().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    pub(crate) fn set_timeline_post_time_delay(&self, delay: Duration) {
+        self.timeline_post_time_delay_ms.store(
             delay.as_millis().min(u64::MAX as u128) as u64,
             Ordering::Relaxed,
         );
@@ -2137,6 +2146,13 @@ impl Storage for MemoryStorage {
         cursor: Option<&SortTimeCursor>,
         limit: usize,
     ) -> Result<Vec<IndexedRecord>, StorageError> {
+        #[cfg(test)]
+        {
+            let delay = self.timeline_post_time_delay_ms.load(Ordering::Relaxed);
+            if delay > 0 {
+                std::thread::sleep(Duration::from_millis(delay));
+            }
+        }
         let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
         let mut followed = inner
             .follows

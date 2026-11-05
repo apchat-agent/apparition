@@ -22670,6 +22670,63 @@ mod tests {
         String::from_utf8(body.to_vec()).unwrap()
     }
 
+    #[tokio::test]
+    async fn a_slow_home_timeline_read_does_not_block_a_concurrent_login_request() {
+        let storage = Arc::new(MemoryStorage::default());
+        storage.set_timeline_post_time_delay(Duration::from_millis(700));
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let viewer = "did:plc:slow-timeline-viewer";
+        let generation = storage
+            .rotate_web_session(viewer, "slow-timeline-session")
+            .unwrap();
+        let token = public.issue_session_cookie(
+            viewer,
+            "slow-timeline-session",
+            generation,
+            read_only_session_permissions(),
+        );
+        let app = public.router_with_flow(DisabledOAuthFlow, storage);
+        let started = Instant::now();
+        let timeline = tokio::spawn({
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    axum::http::Request::get("/app")
+                        .header("cookie", format!("{SESSION_COOKIE}={token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        });
+
+        // On a current-thread runtime, polling the timeline request must return control to the
+        // scheduler while the deliberately slow Storage method runs.
+        tokio::task::yield_now().await;
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "polling the home request blocked the runtime for {:?}",
+            started.elapsed()
+        );
+        let login = tokio::time::timeout(
+            Duration::from_millis(250),
+            app.oneshot(axum::http::Request::get("/login").body(Body::empty()).unwrap()),
+        )
+        .await
+        .expect("the cheap login request must remain responsive")
+        .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), timeline)
+                .await
+                .expect("the delayed timeline request should finish")
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+
     #[derive(Clone)]
     struct ParentIdentityTestFlow {
         parent_did: String,
