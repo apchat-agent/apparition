@@ -4666,6 +4666,9 @@ impl SqliteStorage {
         mut work: Option<&mut StatementWork>,
     ) -> Result<Vec<IndexedRecord>, StorageError> {
         let limit = limit.clamp(1, 101);
+        // Check before taking a read-pool connection: the uncached first check
+        // may need to count old posts and post_sort rows itself.
+        let include_unfilled = self.post_sort_backfill_remaining()? > 0;
         let conn = self.read_conn()?;
         let mut followed = conn.prepare(
             "SELECT DISTINCT json_extract(record_json, '$.subject') FROM records
@@ -4683,21 +4686,25 @@ impl SqliteStorage {
         authors.dedup();
         authors.retain(|subject| subject != actor);
 
+        // Every new post is written to post_sort in the same transaction as
+        // records. The fallback is only needed while the startup/backfill walk
+        // is filling older posts; once it reaches zero, scanning post history
+        // to prove that no rows are missing would turn every page into an
+        // author-history walk.
         let mut filled = conn.prepare(
             "SELECT r.did, r.collection, r.rkey, r.uri, r.cid, r.time_us, r.record_json, p.sort_us
              FROM post_sort AS p
              INDEXED BY post_sort_author_order
-             JOIN records AS r ON r.uri = p.uri
+             JOIN records AS r INDEXED BY records_collection_uri
+               ON r.collection='app.bsky.feed.post' AND r.uri = p.uri
              WHERE p.did=?1
-               AND (?2 IS NULL
-                    OR p.sort_us < ?2
-                    OR (p.sort_us = ?2
-                        AND (p.time_us < ?3 OR (p.time_us = ?3 AND p.uri < ?4))))
+               AND (p.sort_us, p.time_us, p.uri) < (?2, ?3, ?4)
              ORDER BY p.sort_us DESC, p.time_us DESC, p.uri DESC
              LIMIT ?5",
         )?;
-        let mut unfilled = conn.prepare(
-            "SELECT r.did, r.collection, r.rkey, r.uri, r.cid, r.time_us, r.record_json
+        let mut unfilled = if include_unfilled {
+            Some(conn.prepare(
+                "SELECT r.did, r.collection, r.rkey, r.uri, r.cid, r.time_us, r.record_json
              FROM records AS r
              INDEXED BY records_author_time
              WHERE r.collection='app.bsky.feed.post' AND r.did=?1
@@ -4708,13 +4715,22 @@ impl SqliteStorage {
                         AND (r.time_us < ?3 OR (r.time_us = ?3 AND r.uri < ?4))))
              ORDER BY r.time_us DESC, r.uri DESC
              LIMIT ?5",
-        )?;
+            )?)
+        } else {
+            None
+        };
 
         let mut page = Vec::new();
         for author in std::iter::once(actor).chain(authors.iter().map(String::as_str)) {
-            let cursor_sort = cursor.map(|cursor| cursor.sort_us.min(i64::MAX as u64) as i64);
-            let cursor_time = cursor.map(|cursor| cursor.time_us.min(i64::MAX as u64) as i64);
-            let cursor_uri = cursor.map(|cursor| cursor.uri.as_str()).unwrap_or("");
+            let cursor_sort = cursor
+                .map(|cursor| cursor.sort_us.min(i64::MAX as u64) as i64)
+                .unwrap_or(i64::MAX);
+            let cursor_time = cursor
+                .map(|cursor| cursor.time_us.min(i64::MAX as u64) as i64)
+                .unwrap_or(i64::MAX);
+            let cursor_uri = cursor
+                .map(|cursor| cursor.uri.as_str())
+                .unwrap_or("\u{10ffff}");
             page.extend(
                 filled
                     .query_map(
@@ -4730,19 +4746,23 @@ impl SqliteStorage {
             if let Some(counted) = work.as_mut() {
                 counted.observe(&filled);
             }
-            page.extend(
-                unfilled
-                    .query_map(
-                        params![author, cursor_sort, cursor_time, cursor_uri, limit as i64],
-                        |row| {
-                            let record = row_to_record(row)?;
-                            Ok((record.time_us, record))
-                        },
-                    )?
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
+            if let Some(unfilled) = unfilled.as_mut() {
+                page.extend(
+                    unfilled
+                        .query_map(
+                            params![author, cursor_sort, cursor_time, cursor_uri, limit as i64],
+                            |row| {
+                                let record = row_to_record(row)?;
+                                Ok((record.time_us, record))
+                            },
+                        )?
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+            }
             if let Some(counted) = work.as_mut() {
-                counted.observe(&unfilled);
+                if let Some(unfilled) = unfilled.as_ref() {
+                    counted.observe(unfilled);
+                }
             }
         }
         drop(filled);
