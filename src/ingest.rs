@@ -4573,6 +4573,20 @@ impl SqliteStorage {
         Ok((records, work))
     }
 
+    /// One page of the post-sort timeline plus SQLite statement work, for
+    /// verifying that a page read stays bounded as post history grows.
+    pub fn timeline_posts_by_post_time_counted(
+        &self,
+        actor: &str,
+        cursor: Option<&SortTimeCursor>,
+        limit: usize,
+    ) -> Result<(Vec<IndexedRecord>, StatementWork), StorageError> {
+        let mut work = StatementWork::default();
+        let records =
+            self.timeline_posts_by_post_time_page(actor, cursor, limit, Some(&mut work))?;
+        Ok((records, work))
+    }
+
     /// One page of the home timeline, assembled from per-author index walks.
     ///
     /// The single statement this replaced planned, without `sqlite_stat` rows, as
@@ -4649,6 +4663,7 @@ impl SqliteStorage {
         actor: &str,
         cursor: Option<&SortTimeCursor>,
         limit: usize,
+        mut work: Option<&mut StatementWork>,
     ) -> Result<Vec<IndexedRecord>, StorageError> {
         let limit = limit.clamp(1, 101);
         let conn = self.read_conn()?;
@@ -4660,6 +4675,9 @@ impl SqliteStorage {
         let mut authors = followed
             .query_map([actor], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
+        if let Some(counted) = work.as_mut() {
+            counted.observe(&followed);
+        }
         drop(followed);
         authors.sort_unstable();
         authors.dedup();
@@ -4709,6 +4727,9 @@ impl SqliteStorage {
                     )?
                     .collect::<Result<Vec<_>, _>>()?,
             );
+            if let Some(counted) = work.as_mut() {
+                counted.observe(&filled);
+            }
             page.extend(
                 unfilled
                     .query_map(
@@ -4720,6 +4741,9 @@ impl SqliteStorage {
                     )?
                     .collect::<Result<Vec<_>, _>>()?,
             );
+            if let Some(counted) = work.as_mut() {
+                counted.observe(&unfilled);
+            }
         }
         drop(filled);
         drop(unfilled);
@@ -6388,7 +6412,7 @@ impl Storage for SqliteStorage {
         cursor: Option<&SortTimeCursor>,
         limit: usize,
     ) -> Result<Vec<IndexedRecord>, StorageError> {
-        self.timeline_posts_by_post_time_page(actor, cursor, limit)
+        self.timeline_posts_by_post_time_page(actor, cursor, limit, None)
     }
 
     fn sort_us_for_record(&self, record: &IndexedRecord) -> Result<u64, StorageError> {

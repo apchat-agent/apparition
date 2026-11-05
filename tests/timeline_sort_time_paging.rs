@@ -167,3 +167,49 @@ fn old_time_us_uri_cursor_does_not_parse_as_a_sort_cursor() {
         "the new sort_us|time_us|uri cursor must parse"
     );
 }
+
+#[test]
+fn sorted_home_timeline_page_visits_a_bounded_number_of_sqlite_steps() {
+    let path = database_path("bounded-work");
+    remove_database(&path);
+    let storage = SqliteStorage::open(&path).unwrap();
+
+    let mut updates = Vec::new();
+    for author_index in 0..12 {
+        let author = format!("did:plc:bulk-{author_index:02}");
+        updates.push(JetstreamStorageUpdate {
+            time_us: 10,
+            upsert: Some(follow_record(VIEWER, &author)),
+            ..JetstreamStorageUpdate::default()
+        });
+        for post_index in 0..256 {
+            let time_us = 1_790_000_000_000_000 + post_index;
+            updates.push(JetstreamStorageUpdate {
+                time_us,
+                upsert: Some(post_record(
+                    &author,
+                    &format!("p-{post_index:04}"),
+                    time_us,
+                    "2026-11-04T06:42:08Z",
+                    "bulk post",
+                )),
+                ..JetstreamStorageUpdate::default()
+            });
+        }
+    }
+    storage.apply_jetstream_batch(&updates).unwrap();
+
+    let (page, work) = storage
+        .timeline_posts_by_post_time_counted(VIEWER, None, 50)
+        .unwrap();
+    assert_eq!(page.len(), 50);
+    assert!(
+        work.vm_steps < 25_000,
+        "one 50-post page across 12 followed authors should not scan each author's 256-post history; SQLite executed {} VM steps ({} fullscan steps)",
+        work.vm_steps,
+        work.fullscan_steps
+    );
+
+    drop(storage);
+    remove_database(&path);
+}
