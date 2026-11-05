@@ -1713,6 +1713,30 @@ mod tests {
         )
     }
 
+    async fn counting_generator_server(
+        calls: Arc<AtomicUsize>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route(
+            "/xrpc/com.atproto.repo.getRecord",
+            get(|State(calls): State<Arc<AtomicUsize>>| async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                axum::Json(json!({
+                    "uri":"at://did:web:creator.test/app.bsky.feed.generator/pinned",
+                    "cid":"generator-cid",
+                    "value":{"did":"did:plc:generator","displayName":"Example"}
+                }))
+            })
+            .with_state(calls),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://localhost:{}", address.port()), task)
+    }
+
     fn public_post(uri: &str) -> serde_json::Value {
         let mut parts = uri.strip_prefix("at://").unwrap().split('/');
         let did = parts.next().unwrap();
@@ -1937,6 +1961,34 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.contains("bsky_fg"), "{error}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn identical_concurrent_feed_resolution_uses_one_pds_lookup() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (pds, server) = counting_generator_server(calls.clone()).await;
+        let parsed = url::Url::parse(&pds).unwrap();
+        let identity = resolver(
+            pds,
+            format!("http://localhost:{}/feed", parsed.port().unwrap()),
+        );
+        let client = Arc::new(client(identity));
+        let uri = "at://did:web:creator.test/app.bsky.feed.generator/pinned";
+        let first_client = client.clone();
+        let second_client = client.clone();
+        let (first, second) = tokio::join!(
+            async move { first_client.resolve_feed(uri).await },
+            async move { second_client.resolve_feed(uri).await },
+        );
+
+        assert!(first.is_ok());
+        assert!(second.is_ok());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "parallel pinned-feed resolution should share one creator-PDS lookup"
+        );
         server.abort();
     }
 
