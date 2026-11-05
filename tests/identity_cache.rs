@@ -26,6 +26,7 @@ struct FakeIdentityBackend {
     documents: Arc<Mutex<HashMap<String, DidDocument>>>,
     handles: Arc<Mutex<HashMap<String, String>>>,
     document_calls: Arc<AtomicUsize>,
+    document_delay_ms: Arc<AtomicUsize>,
 }
 
 impl FakeIdentityBackend {
@@ -62,6 +63,10 @@ impl FakeIdentityBackend {
 impl IdentityBackend for FakeIdentityBackend {
     async fn did_document(&self, did: &str) -> Result<Option<DidDocument>, ResolutionError> {
         self.document_calls.fetch_add(1, Ordering::Relaxed);
+        let delay_ms = self.document_delay_ms.load(Ordering::Relaxed);
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms as u64)).await;
+        }
         Ok(self.documents.lock().unwrap().get(did).cloned())
     }
 
@@ -72,6 +77,24 @@ impl IdentityBackend for FakeIdentityBackend {
     async fn well_known_did(&self, _handle: &str) -> Result<Option<String>, ResolutionError> {
         Ok(None)
     }
+}
+
+#[tokio::test]
+async fn concurrent_identity_document_misses_share_one_backend_lookup() {
+    let backend = FakeIdentityBackend::default();
+    backend.publish(ALICE, Some("alice.test"), "https://alice-pds.test");
+    backend.document_delay_ms.store(100, Ordering::Relaxed);
+    let resolver = IdentityResolver::new(backend.clone(), Duration::ZERO);
+
+    let results =
+        futures_util::future::join_all((0..8).map(|_| resolver.resolve_did_document(ALICE))).await;
+
+    assert!(results.iter().all(Result::is_ok));
+    assert_eq!(
+        backend.document_call_count(),
+        1,
+        "concurrent requests for one DID document should share one backend lookup"
+    );
 }
 
 fn database_path() -> PathBuf {
