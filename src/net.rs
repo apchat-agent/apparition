@@ -23,6 +23,136 @@ static OUTBOUND_REQUESTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 // Repository backfill downloads are large and keep permits for up to REQUEST_TIMEOUT each.
 // A separate pool keeps this background work from occupying interactive request capacity.
 static BACKGROUND_REQUESTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+const PER_HOST_REQUESTS: usize = 4;
+const MAX_HOST_BACKOFF: Duration = Duration::from_secs(60 * 60);
+static OUTBOUND_HOST_GATES: OnceLock<Mutex<HashMap<String, Arc<OutboundHostGate>>>> =
+    OnceLock::new();
+static OUTBOUND_HOST_METRICS: OnceLock<Mutex<BTreeMap<String, (u64, u64)>>> = OnceLock::new();
+
+struct OutboundHostGate {
+    requests: Arc<Semaphore>,
+    backoff: Mutex<HostBackoff>,
+}
+
+#[derive(Default)]
+struct HostBackoff {
+    retry_at: Option<tokio::time::Instant>,
+    consecutive_failures: u32,
+}
+
+impl OutboundHostGate {
+    fn new() -> Self {
+        Self {
+            requests: Arc::new(Semaphore::new(PER_HOST_REQUESTS)),
+            backoff: Mutex::new(HostBackoff::default()),
+        }
+    }
+
+    async fn wait_for_backoff(&self) {
+        loop {
+            let retry_at = self.backoff.lock().ok().and_then(|state| state.retry_at);
+            let Some(retry_at) = retry_at else {
+                return;
+            };
+            if retry_at <= tokio::time::Instant::now() {
+                return;
+            }
+            tokio::time::sleep_until(retry_at).await;
+        }
+    }
+
+    async fn acquire_request_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
+        loop {
+            self.wait_for_backoff().await;
+            let permit = self
+                .requests
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| "outbound host capacity is unavailable".to_owned())?;
+            let retry_at = self.backoff.lock().ok().and_then(|state| state.retry_at);
+            if retry_at.is_none_or(|retry_at| retry_at <= tokio::time::Instant::now()) {
+                return Ok(permit);
+            }
+            drop(permit);
+        }
+    }
+
+    fn observe_response(&self, status: http::StatusCode, retry_after: Option<&http::HeaderValue>) {
+        if let Ok(mut backoff) = self.backoff.lock() {
+            if status == http::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+                backoff.consecutive_failures = backoff.consecutive_failures.saturating_add(1);
+                let default_delay = Duration::from_secs(
+                    1_u64
+                        .checked_shl(backoff.consecutive_failures.saturating_sub(1).min(6))
+                        .unwrap_or(64)
+                        .min(60),
+                );
+                let delay = retry_after
+                    .and_then(retry_after_duration)
+                    .unwrap_or(default_delay)
+                    .min(MAX_HOST_BACKOFF);
+                let until = tokio::time::Instant::now() + delay;
+                backoff.retry_at = Some(backoff.retry_at.map_or(until, |old| old.max(until)));
+            } else if status.is_success() {
+                backoff.consecutive_failures = 0;
+                backoff.retry_at = None;
+            }
+        }
+    }
+}
+
+fn retry_after_duration(value: &http::HeaderValue) -> Option<Duration> {
+    let value = value.to_str().ok()?;
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let retry_at = httpdate::parse_http_date(value).ok()?;
+    retry_at.duration_since(std::time::SystemTime::now()).ok()
+}
+
+fn outbound_host_gate(host: &str) -> Arc<OutboundHostGate> {
+    let gates = OUTBOUND_HOST_GATES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut gates) = gates.lock() {
+        return Arc::clone(
+            gates
+                .entry(host.trim_end_matches('.').to_ascii_lowercase())
+                .or_insert_with(|| Arc::new(OutboundHostGate::new())),
+        );
+    }
+    Arc::new(OutboundHostGate::new())
+}
+
+fn record_outbound_host_call(host: &str, status: Option<u16>) {
+    let counts = OUTBOUND_HOST_METRICS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Ok(mut counts) = counts.lock() {
+        let count = counts.entry(host.to_owned()).or_default();
+        count.0 = count.0.saturating_add(1);
+        if status == Some(http::StatusCode::TOO_MANY_REQUESTS.as_u16()) {
+            count.1 = count.1.saturating_add(1);
+        }
+    }
+}
+
+/// Consume per-host outbound request totals for the shared minute metrics line.
+pub(crate) fn take_outbound_host_metrics() -> String {
+    let counts = OUTBOUND_HOST_METRICS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let Ok(mut counts) = counts.lock() else {
+        return "unavailable".to_owned();
+    };
+    if counts.is_empty() {
+        return "none".to_owned();
+    }
+    let report = counts
+        .iter()
+        .map(|(host, (calls, too_many_requests))| {
+            format!("{host}:calls={calls},429={too_many_requests}")
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    counts.clear();
+    report
+}
 
 tokio::task_local! {
     static USE_BACKGROUND_REQUEST_POOL: bool;
@@ -201,6 +331,7 @@ impl OutboundCallTimer {
 
 impl Drop for OutboundCallTimer {
     fn drop(&mut self) {
+        record_outbound_host_call(&self.host, self.status);
         if let Some(accounting) = &self.accounting {
             let elapsed = self.started.elapsed();
             let status = self.status;
@@ -543,10 +674,12 @@ impl SafeHttpClient {
             .map_err(|_| "outbound request URL is invalid".to_owned())?;
         for redirect_count in 0..=max_redirects {
             let call_started = Instant::now();
-            let addresses = self.resolve_safe(&url).await?;
             let host = url
                 .host_str()
                 .ok_or_else(|| "outbound URL has no host".to_owned())?;
+            let host_gate = outbound_host_gate(host);
+            let _host_permit = host_gate.acquire_request_permit().await?;
+            let addresses = self.resolve_safe(&url).await?;
             let client = self.client_for(host, &addresses)?;
             let mut call_timer = OutboundCallTimer::new(request.method(), &url, call_started);
             if request.headers().contains_key("atproto-proxy") {
@@ -568,6 +701,10 @@ impl SafeHttpClient {
                     message
                 })?;
             call_timer.status = Some(response.status().as_u16());
+            host_gate.observe_response(
+                response.status(),
+                response.headers().get(http::header::RETRY_AFTER),
+            );
 
             if is_redirect(response.status())
                 && let Some(location) = response.headers().get(http::header::LOCATION)
@@ -1027,6 +1164,10 @@ mod tests {
         assert!(
             retry_started.elapsed() >= std::time::Duration::from_millis(900),
             "the next request to a host must honor its Retry-After cooldown"
+        );
+        assert!(
+            super::take_outbound_host_metrics().contains(&format!("{host}:calls=2,429=1")),
+            "the shared minute metric must count calls and 429 responses by host"
         );
 
         server.abort();

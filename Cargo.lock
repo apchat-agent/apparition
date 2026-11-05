@@ -65,6 +65,7 @@ dependencies = [
  "hmac",
  "http",
  "http-body-util",
+ "httpdate",
  "ipld-core",
  "jose-jwk",
  "p256",

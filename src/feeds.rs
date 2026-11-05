@@ -1910,12 +1910,23 @@ mod tests {
                     format!("Slow {index}")
                 } else {
                     "Example".to_owned()
-                }
+                },
+                "tab {index} ({}) returned the wrong cached or fallback generator",
+                uris[index]
             );
         }
         assert!(started.elapsed() < Duration::from_millis(200));
 
-        tokio::time::sleep(Duration::from_millis(5_200)).await;
+        tokio::time::timeout(Duration::from_secs(11), async {
+            loop {
+                if client.background_resolutions.lock().await.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("all host-throttled background resolutions should finish");
         let restarted = Arc::new(FeedClient::new_with_store(
             identity,
             SafeHttpClient::with_resolver(TestResolver)

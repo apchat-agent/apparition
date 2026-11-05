@@ -9637,7 +9637,7 @@ mod recent_posts_storage_tests {
         assert!(text.contains("recent_posts_done=4"), "{text}");
         assert!(text.contains("recent_posts_failed=2"), "{text}");
         assert!(text.contains("recent_posts_dropped=1"), "{text}");
-        assert!(text.contains("outbound_host_calls=\"none\""), "{text}");
+        assert!(text.contains("outbound_host_calls="), "{text}");
     }
 
     #[test]
