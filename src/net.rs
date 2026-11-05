@@ -1253,6 +1253,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn different_service_ports_do_not_share_a_retry_after_gate() {
+        use axum::http::StatusCode;
+
+        let rate_app = Router::new().route(
+            "/rate",
+            get(|| async {
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("retry-after", "1")],
+                    "slow down",
+                )
+            }),
+        );
+        let rate_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rate_port = rate_listener.local_addr().unwrap().port();
+        let rate_server = tokio::spawn(async move {
+            axum::serve(rate_listener, rate_app).await.unwrap();
+        });
+
+        let ok_app = Router::new().route("/ok", get(|| async { "ok" }));
+        let ok_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ok_port = ok_listener.local_addr().unwrap().port();
+        let ok_server = tokio::spawn(async move {
+            axum::serve(ok_listener, ok_app).await.unwrap();
+        });
+
+        let host = format!("origin-{rate_port}-{ok_port}.example.test");
+        let client = SafeHttpClient::with_resolver(FakeResolver::new([
+            vec!["127.0.0.1".parse().unwrap()],
+            vec!["127.0.0.1".parse().unwrap()],
+        ]))
+        .with_http_test_hosts([host.clone()]);
+        let rate_url = Url::parse(&format!("http://{host}:{rate_port}/rate")).unwrap();
+        let response = client
+            .get(&rate_url, http::HeaderMap::new(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let ok_url = Url::parse(&format!("http://{host}:{ok_port}/ok")).unwrap();
+        let next_started = tokio::time::Instant::now();
+        let response = client
+            .get(&ok_url, http::HeaderMap::new(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            next_started.elapsed() < std::time::Duration::from_millis(500),
+            "a cooldown from another service port delayed this request"
+        );
+
+        rate_server.abort();
+        ok_server.abort();
+    }
+
+    #[tokio::test]
     async fn same_host_requests_respect_a_per_host_concurrency_limit() {
         use std::sync::atomic::AtomicUsize;
 
