@@ -27,6 +27,8 @@ pub struct Config {
     pub backfill_max_age_days: u64,
     #[serde(default = "default_profile_counts_cache_ttl_secs")]
     pub profile_counts_cache_ttl_secs: u64,
+    #[serde(default = "default_web_read_timeout_secs")]
+    pub web_read_timeout_secs: u64,
     #[serde(default)]
     pub backfill_enabled: bool,
     #[serde(default = "default_appview_did")]
@@ -61,6 +63,7 @@ impl Default for Config {
             backfill_records_per_second: default_backfill_records_per_second(),
             backfill_max_age_days: default_backfill_max_age_days(),
             profile_counts_cache_ttl_secs: default_profile_counts_cache_ttl_secs(),
+            web_read_timeout_secs: default_web_read_timeout_secs(),
             backfill_enabled: false,
             appview_did: default_appview_did(),
             public_url: default_public_url(),
@@ -151,6 +154,10 @@ impl Config {
                     config.profile_counts_cache_ttl_secs =
                         parse_timeout("APPVIEW_PROFILE_COUNTS_CACHE_TTL_SECS", value)?;
                 }
+                "APPVIEW_WEB_READ_TIMEOUT_SECS" => {
+                    config.web_read_timeout_secs =
+                        parse_timeout("APPVIEW_WEB_READ_TIMEOUT_SECS", value)?;
+                }
                 "APPVIEW_BACKFILL_ENABLED" => config.backfill_enabled = parse_bool(value)?,
                 "APPVIEW_DID" => config.appview_did = value.to_owned(),
                 "APPVIEW_PUBLIC_URL" => config.public_url = value.to_owned(),
@@ -229,6 +236,10 @@ impl Config {
                 env::var("APPVIEW_PROFILE_COUNTS_CACHE_TTL_SECS").unwrap_or_default(),
             ),
             (
+                "APPVIEW_WEB_READ_TIMEOUT_SECS",
+                env::var("APPVIEW_WEB_READ_TIMEOUT_SECS").unwrap_or_default(),
+            ),
+            (
                 "APPVIEW_BACKFILL_ENABLED",
                 env::var("APPVIEW_BACKFILL_ENABLED").unwrap_or_default(),
             ),
@@ -285,6 +296,9 @@ impl Config {
                     }
                     "APPVIEW_PROFILE_COUNTS_CACHE_TTL_SECS" => {
                         config.profile_counts_cache_ttl_secs = parse_timeout(key, &value)?;
+                    }
+                    "APPVIEW_WEB_READ_TIMEOUT_SECS" => {
+                        config.web_read_timeout_secs = parse_timeout(key, &value)?;
                     }
                     "APPVIEW_BACKFILL_ENABLED" => config.backfill_enabled = parse_bool(&value)?,
                     "APPVIEW_DID" => config.appview_did = value,
@@ -380,6 +394,10 @@ fn default_backfill_max_age_days() -> u64 {
 
 fn default_profile_counts_cache_ttl_secs() -> u64 {
     10 * 60
+}
+
+fn default_web_read_timeout_secs() -> u64 {
+    10
 }
 
 fn parse_timeout(variable: &'static str, value: &str) -> Result<u64, ConfigError> {

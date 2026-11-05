@@ -3,7 +3,7 @@ use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     cmp::Reverse,
     collections::{HashMap, HashSet, VecDeque},
     fs,
@@ -378,6 +378,90 @@ pub enum StorageError {
     WriterStopped,
     #[error("blocking storage task failed: {0}")]
     BlockingTask(String),
+    #[error("web SQLite read {operation} exceeded its budget after {elapsed:?}")]
+    WebReadTimeout {
+        operation: &'static str,
+        elapsed: Duration,
+    },
+}
+
+const WEB_READ_PROGRESS_OPS: i32 = 1_000;
+static WEB_READ_BUDGET_MS: AtomicU64 = AtomicU64::new(10_000);
+static WEB_READ_TIMEOUT_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy)]
+struct WebReadBudget {
+    started: Instant,
+    limit: Duration,
+}
+
+thread_local! {
+    static WEB_READ_BUDGET: Cell<Option<WebReadBudget>> = const { Cell::new(None) };
+    static WEB_READ_INTERRUPTED: Cell<bool> = const { Cell::new(false) };
+    static WEB_READ_USED_SQLITE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Configures the maximum time a web storage operation may spend in SQLite.
+/// SQLite read connections enforce the deadline with their progress handler.
+pub fn configure_web_read_timeout(budget: Duration) {
+    WEB_READ_BUDGET_MS.store(
+        budget.as_millis().min(u128::from(u64::MAX)) as u64,
+        Ordering::Relaxed,
+    );
+}
+
+/// Cumulative number of web SQLite reads interrupted for exceeding their budget.
+pub fn web_read_timeout_count() -> u64 {
+    WEB_READ_TIMEOUT_COUNT.load(Ordering::Relaxed)
+}
+
+struct WebReadBudgetGuard {
+    previous_budget: Option<WebReadBudget>,
+    previous_interrupted: bool,
+    previous_used_sqlite: bool,
+}
+
+impl WebReadBudgetGuard {
+    fn install(started: Instant, limit: Duration) -> Self {
+        Self {
+            previous_budget: WEB_READ_BUDGET
+                .with(|budget| budget.replace(Some(WebReadBudget { started, limit }))),
+            previous_interrupted: WEB_READ_INTERRUPTED.with(|value| value.replace(false)),
+            previous_used_sqlite: WEB_READ_USED_SQLITE.with(|value| value.replace(false)),
+        }
+    }
+
+    fn exceeded(&self, elapsed: Duration, limit: Duration) -> bool {
+        WEB_READ_INTERRUPTED.with(Cell::get)
+            || (WEB_READ_USED_SQLITE.with(Cell::get) && elapsed >= limit)
+    }
+}
+
+impl Drop for WebReadBudgetGuard {
+    fn drop(&mut self) {
+        WEB_READ_BUDGET.with(|budget| budget.set(self.previous_budget));
+        WEB_READ_INTERRUPTED.with(|value| value.set(self.previous_interrupted));
+        WEB_READ_USED_SQLITE.with(|value| value.set(self.previous_used_sqlite));
+    }
+}
+
+fn web_read_progress_handler() -> bool {
+    let exceeded = WEB_READ_BUDGET.with(|budget| {
+        budget
+            .get()
+            .is_some_and(|budget| budget.started.elapsed() >= budget.limit)
+    });
+    if exceeded {
+        WEB_READ_INTERRUPTED.with(|interrupted| interrupted.set(true));
+    }
+    exceeded
+}
+
+fn install_web_read_progress_handler(connection: &Connection) {
+    if WEB_READ_BUDGET.with(|budget| budget.get().is_some()) {
+        WEB_READ_USED_SQLITE.with(|used| used.set(true));
+    }
+    connection.progress_handler(WEB_READ_PROGRESS_OPS, Some(web_read_progress_handler));
 }
 
 /// Run a synchronous Storage operation away from Tokio's async worker threads.
@@ -392,7 +476,40 @@ where
     T: Send + 'static,
     F: FnOnce(&S) -> Result<T, StorageError> + Send + 'static,
 {
-    let result = tokio::task::spawn_blocking(move || call(&storage)).await;
+    let budget = Duration::from_millis(WEB_READ_BUDGET_MS.load(Ordering::Relaxed));
+    web_storage_call_with_budget(storage, operation, budget, call).await
+}
+
+async fn web_storage_call_with_budget<S, T, F>(
+    storage: Arc<S>,
+    operation: &'static str,
+    budget: Duration,
+    call: F,
+) -> Result<T, StorageError>
+where
+    S: Storage + 'static,
+    T: Send + 'static,
+    F: FnOnce(&S) -> Result<T, StorageError> + Send + 'static,
+{
+    let result = tokio::task::spawn_blocking(move || {
+        let started = Instant::now();
+        let budget_guard = WebReadBudgetGuard::install(started, budget);
+        let result = call(&storage);
+        let elapsed = started.elapsed();
+        if budget_guard.exceeded(elapsed, budget) {
+            WEB_READ_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                operation,
+                elapsed_ms = elapsed.as_secs_f64() * 1_000.0,
+                budget_ms = budget.as_secs_f64() * 1_000.0,
+                "web SQLite read interrupted after exceeding its time budget"
+            );
+            Err(StorageError::WebReadTimeout { operation, elapsed })
+        } else {
+            result
+        }
+    })
+    .await;
     match result {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) => {
@@ -2879,6 +2996,7 @@ impl SqliteWriterMetrics {
             recent_posts_done,
             recent_posts_failed,
             recent_posts_dropped,
+            web_read_timeout_count = WEB_READ_TIMEOUT_COUNT.load(Ordering::Relaxed),
             "SQLite writer minute metrics"
         );
     }
@@ -4253,6 +4371,7 @@ impl SqliteStorage {
         for offset in 0..count {
             match self.read_connections[(first + offset) % count].try_lock() {
                 Ok(connection) => {
+                    install_web_read_progress_handler(&connection);
                     if offset > 0 {
                         self.read_metrics.record_wait(started.elapsed());
                     }
@@ -4268,6 +4387,7 @@ impl SqliteStorage {
         let connection = self.read_connections[first].lock();
         self.pressure.waiting_reads.fetch_sub(1, Ordering::Relaxed);
         let connection = connection.map_err(|_| StorageError::Poisoned)?;
+        install_web_read_progress_handler(&connection);
         self.read_metrics.record_wait(started.elapsed());
         Ok(connection)
     }
@@ -8352,24 +8472,11 @@ impl<S: Storage + 'static> JetstreamSupervisor<S> {
 mod web_read_timeout_tests {
     use super::*;
 
-    async fn web_storage_call_with_budget<S, T, F>(
-        storage: Arc<S>,
-        operation: &'static str,
-        _budget: Duration,
-        call: F,
-    ) -> Result<T, StorageError>
-    where
-        S: Storage + 'static,
-        T: Send + 'static,
-        F: FnOnce(&S) -> Result<T, StorageError> + Send + 'static,
-    {
-        web_storage_call(storage, operation, call).await
-    }
-
     #[tokio::test]
     async fn a_slow_web_sqlite_read_is_interrupted_at_its_budget() {
         let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
         let started = Instant::now();
+        let timeouts_before = web_read_timeout_count();
         let result = web_storage_call_with_budget(
             storage,
             "slow_read_test",
@@ -8388,7 +8495,13 @@ mod web_read_timeout_tests {
         .await;
 
         assert!(
-            result.is_err(),
+            matches!(
+                result,
+                Err(StorageError::WebReadTimeout {
+                    operation: "slow_read_test",
+                    ..
+                })
+            ),
             "a 10-million-step SQLite read exceeded its 20ms web budget but returned {result:?}"
         );
         assert!(
@@ -8396,6 +8509,7 @@ mod web_read_timeout_tests {
             "the interrupted web read took {:?}",
             started.elapsed()
         );
+        assert!(web_read_timeout_count() > timeouts_before);
     }
 }
 
@@ -8641,6 +8755,7 @@ mod sqlite_writer_tests {
         assert!(text.contains("SQLite writer minute metrics"), "{text}");
         assert!(text.contains("read_wait_count=2"), "{text}");
         assert!(text.contains("read_wait_max_ms=7"), "{text}");
+        assert!(text.contains("web_read_timeout_count="), "{text}");
         assert!(text.contains("wal_bytes=8192"), "{text}");
         assert!(text.contains("wal_frames=3"), "{text}");
         assert!(text.contains("ckpt_frames=2"), "{text}");

@@ -495,12 +495,20 @@ impl IdentityBackend for TestIdentity {
 fn profile_count_ttl_defaults_to_ten_minutes_and_is_configurable() {
     let default = appview_rs::config::Config::default();
     assert_eq!(default.profile_counts_cache_ttl_secs, 600);
+    assert_eq!(default.web_read_timeout_secs, 10);
     let configured = appview_rs::config::Config::from_toml_and_env(
         "profile_counts_cache_ttl_secs = 120",
         [("APPVIEW_PROFILE_COUNTS_CACHE_TTL_SECS", "300")],
     )
     .unwrap();
     assert_eq!(configured.profile_counts_cache_ttl_secs, 300);
+
+    let configured = appview_rs::config::Config::from_toml_and_env(
+        "web_read_timeout_secs = 3",
+        [("APPVIEW_WEB_READ_TIMEOUT_SECS", "2")],
+    )
+    .unwrap();
+    assert_eq!(configured.web_read_timeout_secs, 2);
 }
 
 #[tokio::test]

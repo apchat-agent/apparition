@@ -12,7 +12,7 @@ use appview_rs::{
     },
     ingest::{
         Ingestor, JetstreamConsumer, JetstreamSupervisor, POST_SORT_BACKFILL_BATCH, SqliteStorage,
-        post_sort_backfill,
+        configure_web_read_timeout, post_sort_backfill,
     },
     init_tracing,
     jwt::ServiceJwtVerifier,
@@ -30,6 +30,7 @@ use tracing::{error, info};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let config = Config::load()?;
+    configure_web_read_timeout(Duration::from_secs(config.web_read_timeout_secs));
     init_tracing(&config.log_filter)?;
     let listen_address: SocketAddr = config.listen.parse()?;
     let listener = TcpListener::bind(listen_address).await?;
