@@ -1919,6 +1919,15 @@ mod tests {
                     if query.contains("rkey=broken") {
                         return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
                     }
+                    if query.contains("rkey=throttled") {
+                        let mut response = axum::http::StatusCode::SERVICE_UNAVAILABLE
+                            .into_response();
+                        response.headers_mut().insert(
+                            http::header::RETRY_AFTER,
+                            http::HeaderValue::from_static("3600"),
+                        );
+                        return response;
+                    }
                     if query.contains("rkey=slow-") {
                         tokio::time::sleep(generator_delay).await;
                     }
@@ -2755,6 +2764,28 @@ mod tests {
         let _ = std::fs::remove_file(&db);
         let _ = std::fs::remove_file(db.with_extension("sqlite-wal"));
         let _ = std::fs::remove_file(db.with_extension("sqlite-shm"));
+    }
+
+    #[tokio::test]
+    async fn feed_generator_retry_after_failure_is_not_cached_as_a_final_resolution() {
+        let (pds, server) = fake_pds().await;
+        let port = pds.rsplit(':').next().unwrap().to_owned();
+        let identity = resolver(pds, format!("http://localhost:{port}/feed"));
+        let client = FeedClient::new(
+            identity,
+            SafeHttpClient::with_resolver(TestResolver)
+                .with_http_test_hosts(["localhost".to_owned()]),
+        );
+        let uri = format!("at://{CREATOR}/app.bsky.feed.generator/throttled");
+
+        let _first = client.resolve_feed(&uri).await.unwrap_err();
+        let retry = client.resolve_feed(&uri).await.unwrap_err();
+        assert!(
+            retry.contains(&format!("host localhost:{port} backing off for "))
+                && retry.contains(" s after 503"),
+            "a later visit must reach the host gate and remain retryable: {retry}"
+        );
+        server.abort();
     }
 
     #[test]
