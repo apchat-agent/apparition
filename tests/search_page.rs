@@ -39,6 +39,7 @@ struct FakeSearch {
     requests: Arc<Mutex<Vec<(String, String)>>>,
     posts_body: Arc<Mutex<Value>>,
     cursor_posts_body: Arc<Mutex<Option<Value>>>,
+    cursor_pages: Arc<Mutex<std::collections::HashMap<String, Value>>>,
     actors_body: Arc<Mutex<Value>>,
     fail: Arc<AtomicBool>,
     cursor_forbidden: Arc<AtomicBool>,
@@ -83,14 +84,18 @@ async fn fake_search_posts(
         )
             .into_response();
     }
-    let cursor_page = query
-        .as_deref()
-        .is_some_and(|query| query.contains("cursor="));
-    let body = if cursor_page {
-        fake.cursor_posts_body
+    let requested_cursor = query.as_deref().and_then(|query| {
+        url::form_urlencoded::parse(query.as_bytes())
+            .find(|(key, _)| key == "cursor")
+            .map(|(_, value)| value.into_owned())
+    });
+    let body = if let Some(cursor) = requested_cursor {
+        fake.cursor_pages
             .lock()
             .unwrap()
-            .clone()
+            .get(&cursor)
+            .cloned()
+            .or_else(|| fake.cursor_posts_body.lock().unwrap().clone())
             .unwrap_or_else(|| fake.posts_body())
     } else {
         fake.posts_body()
@@ -158,6 +163,7 @@ async fn start_fake_search_with(
         requests: Arc::new(Mutex::new(Vec::new())),
         posts_body: Arc::new(Mutex::new(posts_body)),
         cursor_posts_body: Arc::new(Mutex::new(None)),
+        cursor_pages: Arc::new(Mutex::new(std::collections::HashMap::new())),
         actors_body: Arc::new(Mutex::new(actors_body)),
         fail: Arc::new(AtomicBool::new(false)),
         cursor_forbidden: Arc::new(AtomicBool::new(false)),
@@ -600,6 +606,40 @@ async fn future_search_results_refill_the_page_from_the_next_cursor() {
     assert_eq!(html.matches("ordinary refill result").count(), 25, "{html}");
     assert!(!html.contains("future search row"), "{html}");
     assert_eq!(fake.calls.load(Ordering::SeqCst), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn future_only_search_refill_stops_after_eight_pages_and_keeps_the_cursor() {
+    let future_page = |cursor: &str, label: &str| {
+        let mut body = search_posts_body(Some(cursor));
+        body["posts"][0]["uri"] = json!(format!(
+            "at://did:plc:futurepost/app.bsky.feed.post/{label}"
+        ));
+        body["posts"][0]["record"]["text"] = json!("hidden future-only search row");
+        body["posts"][0]["record"]["createdAt"] = json!("2999-01-01T00:00:00Z");
+        body
+    };
+    let (base, fake, server) = start_fake_search(future_page("search-cursor-1", "page-0")).await;
+    for page_number in 1..8 {
+        let next_cursor = if page_number == 7 {
+            "search-resume".to_owned()
+        } else {
+            format!("search-cursor-{}", page_number + 1)
+        };
+        fake.cursor_pages.lock().unwrap().insert(
+            format!("search-cursor-{page_number}"),
+            future_page(&next_cursor, &format!("page-{page_number}")),
+        );
+    }
+    let router = router_with_search(AcceptingFlow, search_client(&base));
+    let cookie = login(&router).await;
+
+    let html = get_html(&router, "/search?q=minc", &cookie).await;
+
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 8, "{html}");
+    assert!(!html.contains("hidden future-only search row"), "{html}");
+    assert!(html.contains("cursor=search-resume"), "{html}");
     server.abort();
 }
 

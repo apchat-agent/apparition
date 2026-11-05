@@ -58,6 +58,8 @@ const CHECKPOINT_TRUNCATE: usize = 2;
 /// Hide a post while its own creation timestamp is more than 30 days ahead; the grace window
 /// lets legitimately scheduled posts become visible shortly before their publication date.
 pub const FUTURE_POST_HIDE_WINDOW_US: u64 = 30 * 24 * 60 * 60 * 1_000_000;
+/// At most 500 candidates per list request keeps hidden future rows from turning one page into an unbounded scan.
+pub const FILTERED_POST_PAGE_SCAN_LIMIT: usize = 500;
 static FUTURE_POSTS_HIDDEN: AtomicU64 = AtomicU64::new(0);
 static NEXT_MEMORY_DATABASE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -117,30 +119,40 @@ pub fn post_is_too_far_in_future(record: &IndexedRecord, now_us: u64) -> bool {
 
 /// Read enough cursor-ordered candidates to return a visible page and one-item lookahead. The
 /// fetch closure remains page-sized, while advancing its cursor across every examined row keeps
-/// future-dated rows from repeating or displacing ordinary posts on later pages.
+/// future-dated rows from repeating or displacing ordinary posts on later pages. A capped short
+/// page carries the last examined cursor so the next request can continue the scan.
 pub fn filtered_post_page<C, F, G>(
     cursor: Option<C>,
     limit: usize,
     now_us: u64,
     mut fetch: F,
     mut cursor_after: G,
-) -> Result<(Vec<IndexedRecord>, bool), StorageError>
+) -> Result<(Vec<IndexedRecord>, bool, Option<C>), StorageError>
 where
     C: Clone,
     F: FnMut(Option<&C>, usize) -> Result<Vec<IndexedRecord>, StorageError>,
     G: FnMut(&IndexedRecord) -> C,
 {
     let limit = limit.clamp(1, 100);
-    let batch_limit = (limit + 1).min(101);
     let mut scan_cursor = cursor;
     let mut visible = Vec::with_capacity(limit + 1);
+    let mut rows_examined = 0usize;
+    let mut scan_capped = false;
     loop {
+        if rows_examined >= FILTERED_POST_PAGE_SCAN_LIMIT {
+            scan_capped = true;
+            break;
+        }
+        let batch_limit = (limit + 1)
+            .min(101)
+            .min(FILTERED_POST_PAGE_SCAN_LIMIT - rows_examined);
         let batch = fetch(scan_cursor.as_ref(), batch_limit)?;
         if batch.is_empty() {
             break;
         }
         let batch_len = batch.len();
         for record in batch {
+            rows_examined += 1;
             scan_cursor = Some(cursor_after(&record));
             if !post_is_too_far_in_future(&record, now_us) {
                 visible.push(record);
@@ -153,8 +165,15 @@ where
             break;
         }
     }
-    let has_more = visible.len() > limit;
-    Ok((visible, has_more))
+    let has_more = visible.len() > limit || scan_capped;
+    let next_cursor = if visible.len() > limit {
+        visible.get(limit - 1).map(&mut cursor_after)
+    } else if scan_capped {
+        scan_cursor
+    } else {
+        None
+    };
+    Ok((visible, has_more, next_cursor))
 }
 
 fn take_future_posts_hidden() -> u64 {

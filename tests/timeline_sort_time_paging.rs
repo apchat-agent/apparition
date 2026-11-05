@@ -1,6 +1,7 @@
 use appview_rs::ingest::{
-    FUTURE_POST_HIDE_WINDOW_US, IndexedRecord, JetstreamStorageUpdate, SortTimeCursor,
-    SqliteStorage, Storage, filtered_post_page, post_is_too_far_in_future, post_sort_us,
+    FILTERED_POST_PAGE_SCAN_LIMIT, FUTURE_POST_HIDE_WINDOW_US, IndexedRecord,
+    JetstreamStorageUpdate, SortTimeCursor, SqliteStorage, Storage, filtered_post_page,
+    post_is_too_far_in_future, post_sort_us,
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -309,7 +310,7 @@ fn future_posts_refill_three_home_pages_without_duplicates_or_gaps() {
     let mut cursor = None;
     let mut walked = Vec::new();
     for page_number in 0..3 {
-        let (page, has_more) = filtered_post_page(
+        let (page, has_more, next_cursor) = filtered_post_page(
             cursor.clone(),
             10,
             now_us,
@@ -327,12 +328,7 @@ fn future_posts_refill_three_home_pages_without_duplicates_or_gaps() {
             "page {page_number} has ten posts and lookahead"
         );
         walked.extend(page.iter().take(10).map(|record| record.uri.clone()));
-        let last = &page[9];
-        cursor = Some(SortTimeCursor {
-            sort_us: post_sort_us(last),
-            time_us: last.time_us,
-            uri: last.uri.clone(),
-        });
+        cursor = next_cursor;
         assert!(has_more, "ordinary posts remain after page {page_number}");
     }
     assert_eq!(walked.len(), 30);
@@ -344,7 +340,7 @@ fn future_posts_refill_three_home_pages_without_duplicates_or_gaps() {
 }
 
 #[test]
-fn a_home_page_with_many_future_posts_stays_under_the_vm_step_cap() {
+fn five_thousand_future_posts_are_skipped_in_bounded_cursor_pages() {
     let path = database_path("future-bounded-work");
     remove_database(&path);
     let storage = SqliteStorage::open(&path).unwrap();
@@ -356,7 +352,7 @@ fn a_home_page_with_many_future_posts_stays_under_the_vm_step_cap() {
         upsert: Some(follow_record(VIEWER, FOLLOWED_A)),
         ..JetstreamStorageUpdate::default()
     }];
-    for index in 0..120 {
+    for index in 0..5_000 {
         let time_us = now_us - index * 1_000_000;
         updates.push(JetstreamStorageUpdate {
             time_us,
@@ -387,13 +383,15 @@ fn a_home_page_with_many_future_posts_stays_under_the_vm_step_cap() {
     storage.apply_jetstream_batch(&updates).unwrap();
 
     let mut work = appview_rs::ingest::StatementWork::default();
-    let (page, has_more) = filtered_post_page(
+    let mut rows_read = 0usize;
+    let (first_page, has_more, mut cursor) = filtered_post_page(
         None,
         50,
         now_us,
         |cursor, limit| {
             let (records, measured) =
                 storage.timeline_posts_by_post_time_counted(VIEWER, cursor, limit)?;
+            rows_read += records.len();
             work.vm_steps += measured.vm_steps;
             work.fullscan_steps += measured.fullscan_steps;
             Ok(records)
@@ -406,17 +404,50 @@ fn a_home_page_with_many_future_posts_stays_under_the_vm_step_cap() {
     )
     .unwrap();
 
-    assert_eq!(page.len(), 51);
-    assert!(has_more);
-    assert!(
-        page.iter()
-            .take(50)
-            .all(|record| record.uri.contains("ordinary-"))
-    );
     assert!(work.vm_steps < 25_000, "SQLite VM steps: {}", work.vm_steps);
+    assert!(
+        first_page.is_empty(),
+        "the first bounded scan only saw future posts"
+    );
+    assert!(has_more);
+    assert_eq!(rows_read, FILTERED_POST_PAGE_SCAN_LIMIT);
+    assert!(
+        cursor.is_some(),
+        "the capped empty page must carry a cursor"
+    );
     eprintln!(
         "future-filter home-page work: {} VM steps, {} fullscan steps",
         work.vm_steps, work.fullscan_steps
+    );
+
+    let expected = (0..30)
+        .map(|index| format!("ordinary-{index:03}"))
+        .collect::<Vec<_>>();
+    let mut walked = Vec::new();
+    while walked.len() < expected.len() {
+        let (page, has_more, next_cursor) = filtered_post_page(
+            cursor.clone(),
+            10,
+            now_us,
+            |cursor, limit| storage.timeline_posts_by_post_time(VIEWER, cursor, limit),
+            |record| SortTimeCursor {
+                sort_us: post_sort_us(record),
+                time_us: record.time_us,
+                uri: record.uri.clone(),
+            },
+        )
+        .unwrap();
+        walked.extend(
+            page.iter()
+                .take(10)
+                .map(|record| record.uri.rsplit('/').next().unwrap().to_owned()),
+        );
+        cursor = next_cursor;
+        assert!(has_more || walked.len() >= expected.len());
+    }
+    assert_eq!(
+        walked, expected,
+        "resuming after capped scans has no gap or duplicate"
     );
 
     drop(storage);

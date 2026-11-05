@@ -335,7 +335,7 @@ async fn get_author_feed<S: Storage + 'static, B: IdentityBackend>(
         Arc::clone(&state.storage),
         "author_feed_page",
         move |storage| {
-            let (feed_records, has_more) = filtered_post_page(
+            let (feed_records, has_more, next_cursor) = filtered_post_page(
                 cursor.clone(),
                 limit,
                 now_us,
@@ -352,18 +352,12 @@ async fn get_author_feed<S: Storage + 'static, B: IdentityBackend>(
                 .into_iter()
                 .map(|post| json!({"post":post}))
                 .collect::<Vec<_>>();
-            let next_cursor = if has_more {
-                feed_records.last().map(|last| {
-                    RecordCursor {
-                        time_us: last.time_us,
-                        uri: last.uri.clone(),
-                    }
-                    .encode()
-                })
-            } else {
-                None
-            };
-            Ok((feed, next_cursor))
+            Ok((
+                feed,
+                has_more
+                    .then(|| next_cursor.map(|cursor| cursor.encode()))
+                    .flatten(),
+            ))
         },
     )
     .await?;
@@ -541,7 +535,7 @@ async fn get_timeline<S: Storage + 'static, B: IdentityBackend>(
         Arc::clone(&state.storage),
         "timeline_page",
         move |storage| {
-            let (feed_records, has_more) = filtered_post_page(
+            let (feed_records, has_more, next_cursor) = filtered_post_page(
                 cursor.clone(),
                 limit,
                 now_us,
@@ -556,18 +550,12 @@ async fn get_timeline<S: Storage + 'static, B: IdentityBackend>(
                 .into_iter()
                 .map(|post| json!({"post":post}))
                 .collect::<Vec<_>>();
-            let next_cursor = if has_more {
-                feed_records.last().map(|last| {
-                    RecordCursor {
-                        time_us: last.time_us,
-                        uri: last.uri.clone(),
-                    }
-                    .encode()
-                })
-            } else {
-                None
-            };
-            Ok((feed, next_cursor))
+            Ok((
+                feed,
+                has_more
+                    .then(|| next_cursor.map(|cursor| cursor.encode()))
+                    .flatten(),
+            ))
         },
     )
     .await?;
