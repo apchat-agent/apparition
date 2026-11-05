@@ -404,9 +404,20 @@ async fn get_posts_uses_one_sqlite_record_lookup_for_a_full_uri_batch() {
             ) && (statement.contains("AND uri IN") || statement.contains("AND uri='at://"))
         })
         .count();
+    let post_count_cache_lookup_count = trace.count_containing("FROM post_counts WHERE uri=");
+    let author_count_query_count =
+        trace.count_containing(appview_rs::ingest::StatementTrace::PROFILE_COUNTS_SQL);
     assert_eq!(
         record_lookup_count, 1,
         "one 25-URI getPosts request should read its records with one SQL statement; observed {record_lookup_count} statements"
+    );
+    assert_eq!(
+        post_count_cache_lookup_count, 1,
+        "one 25-URI getPosts request should load cached interaction counts in one SQL statement; observed {post_count_cache_lookup_count} statements"
+    );
+    assert_eq!(
+        author_count_query_count, 1,
+        "25 posts by one author should compute that author's profile counts once; observed {author_count_query_count} statements"
     );
 }
 
