@@ -6,11 +6,13 @@ use appview_rs::ingest::SqliteStorage;
 const TRACKED_DIDS: usize = 300;
 const REGISTERED_DIDS: usize = 200;
 const UNTRACKED_POSTS: usize = 780_000;
-const TRACKED_POSTS: usize = 20_000;
+const TRACKED_POSTS: usize = 50_000;
 const LIKES: usize = 100_000;
 const REPOSTS: usize = 100_000;
+const REPLIES: usize = 100_000;
 const FOLLOW_HISTORY_PER_REGISTERED: usize = 5_700;
 const NOTIFICATIONS: usize = 200_000;
+const HOT_POSTS_PER_AUTHOR: usize = 10_001;
 
 pub fn ensure_database(path: &Path) -> Result<bool, Box<dyn Error>> {
     if path.exists() {
@@ -56,12 +58,34 @@ pub fn ensure_database(path: &Path) -> Result<bool, Box<dyn Error>> {
     {
         let mut insert = transaction.prepare_cached(
             "INSERT INTO records(did,collection,rkey,uri,cid,time_us,record_json)
+             VALUES(?1,'app.bsky.graph.follow',?2,?3,?4,?5,?6)",
+        )?;
+        for actor in 0..REGISTERED_DIDS {
+            for target in 0..TRACKED_DIDS {
+                let did = registered_did(actor);
+                let rkey = format!("synthetic-follow-{target}");
+                let uri = format!("at://{did}/app.bsky.graph.follow/{rkey}");
+                insert.execute(params![
+                    did,
+                    rkey,
+                    uri,
+                    format!("cid-follow-{actor}-{target}"),
+                    1_699_000_000_000_000_i64 + (actor * TRACKED_DIDS + target) as i64,
+                    format!(r#"{{"subject":"{}"}}"#, tracked_did(target)),
+                ])?;
+            }
+        }
+    }
+
+    {
+        let mut insert = transaction.prepare_cached(
+            "INSERT INTO records(did,collection,rkey,uri,cid,time_us,record_json)
              VALUES(?1,?2,?3,?4,?5,?6,?7)",
         )?;
         let tracked_post = r#"{"$type":"app.bsky.feed.post","text":"synthetic tracked post"}"#;
         let plain_post = r#"{"$type":"app.bsky.feed.post","text":"synthetic untracked post"}"#;
         for index in 0..TRACKED_POSTS {
-            let author = index % TRACKED_DIDS;
+            let author = tracked_author(index);
             let rkey = format!("tracked-post-{index}");
             let uri = format!(
                 "at://{}/{}/{}",
@@ -103,8 +127,9 @@ pub fn ensure_database(path: &Path) -> Result<bool, Box<dyn Error>> {
                 let did = format!("did:plc:synthetic-untracked-{author:05}");
                 let rkey = format!("{prefix}-{index}");
                 let subject_author = index % TRACKED_DIDS;
+                let subject_rkey = tracked_post_rkey(subject_author);
                 let target_uri = format!(
-                    "at://{}/{}/tracked-post-{subject_author}",
+                    "at://{}/{}/tracked-post-{subject_rkey}",
                     tracked_did(subject_author),
                     "app.bsky.feed.post"
                 );
@@ -122,6 +147,31 @@ pub fn ensure_database(path: &Path) -> Result<bool, Box<dyn Error>> {
                 ])?;
             }
         }
+
+        for index in 0..REPLIES {
+            let author = index % 20_000;
+            let did = format!("did:plc:synthetic-untracked-{author:05}");
+            let rkey = format!("reply-{index}");
+            let subject_author = index % TRACKED_DIDS;
+            let subject_rkey = tracked_post_rkey(subject_author);
+            let target_uri = format!(
+                "at://{}/app.bsky.feed.post/tracked-post-{subject_rkey}",
+                tracked_did(subject_author)
+            );
+            let uri = format!("at://{did}/app.bsky.feed.post/{rkey}");
+            let record = format!(
+                r#"{{"$type":"app.bsky.feed.post","text":"synthetic reply","reply":{{"root":{{"uri":"{target_uri}","cid":"cid-target"}},"parent":{{"uri":"{target_uri}","cid":"cid-target"}}}}}}"#
+            );
+            insert.execute(params![
+                did,
+                "app.bsky.feed.post",
+                rkey,
+                uri,
+                format!("cid-reply-{index}"),
+                1_700_000_250_000_000_i64 + index as i64,
+                record,
+            ])?;
+        }
     }
 
     {
@@ -131,7 +181,8 @@ pub fn ensure_database(path: &Path) -> Result<bool, Box<dyn Error>> {
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
         )?;
         for index in 0..NOTIFICATIONS {
-            let author = index % 20_000;
+            let activity_index = index / 2;
+            let author = activity_index % 20_000;
             let source_did = format!("did:plc:synthetic-untracked-{author:05}");
             let collection = if index % 2 == 0 {
                 "app.bsky.feed.like"
@@ -139,11 +190,15 @@ pub fn ensure_database(path: &Path) -> Result<bool, Box<dyn Error>> {
                 "app.bsky.feed.repost"
             };
             let reason = if index % 2 == 0 { "like" } else { "repost" };
-            let source_rkey = format!("synthetic-notification-{index}");
+            let source_rkey = format!(
+                "{}-{activity_index}",
+                if index % 2 == 0 { "like" } else { "repost" }
+            );
             let source_uri = format!("at://{source_did}/{collection}/{source_rkey}");
             let target = index % TRACKED_DIDS;
+            let target_rkey = tracked_post_rkey(target);
             let reason_subject = format!(
-                "at://{}/{}/tracked-post-{target}",
+                "at://{}/{}/tracked-post-{target_rkey}",
                 tracked_did(target),
                 "app.bsky.feed.post"
             );
@@ -182,4 +237,20 @@ fn registered_did(index: usize) -> String {
 
 fn tracked_did(index: usize) -> String {
     format!("did:plc:synthetic-tracked-{index:03}")
+}
+
+fn tracked_author(index: usize) -> usize {
+    if index < HOT_POSTS_PER_AUTHOR * 3 {
+        index / HOT_POSTS_PER_AUTHOR
+    } else {
+        3 + (index - HOT_POSTS_PER_AUTHOR * 3) % (TRACKED_DIDS - 3)
+    }
+}
+
+fn tracked_post_rkey(author: usize) -> usize {
+    if author < 3 {
+        author
+    } else {
+        HOT_POSTS_PER_AUTHOR * 3 + author - 3
+    }
 }
