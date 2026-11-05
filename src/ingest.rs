@@ -504,7 +504,9 @@ where
     T: Send + 'static,
     F: FnOnce(&S) -> Result<T, StorageError> + Send + 'static,
 {
+    let trace_sink = STATEMENT_TRACE_SINK.with(|sink| sink.borrow().clone());
     let result = tokio::task::spawn_blocking(move || {
+        let _trace_sink = StatementTraceSinkGuard::install(trace_sink);
         let started = Instant::now();
         let budget_guard = WebReadBudgetGuard::install(started, budget);
         let result = call(&storage);
@@ -3503,6 +3505,20 @@ thread_local! {
     static STATEMENT_TRACE_SINK: RefCell<Option<StatementTrace>> = const { RefCell::new(None) };
 }
 
+struct StatementTraceSinkGuard(Option<StatementTrace>);
+
+impl StatementTraceSinkGuard {
+    fn install(trace: Option<StatementTrace>) -> Self {
+        Self(STATEMENT_TRACE_SINK.with(|sink| sink.replace(trace)))
+    }
+}
+
+impl Drop for StatementTraceSinkGuard {
+    fn drop(&mut self) {
+        STATEMENT_TRACE_SINK.with(|sink| sink.replace(self.0.take()));
+    }
+}
+
 fn push_traced_statement(sql: &str) {
     STATEMENT_TRACE_SINK.with(|sink| {
         if let Some(sink) = sink.borrow().as_ref() {
@@ -4428,9 +4444,9 @@ impl SqliteStorage {
         self.writer.flush()
     }
 
-    /// Records statements executed on the calling thread from now on (read
-    /// pool connections get the tracer installed; the sink lives in a
-    /// thread-local, so other threads' queries are not recorded).
+    /// Records statements executed from now on on this request context (read
+    /// pool connections get the tracer installed; the thread-local sink is
+    /// propagated to web blocking calls made by this context).
     pub fn trace_statements(&self) -> StatementTrace {
         let trace = StatementTrace::default();
         for connection in &self.read_connections {
