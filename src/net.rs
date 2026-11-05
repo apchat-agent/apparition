@@ -1454,8 +1454,10 @@ mod tests {
         // Match the configured global pool sizes so the first pool_size blocked calls fill it.
         let foreground = check_pool(false, 32).await;
         let background = check_pool(true, 6).await;
-        assert!(foreground.is_ok(), "foreground pool: {foreground:?}");
-        assert!(background.is_ok(), "background pool: {background:?}");
+        assert!(
+            foreground.is_ok() && background.is_ok(),
+            "foreground pool: {foreground:?}; background pool: {background:?}"
+        );
     }
 
     #[tokio::test]
