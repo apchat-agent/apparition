@@ -19969,6 +19969,61 @@ mod tests {
     }
 
     #[test]
+    fn future_quote_embed_uses_the_unavailable_post_placeholder() {
+        let storage = MemoryStorage::default();
+        let quoted = test_web_post(
+            "did:plc:futurepost",
+            "future",
+            1_800_000_000_000_000,
+            "future post body must stay hidden",
+            None,
+        );
+        let uri = quoted.uri.clone();
+        storage.put_record(&quoted).unwrap();
+
+        let rendered = render_web_quote(
+            &WebRenderContext::default(),
+            &storage,
+            &quote_embed(&uri),
+            &QuoteRenderIndex::default(),
+            0,
+        );
+
+        assert!(rendered.contains("Post unavailable"), "{rendered}");
+        assert!(!rendered.contains("future post body must stay hidden"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn future_posts_are_removed_from_following_before_page_rendering() {
+        let storage = Arc::new(MemoryStorage::default());
+        let viewer = "did:plc:future-viewer";
+        let author = "did:plc:future-author";
+        let mut future = test_web_post(
+            author,
+            "future",
+            1_800_000_000_000_002,
+            "future timeline post must stay hidden",
+            None,
+        );
+        future.record["createdAt"] = json!("2999-01-01T00:00:00Z");
+        let ordinary = test_web_post(
+            author,
+            "ordinary",
+            1_800_000_000_000_001,
+            "ordinary timeline post remains visible",
+            None,
+        );
+        storage.put_record(&future).unwrap();
+        storage.put_record(&ordinary).unwrap();
+        storage.set_follow(viewer, author, true).unwrap();
+
+        let page = request_test_timeline_at(storage, viewer, "/app?limit=1").await;
+
+        assert!(page.contains("ordinary timeline post remains visible"), "{page}");
+        assert!(!page.contains("future timeline post must stay hidden"), "{page}");
+    }
+
+    #[test]
     fn case33_nested_quote_link_keeps_its_label_and_adds_the_known_author_handle() {
         let storage = MemoryStorage::default();
         let did = "did:plc:nested-author";
