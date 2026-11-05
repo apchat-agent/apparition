@@ -4892,10 +4892,10 @@ impl SqliteStorage {
                         .collect::<Result<Vec<_>, _>>()?,
                 );
             }
-            if let Some(counted) = work.as_mut() {
-                if let Some(unfilled) = unfilled.as_ref() {
-                    counted.observe(unfilled);
-                }
+            if let Some(counted) = work.as_mut()
+                && let Some(unfilled) = unfilled.as_ref()
+            {
+                counted.observe(unfilled);
             }
         }
         drop(filled);
