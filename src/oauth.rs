@@ -23482,6 +23482,7 @@ mod tests {
     struct FeedTestState {
         auth_calls: usize,
         auth_requests: Vec<(String, String)>,
+        auth_delay: Duration,
         skeleton_authorizations: Vec<Option<String>>,
         video_requests: Vec<(String, String)>,
         pds_url: String,
@@ -23615,31 +23616,42 @@ mod tests {
                 get(move |uri: Uri| {
                     let state = auth_state.clone();
                     async move {
-                        let mut state = state.lock().unwrap();
-                        state.auth_calls += 1;
-                        let parameters = url::form_urlencoded::parse(
-                            uri.query().unwrap_or_default().as_bytes(),
-                        )
-                        .into_owned()
-                        .collect::<HashMap<_, _>>();
-                        state.auth_requests.push((
-                            parameters.get("aud").cloned().unwrap_or_default(),
-                            parameters.get("lxm").cloned().unwrap_or_default(),
-                        ));
-                        if state.fail_auth {
-                            (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(json!({"error":"Unavailable"})),
+                        let (response, delay) = {
+                            let mut state = state.lock().unwrap();
+                            state.auth_calls += 1;
+                            let parameters = url::form_urlencoded::parse(
+                                uri.query().unwrap_or_default().as_bytes(),
                             )
-                        } else {
-                            let token = match parameters.get("lxm").map(String::as_str) {
-                                Some("app.bsky.video.getUploadLimits") => "limits-service-jwt",
-                                Some("com.atproto.repo.uploadBlob") => "upload-blob-service-jwt",
-                                Some("app.bsky.video.getJobStatus") => "job-status-service-jwt",
-                                _ => SERVICE_JWT,
+                            .into_owned()
+                            .collect::<HashMap<_, _>>();
+                            state.auth_requests.push((
+                                parameters.get("aud").cloned().unwrap_or_default(),
+                                parameters.get("lxm").cloned().unwrap_or_default(),
+                            ));
+                            let response = if state.fail_auth {
+                                (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    Json(json!({"error":"Unavailable"})),
+                                )
+                            } else {
+                                let token = match parameters.get("lxm").map(String::as_str) {
+                                    Some("app.bsky.video.getUploadLimits") => {
+                                        "limits-service-jwt"
+                                    }
+                                    Some("com.atproto.repo.uploadBlob") => {
+                                        "upload-blob-service-jwt"
+                                    }
+                                    Some("app.bsky.video.getJobStatus") => {
+                                        "job-status-service-jwt"
+                                    }
+                                    _ => SERVICE_JWT,
+                                };
+                                (StatusCode::OK, Json(json!({"token":token})))
                             };
-                            (StatusCode::OK, Json(json!({"token":token})))
-                        }
+                            (response, state.auth_delay)
+                        };
+                        tokio::time::sleep(delay).await;
+                        response
                     }
                 }),
             )
@@ -25913,6 +25925,27 @@ mod tests {
                 .iter()
                 .all(|authorization| authorization.as_deref() == Some("Bearer case23-service-jwt"))
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn concurrent_service_auth_requests_are_merged() {
+        let (flow, state, server) = feed_test_flow(false).await;
+        state.lock().unwrap().auth_delay = Duration::from_millis(80);
+        let (first, second) = tokio::join!(
+            flow.service_auth_token(
+                FEED_VIEWER_DID,
+                FEED_SERVICE_DID,
+                "app.bsky.feed.getFeedSkeleton"
+            ),
+            flow.service_auth_token(
+                FEED_VIEWER_DID,
+                FEED_SERVICE_DID,
+                "app.bsky.feed.getFeedSkeleton"
+            )
+        );
+        assert_eq!(first.unwrap(), second.unwrap());
+        assert_eq!(state.lock().unwrap().auth_calls, 1);
         server.abort();
     }
 
