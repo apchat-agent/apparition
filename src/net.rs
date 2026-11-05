@@ -1380,7 +1380,7 @@ mod tests {
     async fn backing_off_host_does_not_occupy_either_global_request_pool() {
         use axum::http::StatusCode;
 
-        async fn check_pool(background: bool, pool_size: usize) {
+        async fn check_pool(background: bool, pool_size: usize) -> Result<(), String> {
             let failures = Arc::new(AtomicUsize::new(0));
             let route_failures = Arc::clone(&failures);
             let app = Router::new()
@@ -1433,20 +1433,29 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
             let b = tokio::time::timeout(std::time::Duration::from_secs(1), request(&b_host, "/b"))
-                .await
-                .expect("a backing-off host occupied the shared request pool")
-                .unwrap();
-            assert_eq!(b.status(), StatusCode::OK);
+                .await;
 
             for call in blocked {
                 call.abort();
             }
             server.abort();
+
+            match b {
+                Ok(Ok(response)) if response.status() == StatusCode::OK => Ok(()),
+                Ok(Ok(response)) => Err(format!(
+                    "host B returned {} instead of 200",
+                    response.status()
+                )),
+                Ok(Err(error)) => Err(format!("host B request failed: {error}")),
+                Err(_) => Err("a backing-off host occupied the shared request pool".to_owned()),
+            }
         }
 
         // Match the configured global pool sizes so the first pool_size blocked calls fill it.
-        check_pool(false, 32).await;
-        check_pool(true, 6).await;
+        let foreground = check_pool(false, 32).await;
+        let background = check_pool(true, 6).await;
+        assert!(foreground.is_ok(), "foreground pool: {foreground:?}");
+        assert!(background.is_ok(), "background pool: {background:?}");
     }
 
     #[tokio::test]
