@@ -23666,6 +23666,16 @@ mod tests {
                 }),
             )
             .route(
+                "/xrpc/video-rate-limit",
+                get(|| async {
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [(header::RETRY_AFTER, "1")],
+                        "slow down",
+                    )
+                }),
+            )
+            .route(
                 "/xrpc/app.bsky.video.uploadVideo",
                 post(move |headers: HeaderMap, _: Bytes| {
                     let state = video_upload_state.clone();
@@ -25955,6 +25965,62 @@ mod tests {
         let state = state.lock().unwrap();
         assert_eq!(state.auth_calls, 0);
         assert_eq!(state.skeleton_authorizations.as_slice(), [None]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn video_upload_observes_host_retry_after_backoff() {
+        let (mut flow, state, server) = feed_test_flow(false).await;
+        flow.video_service_url = state.lock().unwrap().pds_url.clone();
+        let pds_audience = flow.pds_service_did(FEED_VIEWER_DID).await.unwrap();
+        flow.service_auth_token(
+            FEED_VIEWER_DID,
+            VIDEO_SERVICE_DID,
+            "app.bsky.video.getUploadLimits",
+        )
+        .await
+        .unwrap();
+        flow.service_auth_token(
+            FEED_VIEWER_DID,
+            &pds_audience,
+            "com.atproto.repo.uploadBlob",
+        )
+        .await
+        .unwrap();
+        let backoff_url = reqwest::Url::parse(&format!(
+            "{}/xrpc/video-rate-limit",
+            state.lock().unwrap().pds_url
+        ))
+        .unwrap();
+        let response = flow
+            .http_client
+            .get(&backoff_url, HeaderMap::new(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let (mut temporary, mut file) = create_temporary_video_file().unwrap();
+        file.write_all(b"video").await.unwrap();
+        drop(file);
+        let video = PostVideo {
+            path: temporary.take_path(),
+            mime_type: "video/mp4".to_owned(),
+            alt: String::new(),
+            width: 1920,
+            height: 1080,
+            duration_seconds: 1.0,
+            size_bytes: 5,
+            filename: "clip.mp4".to_owned(),
+        };
+        let started = tokio::time::Instant::now();
+        flow.upload_video_blob(FEED_VIEWER_DID, &video)
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(900),
+            "video requests must observe the host Retry-After cooldown"
+        );
+        assert_eq!(state.lock().unwrap().video_requests.len(), 3);
         server.abort();
     }
 
