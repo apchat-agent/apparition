@@ -111,12 +111,13 @@ fn retry_after_duration(value: &http::HeaderValue) -> Option<Duration> {
     retry_at.duration_since(std::time::SystemTime::now()).ok()
 }
 
-fn outbound_host_gate(host: &str) -> Arc<OutboundHostGate> {
+fn outbound_host_gate(host: &str, port: u16) -> Arc<OutboundHostGate> {
     let gates = OUTBOUND_HOST_GATES.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(mut gates) = gates.lock() {
+        let gate_key = format!("{}:{port}", host.trim_end_matches('.').to_ascii_lowercase());
         return Arc::clone(
             gates
-                .entry(host.trim_end_matches('.').to_ascii_lowercase())
+                .entry(gate_key)
                 .or_insert_with(|| Arc::new(OutboundHostGate::new())),
         );
     }
@@ -615,7 +616,10 @@ impl SafeHttpClient {
         let host = url
             .host_str()
             .ok_or_else(|| "outbound URL has no host".to_owned())?;
-        let host_gate = outbound_host_gate(host);
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| "URL has no port".to_owned())?;
+        let host_gate = outbound_host_gate(host, port);
         let result = async {
             let _request_permit = request_pool(self.background)
                 .acquire_owned()
@@ -756,7 +760,10 @@ impl SafeHttpClient {
             let host = url
                 .host_str()
                 .ok_or_else(|| "outbound URL has no host".to_owned())?;
-            let host_gate = outbound_host_gate(host);
+            let port = url
+                .port_or_known_default()
+                .ok_or_else(|| "URL has no port".to_owned())?;
+            let host_gate = outbound_host_gate(host, port);
             let _host_permit = host_gate.acquire_request_permit().await?;
             let addresses = self.resolve_safe(&url).await?;
             let client = self.client_for(host, &addresses)?;
