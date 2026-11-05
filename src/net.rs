@@ -1251,11 +1251,11 @@ mod tests {
                     if requests.fetch_add(1, Ordering::SeqCst) == 0 {
                         (
                             StatusCode::TOO_MANY_REQUESTS,
-                            [("retry-after", "1")],
+                            [("retry-after", "2")],
                             "slow down",
                         )
                     } else {
-                        (StatusCode::OK, [("retry-after", "1")], "ok")
+                        (StatusCode::OK, [("retry-after", "2")], "ok")
                     }
                 }
             }),
@@ -1286,7 +1286,7 @@ mod tests {
         assert_eq!(second.status(), StatusCode::OK);
         assert_eq!(requests.load(Ordering::SeqCst), 2);
         assert!(
-            retry_started.elapsed() >= std::time::Duration::from_millis(900),
+            retry_started.elapsed() >= std::time::Duration::from_millis(1900),
             "the next request to a host must honor its Retry-After cooldown"
         );
         assert!(
@@ -1418,35 +1418,38 @@ mod tests {
     async fn backing_off_host_does_not_occupy_either_global_request_pool() {
         use axum::http::StatusCode;
 
-        async fn check_pool(background: bool, pool_size: usize) -> Result<(), String> {
+        async fn check_pool(
+            background: bool,
+            pool_size: usize,
+            streaming: bool,
+        ) -> Result<(), String> {
             let failures = Arc::new(AtomicUsize::new(0));
             let route_failures = Arc::clone(&failures);
+            let retry_after = if streaming { "2" } else { "3600" };
+            let a_handler = move || {
+                let failures = Arc::clone(&route_failures);
+                async move {
+                    if failures.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            [("retry-after", retry_after)],
+                            "temporarily unavailable",
+                        )
+                    } else {
+                        (StatusCode::OK, [("retry-after", retry_after)], "ok")
+                    }
+                }
+            };
             let app = Router::new()
-                .route(
-                    "/a",
-                    get(move || {
-                        let failures = Arc::clone(&route_failures);
-                        async move {
-                            if failures.fetch_add(1, Ordering::SeqCst) == 0 {
-                                (
-                                    StatusCode::SERVICE_UNAVAILABLE,
-                                    [("retry-after", "3600")],
-                                    "temporarily unavailable",
-                                )
-                            } else {
-                                (StatusCode::OK, [("retry-after", "3600")], "ok")
-                            }
-                        }
-                    }),
-                )
+                .route("/a", get(a_handler.clone()).post(a_handler))
                 .route("/b", get(|| async { "ok" }));
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = listener.local_addr().unwrap().port();
             let server = tokio::spawn(async move {
                 axum::serve(listener, app).await.unwrap();
             });
-            let a_host = format!("backoff-{background}-{port}.example.test");
-            let b_host = format!("healthy-{background}-{port}.example.test");
+            let a_host = format!("backoff-{background}-{streaming}-{port}.example.test");
+            let b_host = format!("healthy-{background}-{streaming}-{port}.example.test");
             let client = SafeHttpClient::with_resolver(FakeResolver::new(
                 (0..pool_size + 2).map(|_| vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]),
             ))
@@ -1459,7 +1462,21 @@ mod tests {
             let request = |host: &str, path: &str| {
                 let url = Url::parse(&format!("http://{host}:{port}{path}")).unwrap();
                 let client = client.clone();
-                async move { client.get(&url, http::HeaderMap::new(), 1024).await }
+                let is_backoff_path = path == "/a";
+                async move {
+                    if streaming && is_backoff_path {
+                        client
+                            .post_stream(
+                                &url,
+                                http::HeaderMap::new(),
+                                reqwest::Body::from("video bytes"),
+                                1024,
+                            )
+                            .await
+                    } else {
+                        client.get(&url, http::HeaderMap::new(), 1024).await
+                    }
+                }
             };
 
             let first = request(&a_host, "/a").await.unwrap();
@@ -1490,11 +1507,18 @@ mod tests {
         }
 
         // Match the configured global pool sizes so the first pool_size blocked calls fill it.
-        let foreground = check_pool(false, 32).await;
-        let background = check_pool(true, 6).await;
+        let foreground = check_pool(false, 32, false).await;
+        let background = check_pool(true, 6, false).await;
+        let foreground_stream = check_pool(false, 32, true).await;
+        let background_stream = check_pool(true, 6, true).await;
         assert!(
-            foreground.is_ok() && background.is_ok(),
-            "foreground pool: {foreground:?}; background pool: {background:?}"
+            foreground.is_ok()
+                && background.is_ok()
+                && foreground_stream.is_ok()
+                && background_stream.is_ok(),
+            "foreground GET pool: {foreground:?}; background GET pool: {background:?}; \
+             foreground post_stream pool: {foreground_stream:?}; background post_stream pool: \
+             {background_stream:?}"
         );
     }
 
