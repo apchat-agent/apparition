@@ -10,6 +10,7 @@ use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
+    hash::{Hash, Hasher},
     pin::Pin,
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
@@ -272,6 +273,9 @@ type InFlightPagePostFetches = tokio::sync::Mutex<
 >;
 type InFlightGeneratorResolutions =
     tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Result<ResolvedFeed, String>>>>>;
+type InFlightSkeletonRequests = tokio::sync::Mutex<
+    HashMap<String, Arc<tokio::sync::OnceCell<Result<FeedSkeletonPage, String>>>>,
+>;
 
 fn post_fetch_flight_key(proxy: &str, uris: &[String]) -> String {
     let mut unique_uris = uris.to_vec();
@@ -573,6 +577,7 @@ pub struct FeedClient<B: IdentityBackend> {
     public_appview_base: String,
     generator_cache: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, ResolvedFeed)>>,
     in_flight_generator_resolutions: InFlightGeneratorResolutions,
+    in_flight_skeleton_requests: InFlightSkeletonRequests,
     live_post_cache: LivePostCache,
     in_flight_post_fetches: InFlightPostFetches,
     in_flight_page_post_fetches: InFlightPagePostFetches,
@@ -592,6 +597,7 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
             public_appview_base: crate::profile_counts::PUBLIC_APPVIEW_BASE.to_owned(),
             generator_cache: tokio::sync::Mutex::new(HashMap::new()),
             in_flight_generator_resolutions: tokio::sync::Mutex::new(HashMap::new()),
+            in_flight_skeleton_requests: tokio::sync::Mutex::new(HashMap::new()),
             live_post_cache: tokio::sync::Mutex::new(HashMap::new()),
             in_flight_post_fetches: tokio::sync::Mutex::new(HashMap::new()),
             in_flight_page_post_fetches: tokio::sync::Mutex::new(HashMap::new()),
@@ -862,6 +868,45 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
     }
 
     pub async fn get_skeleton(
+        &self,
+        feed: &ResolvedFeed,
+        cursor: Option<&str>,
+        service_jwt: Option<&str>,
+    ) -> Result<FeedSkeletonPage, String> {
+        let mut jwt_hasher = std::collections::hash_map::DefaultHasher::new();
+        service_jwt.hash(&mut jwt_hasher);
+        let key = format!(
+            "{}:{}:{}:{}:{}:{}",
+            feed.uri.len(),
+            feed.uri,
+            feed.endpoint.len(),
+            feed.endpoint,
+            cursor.unwrap_or_default().len(),
+            cursor.unwrap_or_default(),
+            jwt_hasher.finish()
+        );
+        let cell = {
+            let mut in_flight = self.in_flight_skeleton_requests.lock().await;
+            in_flight
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+                .clone()
+        };
+        let result = cell
+            .get_or_init(|| async { self.get_skeleton_uncached(feed, cursor, service_jwt).await })
+            .await
+            .clone();
+        let mut in_flight = self.in_flight_skeleton_requests.lock().await;
+        if in_flight
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, &cell))
+        {
+            in_flight.remove(&key);
+        }
+        result
+    }
+
+    async fn get_skeleton_uncached(
         &self,
         feed: &ResolvedFeed,
         cursor: Option<&str>,
