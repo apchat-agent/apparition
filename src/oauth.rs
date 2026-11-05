@@ -22933,6 +22933,77 @@ mod tests {
         assert!(refreshed_page.contains("@original.cache.test"));
     }
 
+    #[derive(Clone)]
+    struct FailedAuthorProfileFlow;
+
+    impl OAuthFlow for FailedAuthorProfileFlow {
+        fn authorize<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: Vec<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async { Err("authorization is unavailable in this test".to_owned()) })
+        }
+
+        fn callback<'a>(
+            &'a self,
+            _: OAuthCallback,
+        ) -> Pin<Box<dyn Future<Output = Result<OAuthAccount, String>> + Send + 'a>> {
+            Box::pin(async { Err("callback is unavailable in this test".to_owned()) })
+        }
+
+        fn logout<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn fetch_author_profile<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<FetchedAuthorProfile, String>> + Send + 'a>>
+        {
+            Box::pin(async {
+                Err("host pds.example.test:443 backing off for 3600 s after 503".to_owned())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_refresh_remote_failure_does_not_poison_the_local_profile_cache() {
+        let storage = Arc::new(MemoryStorage::default());
+        let did = "did:plc:profile-cache-retry-test";
+        storage
+            .set_profile_index_entry(
+                did,
+                ProfileIndexEntry {
+                    has_profile: true,
+                    fetched_at_ms: 0,
+                },
+            )
+            .unwrap();
+        storage.enqueue_profile_fetches(&[did.to_owned()]).unwrap();
+
+        let worker = ProfileRefreshWorker::new(
+            FailedAuthorProfileFlow,
+            Arc::clone(&storage),
+            Duration::from_secs(30),
+        );
+        assert_eq!(worker.refresh_once().await.unwrap(), 1);
+        assert!(
+            storage.profile_index_snapshot().unwrap()[did].has_profile,
+            "a transient remote failure must preserve the last known profile cache entry"
+        );
+
+        // A later page visit must be able to queue a retry instead of treating the
+        // transient 503/backoff error as an authoritative missing profile.
+        let hydration = hydrate_page_profiles(&*storage, [did.to_owned()], Vec::new()).unwrap();
+        assert_eq!(hydration.authors_needed, 1);
+        assert_eq!(storage.pending_profile_fetches(10).unwrap(), [did]);
+    }
+
     fn quote_embed(uri: &str) -> Value {
         json!({
             "$type":"app.bsky.embed.record",
