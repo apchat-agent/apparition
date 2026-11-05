@@ -100,7 +100,7 @@ impl FakeAppview {
             FakeReply::Garbage => (StatusCode::OK, "not json").into_response(),
             FakeReply::Delay(duration) => {
                 tokio::time::sleep(duration).await;
-                axum::Json(json!({"did": actors.first(), "followersCount": 9})).into_response()
+                axum::Json(json!({"did": actors.first(), "followersCount": 9, "followsCount": 8, "postsCount": 7})).into_response()
             }
         }
     }
@@ -146,6 +146,21 @@ async fn profile_count_cache_reuses_remote_counts_within_configured_ttl() {
     );
     assert_eq!(second, first);
     assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn concurrent_profile_count_misses_share_one_remote_request() {
+    let (base, fake, server) = start_fake_appview().await;
+    *fake.reply.lock().unwrap() = FakeReply::Delay(Duration::from_millis(100));
+    let client = counts_client(&base, Duration::from_secs(600), Duration::from_secs(1));
+    let results = futures_util::future::join_all((0..8).map(|_| client.get_counts(ALICE))).await;
+    assert!(results.iter().all(Option::is_some));
+    assert_eq!(
+        fake.calls.load(Ordering::SeqCst),
+        1,
+        "identical concurrent profile lookups should share their in-flight AppView request"
+    );
     server.abort();
 }
 
