@@ -39,6 +39,22 @@ SELECT did, collection, rkey, uri, cid, time_us, record_json FROM records
 WHERE collection='app.bsky.feed.post' AND did=?1
 AND (?2 IS NULL OR time_us<?2 OR (time_us=?2 AND uri<?3))
 ORDER BY time_us DESC,uri DESC LIMIT ?4;
+.print 'profile post page excluding replies'
+EXPLAIN QUERY PLAN
+SELECT did, collection, rkey, uri, cid, time_us, record_json FROM records
+WHERE collection='app.bsky.feed.post' AND did=?1
+AND json_type(record_json,'$.reply') IS NULL
+AND (?2 IS NULL OR time_us<?2 OR (time_us=?2 AND uri<?3))
+ORDER BY time_us DESC,uri DESC LIMIT ?4;
+.print 'getFollows: actor ordered page'
+EXPLAIN QUERY PLAN
+SELECT did,collection,rkey,uri,cid,time_us,record_json FROM records
+WHERE collection='app.bsky.graph.follow' AND did=?1
+ORDER BY time_us DESC,uri DESC LIMIT ?2;
+.print 'getPostThread: ancestor and root exact URI lookup'
+EXPLAIN QUERY PLAN
+SELECT did,collection,rkey,uri,cid,time_us,record_json FROM records
+WHERE collection='app.bsky.feed.post' AND uri=?1;
 .print 'getTimeline: followed-author discovery'
 EXPLAIN QUERY PLAN
 SELECT DISTINCT json_extract(record_json,'$.subject') FROM records
@@ -101,16 +117,27 @@ SELECT source_did,source_collection,source_rkey,source_uri,reason,reason_subject
 FROM notification_events
 WHERE subject_did=?1 AND (?2 IS NULL OR time_us<?2 OR (time_us=?2 AND (source_uri<?3 OR (source_uri=?3 AND reason<?4))))
 ORDER BY time_us DESC,source_uri DESC,reason DESC LIMIT ?5;
-.print 'post page author interaction counts: batched URI lookup'
+.print 'post page cached interaction counts: batched URI lookup'
 EXPLAIN QUERY PLAN
-SELECT json_extract(record_json,'$.subject.uri'),COUNT(*) FROM records
-WHERE collection=?1 AND json_extract(record_json,'$.subject.uri') IN (SELECT value FROM json_each(?2))
-GROUP BY 1;
-.print 'post interaction cache fill: one indexed aggregation per relation and URI batch'
+SELECT uri,like_count,repost_count,reply_count,quote_count FROM post_counts
+WHERE uri IN (SELECT value FROM json_each(?1));
+.print 'post interaction cache fill: likes or reposts, one indexed aggregation per relation and URI batch'
 EXPLAIN QUERY PLAN
 SELECT json_extract(record_json,'$.subject.uri'),COUNT(*) FROM records
 INDEXED BY records_collection_subject_uri
 WHERE collection=?1 AND json_extract(record_json,'$.subject.uri') IN (SELECT value FROM json_each(?2))
+GROUP BY 1;
+.print 'post interaction cache fill: replies, one indexed aggregation per URI batch'
+EXPLAIN QUERY PLAN
+SELECT json_extract(record_json,'$.reply.parent.uri'),COUNT(*) FROM records
+INDEXED BY records_collection_parent_uri
+WHERE collection='app.bsky.feed.post' AND json_extract(record_json,'$.reply.parent.uri') IN (SELECT value FROM json_each(?1))
+GROUP BY 1;
+.print 'post interaction cache fill: quotes, one indexed aggregation per URI batch'
+EXPLAIN QUERY PLAN
+SELECT json_extract(record_json,'$.embed.record.uri'),COUNT(*) FROM records
+INDEXED BY records_collection_embed_record_uri
+WHERE collection='app.bsky.feed.post' AND json_extract(record_json,'$.embed.record.uri') IN (SELECT value FROM json_each(?1))
 GROUP BY 1;
 .print 'signed post page: viewer like/repost URI lookup'
 EXPLAIN QUERY PLAN
