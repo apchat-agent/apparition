@@ -361,6 +361,47 @@ async fn repeated_xrpc_array_parameters_return_all_values() {
 }
 
 #[tokio::test]
+async fn get_posts_uses_one_sqlite_record_lookup_for_a_full_uri_batch() {
+    let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
+    storage.set_verified_handle(ALICE, "alice.example.test").unwrap();
+    let mut uris = Vec::new();
+    for index in 0..25 {
+        let rkey = format!("batch-{index:02}");
+        let uri = format!("at://{ALICE}/app.bsky.feed.post/{rkey}");
+        storage
+            .put_record(&IndexedRecord {
+                did: ALICE.to_owned(),
+                collection: "app.bsky.feed.post".to_owned(),
+                rkey,
+                uri: uri.clone(),
+                cid: Some(format!("cid-batch-{index:02}")),
+                time_us: 1_800_000_000_000_000 - index,
+                record: json!({"$type":"app.bsky.feed.post","text":"batch"}),
+            })
+            .unwrap();
+        uris.push(uri);
+    }
+    storage.writer_barrier().unwrap();
+    let (router, _) = api_for_storage(Arc::clone(&storage));
+    let trace = storage.trace_statements();
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    for uri in &uris {
+        query.append_pair("uris", uri);
+    }
+    let uri = format!("/xrpc/app.bsky.feed.getPosts?{}", query.finish());
+    let (status, body) = request(router, &uri, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["posts"].as_array().unwrap().len(), uris.len());
+
+    let record_lookup_count = trace
+        .count_containing("FROM records WHERE collection='app.bsky.feed.post' AND uri=");
+    assert_eq!(
+        record_lookup_count, 1,
+        "one 25-URI getPosts request should read its records with one SQL statement; observed {record_lookup_count} statements"
+    );
+}
+
+#[tokio::test]
 async fn author_feed_cursor_advances_between_pages() {
     let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
     for (rkey, time_us) in [("a", 300), ("b", 200), ("c", 100)] {
