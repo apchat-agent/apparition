@@ -40,6 +40,7 @@ const APPVIEW: &str = "did:web:appview.test";
 #[derive(Clone)]
 enum FakeReply {
     Counts,
+    NotFound,
     ServerError,
     Garbage,
     Delay(Duration),
@@ -94,6 +95,7 @@ impl FakeAppview {
                 };
                 axum::Json(body).into_response()
             }
+            FakeReply::NotFound => (StatusCode::NOT_FOUND, "missing").into_response(),
             FakeReply::ServerError => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "unavailable").into_response()
             }
@@ -160,6 +162,21 @@ async fn concurrent_profile_count_misses_share_one_remote_request() {
         fake.calls.load(Ordering::SeqCst),
         1,
         "identical concurrent profile lookups should share their in-flight AppView request"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn profile_count_404_is_negative_cached_to_avoid_repeated_remote_calls() {
+    let (base, fake, server) = start_fake_appview().await;
+    *fake.reply.lock().unwrap() = FakeReply::NotFound;
+    let client = counts_client(&base, Duration::from_secs(600), Duration::from_secs(1));
+    assert_eq!(client.get_counts(ALICE).await, None);
+    assert_eq!(client.get_counts(ALICE).await, None);
+    assert_eq!(
+        fake.calls.load(Ordering::SeqCst),
+        1,
+        "a recent 404 for a profile's remote counts should be negative cached"
     );
     server.abort();
 }
