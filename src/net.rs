@@ -1367,6 +1367,139 @@ mod tests {
             "same-host requests exceeded the intended concurrency cap: {}",
             maximum.load(Ordering::SeqCst)
         );
+        assert_eq!(
+            maximum.load(Ordering::SeqCst),
+            4,
+            "a healthy host should use all four allowed in-flight requests"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn backing_off_host_does_not_occupy_either_global_request_pool() {
+        use axum::http::StatusCode;
+
+        async fn check_pool(background: bool, pool_size: usize) {
+            let failures = Arc::new(AtomicUsize::new(0));
+            let route_failures = Arc::clone(&failures);
+            let app = Router::new()
+                .route(
+                    "/a",
+                    get(move || {
+                        let failures = Arc::clone(&route_failures);
+                        async move {
+                            if failures.fetch_add(1, Ordering::SeqCst) == 0 {
+                                (
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    [("retry-after", "3600")],
+                                    "temporarily unavailable",
+                                )
+                            } else {
+                                (StatusCode::OK, [("retry-after", "3600")], "ok")
+                            }
+                        }
+                    }),
+                )
+                .route("/b", get(|| async { "ok" }));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let a_host = format!("backoff-{background}-{port}.example.test");
+            let b_host = format!("healthy-{background}-{port}.example.test");
+            let client = SafeHttpClient::with_resolver(FakeResolver::new(
+                (0..pool_size + 2).map(|_| vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]),
+            ))
+            .with_http_test_hosts([a_host.clone(), b_host.clone()]);
+            let client = if background {
+                client.background()
+            } else {
+                client
+            };
+            let request = |host: &str, path: &str| {
+                let url = Url::parse(&format!("http://{host}:{port}{path}")).unwrap();
+                let client = client.clone();
+                async move { client.get(&url, http::HeaderMap::new(), 1024).await }
+            };
+
+            let first = request(&a_host, "/a").await.unwrap();
+            assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+            let blocked = (0..pool_size + 1)
+                .map(|_| tokio::spawn(request(&a_host, "/a")))
+                .collect::<Vec<_>>();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            let b = tokio::time::timeout(std::time::Duration::from_secs(1), request(&b_host, "/b"))
+                .await
+                .expect("a backing-off host occupied the shared request pool")
+                .unwrap();
+            assert_eq!(b.status(), StatusCode::OK);
+
+            for call in blocked {
+                call.abort();
+            }
+            server.abort();
+        }
+
+        // Match the configured global pool sizes so the first pool_size blocked calls fill it.
+        check_pool(false, 32).await;
+        check_pool(true, 6).await;
+    }
+
+    #[tokio::test]
+    async fn long_host_backoff_returns_a_descriptive_error_promptly() {
+        use axum::http::StatusCode;
+
+        // Two seconds preserves short Retry-After cooldowns while bounding any gate wait.
+        const LONG_BACKOFF_TEST_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
+        let app = Router::new().route(
+            "/a",
+            get(|| async {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [("retry-after", "3600")],
+                    "temporarily unavailable",
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let host = format!("long-backoff-{port}.example.test");
+        let client = SafeHttpClient::with_resolver(FakeResolver::new([vec![IpAddr::V4(
+            Ipv4Addr::LOCALHOST,
+        )]]))
+        .with_http_test_hosts([host.clone()]);
+        let url = Url::parse(&format!("http://{host}:{port}/a")).unwrap();
+        let first = client
+            .get(&url, http::HeaderMap::new(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let started = tokio::time::Instant::now();
+        let error = tokio::time::timeout(
+            LONG_BACKOFF_TEST_BOUND + std::time::Duration::from_secs(1),
+            client.get(&url, http::HeaderMap::new(), 1024),
+        )
+        .await
+        .expect("a long host backoff slept instead of failing fast")
+        .unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "fast-fail should return promptly: {error}"
+        );
+        assert!(
+            error.contains(&format!("host {host}:{port} backing off for "))
+                && error.contains(" s after 503"),
+            "error must name the host, remaining seconds, and cause: {error}"
+        );
 
         server.abort();
     }
