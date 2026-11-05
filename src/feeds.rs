@@ -1473,8 +1473,9 @@ pub fn parse_saved_feed_preferences(response: &Value) -> Vec<SavedFeedPreference
 #[cfg(test)]
 mod tests {
     use super::{
-        FeedClient, ResolvedFeed, feed_is_gone, gone_reason, parse_saved_feed_preferences,
-        remove_saved_feed_from_preferences, unix_time_ms,
+        FeedClient, ProxiedPostViewsFetch, ProxiedPostsFetcher, ResolvedFeed, feed_is_gone,
+        gone_reason, parse_saved_feed_preferences, remove_saved_feed_from_preferences,
+        unix_time_ms,
     };
     use crate::{
         identity::{DidDocument, DidService, IdentityBackend, IdentityResolver, ResolutionError},
@@ -1497,7 +1498,7 @@ mod tests {
         pin::Pin,
         sync::{
             Arc, Mutex,
-            atomic::{AtomicU64, Ordering},
+            atomic::{AtomicU64, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -1523,6 +1524,20 @@ mod tests {
     }
 
     struct TestResolver;
+
+    struct CountingPostsProxy {
+        calls: AtomicUsize,
+    }
+
+    impl ProxiedPostsFetcher for CountingPostsProxy {
+        fn fetch_post_views<'a>(&'a self, uris: &'a [String]) -> ProxiedPostViewsFetch<'a> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                Ok(Some(uris.iter().map(|uri| public_post(uri)).collect()))
+            })
+        }
+    }
 
     #[derive(Clone)]
     struct BatchServerState {
@@ -2041,6 +2056,45 @@ mod tests {
         assert_eq!(first.0.len(), 1);
         assert_eq!(second.0.len(), 1);
         assert_eq!(*state.appview_calls.lock().unwrap(), [1]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn identical_concurrent_page_post_batches_share_one_proxy_request() {
+        let uri = "at://did:plc:pagebatch/app.bsky.feed.post/p1";
+        let (pds, server) = fake_pds().await;
+        let identity = fake_batch_identity(["did:plc:pagebatch".to_owned()], &pds);
+        let client = Arc::new(test_client_with_appview(identity, pds));
+        let proxy = Arc::new(CountingPostsProxy {
+            calls: AtomicUsize::new(0),
+        });
+        let first_proxy: Arc<dyn ProxiedPostsFetcher> = proxy.clone();
+        let second_proxy: Arc<dyn ProxiedPostsFetcher> = proxy.clone();
+        let uris = vec![uri.to_owned()];
+        let first_client = client.clone();
+        let second_client = client.clone();
+        let first_uris = uris.clone();
+        let second_uris = uris.clone();
+        let (first, second) = tokio::join!(
+            async move {
+                first_client
+                    .fetch_page_posts_once(Some(first_proxy), &first_uris)
+                    .await
+            },
+            async move {
+                second_client
+                    .fetch_page_posts_once(Some(second_proxy), &second_uris)
+                    .await
+            },
+        );
+
+        assert_eq!(first.0.len(), 1);
+        assert_eq!(second.0.len(), 1);
+        assert_eq!(
+            proxy.calls.load(Ordering::SeqCst),
+            1,
+            "identical concurrent page batches should share one proxied getPosts request"
+        );
         server.abort();
     }
 
