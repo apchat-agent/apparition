@@ -25,6 +25,9 @@ const MAX_PROFILE_COUNT_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_PROFILE_COUNT_TIMEOUT: Duration = Duration::from_secs(3);
 const PROFILE_COUNT_NEGATIVE_TTL: Duration = Duration::from_secs(30);
 const MAX_PROFILE_COUNT_INFLIGHT: usize = 1024;
+type ProfileCountsBatchResult = Option<HashMap<String, ProfileCounts>>;
+type ProfileCountsFlight = Arc<tokio::sync::OnceCell<ProfileCountsBatchResult>>;
+type InFlightProfileCounts = Arc<tokio::sync::Mutex<HashMap<String, ProfileCountsFlight>>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProfileCounts {
@@ -41,11 +44,7 @@ pub struct ProfileCountsClient {
     timeout: Duration,
     enabled: bool,
     cache: Arc<Mutex<HashMap<String, CachedCounts>>>,
-    inflight: Arc<
-        tokio::sync::Mutex<
-            HashMap<String, Arc<tokio::sync::OnceCell<Option<HashMap<String, ProfileCounts>>>>>,
-        >,
-    >,
+    inflight: InFlightProfileCounts,
 }
 
 #[derive(Clone, Copy)]
