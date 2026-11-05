@@ -7940,7 +7940,7 @@ async fn callback_rejects_sessions_without_the_required_atproto_scope() {
 
 #[tokio::test]
 async fn profile_page_does_not_queue_recent_posts_for_a_handle_identifier() {
-    let handle = "apparition-test.bsky.social";
+    let handle = "alice.example.test";
     let storage = Arc::new(MemoryStorage::default());
     let app = OAuthPublic::new("https://appview.example")
         .unwrap()
