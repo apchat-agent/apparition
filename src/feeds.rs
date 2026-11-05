@@ -876,7 +876,7 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
         let mut jwt_hasher = std::collections::hash_map::DefaultHasher::new();
         service_jwt.hash(&mut jwt_hasher);
         let key = format!(
-            "{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}",
             feed.uri.len(),
             feed.uri,
             feed.endpoint.len(),
