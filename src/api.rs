@@ -335,13 +335,11 @@ async fn get_author_feed<S: Storage + 'static, B: IdentityBackend>(
         move |storage| {
             let page_records =
                 storage.author_posts(&actor, cursor.as_ref(), limit + 1, include_replies)?;
-            let feed = page_records
-                .iter()
-                .take(limit)
-                .map(|record| {
-                    post_view(storage, record, viewer.as_deref()).map(|post| json!({"post":post}))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let feed_records = page_records.iter().take(limit).cloned().collect::<Vec<_>>();
+            let feed = post_views_for_page(storage, &feed_records, viewer.as_deref())?
+                .into_iter()
+                .map(|post| json!({"post":post}))
+                .collect::<Vec<_>>();
             let next_cursor = if page_records.len() > limit {
                 page_records.get(limit - 1).map(|last| {
                     RecordCursor {
@@ -377,16 +375,12 @@ async fn get_posts<S: Storage + 'static, B: IdentityBackend>(
     let uris = uris.into_iter().take(25).collect::<Vec<_>>();
     let viewer = claims.map(|claims| claims.iss);
     let posts = api_storage_call(Arc::clone(&state.storage), "posts_by_uri", move |storage| {
-        let mut records = Vec::new();
-        for uri in uris {
-            if let Some(record) = storage.record_by_uri(POST, &uri)? {
-                records.push(record);
-            }
-        }
-        records
+        let records_by_uri = storage.records_by_uri(POST, &uris)?;
+        let records = uris
             .iter()
-            .map(|record| post_view(storage, record, viewer.as_deref()))
-            .collect::<Result<Vec<_>, _>>()
+            .filter_map(|uri| records_by_uri.get(uri).cloned())
+            .collect::<Vec<_>>();
+        post_views_for_page(storage, &records, viewer.as_deref())
     })
     .await?;
     Ok(Json(json!({"posts":posts})))
@@ -528,13 +522,11 @@ async fn get_timeline<S: Storage + 'static, B: IdentityBackend>(
         "timeline_page",
         move |storage| {
             let page_records = storage.timeline_posts(&actor, cursor.as_ref(), limit + 1)?;
-            let feed = page_records
-                .iter()
-                .take(limit)
-                .map(|record| {
-                    post_view(storage, record, Some(&actor)).map(|post| json!({"post":post}))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let feed_records = page_records.iter().take(limit).cloned().collect::<Vec<_>>();
+            let feed = post_views_for_page(storage, &feed_records, Some(&actor))?
+                .into_iter()
+                .map(|post| json!({"post":post}))
+                .collect::<Vec<_>>();
             let next_cursor = if page_records.len() > limit {
                 page_records.get(limit - 1).map(|last| {
                     RecordCursor {
@@ -914,6 +906,34 @@ fn post_view<S: Storage>(
     viewer_did: Option<&str>,
 ) -> Result<Value, StorageError> {
     let interactions = storage.post_interaction_summary(&record.uri, viewer_did)?;
+    post_view_with_interactions(storage, record, viewer_did, &interactions)
+}
+
+fn post_views_for_page<S: Storage>(
+    storage: &S,
+    records: &[IndexedRecord],
+    viewer_did: Option<&str>,
+) -> Result<Vec<Value>, StorageError> {
+    let uris = records
+        .iter()
+        .map(|record| record.uri.clone())
+        .collect::<Vec<_>>();
+    let interactions = storage.page_post_interaction_summaries(&uris, viewer_did)?;
+    records
+        .iter()
+        .map(|record| {
+            let summary = interactions.get(&record.uri).cloned().unwrap_or_default();
+            post_view_with_interactions(storage, record, viewer_did, &summary)
+        })
+        .collect()
+}
+
+fn post_view_with_interactions<S: Storage>(
+    storage: &S,
+    record: &IndexedRecord,
+    viewer_did: Option<&str>,
+    interactions: &crate::ingest::PostInteractionSummary,
+) -> Result<Value, StorageError> {
     let mut post = json!({
         "uri":record.uri,"cid":record.cid,"author":profile_view_from_storage(storage, &record.did).unwrap_or_else(|_| json!({"did":record.did,"handle":"handle.invalid"})),
         "record":record.record,
@@ -921,10 +941,10 @@ fn post_view<S: Storage>(
     });
     if viewer_did.is_some() {
         let mut viewer = json!({});
-        if let Some(like) = interactions.viewer_like {
+        if let Some(like) = &interactions.viewer_like {
             viewer["like"] = json!(like);
         }
-        if let Some(repost) = interactions.viewer_repost {
+        if let Some(repost) = &interactions.viewer_repost {
             viewer["repost"] = json!(repost);
         }
         post["viewer"] = viewer;

@@ -363,7 +363,9 @@ async fn repeated_xrpc_array_parameters_return_all_values() {
 #[tokio::test]
 async fn get_posts_uses_one_sqlite_record_lookup_for_a_full_uri_batch() {
     let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
-    storage.set_verified_handle(ALICE, "alice.example.test").unwrap();
+    storage
+        .set_verified_handle(ALICE, "alice.example.test")
+        .unwrap();
     let mut uris = Vec::new();
     for index in 0..25 {
         let rkey = format!("batch-{index:02}");
@@ -394,7 +396,14 @@ async fn get_posts_uses_one_sqlite_record_lookup_for_a_full_uri_batch() {
     assert_eq!(body["posts"].as_array().unwrap().len(), uris.len());
 
     let record_lookup_count = trace
-        .count_containing("FROM records WHERE collection='app.bsky.feed.post' AND uri=");
+        .statements()
+        .iter()
+        .filter(|statement| {
+            statement.starts_with(
+                "SELECT did, collection, rkey, uri, cid, time_us, record_json FROM records",
+            ) && (statement.contains("AND uri IN") || statement.contains("AND uri='at://"))
+        })
+        .count();
     assert_eq!(
         record_lookup_count, 1,
         "one 25-URI getPosts request should read its records with one SQL statement; observed {record_lookup_count} statements"
