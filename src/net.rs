@@ -976,6 +976,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_host_requests_honor_retry_after_after_a_429() {
+        use axum::http::StatusCode;
+        use std::sync::atomic::AtomicUsize;
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let route_requests = Arc::clone(&requests);
+        let app = Router::new().route(
+            "/rate",
+            get(move || {
+                let requests = Arc::clone(&route_requests);
+                async move {
+                    if requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            [("retry-after", "1")],
+                            "slow down",
+                        )
+                    } else {
+                        (StatusCode::OK, [("retry-after", "1")], "ok")
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let host = format!("rate-{port}.example.test");
+        let client = SafeHttpClient::with_resolver(FakeResolver::new([
+            vec!["127.0.0.1".parse().unwrap()],
+            vec!["127.0.0.1".parse().unwrap()],
+        ]))
+        .with_http_test_hosts([host.clone()]);
+        let url = Url::parse(&format!("http://{host}:{port}/rate")).unwrap();
+
+        let first = client
+            .get(&url, http::HeaderMap::new(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_started = tokio::time::Instant::now();
+        let second = client
+            .get(&url, http::HeaderMap::new(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert!(
+            retry_started.elapsed() >= std::time::Duration::from_millis(900),
+            "the next request to a host must honor its Retry-After cooldown"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn same_host_requests_respect_a_per_host_concurrency_limit() {
+        use std::sync::atomic::AtomicUsize;
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let route_active = Arc::clone(&active);
+        let route_maximum = Arc::clone(&maximum);
+        let app = Router::new().route(
+            "/slow",
+            get(move || {
+                let active = Arc::clone(&route_active);
+                let maximum = Arc::clone(&route_maximum);
+                async move {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    "ok"
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let host = format!("cap-{port}.example.test");
+        let address: IpAddr = "127.0.0.1".parse().unwrap();
+        let client =
+            SafeHttpClient::with_resolver(FakeResolver::new(std::iter::repeat_n(vec![address], 8)))
+                .with_http_test_hosts([host.clone()]);
+        let url = Url::parse(&format!("http://{host}:{port}/slow")).unwrap();
+        let mut requests = Vec::new();
+        for _ in 0..8 {
+            let client = client.clone();
+            let url = url.clone();
+            requests.push(tokio::spawn(async move {
+                client
+                    .get(&url, http::HeaderMap::new(), 1024)
+                    .await
+                    .unwrap()
+            }));
+        }
+        for request in requests {
+            assert_eq!(request.await.unwrap().status(), http::StatusCode::OK);
+        }
+        assert!(
+            maximum.load(Ordering::SeqCst) <= 4,
+            "same-host requests exceeded the intended concurrency cap: {}",
+            maximum.load(Ordering::SeqCst)
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn outbound_call_accounting_counts_request_calls_but_not_spawned_background_calls() {
         use super::{RequestOutboundAccounting, with_request_outbound_accounting};
 
