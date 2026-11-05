@@ -240,6 +240,10 @@ fn checkpointer_skips_a_round_while_page_requests_wait_for_connections() {
     let wal_path = PathBuf::from(format!("{}-wal", path.display()));
     let initial_bytes = std::fs::metadata(&wal_path).unwrap().len();
     assert!(initial_bytes > 65_536);
+    assert!(
+        initial_bytes <= 64 * 1024 * 1024,
+        "fixture should stay below the WAL truncation cap: {initial_bytes}"
+    );
 
     let held_connections = (0..4)
         .map(|_| storage.read_conn().unwrap())
@@ -261,17 +265,18 @@ fn checkpointer_skips_a_round_while_page_requests_wait_for_connections() {
     );
 
     let deadline = Instant::now() + Duration::from_secs(4);
-    while std::fs::metadata(&wal_path)
-        .map(|metadata| metadata.len())
-        .unwrap_or(0)
-        > 65_536
-    {
+    while storage.write_backlog() != 0 {
         assert!(
             Instant::now() < deadline,
-            "checkpointer did not reset WAL after pressure cleared"
+            "checkpointer did not catch up after page pressure cleared"
         );
         std::thread::sleep(Duration::from_millis(25));
     }
+    let reused_bytes = std::fs::metadata(&wal_path).unwrap().len();
+    assert_eq!(
+        reused_bytes, initial_bytes,
+        "a fully checkpointed WAL below the cap should keep its reusable size"
+    );
     drop(storage);
 }
 

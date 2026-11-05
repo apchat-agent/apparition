@@ -86,7 +86,7 @@ use serde_json::{Value, json};
 use sha2::Sha256;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     future::Future,
     io::Write,
@@ -1049,6 +1049,7 @@ pub struct OAuthWebState<F, S> {
     notification_streams: Arc<Mutex<HashMap<String, usize>>>,
     timing_console: Arc<TimingConsole>,
     pending_writes: Arc<PendingIndexWrites>,
+    pending_web_posts: Arc<PendingWebPosts>,
     shutdown: WebShutdown,
 }
 
@@ -1384,6 +1385,7 @@ impl OAuthPublic {
             notification_streams: Arc::new(Mutex::new(HashMap::new())),
             timing_console,
             pending_writes: Arc::new(PendingIndexWrites::default()),
+            pending_web_posts: Arc::new(PendingWebPosts::default()),
         });
         let regular_routes = Router::new()
             .route(METADATA_PATH, get(metadata::<F, S>))
@@ -1435,6 +1437,10 @@ impl OAuthPublic {
         let video_routes = Router::new()
             .route("/video", post(upload_video::<F, S>))
             .layer(DefaultBodyLimit::max(MAX_VIDEO_REQUEST_BODY_BYTES))
+            .layer(from_fn_with_state(
+                state.clone(),
+                account_web_outbound_calls::<F, S>,
+            ))
             .with_state(state);
         regular_routes.merge(video_routes)
     }
@@ -2318,6 +2324,13 @@ pub enum OAuthStoreError {
     WriterStopped,
 }
 
+fn oauth_sqlite_busy_error(error: &OAuthStoreError) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("database is locked")
+        || message.contains("database is busy")
+        || message.contains("database table is locked")
+}
+
 struct EphemeralOAuthDatabase(PathBuf);
 
 impl Drop for EphemeralOAuthDatabase {
@@ -2345,6 +2358,8 @@ struct OAuthWriterMetrics {
     transaction_count: AtomicU64,
     transaction_total_ns: AtomicU64,
     transaction_max_ns: AtomicU64,
+    sqlite_busy: AtomicU64,
+    slow_txn: AtomicU64,
     refresh_failures: AtomicU64,
     refresh_grants: AtomicU64,
     refresh_reuses: AtomicU64,
@@ -2360,7 +2375,7 @@ impl OAuthWriterMetrics {
         self.queue_depth.fetch_sub(1, Ordering::Relaxed);
     }
 
-    fn record_batch(&self, elapsed: Duration) {
+    fn record_batch(&self, kind: &'static str, elapsed: Duration) {
         let elapsed_ns = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
         self.batch_count.fetch_add(1, Ordering::Relaxed);
         self.transaction_count.fetch_add(1, Ordering::Relaxed);
@@ -2368,6 +2383,24 @@ impl OAuthWriterMetrics {
             .fetch_add(elapsed_ns, Ordering::Relaxed);
         self.transaction_max_ns
             .fetch_max(elapsed_ns, Ordering::Relaxed);
+        if elapsed >= Duration::from_secs(1) {
+            self.slow_txn.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                kind,
+                duration_ms = elapsed.as_millis() as u64,
+                "slow OAuth SQLite writer transaction"
+            );
+        }
+    }
+
+    fn record_busy(&self, kind: &'static str, error: &OAuthStoreError) {
+        self.sqlite_busy.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            kind,
+            lock_holder = "unknown_or_external_writer",
+            error = %error,
+            "OAuth SQLite writer received SQLITE_BUSY"
+        );
     }
 
     fn record_refresh_failure(&self) {
@@ -2397,6 +2430,8 @@ impl OAuthWriterMetrics {
                 total_ns as f64 / count as f64 / 1_000_000.0
             },
             oauth_writer_transaction_max_ms = max_ns as f64 / 1_000_000.0,
+            sqlite_busy = self.sqlite_busy.swap(0, Ordering::Relaxed),
+            slow_txn = self.slow_txn.swap(0, Ordering::Relaxed),
             oauth_writer_dropped_count = self.dropped.swap(0, Ordering::Relaxed),
             oauth_refresh_failure_count = self.refresh_failures.swap(0, Ordering::Relaxed),
             oauth_refresh_grant_count = self.refresh_grants.swap(0, Ordering::Relaxed),
@@ -2447,7 +2482,13 @@ impl OAuthStoreWriter {
             .await
             .map_err(|_| OAuthStoreError::WriterStopped)?
             .map_err(|_| OAuthStoreError::WriterStopped)?;
-        result.await.map_err(|_| OAuthStoreError::WriterStopped)?
+        let result = result.await.map_err(|_| OAuthStoreError::WriterStopped)?;
+        if let Err(error) = &result
+            && oauth_sqlite_busy_error(error)
+        {
+            self.metrics.record_busy("oauth_store_call", error);
+        }
+        result
     }
 
     fn fire(
@@ -2530,7 +2571,7 @@ fn oauth_store_writer_loop(
             OAuthWriterMessage::Blocking(operation) => {
                 let started = Instant::now();
                 operation(&mut connection);
-                metrics.record_batch(started.elapsed());
+                metrics.record_batch("oauth_store_call", started.elapsed());
             }
             OAuthWriterMessage::Fire(first) => {
                 let mut writes = vec![first];
@@ -2554,13 +2595,21 @@ fn oauth_store_writer_loop(
                 let started = Instant::now();
                 let mut completions = 0_u64;
                 let mut first_error = None;
+                let mut busy_error_recorded = false;
                 match connection.transaction() {
                     Ok(transaction) => {
                         for write in writes {
                             match write(&transaction) {
                                 Ok(()) => completions += 1,
-                                Err(error) if first_error.is_none() => first_error = Some(error),
-                                Err(_) => {}
+                                Err(error) => {
+                                    if oauth_sqlite_busy_error(&error) {
+                                        metrics.record_busy("oauth_cache_write", &error);
+                                        busy_error_recorded = true;
+                                    }
+                                    if first_error.is_none() {
+                                        first_error = Some(error);
+                                    }
+                                }
                             }
                         }
                         if first_error.is_none()
@@ -2572,6 +2621,9 @@ fn oauth_store_writer_loop(
                     Err(error) => first_error = Some(OAuthStoreError::Sqlite(error)),
                 }
                 if let Some(error) = first_error {
+                    if oauth_sqlite_busy_error(&error) && !busy_error_recorded {
+                        metrics.record_busy("oauth_cache_batch", &error);
+                    }
                     tracing::warn!(%error, "OAuth SQLite cache write batch rolled back");
                 } else {
                     tracing::trace!(
@@ -2579,7 +2631,7 @@ fn oauth_store_writer_loop(
                         "OAuth SQLite cache writes committed"
                     );
                 }
-                metrics.record_batch(started.elapsed());
+                metrics.record_batch("oauth_cache_batch", started.elapsed());
             }
         }
         if Instant::now() >= next_metrics {
@@ -6486,6 +6538,10 @@ async fn account_web_outbound_calls<F: OAuthFlow, S: Storage + 'static>(
             "/repost" => Some("repost"),
             "/reply" => Some("reply"),
             "/post" => Some("post"),
+            "/quote" => Some("quote"),
+            "/video" => Some("video"),
+            "/profile/action" => Some("profile/action"),
+            "/feeds/remove" => Some("feeds/remove"),
             _ => None,
         }
     } else {
@@ -9143,7 +9199,7 @@ where
     let timeline_started = std::time::Instant::now();
     let timeline_actor = did.clone();
     let timeline_cursor = cursor.clone();
-    let timeline_page = match web_storage_call(
+    let mut timeline_page = match web_storage_call(
         Arc::clone(&state.storage),
         "home_timeline",
         move |storage| {
@@ -9162,6 +9218,26 @@ where
         }
     };
     page_timing.timeline_fetch_index_ms = timeline_started.elapsed().as_millis() as u64;
+    if cursor.is_none() {
+        let mut seen = timeline_page
+            .iter()
+            .map(|record| record.uri.clone())
+            .collect::<HashSet<_>>();
+        let mut pending = state
+            .pending_web_posts
+            .for_actor(&did)
+            .into_iter()
+            .filter(|record| seen.insert(record.uri.clone()))
+            .collect::<Vec<_>>();
+        pending.sort_by(|left, right| {
+            right
+                .time_us
+                .cmp(&left.time_us)
+                .then_with(|| right.uri.cmp(&left.uri))
+        });
+        pending.extend(timeline_page);
+        timeline_page = pending;
+    }
     let has_more = timeline_page.len() > limit;
     let next_cursor_record = timeline_page.get(limit.saturating_sub(1)).cloned();
     let mutes_started = std::time::Instant::now();
@@ -12656,20 +12732,17 @@ where
                 .create_profile_graph_record(&viewer_did, "app.bsky.graph.follow", record)
                 .await
             {
-                Ok(created) => match persist_created_record(
-                    state.storage.clone(),
-                    &viewer_did,
-                    "app.bsky.graph.follow",
-                    created,
-                )
-                .await
-                {
-                    Ok(()) => state
-                        .storage
-                        .set_follow(&viewer_did, subject_did, true)
-                        .map_err(|error| error.to_string()),
-                    Err(error) => Err(error),
-                },
+                Ok(created) => {
+                    queue_created_record(
+                        state.storage.clone(),
+                        &viewer_did,
+                        "app.bsky.graph.follow",
+                        created,
+                        "profile action",
+                        None,
+                    );
+                    Ok(())
+                }
                 Err(error) => Err(error),
             }
         }
@@ -12708,21 +12781,17 @@ where
                 .delete_profile_graph_record(&viewer_did, collection, &record.uri)
                 .await
             {
-                Ok(()) => match remove_deleted_record(
-                    state.storage.clone(),
-                    &viewer_did,
-                    collection,
-                    &record.uri,
-                )
-                .await
-                {
-                    Ok(()) if action == "unfollow" => state
-                        .storage
-                        .set_follow(&viewer_did, subject_did, false)
-                        .map_err(|error| error.to_string()),
-                    Ok(()) => Ok(()),
-                    Err(error) => Err(error),
-                },
+                Ok(()) => {
+                    queue_deleted_record(
+                        state.storage.clone(),
+                        &viewer_did,
+                        collection,
+                        &record.uri,
+                        "profile action",
+                        (action == "unfollow").then_some(subject_did),
+                    );
+                    Ok(())
+                }
                 Err(error) => Err(error),
             }
         }
@@ -12738,13 +12807,15 @@ where
                 .await
             {
                 Ok(created) => {
-                    persist_created_record(
+                    queue_created_record(
                         state.storage.clone(),
                         &viewer_did,
                         "app.bsky.graph.block",
                         created,
-                    )
-                    .await
+                        "profile action",
+                        None,
+                    );
+                    Ok(())
                 }
                 Err(error) => Err(error),
             }
@@ -12810,13 +12881,15 @@ where
                 .await
             {
                 Ok(created) => {
-                    persist_created_record(
+                    queue_created_record(
                         state.storage.clone(),
                         &viewer_did,
                         "app.bsky.graph.listitem",
                         created,
-                    )
-                    .await
+                        "profile action",
+                        None,
+                    );
+                    Ok(())
                 }
                 Err(error) => Err(error),
             }
@@ -12870,13 +12943,15 @@ where
                 .await
             {
                 Ok(()) => {
-                    remove_deleted_record(
+                    queue_deleted_record(
                         state.storage.clone(),
                         &viewer_did,
                         "app.bsky.graph.listitem",
                         item_uri,
-                    )
-                    .await
+                        "profile action",
+                        None,
+                    );
+                    Ok(())
                 }
                 Err(error) => Err(error),
             }
@@ -12937,13 +13012,15 @@ where
                     .await
                 {
                     Ok(()) => {
-                        remove_deleted_record(
+                        queue_deleted_record(
                             state.storage.clone(),
                             &viewer_did,
                             "app.bsky.graph.listitem",
                             item_uri,
-                        )
-                        .await
+                            "profile action",
+                            None,
+                        );
+                        Ok(())
                     }
                     Err(error) => Err(error),
                 }
@@ -12960,13 +13037,15 @@ where
                     .await
                 {
                     Ok(created) => {
-                        persist_created_record(
+                        queue_created_record(
                             state.storage.clone(),
                             &viewer_did,
                             "app.bsky.graph.listitem",
                             created,
-                        )
-                        .await
+                            "profile action",
+                            None,
+                        );
+                        Ok(())
                     }
                     Err(error) => Err(error),
                 }
@@ -15038,18 +15117,15 @@ where
     if submission.parent_uri.is_some() {
         redirect = format!("/app/thread?uri={}", form_encoded(&created.uri));
     }
-    match persist_created_record(state.storage.clone(), &did, "app.bsky.feed.post", created).await {
-        Ok(()) => Redirect::to(&redirect).into_response(),
-        Err(error) => web_write_response(
-            &state.public,
-            &headers,
-            "video",
-            "video post",
-            &did,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &error,
-        ),
-    }
+    queue_created_record(
+        state.storage.clone(),
+        &did,
+        "app.bsky.feed.post",
+        created,
+        "video",
+        Some(Arc::clone(&state.pending_web_posts)),
+    );
+    Redirect::to(&redirect).into_response()
 }
 
 fn external_embed_value(external: &PostExternal, thumb_blob: Option<Value>) -> Value {
@@ -15177,20 +15253,15 @@ where
     };
     match created {
         Ok(created) => {
-            match persist_created_record(state.storage.clone(), &did, "app.bsky.feed.post", created)
-                .await
-            {
-                Ok(()) => Redirect::to("/app").into_response(),
-                Err(error) => web_write_response(
-                    &state.public,
-                    &headers,
-                    "post",
-                    "post",
-                    &did,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &error,
-                ),
-            }
+            queue_created_record(
+                state.storage.clone(),
+                &did,
+                "app.bsky.feed.post",
+                created,
+                "post",
+                Some(Arc::clone(&state.pending_web_posts)),
+            );
+            Redirect::to("/app").into_response()
         }
         Err(error) => image_or_text_action_error(
             &state.public,
@@ -15359,18 +15430,15 @@ where
             );
         }
     };
-    match persist_created_record(state.storage.clone(), &did, "app.bsky.feed.post", created).await {
-        Ok(()) => Redirect::to("/app").into_response(),
-        Err(error) => web_write_response(
-            &state.public,
-            &headers,
-            "quote",
-            "quote",
-            &did,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &error,
-        ),
-    }
+    queue_created_record(
+        state.storage.clone(),
+        &did,
+        "app.bsky.feed.post",
+        created,
+        "quote",
+        Some(Arc::clone(&state.pending_web_posts)),
+    );
+    Redirect::to("/app").into_response()
 }
 
 async fn write_reply<F, S>(
@@ -15522,18 +15590,15 @@ where
         }
     };
     let redirect = format!("/app/thread?uri={}", form_encoded(&created.uri));
-    match persist_created_record(state.storage.clone(), &did, "app.bsky.feed.post", created).await {
-        Ok(()) => Redirect::to(&redirect).into_response(),
-        Err(error) => web_write_response(
-            &state.public,
-            &headers,
-            "reply",
-            "reply",
-            &did,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &error,
-        ),
-    }
+    queue_created_record(
+        state.storage.clone(),
+        &did,
+        "app.bsky.feed.post",
+        created,
+        "reply",
+        Some(Arc::clone(&state.pending_web_posts)),
+    );
+    Redirect::to(&redirect).into_response()
 }
 
 fn record_index_rkey(did: &str, collection: &str, uri: &str) -> Result<String, String> {
@@ -15563,65 +15628,147 @@ fn indexed_created_record(
     })
 }
 
-async fn persist_created_record<S: Storage + 'static>(
-    storage: Arc<S>,
-    did: &str,
-    collection: &str,
-    created: PdsCreatedRecord,
-) -> Result<(), String> {
-    let record = indexed_created_record(did, collection, &created)?;
-    tokio::task::spawn_blocking(move || storage.put_record(&record))
-        .await
-        .map_err(|error| format!("index write task failed: {error}"))?
-        .map_err(|error| format!("could not index PDS record: {error}"))
+const PENDING_WEB_POST_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_PENDING_WEB_POSTS: usize = 4_096;
+const MAX_PENDING_WEB_POSTS_PER_ACTOR: usize = 100;
+
+#[derive(Default)]
+struct PendingWebPosts {
+    records: Mutex<HashMap<String, VecDeque<(Instant, IndexedRecord)>>>,
 }
 
-async fn remove_deleted_record<S: Storage + 'static>(
-    storage: Arc<S>,
-    did: &str,
-    collection: &str,
-    uri: &str,
-) -> Result<(), String> {
-    let rkey = record_index_rkey(did, collection, uri)?;
-    let did = did.to_owned();
-    let collection = collection.to_owned();
-    tokio::task::spawn_blocking(move || storage.delete_record(&did, &collection, &rkey))
-        .await
-        .map_err(|error| format!("index delete task failed: {error}"))?
-        .map_err(|error| format!("could not remove deleted PDS record: {error}"))
+impl PendingWebPosts {
+    fn prune(records: &mut HashMap<String, VecDeque<(Instant, IndexedRecord)>>) {
+        let now = Instant::now();
+        records.retain(|_, actor_records| {
+            while actor_records
+                .front()
+                .is_some_and(|(created, _)| now.duration_since(*created) >= PENDING_WEB_POST_TTL)
+            {
+                actor_records.pop_front();
+            }
+            !actor_records.is_empty()
+        });
+    }
+
+    fn register(&self, record: IndexedRecord) {
+        let Ok(mut records) = self.records.lock() else {
+            return;
+        };
+        Self::prune(&mut records);
+        let actor = record.did.clone();
+        {
+            let actor_records = records.entry(actor.clone()).or_default();
+            actor_records.retain(|(_, existing)| existing.uri != record.uri);
+            actor_records.push_back((Instant::now(), record));
+            while actor_records.len() > MAX_PENDING_WEB_POSTS_PER_ACTOR {
+                actor_records.pop_front();
+            }
+        }
+        while records.values().map(VecDeque::len).sum::<usize>() > MAX_PENDING_WEB_POSTS {
+            let oldest = records
+                .iter()
+                .filter_map(|(did, held)| held.front().map(|(created, _)| (did.clone(), *created)))
+                .min_by_key(|(_, created)| *created)
+                .map(|(did, _)| did);
+            let Some(oldest) = oldest else {
+                break;
+            };
+            let remove_actor = if let Some(held) = records.get_mut(&oldest) {
+                held.pop_front();
+                held.is_empty()
+            } else {
+                false
+            };
+            if remove_actor {
+                records.remove(&oldest);
+            }
+        }
+    }
+
+    fn remove(&self, did: &str, uri: &str) {
+        if let Ok(mut records) = self.records.lock() {
+            let mut remove_actor = false;
+            if let Some(actor_records) = records.get_mut(did) {
+                actor_records.retain(|(_, record)| record.uri != uri);
+                remove_actor = actor_records.is_empty();
+            }
+            if remove_actor {
+                records.remove(did);
+            }
+        }
+    }
+
+    fn for_actor(&self, did: &str) -> Vec<IndexedRecord> {
+        let Ok(mut records) = self.records.lock() else {
+            return Vec::new();
+        };
+        Self::prune(&mut records);
+        records
+            .get(did)
+            .into_iter()
+            .flat_map(|records| records.iter().map(|(_, record)| record.clone()))
+            .collect()
+    }
 }
 
 /// One local index write handed to the writer after the PDS already accepted the
 /// record: the response is on its way, so this must never surface to the user.
 #[derive(Clone)]
 enum IndexWrite {
-    Put(Box<IndexedRecord>),
+    Put {
+        record: Box<IndexedRecord>,
+        pending_posts: Option<Arc<PendingWebPosts>>,
+    },
     Delete {
         did: String,
         collection: String,
         rkey: String,
+        follow_subject: Option<String>,
     },
 }
 
 impl IndexWrite {
     fn apply<S: Storage + ?Sized>(&self, storage: &S) -> Result<(), StorageError> {
         match self {
-            Self::Put(record) => storage.put_record(record),
+            Self::Put {
+                record,
+                pending_posts,
+            } => {
+                storage.put_record(record)?;
+                if record.collection == "app.bsky.graph.follow"
+                    && let Some(subject) = record.record.get("subject").and_then(Value::as_str)
+                {
+                    storage.set_follow(&record.did, subject, true)?;
+                }
+                if let Some(pending_posts) = pending_posts {
+                    pending_posts.remove(&record.did, &record.uri);
+                }
+                Ok(())
+            }
             Self::Delete {
                 did,
                 collection,
                 rkey,
-            } => storage.delete_record(did, collection, rkey),
+                follow_subject,
+            } => {
+                storage.delete_record(did, collection, rkey)?;
+                if let Some(subject) = follow_subject {
+                    storage.set_follow(did, subject, false)?;
+                }
+                Ok(())
+            }
         }
     }
 
     fn target(&self) -> String {
         match self {
-            Self::Put(record) => record.uri.clone(),
+            Self::Put { record, .. } => record.uri.clone(),
             Self::Delete {
                 did,
                 collection,
                 rkey,
+                ..
             } => format!("at://{did}/{collection}/{rkey}"),
         }
     }
@@ -15687,7 +15834,7 @@ fn hand_off_index_write<S: Storage + 'static>(
         };
         let mut backoff = INDEX_WRITE_FIRST_BACKOFF;
         for attempt in 1..=INDEX_WRITE_ATTEMPTS {
-            if matches!(write, IndexWrite::Put(_))
+            if matches!(&write, IndexWrite::Put { .. })
                 && pending
                     .as_ref()
                     .is_some_and(|binding| binding.entry.cancelled.load(Ordering::Relaxed))
@@ -15704,16 +15851,18 @@ fn hand_off_index_write<S: Storage + 'static>(
             }
             let attempt_write = write.clone();
             let attempt_storage = storage.clone();
-            let result =
-                tokio::task::spawn_blocking(move || attempt_write.apply(attempt_storage.as_ref()))
-                    .await
-                    .map_err(|error| format!("index write task failed: {error}"));
+            let result = tokio::task::spawn_blocking(move || {
+                let _operation = crate::ingest::SqliteOperationKindGuard::enter("web_write");
+                attempt_write.apply(attempt_storage.as_ref())
+            })
+            .await
+            .map_err(|error| format!("index write task failed: {error}"));
             match result {
                 Ok(Ok(())) => {
                     if let Some(binding) = &pending {
                         binding.writes.complete(&binding.key);
                         if binding.entry.cancelled.load(Ordering::Relaxed)
-                            && let IndexWrite::Put(record) = &write
+                            && let IndexWrite::Put { record, .. } = &write
                         {
                             // The row landed after the unlike asked to cancel: delete
                             // it again so the unlike can never leave a stale row.
@@ -15723,6 +15872,7 @@ fn hand_off_index_write<S: Storage + 'static>(
                                     did: record.did.clone(),
                                     collection: record.collection.clone(),
                                     rkey: record.rkey.clone(),
+                                    follow_subject: None,
                                 },
                                 route,
                                 Arc::new(AtomicU8::new(INDEX_WRITE_UNSET)),
@@ -15787,6 +15937,68 @@ fn report_index_hand_off_failure(
 ) {
     outcome.store(INDEX_WRITE_FAILED, Ordering::Relaxed);
     count_failed_index_write(route, target, 0, error);
+}
+
+/// Queues the local record created by a PDS-successful web action. The worker
+/// retries SQLite lock/busy errors; all terminal errors are logged and counted
+/// without changing the response that the PDS already earned.
+fn queue_created_record<S: Storage + 'static>(
+    storage: Arc<S>,
+    did: &str,
+    collection: &str,
+    created: PdsCreatedRecord,
+    route: &'static str,
+    pending_posts: Option<Arc<PendingWebPosts>>,
+) {
+    let outcome = index_write_outcome_slot();
+    match indexed_created_record(did, collection, &created) {
+        Ok(record) => {
+            if collection == "app.bsky.feed.post"
+                && let Some(pending_posts) = &pending_posts
+            {
+                pending_posts.register(record.clone());
+            }
+            hand_off_index_write(
+                storage,
+                IndexWrite::Put {
+                    record: Box::new(record),
+                    pending_posts,
+                },
+                route,
+                outcome,
+                None,
+            );
+        }
+        Err(error) => report_index_hand_off_failure(route, &created.uri, &error, &outcome),
+    }
+}
+
+/// Queues the local deletion that follows a PDS-successful delete. Follow rows
+/// are updated by the same worker operation as their record deletion.
+fn queue_deleted_record<S: Storage + 'static>(
+    storage: Arc<S>,
+    did: &str,
+    collection: &str,
+    uri: &str,
+    route: &'static str,
+    follow_subject: Option<&str>,
+) {
+    let outcome = index_write_outcome_slot();
+    match record_index_rkey(did, collection, uri) {
+        Ok(rkey) => hand_off_index_write(
+            storage,
+            IndexWrite::Delete {
+                did: did.to_owned(),
+                collection: collection.to_owned(),
+                rkey,
+                follow_subject: follow_subject.map(str::to_owned),
+            },
+            route,
+            outcome,
+            None,
+        ),
+        Err(error) => report_index_hand_off_failure(route, uri, &error, &outcome),
+    }
 }
 
 /// `(collection, viewer, subject)` — the key of a like/repost the viewer just
@@ -15950,6 +16162,7 @@ where
                             did: did.clone(),
                             collection: "app.bsky.feed.like".to_owned(),
                             rkey,
+                            follow_subject: None,
                         },
                         "like",
                         outcome,
@@ -16042,7 +16255,10 @@ where
                         .register(pending_key.clone(), entry.clone());
                     hand_off_index_write(
                         state.storage.clone(),
-                        IndexWrite::Put(Box::new(record)),
+                        IndexWrite::Put {
+                            record: Box::new(record),
+                            pending_posts: None,
+                        },
                         "like",
                         outcome,
                         Some(PendingIndexWriteBinding {
@@ -16168,7 +16384,10 @@ where
                         .register(pending_key.clone(), entry.clone());
                     hand_off_index_write(
                         state.storage.clone(),
-                        IndexWrite::Put(Box::new(record)),
+                        IndexWrite::Put {
+                            record: Box::new(record),
+                            pending_posts: None,
+                        },
                         "repost",
                         outcome,
                         Some(PendingIndexWriteBinding {
@@ -28020,6 +28239,12 @@ mod tests {
         unlike_calls: usize,
         repost_calls: usize,
         unlike_uris: Vec<String>,
+        post_calls: usize,
+        reply_calls: usize,
+        quote_calls: usize,
+        profile_graph_create_calls: usize,
+        profile_graph_delete_calls: usize,
+        list_item_uri: Option<String>,
     }
 
     /// A PDS that always accepts the write; counts how often each route actually reached it.
@@ -28070,6 +28295,170 @@ mod tests {
             _: &'a str,
         ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
             Box::pin(async { Ok(()) })
+        }
+
+        fn create_post<'a>(
+            &'a self,
+            did: &'a str,
+            text: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+            let state = self.state.clone();
+            let did = did.to_owned();
+            let text = text.to_owned();
+            Box::pin(async move {
+                state.lock().unwrap().post_calls += 1;
+                let mut created = AnswerFlow::created(
+                    &did,
+                    "app.bsky.feed.post",
+                    "answer-post-r1",
+                    "answer-post-cid",
+                    &Value::Null,
+                );
+                created.record = json!({"$type":"app.bsky.feed.post","text":text});
+                Ok(created)
+            })
+        }
+
+        fn create_reply<'a>(
+            &'a self,
+            did: &'a str,
+            text: &'a str,
+            root: PostStrongRef,
+            parent: PostStrongRef,
+        ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+            let state = self.state.clone();
+            let did = did.to_owned();
+            let text = text.to_owned();
+            Box::pin(async move {
+                state.lock().unwrap().reply_calls += 1;
+                let mut created = AnswerFlow::created(
+                    &did,
+                    "app.bsky.feed.post",
+                    "answer-reply-r1",
+                    "answer-reply-cid",
+                    &Value::Null,
+                );
+                created.record = json!({
+                    "$type":"app.bsky.feed.post",
+                    "text":text,
+                    "reply":{"root":root,"parent":parent}
+                });
+                Ok(created)
+            })
+        }
+
+        fn create_quote<'a>(
+            &'a self,
+            did: &'a str,
+            text: &'a str,
+            quoted: PostStrongRef,
+        ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+            let state = self.state.clone();
+            let did = did.to_owned();
+            let text = text.to_owned();
+            Box::pin(async move {
+                state.lock().unwrap().quote_calls += 1;
+                let mut created = AnswerFlow::created(
+                    &did,
+                    "app.bsky.feed.post",
+                    "answer-quote-r1",
+                    "answer-quote-cid",
+                    &Value::Null,
+                );
+                created.record = json!({
+                    "$type":"app.bsky.feed.post",
+                    "text":text,
+                    "embed":{"$type":"app.bsky.embed.record","record":quoted}
+                });
+                Ok(created)
+            })
+        }
+
+        fn create_post_with_video<'a>(
+            &'a self,
+            did: &'a str,
+            text: &'a str,
+            _video: PostVideo,
+            reply: Option<Value>,
+            quote: Option<PostStrongRef>,
+        ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+            let state = self.state.clone();
+            let did = did.to_owned();
+            let text = text.to_owned();
+            Box::pin(async move {
+                state.lock().unwrap().post_calls += 1;
+                let mut created = AnswerFlow::created(
+                    &did,
+                    "app.bsky.feed.post",
+                    "answer-video-r1",
+                    "answer-video-cid",
+                    &Value::Null,
+                );
+                let mut record = json!({"$type":"app.bsky.feed.post","text":text});
+                if let Some(reply) = reply {
+                    record["reply"] = reply;
+                }
+                if let Some(quote) = quote {
+                    record["quote"] = json!(quote);
+                }
+                created.record = record;
+                Ok(created)
+            })
+        }
+
+        fn create_profile_graph_record<'a>(
+            &'a self,
+            did: &'a str,
+            collection: &'a str,
+            record: Value,
+        ) -> Pin<Box<dyn Future<Output = Result<PdsCreatedRecord, String>> + Send + 'a>> {
+            let state = self.state.clone();
+            let did = did.to_owned();
+            let collection = collection.to_owned();
+            Box::pin(async move {
+                let index = {
+                    let mut state = state.lock().unwrap();
+                    state.profile_graph_create_calls += 1;
+                    state.profile_graph_create_calls
+                };
+                Ok(PdsCreatedRecord {
+                    uri: format!("at://{did}/{collection}/answer-graph-{index}"),
+                    cid: format!("answer-graph-cid-{index}"),
+                    record,
+                    time_us: 1,
+                })
+            })
+        }
+
+        fn delete_profile_graph_record<'a>(
+            &'a self,
+            _did: &'a str,
+            _collection: &'a str,
+            _uri: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            let state = self.state.clone();
+            Box::pin(async move {
+                state.lock().unwrap().profile_graph_delete_calls += 1;
+                Ok(())
+            })
+        }
+
+        fn profile_list_choices<'a>(
+            &'a self,
+            _did: &'a str,
+            _subject: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<ProfileListChoice>, String>> + Send + 'a>>
+        {
+            let state = self.state.clone();
+            Box::pin(async move {
+                let item_uri = state.lock().unwrap().list_item_uri.clone();
+                Ok(vec![ProfileListChoice {
+                    uri: format!("at://{ANSWER_VIEWER}/app.bsky.graph.list/answers"),
+                    name: "Answers".to_owned(),
+                    purpose: "app.bsky.graph.defs#curatelist".to_owned(),
+                    item_uri,
+                }])
+            })
         }
 
         fn like<'a>(
@@ -28135,6 +28524,7 @@ mod tests {
     struct FlakyPutStorage {
         inner: MemoryStorage,
         lock_failures: AtomicUsize,
+        delete_lock_failures: AtomicUsize,
     }
 
     impl FlakyPutStorage {
@@ -28161,6 +28551,10 @@ mod tests {
             collection: &str,
             rkey: &str,
         ) -> Result<(), StorageError> {
+            if self.delete_lock_failures.load(Ordering::SeqCst) > 0 {
+                self.delete_lock_failures.fetch_sub(1, Ordering::SeqCst);
+                return Err(Self::lock_failure("database is locked"));
+            }
             self.inner.delete_record(did, collection, rkey)
         }
 
@@ -28637,6 +29031,67 @@ mod tests {
             .unwrap()
     }
 
+    async fn post_web_form(app: &Router, cookie: &str, path: &str, body: String) -> Response {
+        app.clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("origin", "https://appview.example")
+                    .header("sec-fetch-site", "same-origin")
+                    .header("cookie", cookie)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn post_video_form(app: &Router, cookie: &str) -> Response {
+        let boundary = "av84-video-boundary";
+        let mut body = Vec::new();
+        for (name, value) in [
+            ("text", "video post"),
+            ("video_alt", "sample"),
+            ("video_duration", "3"),
+            ("video_width", "640"),
+            ("video_height", "360"),
+        ] {
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"video\"; filename=\"sample.mp4\"\r\nContent-Type: video/mp4\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(b"\0\0\0\x0cftypisom");
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        app.clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/video")
+                    .header("origin", "https://appview.example")
+                    .header("sec-fetch-site", "same-origin")
+                    .header("cookie", cookie)
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
     fn like_form_body(uri: &str) -> String {
         format!("uri={}&cid=cid-post", form_encoded(uri))
     }
@@ -28668,6 +29123,229 @@ mod tests {
         let output = captured_logs(logs);
         assert!(found, "no line containing {needle:?} in the logs: {output}");
         output
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_reply_quote_and_video_answer_after_the_pds_when_the_index_is_busy() {
+        let storage = Arc::new(FlakyPutStorage {
+            inner: MemoryStorage::default(),
+            lock_failures: AtomicUsize::new(usize::MAX),
+            delete_lock_failures: AtomicUsize::new(0),
+        });
+        let parent = test_web_post("did:plc:av84-parent", "parent", 1, "parent", None);
+        storage.inner.put_record(&parent).unwrap();
+        let flow = AnswerFlow::default();
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        let app = public.router_with_flow(flow, storage.clone());
+        let cookie = answer_session_cookie(&public, storage.as_ref(), ANSWER_VIEWER);
+
+        let cases = [
+            ("/post", "text=post+accepted".to_owned()),
+            (
+                "/reply",
+                format!(
+                    "parent_uri={}&text=reply+accepted",
+                    form_encoded(&parent.uri)
+                ),
+            ),
+            (
+                "/quote",
+                format!(
+                    "quote_uri={}&text=quote+accepted",
+                    form_encoded(&parent.uri)
+                ),
+            ),
+        ];
+        for (path, body) in cases {
+            let response = post_web_form(&app, &cookie, path, body).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::SEE_OTHER,
+                "{path} must answer success after PDS acceptance even when local indexing is locked"
+            );
+        }
+        let video = post_video_form(&app, &cookie).await;
+        assert_eq!(
+            video.status(),
+            StatusCode::SEE_OTHER,
+            "/video must answer success after PDS acceptance even when local indexing is locked"
+        );
+        let home = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/app")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(home.status(), StatusCode::OK);
+        let html = String::from_utf8(
+            home.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        for text in [
+            "post accepted",
+            "reply accepted",
+            "quote accepted",
+            "video post",
+        ] {
+            assert!(
+                html.contains(text),
+                "PDS-accepted {text:?} must appear on the next home page while indexing is locked"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reply_answers_without_waiting_for_the_held_sqlite_writer() {
+        let path = held_writer_page_path("reply-answer");
+        remove_held_writer_database(&path);
+        let storage = Arc::new(crate::ingest::SqliteStorage::open(&path).unwrap());
+        let parent = test_web_post("did:plc:av84-parent", "parent", 1, "parent", None);
+        storage.put_record(&parent).unwrap();
+        let flow = AnswerFlow::default();
+        let flow_state = flow.state.clone();
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        let app = public.router_with_flow(flow, storage.clone());
+        let cookie = answer_session_cookie(&public, storage.as_ref(), ANSWER_VIEWER);
+
+        let gate = storage.hold_writer(Duration::from_secs(3));
+        gate.recv_timeout(Duration::from_secs(1))
+            .expect("the writer picked up the hold");
+
+        let started = Instant::now();
+        let response = post_web_form(
+            &app,
+            &cookie,
+            "/reply",
+            format!(
+                "parent_uri={}&text=reply+accepted",
+                form_encoded(&parent.uri)
+            ),
+        )
+        .await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(
+            elapsed_ms < 500,
+            "the reply waited {elapsed_ms} ms behind the held writer instead of answering after PDS OK"
+        );
+        assert_eq!(flow_state.lock().unwrap().reply_calls, 1);
+
+        let reply_uri = format!("at://{ANSWER_VIEWER}/app.bsky.feed.post/answer-reply-r1");
+        assert!(
+            wait_until(
+                || storage
+                    .record_by_uri("app.bsky.feed.post", &reply_uri)
+                    .unwrap()
+                    .is_some(),
+                Duration::from_secs(5)
+            )
+            .await,
+            "the queued reply must be indexed after the writer catches up"
+        );
+        drop(app);
+        drop(storage);
+        remove_held_writer_database(&path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn profile_graph_create_routes_answer_after_the_pds_when_the_index_is_busy() {
+        let storage = Arc::new(FlakyPutStorage {
+            inner: MemoryStorage::default(),
+            lock_failures: AtomicUsize::new(usize::MAX),
+            delete_lock_failures: AtomicUsize::new(0),
+        });
+        let flow = AnswerFlow::default();
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        let app = public.router_with_flow(flow, storage.clone());
+        let cookie = answer_session_cookie(&public, storage.as_ref(), ANSWER_VIEWER);
+        let subject = "did:plc:av84-subject";
+        let list_uri = format!("at://{ANSWER_VIEWER}/app.bsky.graph.list/answers");
+
+        for action in ["follow", "block", "list_add", "list_toggle"] {
+            let mut body = format!("subject={}&action={action}", form_encoded(subject));
+            if matches!(action, "block" | "list_add" | "list_toggle") {
+                body.push_str("&confirm=yes");
+            }
+            if matches!(action, "list_add" | "list_toggle") {
+                body.push_str(&format!("&list_uri={}", form_encoded(&list_uri)));
+            }
+            let response = post_web_form(&app, &cookie, "/profile/action", body).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::SEE_OTHER,
+                "{action} must answer success after PDS acceptance even when local indexing is locked"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn profile_graph_delete_routes_answer_after_the_pds_when_the_index_is_busy() {
+        let storage = Arc::new(FlakyPutStorage {
+            inner: MemoryStorage::default(),
+            lock_failures: AtomicUsize::new(0),
+            delete_lock_failures: AtomicUsize::new(usize::MAX),
+        });
+        let subject = "did:plc:av84-subject";
+        let list_item_uri = format!("at://{ANSWER_VIEWER}/app.bsky.graph.listitem/answer-item");
+        for (collection, rkey, record_subject) in [
+            ("app.bsky.graph.follow", "answer-follow", subject),
+            ("app.bsky.graph.block", "answer-block", subject),
+            ("app.bsky.graph.listitem", "answer-item", subject),
+        ] {
+            storage
+                .inner
+                .put_record(&IndexedRecord {
+                    did: ANSWER_VIEWER.to_owned(),
+                    collection: collection.to_owned(),
+                    rkey: rkey.to_owned(),
+                    uri: format!("at://{ANSWER_VIEWER}/{collection}/{rkey}"),
+                    cid: Some(format!("cid-{rkey}")),
+                    time_us: 1,
+                    record: json!({
+                        "$type":collection,
+                        "subject":record_subject,
+                        "list":format!("at://{ANSWER_VIEWER}/app.bsky.graph.list/answers")
+                    }),
+                })
+                .unwrap();
+        }
+        let flow = AnswerFlow::default();
+        flow.state.lock().unwrap().list_item_uri = Some(list_item_uri.clone());
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        let app = public.router_with_flow(flow, storage.clone());
+        let cookie = answer_session_cookie(&public, storage.as_ref(), ANSWER_VIEWER);
+        let list_uri = format!("at://{ANSWER_VIEWER}/app.bsky.graph.list/answers");
+        let cases = [
+            ("unfollow", String::new()),
+            ("unblock", String::new()),
+            (
+                "list_remove",
+                format!("&item_uri={}&confirm=yes", form_encoded(&list_item_uri)),
+            ),
+            (
+                "list_toggle",
+                format!("&list_uri={}", form_encoded(&list_uri)),
+            ),
+        ];
+        for (action, extra) in cases {
+            let body = format!("subject={}&action={action}{extra}", form_encoded(subject));
+            let response = post_web_form(&app, &cookie, "/profile/action", body).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::SEE_OTHER,
+                "{action} must answer success after PDS acceptance even when local indexing is locked"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -28734,6 +29412,7 @@ mod tests {
         let storage = Arc::new(FlakyPutStorage {
             inner: MemoryStorage::default(),
             lock_failures: AtomicUsize::new(usize::MAX),
+            delete_lock_failures: AtomicUsize::new(0),
         });
         let post = test_web_post(
             "did:plc:failing-author",
@@ -28937,6 +29616,7 @@ mod tests {
         let storage = Arc::new(FlakyPutStorage {
             inner: MemoryStorage::default(),
             lock_failures: AtomicUsize::new(3),
+            delete_lock_failures: AtomicUsize::new(0),
         });
         let post = test_web_post(
             "did:plc:retry-author",
@@ -28982,6 +29662,7 @@ mod tests {
         let storage = Arc::new(FlakyPutStorage {
             inner: MemoryStorage::default(),
             lock_failures: AtomicUsize::new(0),
+            delete_lock_failures: AtomicUsize::new(0),
         });
         let post = test_web_post(
             "did:plc:landed-author",
@@ -29201,6 +29882,7 @@ mod tests {
         let storage = Arc::new(FlakyPutStorage {
             inner: MemoryStorage::default(),
             lock_failures: AtomicUsize::new(2),
+            delete_lock_failures: AtomicUsize::new(0),
         });
         let post = test_web_post(
             "did:plc:locked-author",

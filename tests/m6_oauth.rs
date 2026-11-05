@@ -2361,6 +2361,13 @@ async fn quote_composer_quotes_existing_quote_posts_and_notifies_once() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    wait_for_indexed(
+        storage.as_ref(),
+        "app.bsky.feed.post",
+        "at://did:plc:alice/app.bsky.feed.post/pds-quote-r1",
+        true,
+    )
+    .await;
     let records = storage.records().unwrap();
     let quote = records
         .iter()
@@ -5038,6 +5045,13 @@ async fn reply_form_checks_origin_and_writes_through_to_the_index() {
             "reply:did:plc:alice:Reply text:at://did:plc:friend/app.bsky.feed.post/parent:parent-cid:at://did:plc:friend/app.bsky.feed.post/parent:parent-cid"
         ]
     );
+    wait_for_indexed(
+        storage.as_ref(),
+        "app.bsky.feed.post",
+        "at://did:plc:alice/app.bsky.feed.post/pds-reply-r1",
+        true,
+    )
+    .await;
     let indexed = storage
         .record_by_uri(
             "app.bsky.feed.post",
@@ -8505,6 +8519,16 @@ async fn profile_follow_form_creates_the_follow_record_in_the_viewers_repo() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert!(
+        wait_until(
+            || storage
+                .is_following("did:plc:alice", "did:plc:friend")
+                .unwrap(),
+            Duration::from_secs(10),
+        )
+        .await,
+        "the queued follow write should update the local relationship"
+    );
     assert!(
         storage
             .is_following("did:plc:alice", "did:plc:friend")

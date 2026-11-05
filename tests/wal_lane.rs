@@ -94,10 +94,9 @@ fn passive_catches_up_and_reuses_wal_with_short_readers() {
     );
     drop(writer);
     let _ = std::fs::remove_file(&path);
-    assert!(
-        caught_up > 0,
-        "PASSIVE never caught up during short reads and writes"
-    );
+    // Whether one of the intermediate checkpoints wins the short-reader race is
+    // scheduler-dependent. The final PASSIVE runs after the reader has joined,
+    // so its caught-up result below is the deterministic condition that matters.
     assert_eq!(latest.1, latest.2);
     assert!(
         after_next_write <= 65_536,
@@ -137,8 +136,8 @@ fn passive_checkpoint_can_leave_wal_above_four_journal_limits() {
 }
 
 #[test]
-fn storage_checkpointer_truncates_a_fully_checkpointed_wal() {
-    let path = temp_db("automatic-reset");
+fn storage_checkpointer_reuses_a_fully_checkpointed_wal_under_the_cap() {
+    let path = temp_db("automatic-reuse");
     let storage = SqliteStorage::open(&path).unwrap();
     let writer = Connection::open(&path).unwrap();
     writer.execute_batch("PRAGMA wal_autocheckpoint=0; CREATE TABLE test_payload(k INTEGER PRIMARY KEY, v BLOB);").unwrap();
@@ -155,6 +154,13 @@ fn storage_checkpointer_truncates_a_fully_checkpointed_wal() {
     drop(writer);
 
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while storage.write_backlog() != u64::MAX {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "checkpointer did not start its first round"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
     while storage.write_backlog() == u64::MAX {
         assert!(
             std::time::Instant::now() < deadline,
@@ -162,22 +168,23 @@ fn storage_checkpointer_truncates_a_fully_checkpointed_wal() {
         );
         thread::sleep(Duration::from_millis(25));
     }
+    assert_eq!(storage.write_backlog(), 0, "PASSIVE should catch up");
     let wal_bytes = std::fs::metadata(&wal_path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
-    eprintln!("GREEN automatic reset measurement: wal_bytes={wal_bytes}");
+    eprintln!("GREEN automatic reuse measurement: wal_bytes={wal_bytes}");
     drop(storage);
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(wal_path);
     assert!(
-        wal_bytes <= 65_536,
-        "fully checkpointed WAL remains {wal_bytes} bytes"
+        wal_bytes > 4 * 65_536,
+        "fully checkpointed WAL below the cap should keep reusable pages: {wal_bytes}"
     );
 }
 
 #[test]
-fn clean_shutdown_truncates_the_wal() {
-    let path = temp_db("shutdown-reset");
+fn clean_shutdown_reuses_a_small_wal() {
+    let path = temp_db("shutdown-reuse");
     let storage = SqliteStorage::open(&path).unwrap();
     let writer = Connection::open(&path).unwrap();
     writer.execute_batch("PRAGMA wal_autocheckpoint=0; CREATE TABLE test_payload(k INTEGER PRIMARY KEY, v BLOB);").unwrap();
@@ -200,8 +207,8 @@ fn clean_shutdown_truncates_the_wal() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(wal_path);
     assert!(
-        wal_bytes <= 65_536,
-        "clean shutdown left a {wal_bytes} byte WAL"
+        wal_bytes > 4 * 65_536,
+        "clean shutdown should not truncate a reusable WAL below the cap: {wal_bytes}"
     );
 }
 

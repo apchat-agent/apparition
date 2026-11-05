@@ -51,7 +51,36 @@ const WAL_JOURNAL_SIZE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 const WAL_PRESSURE_CHECKPOINT_BYTES: u64 = WAL_JOURNAL_SIZE_LIMIT_BYTES * 3;
 const CHECKPOINT_BUSY_TIMEOUT: Duration = Duration::from_millis(50);
 const SQLITE_WRITER_METRICS_INTERVAL: Duration = Duration::from_secs(60);
+const SQLITE_SLOW_WRITE_THRESHOLD: Duration = Duration::from_secs(1);
+const CHECKPOINT_NONE: usize = 0;
+const CHECKPOINT_PASSIVE: usize = 1;
+const CHECKPOINT_TRUNCATE: usize = 2;
 static NEXT_MEMORY_DATABASE_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    static SQLITE_OPERATION_KIND: Cell<Option<&'static str>> = const { Cell::new(None) };
+}
+
+/// Labels the SQLite writer operation submitted by the current blocking task.
+/// The label crosses the actor queue with the operation so slow transactions
+/// and SQLITE_BUSY logs retain the originating kind.
+pub(crate) struct SqliteOperationKindGuard(Option<&'static str>);
+
+impl SqliteOperationKindGuard {
+    pub(crate) fn enter(kind: &'static str) -> Self {
+        Self(SQLITE_OPERATION_KIND.with(|current| current.replace(Some(kind))))
+    }
+}
+
+impl Drop for SqliteOperationKindGuard {
+    fn drop(&mut self) {
+        SQLITE_OPERATION_KIND.with(|current| current.set(self.0));
+    }
+}
+
+fn current_sqlite_operation_kind(default: &'static str) -> &'static str {
+    SQLITE_OPERATION_KIND.with(|current| current.get().unwrap_or(default))
+}
 
 struct EphemeralDatabase(PathBuf);
 
@@ -64,6 +93,15 @@ impl Drop for EphemeralDatabase {
 }
 const JETSTREAM_BATCH_SIZE: usize = 200;
 const JETSTREAM_BATCH_DELAY: Duration = Duration::from_millis(250);
+const JETSTREAM_LOCK_RETRY_FIRST_BACKOFF: Duration = Duration::from_millis(50);
+const JETSTREAM_LOCK_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(1);
+
+fn is_jetstream_sqlite_lock(error: &IngestError) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("database is locked")
+        || message.contains("database is busy")
+        || message.contains("database table is locked")
+}
 
 fn backfill_retry_delay(failures: u32) -> Duration {
     let exponent = failures.saturating_sub(1).min(63);
@@ -761,6 +799,8 @@ pub trait Storage: Send + Sync {
         false
     }
     fn record_backfill_wait(&self, _waited: Duration) {}
+    /// Records a Jetstream batch retry after SQLite returned BUSY/LOCKED.
+    fn record_jetstream_lock_retry(&self) {}
     fn put_record(&self, record: &IndexedRecord) -> Result<(), StorageError>;
     /// Queues a cache-warm write without waiting for the writer. Page paths
     /// use it for records they render from their own copy (freshly fetched
@@ -789,6 +829,7 @@ pub trait Storage: Send + Sync {
         following: &[String],
         records_per_second: u64,
     ) -> Result<(), StorageError> {
+        let _operation = SqliteOperationKindGuard::enter("backfill");
         let _ = records_per_second;
         self.replace_repo_snapshot(did, records, following)
     }
@@ -807,6 +848,7 @@ pub trait Storage: Send + Sync {
         records_per_second: u64,
         window_start_us: Option<u64>,
     ) -> Result<(), StorageError> {
+        let _operation = SqliteOperationKindGuard::enter("backfill");
         let _ = window_start_us;
         self.replace_repo_snapshot_throttled(did, records, following, records_per_second)
     }
@@ -1276,9 +1318,21 @@ pub struct MemoryStorage {
     #[cfg(test)]
     notification_window_read_delay_ms: AtomicU64,
     cursor_lock_failures: AtomicUsize,
+    #[cfg(test)]
+    apply_jetstream_busy_failures: AtomicUsize,
+    #[cfg(test)]
+    apply_jetstream_attempts: AtomicUsize,
+    #[cfg(test)]
+    jetstream_lock_retries: AtomicUsize,
 }
 
 impl MemoryStorage {
+    #[cfg(test)]
+    fn set_apply_jetstream_busy_failures(&self, failures: usize) {
+        self.apply_jetstream_busy_failures
+            .store(failures, Ordering::SeqCst);
+    }
+
     fn replace_snapshot_state(
         &self,
         did: &str,
@@ -1445,6 +1499,11 @@ struct BackfillRetry {
 }
 
 impl Storage for MemoryStorage {
+    fn record_jetstream_lock_retry(&self) {
+        #[cfg(test)]
+        self.jetstream_lock_retries.fetch_add(1, Ordering::SeqCst);
+    }
+
     fn put_record(&self, record: &IndexedRecord) -> Result<(), StorageError> {
         #[cfg(test)]
         {
@@ -1482,6 +1541,18 @@ impl Storage for MemoryStorage {
         &self,
         updates: &[JetstreamStorageUpdate],
     ) -> Result<BatchApplyTiming, StorageError> {
+        #[cfg(test)]
+        {
+            self.apply_jetstream_attempts.fetch_add(1, Ordering::SeqCst);
+            if self.apply_jetstream_busy_failures.load(Ordering::SeqCst) > 0 {
+                self.apply_jetstream_busy_failures
+                    .fetch_sub(1, Ordering::SeqCst);
+                return Err(StorageError::Sqlite(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    Some("database is locked".to_owned()),
+                )));
+            }
+        }
         let started = Instant::now();
         if updates.is_empty() {
             return Ok(BatchApplyTiming::default());
@@ -2884,9 +2955,9 @@ type FireWrite =
 type BlockingWrite = Box<dyn FnOnce(&mut Connection) + Send>;
 
 enum SqliteWriterMessage {
-    Fire(FireWrite),
-    Blocking(BlockingWrite),
-    Urgent(BlockingWrite),
+    Fire(&'static str, FireWrite),
+    Blocking(&'static str, BlockingWrite),
+    Urgent(&'static str, BlockingWrite),
 }
 
 #[derive(Default)]
@@ -2912,6 +2983,9 @@ struct SqliteWriterMetrics {
     transaction_count: AtomicU64,
     transaction_total_ns: AtomicU64,
     transaction_max_ns: AtomicU64,
+    sqlite_busy: AtomicU64,
+    slow_txn: AtomicU64,
+    jetstream_lock_retries: AtomicU64,
     /// The recent-posts worker's cumulative counts, shared with `SqliteStorage`
     /// so the minute line can carry them; swapped to the storage's counters
     /// once at open (the default is a private scratch instance).
@@ -2925,6 +2999,11 @@ struct WalMetrics {
     checkpointed: AtomicU64,
     reset: AtomicBool,
     backfill_wait_ns: AtomicU64,
+    sqlite_busy: AtomicU64,
+    slow_txn: AtomicU64,
+    ckpt_passive_max_ns: AtomicU64,
+    ckpt_truncate_max_ns: AtomicU64,
+    active_checkpoint: AtomicUsize,
 }
 
 impl WalMetrics {
@@ -2962,7 +3041,7 @@ impl SqliteWriterMetrics {
         self.queue_depth.fetch_sub(1, Ordering::Relaxed);
     }
 
-    fn record_batch(&self, elapsed: Duration) {
+    fn record_batch(&self, kind: &'static str, elapsed: Duration) {
         let elapsed_ns = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
         self.batch_count.fetch_add(1, Ordering::Relaxed);
         self.transaction_count.fetch_add(1, Ordering::Relaxed);
@@ -2970,6 +3049,24 @@ impl SqliteWriterMetrics {
             .fetch_add(elapsed_ns, Ordering::Relaxed);
         self.transaction_max_ns
             .fetch_max(elapsed_ns, Ordering::Relaxed);
+        if elapsed >= SQLITE_SLOW_WRITE_THRESHOLD {
+            self.slow_txn.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                kind,
+                duration_ms = elapsed.as_millis() as u64,
+                "slow SQLite writer transaction"
+            );
+        }
+    }
+
+    fn record_busy(&self, kind: &'static str, error: &StorageError, lock_holder: &str) {
+        self.sqlite_busy.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            kind,
+            lock_holder,
+            error = %error,
+            "SQLite writer received SQLITE_BUSY"
+        );
     }
 
     fn record_failed_write(&self) {
@@ -2981,6 +3078,10 @@ impl SqliteWriterMetrics {
         let count = self.transaction_count.swap(0, Ordering::Relaxed);
         let total_ns = self.transaction_total_ns.swap(0, Ordering::Relaxed);
         let max_ns = self.transaction_max_ns.swap(0, Ordering::Relaxed);
+        let sqlite_busy = self.sqlite_busy.swap(0, Ordering::Relaxed)
+            + wal_metrics.sqlite_busy.swap(0, Ordering::Relaxed);
+        let slow_txn = self.slow_txn.swap(0, Ordering::Relaxed)
+            + wal_metrics.slow_txn.swap(0, Ordering::Relaxed);
         let (recent_posts_queued, recent_posts_done, recent_posts_failed, recent_posts_dropped) =
             self.recent_posts
                 .lock()
@@ -2997,6 +3098,13 @@ impl SqliteWriterMetrics {
                 total_ns as f64 / count as f64 / 1_000_000.0
             },
             transaction_max_ms = max_ns as f64 / 1_000_000.0,
+            sqlite_busy,
+            slow_txn,
+            ckpt_passive_ms_max =
+                wal_metrics.ckpt_passive_max_ns.swap(0, Ordering::Relaxed) as f64 / 1_000_000.0,
+            ckpt_truncate_ms_max =
+                wal_metrics.ckpt_truncate_max_ns.swap(0, Ordering::Relaxed) as f64 / 1_000_000.0,
+            jetstream_lock_retries = self.jetstream_lock_retries.swap(0, Ordering::Relaxed),
             dropped_count = self.dropped.swap(0, Ordering::Relaxed),
             failed_write_count = self.failed_writes.swap(0, Ordering::Relaxed),
             read_wait_count = read_metrics.waits.swap(0, Ordering::Relaxed),
@@ -3054,6 +3162,7 @@ struct SqliteWriter {
     worker: Option<std::thread::JoinHandle<()>>,
     metrics: Arc<SqliteWriterMetrics>,
     pressure: Arc<StoragePressure>,
+    wal_metrics: Arc<WalMetrics>,
 }
 
 impl SqliteWriter {
@@ -3085,6 +3194,7 @@ impl SqliteWriter {
             worker: Some(worker),
             metrics,
             pressure,
+            wal_metrics,
         })
     }
 
@@ -3101,10 +3211,14 @@ impl SqliteWriter {
         &self,
         operation: impl FnOnce(&mut Connection) -> Result<R, StorageError> + Send + 'static,
     ) -> Result<R, StorageError> {
+        let kind = current_sqlite_operation_kind("writer_call");
         let (reply, result) = mpsc::sync_channel(1);
-        let command = SqliteWriterMessage::Blocking(Box::new(move |connection| {
-            let _ = reply.send(operation(connection));
-        }));
+        let command = SqliteWriterMessage::Blocking(
+            kind,
+            Box::new(move |connection| {
+                let _ = reply.send(operation(connection));
+            }),
+        );
         self.metrics.queued();
         let Some(sender) = self.sender.as_ref() else {
             self.metrics.dequeued();
@@ -3114,17 +3228,28 @@ impl SqliteWriter {
             self.metrics.dequeued();
             return Err(StorageError::WriterStopped);
         }
-        result.recv().map_err(|_| StorageError::WriterStopped)?
+        let result = result.recv().map_err(|_| StorageError::WriterStopped)?;
+        if let Err(error) = &result
+            && is_sqlite_busy_error(error)
+        {
+            self.metrics
+                .record_busy(kind, error, checkpoint_lock_holder(&self.wal_metrics));
+        }
+        result
     }
 
     fn call_live<R: Send + 'static>(
         &self,
         operation: impl FnOnce(&mut Connection) -> Result<R, StorageError> + Send + 'static,
     ) -> Result<R, StorageError> {
+        let kind = current_sqlite_operation_kind("ingest_batch");
         let (reply, result) = mpsc::sync_channel(1);
-        let command = SqliteWriterMessage::Urgent(Box::new(move |connection| {
-            let _ = reply.send(operation(connection));
-        }));
+        let command = SqliteWriterMessage::Urgent(
+            kind,
+            Box::new(move |connection| {
+                let _ = reply.send(operation(connection));
+            }),
+        );
         self.metrics.queued();
         self.pressure
             .waiting_live_ingest
@@ -3143,7 +3268,14 @@ impl SqliteWriter {
                 .fetch_sub(1, Ordering::Relaxed);
             return Err(StorageError::WriterStopped);
         }
-        result.recv().map_err(|_| StorageError::WriterStopped)?
+        let result = result.recv().map_err(|_| StorageError::WriterStopped)?;
+        if let Err(error) = &result
+            && is_sqlite_busy_error(error)
+        {
+            self.metrics
+                .record_busy(kind, error, checkpoint_lock_holder(&self.wal_metrics));
+        }
+        result
     }
 
     /// Queues a fire-and-forget write. Returns whether it was enqueued; a caller
@@ -3155,12 +3287,13 @@ impl SqliteWriter {
         + Send
         + 'static,
     ) -> bool {
+        let kind = current_sqlite_operation_kind("queued_write");
         let Some(sender) = self.sender.as_ref() else {
             self.metrics.dropped.fetch_add(1, Ordering::Relaxed);
             return false;
         };
         self.metrics.queued();
-        match sender.try_send(SqliteWriterMessage::Fire(Box::new(operation))) {
+        match sender.try_send(SqliteWriterMessage::Fire(kind, Box::new(operation))) {
             Ok(()) => true,
             Err(error) => {
                 self.metrics.dequeued();
@@ -3199,6 +3332,21 @@ impl Drop for SqliteWriter {
     }
 }
 
+fn is_sqlite_busy_error(error: &StorageError) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("database is locked")
+        || message.contains("database is busy")
+        || message.contains("database table is locked")
+}
+
+fn checkpoint_lock_holder(wal_metrics: &WalMetrics) -> &'static str {
+    match wal_metrics.active_checkpoint.load(Ordering::Relaxed) {
+        CHECKPOINT_PASSIVE => "checkpoint_PASSIVE",
+        CHECKPOINT_TRUNCATE => "checkpoint_TRUNCATE",
+        _ => "unknown_or_external_writer",
+    }
+}
+
 fn sqlite_writer_loop(
     mut connection: Connection,
     receiver: Receiver<SqliteWriterMessage>,
@@ -3215,7 +3363,7 @@ fn sqlite_writer_loop(
         }
         let urgent_position = pending
             .iter()
-            .position(|message| matches!(message, SqliteWriterMessage::Urgent(_)));
+            .position(|message| matches!(message, SqliteWriterMessage::Urgent(_, _)));
         let message = if let Some(position) = urgent_position {
             pending.remove(position)
         } else {
@@ -3234,36 +3382,40 @@ fn sqlite_writer_loop(
         };
         metrics.dequeued();
         match message {
-            SqliteWriterMessage::Blocking(operation) => {
+            SqliteWriterMessage::Blocking(kind, operation) => {
                 let started = Instant::now();
                 operation(&mut connection);
-                metrics.record_batch(started.elapsed());
+                metrics.record_batch(kind, started.elapsed());
             }
-            SqliteWriterMessage::Urgent(operation) => {
+            SqliteWriterMessage::Urgent(kind, operation) => {
                 pressure.waiting_live_ingest.fetch_sub(1, Ordering::Relaxed);
                 let started = Instant::now();
                 operation(&mut connection);
-                metrics.record_batch(started.elapsed());
+                metrics.record_batch(kind, started.elapsed());
             }
-            SqliteWriterMessage::Fire(first) => {
+            SqliteWriterMessage::Fire(first_kind, first) => {
                 let mut writes = vec![first];
+                let mut batch_kind = first_kind;
                 let deadline = Instant::now() + SQLITE_WRITER_BATCH_DELAY;
                 while writes.len() < SQLITE_WRITER_BATCH_SIZE {
                     match receiver.try_recv() {
-                        Ok(SqliteWriterMessage::Fire(write)) => {
+                        Ok(SqliteWriterMessage::Fire(kind, write)) => {
                             metrics.dequeued();
+                            if batch_kind != kind {
+                                batch_kind = "mixed_queued_write_batch";
+                            }
                             writes.push(write);
                         }
-                        Ok(blocking @ SqliteWriterMessage::Blocking(_)) => {
+                        Ok(blocking @ SqliteWriterMessage::Blocking(_, _)) => {
                             pending.push_back(blocking);
                             break;
                         }
-                        Ok(SqliteWriterMessage::Urgent(operation)) => {
+                        Ok(SqliteWriterMessage::Urgent(kind, operation)) => {
                             metrics.dequeued();
                             pressure.waiting_live_ingest.fetch_sub(1, Ordering::Relaxed);
                             let started = Instant::now();
                             operation(&mut connection);
-                            metrics.record_batch(started.elapsed());
+                            metrics.record_batch(kind, started.elapsed());
                         }
                         Err(TryRecvError::Empty) if Instant::now() < deadline => {
                             std::thread::sleep(Duration::from_micros(100));
@@ -3298,6 +3450,13 @@ fn sqlite_writer_loop(
                                 }
                                 Err(error) => {
                                     metrics.record_failed_write();
+                                    if is_sqlite_busy_error(&error) {
+                                        metrics.record_busy(
+                                            batch_kind,
+                                            &error,
+                                            checkpoint_lock_holder(&wal_metrics),
+                                        );
+                                    }
                                     tracing::warn!(%error, "SQLite queued write failed");
                                     if let Err(rollback_error) = transaction.execute_batch(
                                         "ROLLBACK TO SAVEPOINT queued_write;
@@ -3312,13 +3471,29 @@ fn sqlite_writer_loop(
                         if batch_error.is_none()
                             && let Err(error) = transaction.commit()
                         {
+                            let error = StorageError::Sqlite(error);
+                            if is_sqlite_busy_error(&error) {
+                                metrics.record_busy(
+                                    batch_kind,
+                                    &error,
+                                    checkpoint_lock_holder(&wal_metrics),
+                                );
+                            }
                             tracing::warn!(%error, "SQLite queued write batch commit failed");
-                            batch_error = Some(StorageError::Sqlite(error));
+                            batch_error = Some(error);
                         }
                     }
                     Err(error) => {
+                        let error = StorageError::Sqlite(error);
+                        if is_sqlite_busy_error(&error) {
+                            metrics.record_busy(
+                                batch_kind,
+                                &error,
+                                checkpoint_lock_holder(&wal_metrics),
+                            );
+                        }
                         tracing::warn!(%error, "SQLite queued write batch could not start");
-                        batch_error = Some(StorageError::Sqlite(error));
+                        batch_error = Some(error);
                     }
                 }
                 if batch_error.is_none() {
@@ -3328,7 +3503,7 @@ fn sqlite_writer_loop(
                 } else if let Some(error) = batch_error {
                     tracing::warn!(%error, "SQLite queued write batch rolled back");
                 }
-                metrics.record_batch(started.elapsed());
+                metrics.record_batch(batch_kind, started.elapsed());
             }
         }
         if Instant::now() >= next_metrics {
@@ -3583,7 +3758,7 @@ impl Drop for SqliteStorage {
             let wal_metrics = Arc::clone(&self.wal_metrics);
             let shutdown_checkpoint = self.writer.call(move |connection| {
                 connection.busy_timeout(CHECKPOINT_BUSY_TIMEOUT)?;
-                let result = checkpoint_wal(connection)?;
+                let result = checkpoint_wal(connection, &database_path, &wal_metrics)?;
                 wal_metrics.record_checkpoint(
                     wal_file_bytes(&database_path),
                     result.frames.max(0) as u64,
@@ -3779,37 +3954,114 @@ struct CheckpointResult {
     frames: i64,
     checkpointed: i64,
     reset: bool,
+    truncate_elapsed: Duration,
 }
 
-fn checkpoint_wal(connection: &Connection) -> rusqlite::Result<CheckpointResult> {
-    let (busy, frames, checkpointed) =
-        connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })?;
+fn checkpoint_wal(
+    connection: &Connection,
+    path: &Path,
+    metrics: &WalMetrics,
+) -> rusqlite::Result<CheckpointResult> {
+    metrics
+        .active_checkpoint
+        .store(CHECKPOINT_PASSIVE, Ordering::Relaxed);
+    let passive_started = Instant::now();
+    let passive_result = connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    });
+    let passive_elapsed = passive_started.elapsed();
+    metrics
+        .active_checkpoint
+        .store(CHECKPOINT_NONE, Ordering::Relaxed);
+    let (busy, frames, checkpointed) = passive_result?;
+    metrics
+        .ckpt_passive_max_ns
+        .fetch_max(duration_ns(passive_elapsed), Ordering::Relaxed);
+    if passive_elapsed >= SQLITE_SLOW_WRITE_THRESHOLD {
+        metrics.slow_txn.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            kind = "checkpoint_PASSIVE",
+            duration_ms = passive_elapsed.as_millis() as u64,
+            wal_bytes = wal_file_bytes(path),
+            "slow SQLite checkpoint"
+        );
+    }
+    if busy != 0 {
+        metrics.sqlite_busy.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            kind = "checkpoint_PASSIVE",
+            busy,
+            lock_holder = "active_reader_or_writer",
+            wal_frames = frames,
+            ckpt_frames = checkpointed,
+            "SQLite checkpoint could not advance"
+        );
+    }
     let mut result = CheckpointResult {
         busy,
         frames,
         checkpointed,
         reset: false,
+        truncate_elapsed: Duration::ZERO,
     };
-    if busy == 0 && frames >= 0 && frames == checkpointed {
-        // TRUNCATE is the only round that frees the file immediately. It may
-        // wait for old readers, so this connection has a short busy timeout.
-        let (truncate_busy, truncate_frames, truncate_checkpointed) =
-            connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })?;
+    if busy == 0
+        && frames >= 0
+        && frames == checkpointed
+        && wal_file_bytes(path) > WAL_JOURNAL_SIZE_LIMIT_BYTES
+    {
+        // Keep the ordinary 40 MiB production WAL in its reusable size. Only
+        // acquire TRUNCATE's exclusive checkpoint lock to enforce the configured
+        // 64 MiB cap when PASSIVE has already caught up.
+        metrics
+            .active_checkpoint
+            .store(CHECKPOINT_TRUNCATE, Ordering::Relaxed);
+        let truncate_started = Instant::now();
+        let truncate_result = connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        });
+        result.truncate_elapsed = truncate_started.elapsed();
+        metrics
+            .active_checkpoint
+            .store(CHECKPOINT_NONE, Ordering::Relaxed);
+        let (truncate_busy, truncate_frames, truncate_checkpointed) = truncate_result?;
+        metrics
+            .ckpt_truncate_max_ns
+            .fetch_max(duration_ns(result.truncate_elapsed), Ordering::Relaxed);
+        if result.truncate_elapsed >= SQLITE_SLOW_WRITE_THRESHOLD {
+            metrics.slow_txn.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                kind = "checkpoint_TRUNCATE",
+                duration_ms = result.truncate_elapsed.as_millis() as u64,
+                wal_bytes = wal_file_bytes(path),
+                "slow SQLite checkpoint"
+            );
+        }
+        if truncate_busy != 0 {
+            metrics.sqlite_busy.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                kind = "checkpoint_TRUNCATE",
+                busy = truncate_busy,
+                lock_holder = "active_reader_or_writer",
+                wal_frames = truncate_frames,
+                ckpt_frames = truncate_checkpointed,
+                "SQLite checkpoint truncate could not finish"
+            );
+        }
         result.reset = truncate_busy == 0 && truncate_frames == 0 && truncate_checkpointed == 0;
     }
     Ok(result)
+}
+
+fn duration_ns(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 fn wal_file_bytes(path: &Path) -> u64 {
@@ -3852,7 +4104,7 @@ fn spawn_checkpointer(
                     wal_metrics.record_skipped_checkpoint(file_bytes);
                     continue;
                 }
-                match checkpoint_wal(&connection) {
+                match checkpoint_wal(&connection, &path, &wal_metrics) {
                     Ok(result) => {
                         let file_bytes = wal_file_bytes(&path);
                         wal_metrics.record_checkpoint(
@@ -5325,6 +5577,13 @@ impl SqliteStorage {
 }
 
 impl Storage for SqliteStorage {
+    fn record_jetstream_lock_retry(&self) {
+        self.writer
+            .metrics
+            .jetstream_lock_retries
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     fn write_backlog(&self) -> u64 {
         self.checkpoint_backlog.load(Ordering::Relaxed)
     }
@@ -5789,6 +6048,7 @@ impl Storage for SqliteStorage {
         following: &[String],
         records_per_second: u64,
     ) -> Result<(), StorageError> {
+        let _operation = SqliteOperationKindGuard::enter("backfill");
         let mut affected = {
             let connection = self.read_conn()?;
             let mut statement = connection.prepare(
@@ -6629,6 +6889,7 @@ impl Storage for SqliteStorage {
 
     /// Returns the last `records.rowid` examined (0 when the walk is done), not a count.
     fn backfill_post_sort_batch(&self, limit: usize) -> Result<u64, StorageError> {
+        let _operation = SqliteOperationKindGuard::enter("post_sort_backfill");
         let limit = limit.clamp(1, 10_000);
         let remaining = self.post_sort_backfill_remaining()?;
         if remaining == 0 {
@@ -8301,25 +8562,51 @@ impl<S: Storage + 'static> JetstreamConsumer<S> {
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_owned();
-        let ingestor = self.ingestor.clone();
-        let task = tokio::task::spawn_blocking(move || ingestor.process_json_batch(&events));
-        match tokio::time::timeout(self.event_timeout, task).await {
-            Err(_) => {
-                tracing::warn!(
-                    %did,
-                    %collection,
-                    %rkey,
-                    timeout_seconds = self.event_timeout.as_secs_f64(),
-                    "Jetstream event processing timed out"
-                );
-                Err(IngestError::WebSocket(
-                    "event processing timed out".to_owned(),
-                ))
+        let mut attempt = 0_u32;
+        let mut backoff = JETSTREAM_LOCK_RETRY_FIRST_BACKOFF;
+        loop {
+            let ingestor = self.ingestor.clone();
+            let batch = events.clone();
+            let task = tokio::task::spawn_blocking(move || ingestor.process_json_batch(&batch));
+            let result = match tokio::time::timeout(self.event_timeout, task).await {
+                Err(_) => {
+                    tracing::warn!(
+                        %did,
+                        %collection,
+                        %rkey,
+                        timeout_seconds = self.event_timeout.as_secs_f64(),
+                        "Jetstream event processing timed out"
+                    );
+                    return Err(IngestError::WebSocket(
+                        "event processing timed out".to_owned(),
+                    ));
+                }
+                Ok(Err(error)) => {
+                    return Err(IngestError::WebSocket(format!(
+                        "Jetstream event processing task failed: {error}"
+                    )));
+                }
+                Ok(Ok(result)) => result,
+            };
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) if is_jetstream_sqlite_lock(&error) => {
+                    attempt += 1;
+                    self.ingestor.storage.record_jetstream_lock_retry();
+                    tracing::warn!(
+                        %did,
+                        %collection,
+                        %rkey,
+                        attempt,
+                        backoff_ms = backoff.as_millis() as u64,
+                        error = %error,
+                        "Jetstream batch retry after SQLite lock"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(JETSTREAM_LOCK_RETRY_MAX_BACKOFF);
+                }
+                Err(error) => return Err(error),
             }
-            Ok(Err(error)) => Err(IngestError::WebSocket(format!(
-                "Jetstream event processing task failed: {error}"
-            ))),
-            Ok(Ok(result)) => result,
         }
     }
 
@@ -8625,6 +8912,35 @@ mod backfill_resource_tests {
 mod jetstream_catchup_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn a_busy_batch_retries_without_advancing_or_reconnecting_the_consumer() {
+        let storage = Arc::new(MemoryStorage::default());
+        storage.set_apply_jetstream_busy_failures(2);
+        let consumer = JetstreamConsumer::new(
+            Ingestor::new(storage.clone(), ScopeMode::Full),
+            Duration::from_millis(1),
+        );
+        let event = r#"{"did":"did:plc:av84-ingest","time_us":1234,"kind":"commit","commit":{"operation":"create","collection":"app.bsky.feed.post","rkey":"post-r1","cid":"cid-r1","record":{"$type":"app.bsky.feed.post","text":"retry me"}}}"#;
+
+        consumer
+            .process_event_batch(vec![event.to_owned()])
+            .await
+            .unwrap();
+
+        assert_eq!(storage.apply_jetstream_attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(storage.jetstream_lock_retries.load(Ordering::SeqCst), 2);
+        assert_eq!(storage.cursor().unwrap(), Some(1234));
+        assert!(
+            storage
+                .record_by_uri(
+                    "app.bsky.feed.post",
+                    "at://did:plc:av84-ingest/app.bsky.feed.post/post-r1"
+                )
+                .unwrap()
+                .is_some()
+        );
+    }
+
     #[test]
     fn stale_saved_cursor_starts_recently_and_records_the_skipped_window() {
         let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
@@ -8680,16 +8996,16 @@ mod sqlite_writer_tests {
     use super::*;
 
     fn test_path(label: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join(format!(
-                "sqlite-writer-{label}-{}-{}.sqlite3",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ))
+        let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        fs::create_dir_all(&target).unwrap();
+        target.join(format!(
+            "sqlite-writer-{label}-{}-{}.sqlite3",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
     }
 
     fn remove_database(path: &Path) {
@@ -8703,6 +9019,49 @@ mod sqlite_writer_tests {
     fn count_busy_call(_attempt: i32) -> bool {
         CHECKPOINT_BUSY_CALLS.fetch_add(1, Ordering::Relaxed);
         false
+    }
+
+    #[test]
+    fn the_writer_counts_a_busy_call_with_an_external_lock_holder() {
+        let path = test_path("busy-metric");
+        remove_database(&path);
+        let storage = SqliteStorage::open(&path).unwrap();
+        storage
+            .writer
+            .call(|connection| {
+                connection.busy_timeout(Duration::from_millis(1))?;
+                Ok(())
+            })
+            .unwrap();
+        let holder = Connection::open(&path).unwrap();
+        holder
+            .execute_batch("PRAGMA busy_timeout=5000; BEGIN IMMEDIATE;")
+            .unwrap();
+
+        let record = IndexedRecord {
+            did: "did:plc:av84-busy-metric".to_owned(),
+            collection: "app.bsky.feed.post".to_owned(),
+            rkey: "busy-r1".to_owned(),
+            uri: "at://did:plc:av84-busy-metric/app.bsky.feed.post/busy-r1".to_owned(),
+            cid: Some("cid-busy".to_owned()),
+            time_us: 1,
+            record: serde_json::json!({"$type":"app.bsky.feed.post","text":"busy"}),
+        };
+        let error = storage.put_record(&record).unwrap_err();
+        assert!(is_sqlite_busy_error(&error), "unexpected error: {error}");
+        assert_eq!(
+            storage.writer.metrics.sqlite_busy.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            checkpoint_lock_holder(&storage.wal_metrics),
+            "unknown_or_external_writer"
+        );
+
+        holder.execute_batch("COMMIT;").unwrap();
+        drop(holder);
+        drop(storage);
+        remove_database(&path);
     }
 
     #[test]
@@ -8729,20 +9088,88 @@ mod sqlite_writer_tests {
         let checkpointer = Connection::open(&path).unwrap();
         checkpointer.busy_handler(Some(count_busy_call)).unwrap();
         CHECKPOINT_BUSY_CALLS.store(0, Ordering::Relaxed);
+        let wal_metrics = WalMetrics::default();
 
         // The open reader pins an old snapshot, so PASSIVE cannot catch up. A
         // TRUNCATE here would copy the whole backlog while holding writers out
         // and then wait for the reader: the stall this checkpointer prevents.
-        let behind = checkpoint_wal(&checkpointer).unwrap();
+        let behind = checkpoint_wal(&checkpointer, &path, &wal_metrics).unwrap();
         assert!(behind.frames > behind.checkpointed, "{behind:?}");
         assert!(!behind.reset);
         assert_eq!(CHECKPOINT_BUSY_CALLS.load(Ordering::Relaxed), 0);
 
         reader.execute_batch("COMMIT").unwrap();
-        let caught_up = checkpoint_wal(&checkpointer).unwrap();
-        assert!(caught_up.reset, "{caught_up:?}");
+        let caught_up = checkpoint_wal(&checkpointer, &path, &wal_metrics).unwrap();
+        assert_eq!(caught_up.frames, caught_up.checkpointed, "{caught_up:?}");
+        assert!(
+            !caught_up.reset,
+            "a caught-up WAL under the 64 MiB limit is reused without TRUNCATE: {caught_up:?}"
+        );
 
         drop((reader, checkpointer, writer));
+        remove_database(&path);
+    }
+
+    #[test]
+    fn a_40_mib_reusable_wal_does_not_take_truncate_lock_during_a_writer() {
+        let path = test_path("large-wal-concurrent-writer");
+        remove_database(&path);
+        let mut writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA wal_autocheckpoint=0;
+                 PRAGMA journal_size_limit=67108864;
+                 CREATE TABLE t(k INTEGER PRIMARY KEY, v BLOB);",
+            )
+            .unwrap();
+        {
+            let transaction = writer.transaction().unwrap();
+            for index in 0..10_000 {
+                transaction
+                    .execute("INSERT INTO t VALUES (?1, zeroblob(2048))", [index])
+                    .unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+        let before = wal_file_bytes(&path);
+        assert!(before >= 32 * 1024 * 1024, "WAL only had {before} bytes");
+        assert!(
+            before <= WAL_JOURNAL_SIZE_LIMIT_BYTES,
+            "reusable WAL unexpectedly exceeded its configured cap: {before} bytes"
+        );
+
+        let competing_writer = Connection::open(&path).unwrap();
+        competing_writer
+            .execute_batch("PRAGMA busy_timeout=5000; BEGIN IMMEDIATE;")
+            .unwrap();
+        competing_writer
+            .execute("INSERT INTO t VALUES (10001, zeroblob(2048))", [])
+            .unwrap();
+        let checkpointer = Connection::open(&path).unwrap();
+        checkpointer.busy_timeout(CHECKPOINT_BUSY_TIMEOUT).unwrap();
+        let metrics = WalMetrics::default();
+
+        let during_started = Instant::now();
+        let during_writer = checkpoint_wal(&checkpointer, &path, &metrics).unwrap();
+        let during_elapsed = during_started.elapsed();
+        assert_eq!(during_writer.truncate_elapsed, Duration::ZERO);
+        assert_eq!(metrics.ckpt_truncate_max_ns.load(Ordering::Relaxed), 0);
+        competing_writer.execute_batch("COMMIT;").unwrap();
+        let caught_up_started = Instant::now();
+        let caught_up = checkpoint_wal(&checkpointer, &path, &metrics).unwrap();
+        let caught_up_elapsed = caught_up_started.elapsed();
+        assert_eq!(caught_up.frames, caught_up.checkpointed, "{caught_up:?}");
+        assert_eq!(caught_up.truncate_elapsed, Duration::ZERO);
+        assert!(!caught_up.reset);
+
+        eprintln!(
+            "WAL repro: bytes={before} passive_during_writer_ms={} passive_after_ms={} truncate_ms={}",
+            during_elapsed.as_micros() as f64 / 1_000.0,
+            caught_up_elapsed.as_micros() as f64 / 1_000.0,
+            caught_up.truncate_elapsed.as_micros() as f64 / 1_000.0,
+        );
+        drop((competing_writer, checkpointer, writer));
         remove_database(&path);
     }
 
@@ -8781,10 +9208,22 @@ mod sqlite_writer_tests {
         read_metrics.record_wait(Duration::from_millis(3));
         let wal_metrics = WalMetrics::default();
         wal_metrics.record_checkpoint(8_192, 3, 2, true);
+        wal_metrics.sqlite_busy.store(1, Ordering::Relaxed);
+        wal_metrics.slow_txn.store(2, Ordering::Relaxed);
+        wal_metrics
+            .ckpt_passive_max_ns
+            .store(10_000_000, Ordering::Relaxed);
+        wal_metrics
+            .ckpt_truncate_max_ns
+            .store(250_000_000, Ordering::Relaxed);
         wal_metrics
             .backfill_wait_ns
             .store(1_500_000, Ordering::Relaxed);
-        SqliteWriterMetrics::default().report(&read_metrics, &wal_metrics);
+        let metrics = SqliteWriterMetrics::default();
+        metrics.sqlite_busy.store(2, Ordering::Relaxed);
+        metrics.slow_txn.store(3, Ordering::Relaxed);
+        metrics.jetstream_lock_retries.store(7, Ordering::Relaxed);
+        metrics.report(&read_metrics, &wal_metrics);
 
         let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
         assert!(text.contains("SQLite writer minute metrics"), "{text}");
@@ -8794,6 +9233,11 @@ mod sqlite_writer_tests {
         assert!(text.contains("wal_bytes=8192"), "{text}");
         assert!(text.contains("wal_frames=3"), "{text}");
         assert!(text.contains("ckpt_frames=2"), "{text}");
+        assert!(text.contains("sqlite_busy=3"), "{text}");
+        assert!(text.contains("slow_txn=5"), "{text}");
+        assert!(text.contains("ckpt_passive_ms_max=10"), "{text}");
+        assert!(text.contains("ckpt_truncate_ms_max=250"), "{text}");
+        assert!(text.contains("jetstream_lock_retries=7"), "{text}");
         assert!(text.contains("wal_reset=true"), "{text}");
         assert!(text.contains("backfill_wait_ms=1.5"), "{text}");
     }
