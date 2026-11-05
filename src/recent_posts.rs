@@ -182,6 +182,15 @@ pub fn on_profile_visit<S: Storage>(
     subject: &str,
     local_post_count: usize,
 ) -> RecentPostsVisit {
+    // Profile links may carry either a DID or a handle in `?did=`. Recent
+    // post workers call PDS APIs that require a DID, so never put a handle in
+    // the DID-only queue.
+    if !subject.starts_with("did:") {
+        return RecentPostsVisit {
+            label: "cached",
+            show_loading_note: false,
+        };
+    }
     // A tracked account (registered or followed by a registered user) already
     // arrives through the firehose; fetching it again would only add PDS load
     // and writer traffic for records the index has.
@@ -286,6 +295,9 @@ where
     F: crate::oauth::OAuthFlow,
     S: Storage + 'static,
 {
+    if !subject.starts_with("did:") {
+        return OlderFetch::Skipped;
+    }
     let subject_owned = subject.to_owned();
     let state = match crate::ingest::web_storage_call(
         std::sync::Arc::clone(&storage),
