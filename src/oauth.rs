@@ -2296,6 +2296,10 @@ impl<B: crate::identity::IdentityBackend + 'static> crate::feeds::ProxiedPostsFe
                 .await
         })
     }
+
+    fn singleflight_key(&self) -> Option<String> {
+        Some(format!("viewer:{}", self.viewer_did))
+    }
 }
 
 #[derive(Deserialize, Serialize)]

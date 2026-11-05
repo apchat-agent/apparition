@@ -47,6 +47,12 @@ pub type ProxiedPostViewsFetch<'a> =
 /// warns once for the batch and falls back so no post is lost.
 pub trait ProxiedPostsFetcher: Send + Sync {
     fn fetch_post_views<'a>(&'a self, uris: &'a [String]) -> ProxiedPostViewsFetch<'a>;
+
+    /// Stable identity for equivalent viewer-scoped proxy routes. Implementors that cannot
+    /// provide one retain pointer-scoped request coalescing.
+    fn singleflight_key(&self) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,6 +264,25 @@ type InFlightPostFetches = tokio::sync::Mutex<
         Arc<tokio::sync::OnceCell<(HashMap<String, FetchedPublicPost>, PostRouteStats)>>,
     >,
 >;
+type InFlightPagePostFetches = tokio::sync::Mutex<
+    HashMap<
+        String,
+        Arc<tokio::sync::OnceCell<(HashMap<String, FetchedPublicPost>, PostRouteStats, u64)>>,
+    >,
+>;
+
+fn post_fetch_flight_key(proxy: &str, uris: &[String]) -> String {
+    let mut unique_uris = uris.to_vec();
+    unique_uris.sort_unstable();
+    unique_uris.dedup();
+    let mut key = format!("{proxy}:");
+    for uri in unique_uris {
+        key.push_str(&uri.len().to_string());
+        key.push(':');
+        key.push_str(&uri);
+    }
+    key
+}
 
 fn unix_time_us() -> u64 {
     std::time::SystemTime::now()
@@ -547,6 +572,7 @@ pub struct FeedClient<B: IdentityBackend> {
     generator_cache: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, ResolvedFeed)>>,
     live_post_cache: LivePostCache,
     in_flight_post_fetches: InFlightPostFetches,
+    in_flight_page_post_fetches: InFlightPagePostFetches,
     // Failed resolutions are remembered too: the layout resolves every pinned feed on every page,
     // so an uncached failure would repeat its full network cost on each request.
     generator_failures: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, String)>>,
@@ -564,6 +590,7 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
             generator_cache: tokio::sync::Mutex::new(HashMap::new()),
             live_post_cache: tokio::sync::Mutex::new(HashMap::new()),
             in_flight_post_fetches: tokio::sync::Mutex::new(HashMap::new()),
+            in_flight_page_post_fetches: tokio::sync::Mutex::new(HashMap::new()),
             generator_failures: tokio::sync::Mutex::new(HashMap::new()),
             cache_store: None,
             background_resolutions: tokio::sync::Mutex::new(HashSet::new()),
@@ -988,18 +1015,15 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
             return (HashMap::new(), PostRouteStats::default());
         }
 
-        let proxy_id = proxy
-            .as_ref()
-            .map_or(0, |proxy| Arc::as_ptr(proxy) as *const () as usize);
-        let mut unique_uris = uris.to_vec();
-        unique_uris.sort_unstable();
-        unique_uris.dedup();
-        let mut key = format!("{proxy_id}:");
-        for uri in unique_uris {
-            key.push_str(&uri.len().to_string());
-            key.push(':');
-            key.push_str(&uri);
-        }
+        let proxy_key = proxy.as_ref().map_or_else(
+            || "public".to_owned(),
+            |proxy| {
+                proxy.singleflight_key().unwrap_or_else(|| {
+                    format!("unkeyed-{}", Arc::as_ptr(proxy) as *const () as usize)
+                })
+            },
+        );
+        let key = post_fetch_flight_key(&proxy_key, uris);
 
         let cell = {
             let mut in_flight = self.in_flight_post_fetches.lock().await;
@@ -1166,6 +1190,41 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
     /// `fetch_posts`, this does not retry through the public AppView or each
     /// author's PDS: page rendering uses it once, then defers anything missing.
     pub async fn fetch_page_posts_once(
+        &self,
+        proxy: Option<Arc<dyn ProxiedPostsFetcher>>,
+        uris: &[String],
+    ) -> (HashMap<String, FetchedPublicPost>, PostRouteStats, u64) {
+        let proxy_key = proxy.as_ref().map_or_else(
+            || "public".to_owned(),
+            |proxy| {
+                proxy.singleflight_key().unwrap_or_else(|| {
+                    format!("unkeyed-{}", Arc::as_ptr(proxy) as *const () as usize)
+                })
+            },
+        );
+        let key = post_fetch_flight_key(&proxy_key, uris);
+        let cell = {
+            let mut in_flight = self.in_flight_page_post_fetches.lock().await;
+            in_flight
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+                .clone()
+        };
+        let result = cell
+            .get_or_init(|| async { self.fetch_page_posts_once_uncached(proxy, uris).await })
+            .await
+            .clone();
+        let mut in_flight = self.in_flight_page_post_fetches.lock().await;
+        if in_flight
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, &cell))
+        {
+            in_flight.remove(&key);
+        }
+        result
+    }
+
+    async fn fetch_page_posts_once_uncached(
         &self,
         proxy: Option<Arc<dyn ProxiedPostsFetcher>>,
         uris: &[String],
@@ -1526,7 +1585,7 @@ mod tests {
     struct TestResolver;
 
     struct CountingPostsProxy {
-        calls: AtomicUsize,
+        calls: Arc<AtomicUsize>,
     }
 
     impl ProxiedPostsFetcher for CountingPostsProxy {
@@ -1536,6 +1595,10 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(80)).await;
                 Ok(Some(uris.iter().map(|uri| public_post(uri)).collect()))
             })
+        }
+
+        fn singleflight_key(&self) -> Option<String> {
+            Some("test-viewer".to_owned())
         }
     }
 
@@ -2065,11 +2128,13 @@ mod tests {
         let (pds, server) = fake_pds().await;
         let identity = fake_batch_identity(["did:plc:pagebatch".to_owned()], &pds);
         let client = Arc::new(test_client_with_appview(identity, pds));
-        let proxy = Arc::new(CountingPostsProxy {
-            calls: AtomicUsize::new(0),
+        let calls = Arc::new(AtomicUsize::new(0));
+        let first_proxy: Arc<dyn ProxiedPostsFetcher> = Arc::new(CountingPostsProxy {
+            calls: calls.clone(),
         });
-        let first_proxy: Arc<dyn ProxiedPostsFetcher> = proxy.clone();
-        let second_proxy: Arc<dyn ProxiedPostsFetcher> = proxy.clone();
+        let second_proxy: Arc<dyn ProxiedPostsFetcher> = Arc::new(CountingPostsProxy {
+            calls: calls.clone(),
+        });
         let uris = vec![uri.to_owned()];
         let first_client = client.clone();
         let second_client = client.clone();
@@ -2091,7 +2156,7 @@ mod tests {
         assert_eq!(first.0.len(), 1);
         assert_eq!(second.0.len(), 1);
         assert_eq!(
-            proxy.calls.load(Ordering::SeqCst),
+            calls.load(Ordering::SeqCst),
             1,
             "identical concurrent page batches should share one proxied getPosts request"
         );
