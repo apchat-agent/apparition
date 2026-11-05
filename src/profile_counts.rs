@@ -23,6 +23,8 @@ const MAX_PROFILE_COUNT_BATCH_SIZE: usize = 25;
 const MAX_PROFILE_COUNT_CACHE_SIZE: usize = 4096;
 const MAX_PROFILE_COUNT_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_PROFILE_COUNT_TIMEOUT: Duration = Duration::from_secs(3);
+const PROFILE_COUNT_NEGATIVE_TTL: Duration = Duration::from_secs(30);
+const MAX_PROFILE_COUNT_INFLIGHT: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProfileCounts {
@@ -39,12 +41,17 @@ pub struct ProfileCountsClient {
     timeout: Duration,
     enabled: bool,
     cache: Arc<Mutex<HashMap<String, CachedCounts>>>,
+    inflight: Arc<
+        tokio::sync::Mutex<
+            HashMap<String, Arc<tokio::sync::OnceCell<Option<HashMap<String, ProfileCounts>>>>>,
+        >,
+    >,
 }
 
 #[derive(Clone, Copy)]
 struct CachedCounts {
     expires_at: Instant,
-    counts: ProfileCounts,
+    counts: Option<ProfileCounts>,
 }
 
 impl ProfileCountsClient {
@@ -60,6 +67,7 @@ impl ProfileCountsClient {
             timeout: MAX_PROFILE_COUNT_TIMEOUT,
             enabled: true,
             cache: Arc::new(Mutex::new(HashMap::new())),
+            inflight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -78,6 +86,7 @@ impl ProfileCountsClient {
             timeout: MAX_PROFILE_COUNT_TIMEOUT,
             enabled: false,
             cache: Arc::new(Mutex::new(HashMap::new())),
+            inflight: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -103,7 +112,9 @@ impl ProfileCountsClient {
                     continue;
                 }
                 if let Some(entry) = cache.get(did) {
-                    results.insert(did.clone(), entry.counts);
+                    if let Some(counts) = entry.counts {
+                        results.insert(did.clone(), counts);
+                    }
                 } else {
                     missing.push(did.clone());
                 }
@@ -113,11 +124,41 @@ impl ProfileCountsClient {
         }
 
         for batch in missing.chunks(MAX_PROFILE_COUNT_BATCH_SIZE) {
-            if let Some(fetched) = self.fetch_batch(batch).await {
-                for (did, counts) in fetched {
-                    self.cache_counts(did.clone(), counts);
-                    results.insert(did, counts);
+            let flight_key = batch.join("\0");
+            let cell = {
+                let mut inflight = self.inflight.lock().await;
+                if inflight.len() >= MAX_PROFILE_COUNT_INFLIGHT {
+                    inflight.retain(|_, cell| Arc::strong_count(cell) > 1 || cell.get().is_some());
                 }
+                Arc::clone(
+                    inflight
+                        .entry(flight_key.clone())
+                        .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
+                )
+            };
+            let fetched = cell
+                .get_or_init(|| self.fetch_batch(batch))
+                .await
+                .clone()
+                .unwrap_or_default();
+            for did in batch {
+                let counts = fetched.get(did).copied();
+                let ttl = if counts.is_some() {
+                    self.cache_ttl
+                } else {
+                    self.cache_ttl.min(PROFILE_COUNT_NEGATIVE_TTL)
+                };
+                self.cache_counts(did.clone(), counts, ttl);
+                if let Some(counts) = counts {
+                    results.insert(did.clone(), counts);
+                }
+            }
+            let mut inflight = self.inflight.lock().await;
+            if inflight
+                .get(&flight_key)
+                .is_some_and(|current| Arc::ptr_eq(current, &cell))
+            {
+                inflight.remove(&flight_key);
             }
         }
         results
@@ -186,8 +227,8 @@ impl ProfileCountsClient {
         Some(counts)
     }
 
-    fn cache_counts(&self, did: String, counts: ProfileCounts) {
-        if self.cache_ttl.is_zero() {
+    fn cache_counts(&self, did: String, counts: Option<ProfileCounts>, ttl: Duration) {
+        if ttl.is_zero() {
             return;
         }
         let Ok(mut cache) = self.cache.lock() else {
@@ -207,7 +248,7 @@ impl ProfileCountsClient {
         cache.insert(
             did,
             CachedCounts {
-                expires_at: now + self.cache_ttl,
+                expires_at: now + ttl,
                 counts,
             },
         );
