@@ -270,6 +270,8 @@ type InFlightPagePostFetches = tokio::sync::Mutex<
         Arc<tokio::sync::OnceCell<(HashMap<String, FetchedPublicPost>, PostRouteStats, u64)>>,
     >,
 >;
+type InFlightGeneratorResolutions =
+    tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Result<ResolvedFeed, String>>>>>;
 
 fn post_fetch_flight_key(proxy: &str, uris: &[String]) -> String {
     let mut unique_uris = uris.to_vec();
@@ -570,6 +572,7 @@ pub struct FeedClient<B: IdentityBackend> {
     http: SafeHttpClient,
     public_appview_base: String,
     generator_cache: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, ResolvedFeed)>>,
+    in_flight_generator_resolutions: InFlightGeneratorResolutions,
     live_post_cache: LivePostCache,
     in_flight_post_fetches: InFlightPostFetches,
     in_flight_page_post_fetches: InFlightPagePostFetches,
@@ -588,6 +591,7 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
             http,
             public_appview_base: crate::profile_counts::PUBLIC_APPVIEW_BASE.to_owned(),
             generator_cache: tokio::sync::Mutex::new(HashMap::new()),
+            in_flight_generator_resolutions: tokio::sync::Mutex::new(HashMap::new()),
             live_post_cache: tokio::sync::Mutex::new(HashMap::new()),
             in_flight_post_fetches: tokio::sync::Mutex::new(HashMap::new()),
             in_flight_page_post_fetches: tokio::sync::Mutex::new(HashMap::new()),
@@ -696,27 +700,48 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
         {
             return Err(error);
         }
-        let started = std::time::Instant::now();
-        let result = self.resolve_feed_uncached(uri).await;
-        if let Err(error) = &result {
-            tracing::warn!(
-                feed = uri,
-                %error,
-                duration_ms = started.elapsed().as_millis() as u64,
-                "feed generator resolution failed"
-            );
-            let mut failures = self.generator_failures.lock().await;
-            failures.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
-            if failures.len() < 1024 {
-                failures.insert(
-                    uri.to_owned(),
-                    (
-                        tokio::time::Instant::now() + Duration::from_secs(10 * 60),
-                        error.clone(),
-                    ),
-                );
-            }
-            self.save_resolution(uri, &CachedGeneratorResolution::Failure(error.clone()));
+        let key = uri.to_owned();
+        let cell = {
+            let mut in_flight = self.in_flight_generator_resolutions.lock().await;
+            in_flight
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+                .clone()
+        };
+        let result = cell
+            .get_or_init(|| async {
+                let started = std::time::Instant::now();
+                let result = self.resolve_feed_uncached(&key).await;
+                if let Err(error) = &result {
+                    tracing::warn!(
+                        feed = %key,
+                        %error,
+                        duration_ms = started.elapsed().as_millis() as u64,
+                        "feed generator resolution failed"
+                    );
+                    let mut failures = self.generator_failures.lock().await;
+                    failures.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
+                    if failures.len() < 1024 {
+                        failures.insert(
+                            key.clone(),
+                            (
+                                tokio::time::Instant::now() + Duration::from_secs(10 * 60),
+                                error.clone(),
+                            ),
+                        );
+                    }
+                    self.save_resolution(&key, &CachedGeneratorResolution::Failure(error.clone()));
+                }
+                result
+            })
+            .await
+            .clone();
+        let mut in_flight = self.in_flight_generator_resolutions.lock().await;
+        if in_flight
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, &cell))
+        {
+            in_flight.remove(&key);
         }
         result
     }
