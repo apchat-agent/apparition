@@ -23464,6 +23464,23 @@ mod tests {
     #[derive(Clone)]
     struct FeedTestIdentity(HashMap<String, DidDocument>);
 
+    #[derive(Clone)]
+    struct FeedTestResolver;
+
+    impl crate::net::HostResolver for FeedTestResolver {
+        fn resolve<'a>(
+            &'a self,
+            _: &'a str,
+            _: u16,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Vec<std::net::IpAddr>, String>> + Send + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(vec![std::net::Ipv4Addr::LOCALHOST.into()]) })
+        }
+    }
+
     impl IdentityBackend for FeedTestIdentity {
         async fn did_document(&self, did: &str) -> Result<Option<DidDocument>, ResolutionError> {
             Ok(self.0.get(did).cloned())
@@ -23578,7 +23595,8 @@ mod tests {
     ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let pds = format!("http://127.0.0.1:{}", address.port());
+        let pds_host = format!("feed-test-{}.example.test", address.port());
+        let pds = format!("http://{pds_host}:{}", address.port());
         let service_endpoint = format!("{pds}/fg");
         let state = Arc::new(Mutex::new(FeedTestState {
             pds_url: pds.clone(),
@@ -23995,7 +24013,8 @@ mod tests {
             identity_resolver,
             store,
             &pds,
-            SafeHttpClient::new().with_http_test_hosts(["127.0.0.1".to_owned()]),
+            SafeHttpClient::with_resolver(FeedTestResolver)
+                .with_http_test_hosts([pds_host.clone()]),
             &public_appview_base,
         )
         .unwrap()
@@ -24007,7 +24026,7 @@ mod tests {
         flow.feed_client = Arc::new(
             FeedClient::new_with_store(
                 feed_identity,
-                SafeHttpClient::new().with_http_test_hosts(["127.0.0.1".to_owned()]),
+                SafeHttpClient::with_resolver(FeedTestResolver).with_http_test_hosts([pds_host]),
                 feed_store,
             )
             .with_public_appview_base(public_appview_base),
@@ -25982,7 +26001,8 @@ mod tests {
         )
         .await
         .unwrap();
-        flow.http_client = SafeHttpClient::new().with_http_test_hosts(["localhost".to_owned()]);
+        flow.http_client = SafeHttpClient::with_resolver(FeedTestResolver)
+            .with_http_test_hosts(["localhost".to_owned()]);
         flow.video_service_url = format!("http://localhost:{}", pds_url.port().unwrap());
         let backoff_url =
             reqwest::Url::parse(&format!("{}/xrpc/video-rate-limit", flow.video_service_url))
@@ -26022,7 +26042,10 @@ mod tests {
     #[tokio::test]
     async fn video_upload_uses_pds_upload_blob_service_auth_parameters() {
         let (mut flow, state, server) = feed_test_flow(false).await;
-        flow.video_service_url = state.lock().unwrap().pds_url.clone();
+        let pds_url = reqwest::Url::parse(&state.lock().unwrap().pds_url).unwrap();
+        flow.http_client = SafeHttpClient::with_resolver(FeedTestResolver)
+            .with_http_test_hosts(["localhost".to_owned()]);
+        flow.video_service_url = format!("http://localhost:{}", pds_url.port().unwrap());
         let (mut temporary, mut file) = create_temporary_video_file().unwrap();
         file.write_all(b"video").await.unwrap();
         drop(file);
@@ -26054,7 +26077,7 @@ mod tests {
                     "app.bsky.video.getUploadLimits".to_owned()
                 ),
                 (
-                    "did:web:127.0.0.1".to_owned(),
+                    format!("did:web:{}", pds_url.host_str().unwrap()),
                     "com.atproto.repo.uploadBlob".to_owned()
                 ),
             ]
