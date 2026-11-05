@@ -1223,7 +1223,14 @@ fn plc_did_document_url(plc_directory: &Url, did: &str) -> Result<Url, Resolutio
 
 #[cfg(test)]
 mod tests {
-    use super::{HttpIdentityBackend, plc_did_document_url};
+    use super::{
+        DidDocument, HttpIdentityBackend, IdentityBackend, IdentityResolver, ResolutionError,
+        SqliteIdentityCache, plc_did_document_url,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     #[test]
     fn plc_did_is_appended_as_a_path_segment_for_each_base_shape() {
@@ -1252,5 +1259,58 @@ mod tests {
             let actual = plc_did_document_url(&backend.plc_directory, DID).unwrap();
             assert_eq!(actual.as_str(), expected, "base URL: {base}");
         }
+    }
+
+    #[derive(Clone)]
+    struct RetryBackend {
+        calls: Arc<AtomicUsize>,
+        document: DidDocument,
+    }
+
+    impl IdentityBackend for RetryBackend {
+        async fn did_document(&self, _: &str) -> Result<Option<DidDocument>, ResolutionError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(ResolutionError::Backend(
+                    "host plc.example.test:443 backing off for 3600 s after 503".to_owned(),
+                ))
+            } else {
+                Ok(Some(self.document.clone()))
+            }
+        }
+
+        async fn dns_txt_did(&self, _: &str) -> Result<Option<String>, ResolutionError> {
+            Ok(None)
+        }
+
+        async fn well_known_did(&self, _: &str) -> Result<Option<String>, ResolutionError> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_identity_backend_errors_are_not_persisted_as_negative_results() {
+        const DID: &str = "did:plc:identityretrytest";
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let backend = RetryBackend {
+            calls: Arc::clone(&calls),
+            document: DidDocument {
+                id: DID.to_owned(),
+                also_known_as: Vec::new(),
+                verification_method: Vec::new(),
+                service: Vec::new(),
+            },
+        };
+        let persistent = Arc::new(SqliteIdentityCache::open(":memory:").unwrap());
+        let resolver = IdentityResolver::new(backend, std::time::Duration::from_secs(60))
+            .with_persistent_cache(persistent);
+
+        assert!(resolver.resolve_did_document(DID).await.is_err());
+        assert_eq!(
+            resolver.resolve_did_document(DID).await.unwrap().id,
+            DID,
+            "a later request must be able to retry after a remote backoff error"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }
