@@ -22,7 +22,7 @@ pub struct SearchCallError {
     pub detail: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct SearchPostsPage {
     pub posts: Vec<FetchedPublicPost>,
     pub cursor: Option<String>,

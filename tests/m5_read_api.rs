@@ -1372,3 +1372,138 @@ async fn proxied_timeline_uses_the_jwt_issuer_as_the_account_did() {
             .all(|item| { item["post"]["author"]["did"] == ALICE })
     );
 }
+
+#[tokio::test]
+async fn xrpc_lists_hide_future_posts_while_exact_post_opens_remain_available() {
+    let storage = fixture_storage();
+    let future_uri = format!("at://{ALICE}/app.bsky.feed.post/future");
+    storage
+        .put_record(&IndexedRecord {
+            did: ALICE.into(),
+            collection: "app.bsky.feed.post".into(),
+            rkey: "future".into(),
+            uri: future_uri.clone(),
+            cid: Some("cid-future".into()),
+            time_us: 1_800_000_000_000_010,
+            record: json!({"$type":"app.bsky.feed.post","text":"future direct post","createdAt":"2999-01-01T00:00:00Z"}),
+        })
+        .unwrap();
+    for (rkey, time_us, text, created_at) in [
+        (
+            "future-reply",
+            1_800_000_000_000_012,
+            "future thread reply",
+            "2999-01-01T00:00:00Z",
+        ),
+        (
+            "ordinary-reply",
+            1_800_000_000_000_011,
+            "ordinary thread reply",
+            "2026-11-04T00:00:00Z",
+        ),
+    ] {
+        storage
+            .put_record(&IndexedRecord {
+                did: FRIEND.into(),
+                collection: "app.bsky.feed.post".into(),
+                rkey: rkey.into(),
+                uri: format!("at://{FRIEND}/app.bsky.feed.post/{rkey}"),
+                cid: Some(format!("cid-{rkey}")),
+                time_us,
+                record: json!({
+                    "$type":"app.bsky.feed.post",
+                    "text":text,
+                    "createdAt":created_at,
+                    "reply":{"root":{"uri":format!("at://{ALICE}/app.bsky.feed.post/p1")},"parent":{"uri":format!("at://{ALICE}/app.bsky.feed.post/p1")}}
+                }),
+            })
+            .unwrap();
+    }
+    storage
+        .put_record(&IndexedRecord {
+            did: FRIEND.into(),
+            collection: "app.bsky.feed.like".into(),
+            rkey: "like-future".into(),
+            uri: format!("at://{FRIEND}/app.bsky.feed.like/like-future"),
+            cid: Some("cid-like-future".into()),
+            time_us: 1_800_000_000_000_013,
+            record: json!({"subject":{"uri":future_uri,"cid":"cid-future"},"createdAt":"2026-11-04T00:00:00Z"}),
+        })
+        .unwrap();
+    let (router, signing_key) = api_for_storage(storage);
+
+    let (status, author_feed) = request(
+        router.clone(),
+        "/xrpc/app.bsky.feed.getAuthorFeed?actor=did%3Aplc%3Aalice&limit=1",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{author_feed}");
+    assert_eq!(author_feed["feed"].as_array().unwrap().len(), 1);
+    assert_eq!(author_feed["feed"][0]["post"]["record"]["text"], "hello");
+
+    let timeline_jwt = token(
+        &signing_key,
+        APPVIEW,
+        "app.bsky.feed.getTimeline",
+        expiry(60),
+        Some(ALICE),
+    );
+    let (status, timeline) = request(
+        router.clone(),
+        "/xrpc/app.bsky.feed.getTimeline?limit=1",
+        Some(&timeline_jwt),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{timeline}");
+    assert_eq!(timeline["feed"].as_array().unwrap().len(), 1);
+    assert_ne!(
+        timeline["feed"][0]["post"]["record"]["text"],
+        "future direct post"
+    );
+
+    let encoded_future_uri =
+        url::form_urlencoded::byte_serialize(future_uri.as_bytes()).collect::<String>();
+    let (status, posts) = request(
+        router.clone(),
+        &format!("/xrpc/app.bsky.feed.getPosts?uris={encoded_future_uri}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{posts}");
+    assert_eq!(posts["posts"][0]["record"]["text"], "future direct post");
+
+    let parent_uri = format!("at://{ALICE}/app.bsky.feed.post/p1");
+    let encoded_parent_uri =
+        url::form_urlencoded::byte_serialize(parent_uri.as_bytes()).collect::<String>();
+    let (status, thread) = request(
+        router.clone(),
+        &format!("/xrpc/app.bsky.feed.getPostThread?uri={encoded_parent_uri}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{thread}");
+    let reply_texts = serde_json::to_string(&thread["thread"]["replies"]).unwrap();
+    assert!(reply_texts.contains("ordinary thread reply"), "{thread}");
+    assert!(!reply_texts.contains("future thread reply"), "{thread}");
+
+    let notification_jwt = token(
+        &signing_key,
+        APPVIEW,
+        "app.bsky.notification.listNotifications",
+        expiry(60),
+        Some(ALICE),
+    );
+    let (status, notifications) = request(
+        router,
+        "/xrpc/app.bsky.notification.listNotifications?limit=10",
+        Some(&notification_jwt),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{notifications}");
+    let notification_text = serde_json::to_string(&notifications["notifications"]).unwrap();
+    assert!(
+        !notification_text.contains("future direct post"),
+        "{notifications}"
+    );
+}

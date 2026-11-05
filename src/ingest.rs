@@ -55,6 +55,10 @@ const SQLITE_SLOW_WRITE_THRESHOLD: Duration = Duration::from_secs(1);
 const CHECKPOINT_NONE: usize = 0;
 const CHECKPOINT_PASSIVE: usize = 1;
 const CHECKPOINT_TRUNCATE: usize = 2;
+/// Hide a post while its own creation timestamp is more than 30 days ahead; the grace window
+/// lets legitimately scheduled posts become visible shortly before their publication date.
+pub const FUTURE_POST_HIDE_WINDOW_US: u64 = 30 * 24 * 60 * 60 * 1_000_000;
+static FUTURE_POSTS_HIDDEN: AtomicU64 = AtomicU64::new(0);
 static NEXT_MEMORY_DATABASE_ID: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
@@ -80,6 +84,81 @@ impl Drop for SqliteOperationKindGuard {
 
 fn current_sqlite_operation_kind(default: &'static str) -> &'static str {
     SQLITE_OPERATION_KIND.with(|current| current.get().unwrap_or(default))
+}
+
+/// Current wall time for page-level visibility decisions, in Unix microseconds.
+pub fn visibility_now_us() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
+        .min(u64::MAX as u128) as u64
+}
+
+/// Whether this post's own `createdAt` is more than the visibility grace window ahead of `now`.
+/// Missing or malformed timestamps remain visible, and the supplied clock makes this policy
+/// deterministic in tests.
+pub fn post_is_too_far_in_future(record: &IndexedRecord, now_us: u64) -> bool {
+    if record.collection != "app.bsky.feed.post" {
+        return false;
+    }
+    let Some(created_at) = record.record.get("createdAt").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(created_us) = crate::backfill::parse_rfc3339_micros(created_at) else {
+        return false;
+    };
+    let hidden = created_us > now_us.saturating_add(FUTURE_POST_HIDE_WINDOW_US);
+    if hidden {
+        FUTURE_POSTS_HIDDEN.fetch_add(1, Ordering::Relaxed);
+    }
+    hidden
+}
+
+/// Read enough cursor-ordered candidates to return a visible page and one-item lookahead. The
+/// fetch closure remains page-sized, while advancing its cursor across every examined row keeps
+/// future-dated rows from repeating or displacing ordinary posts on later pages.
+pub fn filtered_post_page<C, F, G>(
+    cursor: Option<C>,
+    limit: usize,
+    now_us: u64,
+    mut fetch: F,
+    mut cursor_after: G,
+) -> Result<(Vec<IndexedRecord>, bool), StorageError>
+where
+    C: Clone,
+    F: FnMut(Option<&C>, usize) -> Result<Vec<IndexedRecord>, StorageError>,
+    G: FnMut(&IndexedRecord) -> C,
+{
+    let limit = limit.clamp(1, 100);
+    let batch_limit = (limit + 1).min(101);
+    let mut scan_cursor = cursor;
+    let mut visible = Vec::with_capacity(limit + 1);
+    loop {
+        let batch = fetch(scan_cursor.as_ref(), batch_limit)?;
+        if batch.is_empty() {
+            break;
+        }
+        let batch_len = batch.len();
+        for record in batch {
+            scan_cursor = Some(cursor_after(&record));
+            if !post_is_too_far_in_future(&record, now_us) {
+                visible.push(record);
+                if visible.len() > limit {
+                    break;
+                }
+            }
+        }
+        if visible.len() > limit || batch_len < batch_limit {
+            break;
+        }
+    }
+    let has_more = visible.len() > limit;
+    Ok((visible, has_more))
+}
+
+fn take_future_posts_hidden() -> u64 {
+    FUTURE_POSTS_HIDDEN.swap(0, Ordering::Relaxed)
 }
 
 struct EphemeralDatabase(PathBuf);
@@ -3120,6 +3199,7 @@ impl SqliteWriterMetrics {
             recent_posts_done,
             recent_posts_failed,
             recent_posts_dropped,
+            future_hidden = take_future_posts_hidden(),
             web_read_timeout_count = WEB_READ_TIMEOUT_COUNT.load(Ordering::Relaxed),
             outbound_host_calls = %outbound_host_calls,
             "SQLite writer minute metrics"
