@@ -1444,7 +1444,10 @@ mod tests {
         io::{self, Write},
         net::{IpAddr, Ipv4Addr},
         pin::Pin,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
         time::Duration,
     };
     use tokio::net::TcpListener;
@@ -1478,6 +1481,7 @@ mod tests {
         fallback_status: StatusCode,
         appview_calls: Arc<Mutex<Vec<usize>>>,
         pds_calls: Arc<Mutex<usize>>,
+        appview_delay_ms: Arc<AtomicU64>,
     }
 
     async fn batch_get_posts(
@@ -1489,6 +1493,10 @@ mod tests {
             .map(|(_, value)| value.into_owned())
             .collect::<Vec<_>>();
         state.appview_calls.lock().unwrap().push(uris.len());
+        let delay_ms = state.appview_delay_ms.load(Ordering::Relaxed);
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
         if !state.appview_status.is_success() {
             return state.appview_status.into_response();
         }
@@ -1558,6 +1566,7 @@ mod tests {
             fallback_status,
             appview_calls: Arc::new(Mutex::new(Vec::new())),
             pds_calls: Arc::new(Mutex::new(0)),
+            appview_delay_ms: Arc::new(AtomicU64::new(0)),
         };
         let app = Router::new()
             .route("/xrpc/app.bsky.feed.getPosts", get(batch_get_posts))
@@ -1945,6 +1954,31 @@ mod tests {
         );
         assert_eq!(page.dropped_count, 1);
         assert_eq!(page.cursor.as_deref(), Some("next-cursor"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn identical_concurrent_post_fetches_share_one_appview_request() {
+        let uri = "at://did:plc:concurrent/app.bsky.feed.post/p1";
+        let posts = HashMap::from([(uri.to_owned(), public_post(uri))]);
+        let (pds, state, server) = batch_server(posts, HashMap::new(), StatusCode::OK).await;
+        state.appview_delay_ms.store(80, Ordering::Relaxed);
+        let pds_endpoint = pds.trim_end_matches("/xrpc/").to_owned();
+        let identity = fake_batch_identity(["did:plc:concurrent".to_owned()], &pds_endpoint);
+        let client = Arc::new(test_client_with_appview(identity, pds));
+        let uris = vec![uri.to_owned()];
+        let first_client = client.clone();
+        let second_client = client.clone();
+        let first_uris = uris.clone();
+        let second_uris = uris.clone();
+        let (first, second) = tokio::join!(
+            async move { first_client.fetch_posts(None, &first_uris).await },
+            async move { second_client.fetch_posts(None, &second_uris).await },
+        );
+
+        assert_eq!(first.0.len(), 1);
+        assert_eq!(second.0.len(), 1);
+        assert_eq!(*state.appview_calls.lock().unwrap(), [1]);
         server.abort();
     }
 
