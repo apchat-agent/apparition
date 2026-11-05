@@ -2660,23 +2660,19 @@ impl SqliteOAuthStore {
             .map_err(|error| error.to_string())?;
         let connection = Arc::clone(&self.read_connection);
         let key = key.to_owned();
-        tokio::task::spawn_blocking(move || {
-            connection
-                .lock()
-                .map_err(|_| "OAuth cache database lock is poisoned".to_owned())?
+        crate::ingest::web_blocking_call(connection, "oauth_web_cache_get", move |connection| {
+            let connection = connection.lock().map_err(|_| StorageError::Poisoned)?;
+            crate::ingest::install_web_read_progress_handler(&connection);
+            Ok(connection
                 .query_row(
                     "SELECT value_json, stored_at_ms FROM web_cache WHERE cache_key=?1",
                     [key],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
-                .optional()
-                .map_err(|error| error.to_string())
+                .optional()?)
         })
         .await
-        .map_err(|error| {
-            tracing::error!(%error, operation = "oauth_web_cache_get", "OAuth cache blocking read task failed");
-            error.to_string()
-        })?
+        .map_err(|error| error.to_string())
         .inspect_err(|error| {
             tracing::warn!(%error, operation = "oauth_web_cache_get", "OAuth cache read failed");
         })
@@ -6161,22 +6157,18 @@ async fn load_page_interactions<S: Storage + 'static>(
     let uris = uris.to_owned();
     let viewer_did = viewer_did.map(str::to_owned);
     let batch_len = uris.len();
-    match tokio::task::spawn_blocking(move || {
+    match web_storage_call(storage, "page_interaction_summaries", move |storage| {
         storage.page_post_interaction_summaries(&uris, viewer_did.as_deref())
     })
     .await
     {
-        Ok(Ok(index)) => index,
-        Ok(Err(error)) => {
+        Ok(index) => index,
+        Err(error) => {
             tracing::warn!(
                 %error,
                 batch_len,
                 "page interaction batch failed; posts fall back to per-post lookups"
             );
-            PageInteractionIndex::new()
-        }
-        Err(error) => {
-            tracing::error!(%error, "blocking page interaction batch task failed");
             PageInteractionIndex::new()
         }
     }
@@ -7831,21 +7823,18 @@ fn start_page_local_parent_lookup<S: Storage + 'static>(
     uris: Vec<String>,
 ) -> PageLocalParentLookupTask {
     tokio::spawn(async move {
-        let worker = tokio::task::spawn_blocking(move || {
-            let started = std::time::Instant::now();
-            storage
-                .records_by_uri("app.bsky.feed.post", &uris)
-                .map(|records| (started.elapsed().as_millis() as u64, records))
-        });
-        match worker.await {
-            Ok(Ok((elapsed, records))) => Ok((elapsed, records)),
-            Ok(Err(error)) => {
+        let started = std::time::Instant::now();
+        match crate::ingest::web_blocking_call(
+            storage,
+            "local_parent_record_lookup",
+            move |storage| storage.records_by_uri("app.bsky.feed.post", &uris),
+        )
+        .await
+        {
+            Ok(records) => Ok((started.elapsed().as_millis() as u64, records)),
+            Err(error) => {
                 tracing::warn!(%error, "local parent record lookup failed");
                 Err(error)
-            }
-            Err(error) => {
-                tracing::error!(%error, "blocking parent lookup task failed");
-                Err(StorageError::BlockingTask(error.to_string()))
             }
         }
     })

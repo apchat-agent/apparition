@@ -457,7 +457,7 @@ fn web_read_progress_handler() -> bool {
     exceeded
 }
 
-fn install_web_read_progress_handler(connection: &Connection) {
+pub(crate) fn install_web_read_progress_handler(connection: &Connection) {
     if WEB_READ_BUDGET.with(|budget| budget.get().is_some()) {
         WEB_READ_USED_SQLITE.with(|used| used.set(true));
     }
@@ -476,18 +476,31 @@ where
     T: Send + 'static,
     F: FnOnce(&S) -> Result<T, StorageError> + Send + 'static,
 {
-    let budget = Duration::from_millis(WEB_READ_BUDGET_MS.load(Ordering::Relaxed));
-    web_storage_call_with_budget(storage, operation, budget, call).await
+    web_blocking_call(storage, operation, call).await
 }
 
-async fn web_storage_call_with_budget<S, T, F>(
+pub(crate) async fn web_blocking_call<S, T, F>(
+    storage: Arc<S>,
+    operation: &'static str,
+    call: F,
+) -> Result<T, StorageError>
+where
+    S: Send + Sync + 'static,
+    T: Send + 'static,
+    F: FnOnce(&S) -> Result<T, StorageError> + Send + 'static,
+{
+    let budget = Duration::from_millis(WEB_READ_BUDGET_MS.load(Ordering::Relaxed));
+    web_blocking_call_with_budget(storage, operation, budget, call).await
+}
+
+async fn web_blocking_call_with_budget<S, T, F>(
     storage: Arc<S>,
     operation: &'static str,
     budget: Duration,
     call: F,
 ) -> Result<T, StorageError>
 where
-    S: Storage + 'static,
+    S: Send + Sync + 'static,
     T: Send + 'static,
     F: FnOnce(&S) -> Result<T, StorageError> + Send + 'static,
 {
@@ -8477,7 +8490,7 @@ mod web_read_timeout_tests {
         let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
         let started = Instant::now();
         let timeouts_before = web_read_timeout_count();
-        let result = web_storage_call_with_budget(
+        let result = web_blocking_call_with_budget(
             storage,
             "slow_read_test",
             Duration::from_millis(20),
