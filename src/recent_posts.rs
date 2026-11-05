@@ -278,15 +278,22 @@ pub enum OlderFetch {
 /// real cause and changes nothing else: the page still renders what is local.
 pub async fn older_posts_while_scrolling<F, S>(
     flow: &F,
-    storage: &S,
+    storage: std::sync::Arc<S>,
     subject: &str,
     oldest_local_rkey: Option<&str>,
 ) -> OlderFetch
 where
     F: crate::oauth::OAuthFlow,
-    S: Storage,
+    S: Storage + 'static,
 {
-    let state = match storage.older_posts_state(subject) {
+    let subject_owned = subject.to_owned();
+    let state = match crate::ingest::web_storage_call(
+        std::sync::Arc::clone(&storage),
+        "older_posts_state",
+        move |storage| storage.older_posts_state(&subject_owned),
+    )
+    .await
+    {
         Ok(state) => state,
         Err(error) => {
             tracing::warn!(
@@ -318,43 +325,62 @@ where
             OlderFetch::Failed
         }
         Ok(page) => {
-            let expected_prefix = format!("at://{subject}/app.bsky.feed.post/");
-            let mut stored = 0_usize;
-            for record in page.records.iter().take(RECENT_POSTS_FETCH_LIMIT) {
-                if record.did != subject
-                    || record.collection != "app.bsky.feed.post"
-                    || !record.uri.starts_with(expected_prefix.as_str())
-                {
-                    tracing::warn!(
-                        did = %subject,
-                        uri = %record.uri,
-                        "the older-posts fetch returned a record outside this account's post collection; skipped it"
-                    );
-                    continue;
+            let fallback_exhausted = page.cursor.is_none();
+            let subject_owned = subject.to_owned();
+            let log_subject = subject.to_owned();
+            let result = crate::ingest::web_storage_call(
+                storage,
+                "persist_older_posts_page",
+                move |storage| {
+                    let expected_prefix =
+                        format!("at://{subject_owned}/app.bsky.feed.post/");
+                    let mut stored = 0_usize;
+                    for record in page.records.iter().take(RECENT_POSTS_FETCH_LIMIT) {
+                        if record.did != subject_owned
+                            || record.collection != "app.bsky.feed.post"
+                            || !record.uri.starts_with(expected_prefix.as_str())
+                        {
+                            tracing::warn!(
+                                did = %subject_owned,
+                                uri = %record.uri,
+                                "the older-posts fetch returned a record outside this account's post collection; skipped it"
+                            );
+                            continue;
+                        }
+                        if let Err(error) = storage.put_record(record) {
+                            tracing::warn!(
+                                %error,
+                                did = %subject_owned,
+                                uri = %record.uri,
+                                "a fetched older post could not be stored; the page continues with what we have"
+                            );
+                            continue;
+                        }
+                        stored += 1;
+                    }
+                    let exhausted = page.cursor.is_none();
+                    if let Err(error) = storage.record_older_posts_page(
+                        &subject_owned,
+                        page.cursor.as_deref(),
+                        exhausted,
+                    ) {
+                        tracing::warn!(
+                            %error,
+                            subject = %subject_owned,
+                            "the older-posts cursor could not be saved; the next Older request restarts from the oldest local rkey"
+                        );
+                    }
+                    Ok((stored, exhausted))
+                },
+            )
+            .await;
+            let (stored, exhausted) = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::warn!(%error, subject = %log_subject, "could not persist the fetched older-posts page");
+                    (0, fallback_exhausted)
                 }
-                // The normal writer path, idempotent on (did, collection,
-                // rkey) exactly like a Jetstream create for the same record.
-                if let Err(error) = storage.put_record(record) {
-                    tracing::warn!(
-                        %error,
-                        did = %subject,
-                        uri = %record.uri,
-                        "a fetched older post could not be stored; the page continues with what we have"
-                    );
-                    continue;
-                }
-                stored += 1;
-            }
-            let exhausted = page.cursor.is_none();
-            if let Err(error) =
-                storage.record_older_posts_page(subject, page.cursor.as_deref(), exhausted)
-            {
-                tracing::warn!(
-                    %error,
-                    subject = %subject,
-                    "the older-posts cursor could not be saved; the next Older request restarts from the oldest local rkey"
-                );
-            }
+            };
             tracing::debug!(
                 did = %subject,
                 stored,

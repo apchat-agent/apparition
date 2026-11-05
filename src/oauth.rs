@@ -8,7 +8,7 @@ use crate::{
     ingest::{
         IndexedNotification, IndexedRecord, MemoryStorage, NotificationCursor,
         NotificationEventRow, NotificationGroupSkip, NotificationKeyWindow, ProfileIndexEntry,
-        RecordCursor, SortTimeCursor, Storage, StorageError,
+        RecordCursor, SortTimeCursor, Storage, StorageError, web_storage_call,
     },
     link_card::{LinkCard, LinkCardFetcher, LinkThumbnail},
     net::{
@@ -45,10 +45,13 @@ use atrium_oauth::{
 };
 
 fn sort_us_for<S: Storage>(storage: &S, record: &IndexedRecord) -> u64 {
-    let Ok(sort_us) = storage.sort_us_for_record(record) else {
-        return crate::ingest::post_sort_us(record);
-    };
-    sort_us
+    match storage.sort_us_for_record(record) {
+        Ok(sort_us) => sort_us,
+        Err(error) => {
+            tracing::warn!(%error, uri = %record.uri, "could not read the post sort time; using its stored timestamp");
+            crate::ingest::post_sort_us(record)
+        }
+    }
 }
 use atrium_xrpc::error::XrpcErrorKind;
 use atrium_xrpc::{
@@ -287,7 +290,7 @@ pub struct OAuthPublic {
     login_allowlist: Option<Arc<HashSet<String>>>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct SessionPermissions {
     write: bool,
     feed: bool,
@@ -2655,16 +2658,28 @@ impl SqliteOAuthStore {
             .flush()
             .await
             .map_err(|error| error.to_string())?;
-        self.read_connection
-            .lock()
-            .map_err(|_| "OAuth cache database lock is poisoned".to_owned())?
-            .query_row(
-                "SELECT value_json, stored_at_ms FROM web_cache WHERE cache_key=?1",
-                [key],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(|error| error.to_string())
+        let connection = Arc::clone(&self.read_connection);
+        let key = key.to_owned();
+        tokio::task::spawn_blocking(move || {
+            connection
+                .lock()
+                .map_err(|_| "OAuth cache database lock is poisoned".to_owned())?
+                .query_row(
+                    "SELECT value_json, stored_at_ms FROM web_cache WHERE cache_key=?1",
+                    [key],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, operation = "oauth_web_cache_get", "OAuth cache blocking read task failed");
+            error.to_string()
+        })?
+        .inspect_err(|error| {
+            tracing::warn!(%error, operation = "oauth_web_cache_get", "OAuth cache read failed");
+        })
     }
 
     pub(crate) fn web_cache_set(&self, key: &str, value_json: &str) -> Result<(), String> {
@@ -5864,7 +5879,19 @@ struct PageShellOptions<'a> {
 /// The viewer's profile for the shared shell, built the way the thread page always did it:
 /// `profile_card_view_from_storage` with a handle/did fallback so the menu never disappears.
 fn viewer_profile_view<S: Storage>(storage: &S, did: &str) -> Value {
-    profile_card_view_from_storage(storage, did).unwrap_or_else(|_| json!({"did":did,"handle":did}))
+    profile_card_view_from_storage(storage, did).unwrap_or_else(|error| {
+        tracing::warn!(%error, did, "could not load the viewer profile; showing the DID fallback");
+        json!({"did":did,"handle":did})
+    })
+}
+
+async fn viewer_profile_view_web<S: Storage + 'static>(storage: Arc<S>, did: String) -> Value {
+    let fallback_did = did.clone();
+    web_storage_call(storage, "viewer_profile", move |storage| {
+        Ok(viewer_profile_view(storage, &did))
+    })
+    .await
+    .unwrap_or_else(|_| json!({"did":fallback_did,"handle":fallback_did}))
 }
 
 fn page_shell_with_options(
@@ -5967,13 +5994,42 @@ fn notification_badge_markup(unread_count: usize) -> String {
     )
 }
 
-fn unread_badge_count<S: Storage>(storage: &S, did: &str) -> usize {
-    storage
-        .unread_notification_count(did)
-        .unwrap_or_else(|error| {
-            tracing::warn!(%error, %did, "could not read notification badge count");
-            0
-        })
+async fn unread_badge_count_web<S: Storage + 'static>(storage: Arc<S>, did: String) -> usize {
+    web_storage_call(storage, "unread_notification_badge", move |storage| {
+        storage.unread_notification_count(&did)
+    })
+    .await
+    .unwrap_or_default()
+}
+
+async fn render_recent_profiles_web<S: Storage + 'static>(
+    storage: Arc<S>,
+    viewer_did: String,
+) -> Result<String, StorageError> {
+    web_storage_call(storage, "recent_search_profiles", move |storage| {
+        render_recent_profiles(storage, &viewer_did)
+    })
+    .await
+}
+
+async fn persist_search_actor_profiles_web<S: Storage + 'static>(
+    storage: Arc<S>,
+    actors: Vec<SearchActor>,
+) -> Result<(), StorageError> {
+    web_storage_call(storage, "persist_search_actor_profiles", move |storage| {
+        let actors = actors.iter().collect::<Vec<_>>();
+        persist_search_actor_profiles(storage, &actors)
+    })
+    .await
+}
+
+async fn sort_us_for_web<S: Storage + 'static>(storage: Arc<S>, record: IndexedRecord) -> u64 {
+    let fallback = record.clone();
+    web_storage_call(storage, "timeline_cursor_sort_time", move |storage| {
+        storage.sort_us_for_record(&record)
+    })
+    .await
+    .unwrap_or_else(|_| crate::ingest::post_sort_us(&fallback))
 }
 
 fn render_feed_tabs(
@@ -6397,7 +6453,7 @@ async fn account_web_outbound_calls<F: OAuthFlow, S: Storage + 'static>(
     let timing_method = request.method().to_string();
     let timing_path = request.uri().path().to_owned();
     let timing_viewer =
-        verified_cookie_did(&state.public, request.headers(), state.storage.as_ref());
+        verified_cookie_did_web(&state.public, request.headers(), Arc::clone(&state.storage)).await;
     let started = std::time::Instant::now();
     let started_at_ms = now_unix_ms();
     let accounting = RequestOutboundAccounting::default();
@@ -6480,7 +6536,9 @@ async fn timing_recent<F: OAuthFlow, S: Storage + 'static>(
     State(state): State<Arc<OAuthWebState<F, S>>>,
     headers: HeaderMap,
 ) -> Response {
-    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+    let Some(did) =
+        verified_cookie_did_web(&state.public, &headers, Arc::clone(&state.storage)).await
+    else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
     let records = state
@@ -6786,7 +6844,7 @@ impl WebRenderContext {
     /// rest of `render_ms`: whatever the identity, interaction and embed
     /// phases did not account for (cookie checks, the unread badge, building
     /// the page shell itself).
-    fn finish_into(self, timing: &mut WebPageTiming) {
+    fn finish_into(&self, timing: &mut WebPageTiming) {
         timing.render_profiles_ms = self.profiles_us.load(Ordering::Relaxed) / 1_000;
         timing.render_interactions_ms = self.interactions_us.load(Ordering::Relaxed) / 1_000;
         timing.render_embeds_ms = self.embeds_us.load(Ordering::Relaxed) / 1_000;
@@ -7330,7 +7388,7 @@ where
         let mut quotes = hydrate_page_quotes(
             flow,
             &quote_viewer_did,
-            quote_storage.as_ref(),
+            quote_storage,
             &prefetched_posts,
             refs.clone(),
             deadline,
@@ -7358,7 +7416,12 @@ where
     let (quote_hydration, (account_data, account_labels_ms)) =
         tokio::join!(quote_hydration, account_data_hydration);
     let profile_write_started = std::time::Instant::now();
-    let profile_result = hydrate_page_profiles(storage.as_ref(), authors, account_data.profiles);
+    let profile_storage = Arc::clone(&storage);
+    let profile_result =
+        web_storage_call(profile_storage, "hydrate_page_profiles", move |storage| {
+            hydrate_page_profiles(storage, authors, account_data.profiles)
+        })
+        .await;
     let profile_hydration_ms =
         account_labels_ms.saturating_add(profile_write_started.elapsed().as_millis() as u64);
     let mut quote_index = quote_hydration.0?;
@@ -7991,6 +8054,16 @@ fn queue_missing_parent_authors<S: Storage>(
     Ok(())
 }
 
+async fn queue_missing_parent_authors_web<S: Storage + 'static>(
+    storage: Arc<S>,
+    parents: PageParentIndex,
+) -> Result<(), StorageError> {
+    web_storage_call(storage, "queue_parent_authors", move |storage| {
+        queue_missing_parent_authors(storage, &parents)
+    })
+    .await
+}
+
 fn quoted_record_ref(embed: &Value) -> Option<QuotedRecordRef> {
     match embed.get("$type").and_then(Value::as_str) {
         Some("app.bsky.embed.record") | Some("app.bsky.embed.record#view") => {}
@@ -8021,37 +8094,41 @@ fn at_uri_collection(uri: &str) -> Option<&str> {
     .then_some(collection)
 }
 
-async fn hydrate_page_quotes<F: OAuthFlow, S: Storage>(
+async fn hydrate_page_quotes<F: OAuthFlow, S: Storage + 'static>(
     _flow: &F,
     _viewer_did: &str,
-    storage: &S,
+    storage: Arc<S>,
     prefetched_posts: &PageParentIndex,
     refs: Vec<QuotedRecordRef>,
     _deadline: tokio::time::Instant,
 ) -> Result<QuoteRenderIndex, StorageError> {
-    let mut result = QuoteRenderIndex::default();
-    for reference in refs {
-        let state = if reference.unavailable {
-            QuoteRenderState::Unavailable
-        } else if let Some(collection) = at_uri_collection(&reference.uri) {
-            if collection == "app.bsky.feed.post" {
-                match prefetched_posts.get(&reference.uri) {
-                    Some(Some(record)) => QuoteRenderState::Found(record.clone()),
-                    Some(None) => QuoteRenderState::Pending,
-                    None => match storage.record_by_uri(collection, &reference.uri)? {
-                        Some(record) => QuoteRenderState::Found(record),
-                        None => QuoteRenderState::Pending,
-                    },
+    let prefetched_posts = prefetched_posts.clone();
+    web_storage_call(storage, "hydrate_page_quotes", move |storage| {
+        let mut result = QuoteRenderIndex::default();
+        for reference in refs {
+            let state = if reference.unavailable {
+                QuoteRenderState::Unavailable
+            } else if let Some(collection) = at_uri_collection(&reference.uri) {
+                if collection == "app.bsky.feed.post" {
+                    match prefetched_posts.get(&reference.uri) {
+                        Some(Some(record)) => QuoteRenderState::Found(record.clone()),
+                        Some(None) => QuoteRenderState::Pending,
+                        None => match storage.record_by_uri(collection, &reference.uri)? {
+                            Some(record) => QuoteRenderState::Found(record),
+                            None => QuoteRenderState::Pending,
+                        },
+                    }
+                } else {
+                    QuoteRenderState::Other(storage.record_by_uri(collection, &reference.uri)?)
                 }
             } else {
-                QuoteRenderState::Other(storage.record_by_uri(collection, &reference.uri)?)
-            }
-        } else {
-            QuoteRenderState::NotFound
-        };
-        result.insert(reference.uri, state);
-    }
-    Ok(result)
+                QuoteRenderState::NotFound
+            };
+            result.insert(reference.uri, state);
+        }
+        Ok(result)
+    })
+    .await
 }
 
 fn icon_content(name: &str) -> &'static str {
@@ -8489,7 +8566,7 @@ where
         return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
     }
     let Some((did, session_id, _, _)) =
-        verified_cookie_session(&state.public, &headers, state.storage.as_ref())
+        verified_cookie_session_web(&state.public, &headers, Arc::clone(&state.storage)).await
     else {
         return clear_session_cookie(
             Redirect::to("/login").into_response(),
@@ -8542,23 +8619,27 @@ where
     response
 }
 
-async fn timeline_hidden_actor_dids<F: OAuthFlow, S: Storage>(
+async fn timeline_hidden_actor_dids<F: OAuthFlow, S: Storage + 'static>(
     flow: &F,
-    storage: &S,
+    storage: Arc<S>,
     viewer_did: &str,
 ) -> Result<HashSet<String>, String> {
-    let mut hidden = storage
-        .records_for_actor_collection(viewer_did, "app.bsky.graph.block", 10_000)
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .filter_map(|record| {
-            record
-                .record
-                .get("subject")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .collect::<HashSet<_>>();
+    let viewer = viewer_did.to_owned();
+    let mut hidden = web_storage_call(storage, "timeline_block_list", move |storage| {
+        Ok(storage
+            .records_for_actor_collection(&viewer, "app.bsky.graph.block", 10_000)?
+            .into_iter()
+            .filter_map(|record| {
+                record
+                    .record
+                    .get("subject")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<HashSet<_>>())
+    })
+    .await
+    .map_err(|error| error.to_string())?;
     match flow.muted_actor_dids(viewer_did).await {
         Ok(muted) => hidden.extend(muted),
         Err(error) => tracing::warn!(%error, "could not load muted accounts for the timeline"),
@@ -8939,34 +9020,63 @@ where
 {
     let mut page_timing = WebPageTiming::new("app");
     let session_started = std::time::Instant::now();
-    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+    let public = state.public.clone();
+    let session_headers = headers.clone();
+    let session =
+        match web_storage_call(Arc::clone(&state.storage), "web_session", move |storage| {
+            verify_cookie_session(&public, &session_headers, storage)
+        })
+        .await
+        {
+            Ok(session) => session,
+            Err(error) => {
+                return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+            }
+        };
+    let Some((did, _, _, permissions)) = session else {
         return Redirect::to("/login").into_response();
     };
     page_timing.session_token_refresh_ms = session_started.elapsed().as_millis() as u64;
     let saved_feeds_started = std::time::Instant::now();
-    let tabs = pinned_feeds_for_layout(
-        &state.flow,
-        &did,
-        verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()),
-    )
-    .await;
+    let tabs = pinned_feeds_for_layout(&state.flow, &did, permissions.feed).await;
     page_timing.saved_feeds_ms = saved_feeds_started.elapsed().as_millis() as u64;
     page_timing.preferences_ms = tabs.preferences_ms;
     page_timing.tabs_ms = tabs.tabs_ms;
     let pinned_feeds = tabs.feeds;
     if query.is_empty() {
-        match state.storage.last_active_feed_tab(&did) {
+        let viewer = did.clone();
+        match web_storage_call(
+            Arc::clone(&state.storage),
+            "last_active_feed_tab",
+            move |storage| storage.last_active_feed_tab(&viewer),
+        )
+        .await
+        {
             Ok(Some(tab)) if tab != "following" => {
                 if let Some(feed) = pinned_feeds.iter().find(|feed| feed.uri == tab) {
                     return Redirect::to(&feed_link_href(feed)).into_response();
                 }
-                if let Err(error) = state.storage.set_last_active_feed_tab(&did, "following") {
+                let viewer = did.clone();
+                if let Err(error) = web_storage_call(
+                    Arc::clone(&state.storage),
+                    "reset_active_feed_tab",
+                    move |storage| storage.set_last_active_feed_tab(&viewer, "following"),
+                )
+                .await
+                {
                     tracing::warn!(%error, viewer_did = %did, "could not reset an unavailable remembered feed tab; showing the page anyway");
                 }
             }
             Ok(Some(_)) => {}
             Ok(None) => {
-                if let Err(error) = state.storage.set_last_active_feed_tab(&did, "following") {
+                let viewer = did.clone();
+                if let Err(error) = web_storage_call(
+                    Arc::clone(&state.storage),
+                    "remember_active_feed_tab",
+                    move |storage| storage.set_last_active_feed_tab(&viewer, "following"),
+                )
+                .await
+                {
                     tracing::warn!(%error, viewer_did = %did, "could not remember the Following feed tab; showing the page anyway");
                 }
             }
@@ -8974,8 +9084,17 @@ where
                 tracing::warn!(%error, viewer_did = %did, "could not load the remembered feed tab; showing the page anyway");
             }
         }
-    } else if let Err(error) = state.storage.set_last_active_feed_tab(&did, "following") {
-        tracing::warn!(%error, viewer_did = %did, "could not remember the Following feed tab; showing the page anyway");
+    } else {
+        let viewer = did.clone();
+        if let Err(error) = web_storage_call(
+            Arc::clone(&state.storage),
+            "remember_active_feed_tab",
+            move |storage| storage.set_last_active_feed_tab(&viewer, "following"),
+        )
+        .await
+        {
+            tracing::warn!(%error, viewer_did = %did, "could not remember the Following feed tab; showing the page anyway");
+        }
     }
     let limit = query
         .get("limit")
@@ -8986,22 +9105,32 @@ where
         .get("cursor")
         .and_then(|cursor| SortTimeCursor::parse(cursor));
     let timeline_started = std::time::Instant::now();
-    let timeline_page =
-        match state
-            .storage
-            .timeline_posts_by_post_time(&did, cursor.as_ref(), limit + 1)
-        {
-            Ok(records) => records,
-            Err(error) => {
-                return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
-            }
-        };
+    let timeline_actor = did.clone();
+    let timeline_cursor = cursor.clone();
+    let timeline_page = match web_storage_call(
+        Arc::clone(&state.storage),
+        "home_timeline",
+        move |storage| {
+            storage.timeline_posts_by_post_time(
+                &timeline_actor,
+                timeline_cursor.as_ref(),
+                limit + 1,
+            )
+        },
+    )
+    .await
+    {
+        Ok(records) => records,
+        Err(error) => {
+            return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+        }
+    };
     page_timing.timeline_fetch_index_ms = timeline_started.elapsed().as_millis() as u64;
     let has_more = timeline_page.len() > limit;
     let next_cursor_record = timeline_page.get(limit.saturating_sub(1)).cloned();
     let mutes_started = std::time::Instant::now();
     let hidden_actors_result =
-        timeline_hidden_actor_dids(&state.flow, state.storage.as_ref(), &did).await;
+        timeline_hidden_actor_dids(&state.flow, Arc::clone(&state.storage), &did).await;
     page_timing.mutes_ms = mutes_started.elapsed().as_millis() as u64;
     let hidden_actors = match hidden_actors_result {
         Ok(hidden) => hidden,
@@ -9069,10 +9198,13 @@ where
         }
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
-    if let Err(error) = queue_missing_parent_authors(state.storage.as_ref(), &parents) {
+    if let Err(error) =
+        queue_missing_parent_authors_web(Arc::clone(&state.storage), parents.clone()).await
+    {
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
-    let rights = verified_cookie_form_rights(&state.public, &headers, state.storage.as_ref());
+    let rights =
+        verified_cookie_form_rights_web(&state.public, &headers, Arc::clone(&state.storage)).await;
     let interaction_uris = quote_records
         .iter()
         .map(|record| record.uri.clone())
@@ -9080,21 +9212,26 @@ where
     let page_interactions =
         load_page_interactions(&state.storage, &interaction_uris, Some(&did)).await;
     let render_started = std::time::Instant::now();
-    let render = WebRenderContext::default();
-    let posts = render_timeline_post_items(
-        state.storage.as_ref(),
-        &timeline,
-        &vec![String::new(); timeline.len()],
-        &parents,
-        &TimelineRenderContext {
-            viewer_did: &did,
+    let render = Arc::new(WebRenderContext::default());
+    let posts = match render_timeline_post_items_web(
+        Arc::clone(&state.storage),
+        TimelinePostRenderJob {
+            records: timeline.iter().map(|record| (*record).clone()).collect(),
+            preludes: vec![String::new(); timeline.len()],
+            parents: parents.clone(),
+            viewer_did: did.clone(),
             rights,
-            quote_index: &quote_index,
-            page_interactions: &page_interactions,
-            list_blocks: &list_blocks,
-            render: &render,
+            quote_index: quote_index.clone(),
+            page_interactions,
+            list_blocks: list_blocks.clone(),
+            render: Arc::clone(&render),
         },
-    );
+    )
+    .await
+    {
+        Ok(posts) => posts,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
     let posts = if posts.is_empty() {
         "<li class=\"empty-state\">No indexed posts yet.</li>".to_owned()
     } else {
@@ -9102,14 +9239,19 @@ where
     };
     let posts_render_ms = render_started.elapsed().as_millis() as u64;
     let indexing_status = if page_records.is_empty() && next_cursor_record.is_none() {
-        let (total, done) = match state.storage.backfill_progress(&did) {
-            Ok(progress) => progress,
-            Err(error) => {
-                return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
-            }
-        };
-        let failed = match state.storage.backfill_failure_count(&did) {
-            Ok(failed) => failed,
+        let viewer = did.clone();
+        let (total, done, failed) = match web_storage_call(
+            Arc::clone(&state.storage),
+            "timeline_indexing_status",
+            move |storage| {
+                let (total, done) = storage.backfill_progress(&viewer)?;
+                let failed = storage.backfill_failure_count(&viewer)?;
+                Ok((total, done, failed))
+            },
+        )
+        .await
+        {
+            Ok(status) => status,
             Err(error) => {
                 return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
             }
@@ -9136,10 +9278,12 @@ where
     };
     let post_form = if rights.post {
         let blob_access =
-            verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref());
+            verified_cookie_blob_access_web(&state.public, &headers, Arc::clone(&state.storage))
+                .await;
         let video_access =
-            verified_cookie_video_access(&state.public, &headers, state.storage.as_ref());
-        let profile = render.viewer_identity(state.storage.as_ref(), &did);
+            verified_cookie_video_access_web(&state.public, &headers, Arc::clone(&state.storage))
+                .await;
+        let profile = viewer_profile_view_web(Arc::clone(&state.storage), did.clone()).await;
         render_composer(ComposerSpec {
             form_attributes: "",
             classes: "media-composer",
@@ -9160,27 +9304,27 @@ where
         String::new()
     };
     let older = if has_more {
-        next_cursor_record
-            .as_ref()
-            .map(|last| {
-                let cursor = SortTimeCursor {
-                    sort_us: sort_us_for(state.storage.as_ref(), last),
-                    time_us: last.time_us,
-                    uri: last.uri.clone(),
-                }
-                .encode();
-                let encoded =
-                    url::form_urlencoded::byte_serialize(cursor.as_bytes()).collect::<String>();
-                format!(
-                    "<a class=\"pagination-link\" rel=\"next\" href=\"/app?limit={limit}&amp;cursor={encoded}\">Older</a>"
-                )
-            })
-            .unwrap_or_default()
+        if let Some(last) = next_cursor_record.as_ref() {
+            let cursor = SortTimeCursor {
+                sort_us: sort_us_for_web(Arc::clone(&state.storage), last.clone()).await,
+                time_us: last.time_us,
+                uri: last.uri.clone(),
+            }
+            .encode();
+            let encoded =
+                url::form_urlencoded::byte_serialize(cursor.as_bytes()).collect::<String>();
+            format!(
+                "<a class=\"pagination-link\" rel=\"next\" href=\"/app?limit={limit}&amp;cursor={encoded}\">Older</a>"
+            )
+        } else {
+            String::new()
+        }
     } else {
         String::new()
     };
-    let viewer_profile = render.viewer_identity(state.storage.as_ref(), &did);
-    let allow_more = verified_cookie_allow_more(&state.public, &headers, state.storage.as_ref());
+    let viewer_profile = viewer_profile_view_web(Arc::clone(&state.storage), did.clone()).await;
+    let allow_more =
+        verified_cookie_allow_more_web(&state.public, &headers, Arc::clone(&state.storage)).await;
     let response = Html(page_shell_with_options(
         "Timeline",
         &format!(
@@ -9193,7 +9337,7 @@ where
             following_active: true,
             show_feed_tabs: true,
             viewer_profile: Some(&viewer_profile),
-            unread_count: unread_badge_count(state.storage.as_ref(), &did),
+            unread_count: unread_badge_count_web(Arc::clone(&state.storage), did.clone()).await,
             allow_more: allow_more.as_deref(),
         },
     ))
@@ -9211,10 +9355,12 @@ where
     F: OAuthFlow,
     S: Storage + 'static,
 {
-    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+    let Some(did) =
+        verified_cookie_did_web(&state.public, &headers, Arc::clone(&state.storage)).await
+    else {
         return Redirect::to("/login").into_response();
     };
-    if !verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()) {
+    if !verified_cookie_feed_access_web(&state.public, &headers, Arc::clone(&state.storage)).await {
         return feed_reauthorization_page();
     }
     let feeds = match state.flow.pinned_feed_tabs(&did).await {
@@ -9232,7 +9378,7 @@ where
     } else {
         entries
     };
-    let viewer_profile = viewer_profile_view(state.storage.as_ref(), &did);
+    let viewer_profile = viewer_profile_view_web(Arc::clone(&state.storage), did.clone()).await;
     Html(page_shell_with_options(
         "Feeds",
         &format!(
@@ -9245,7 +9391,7 @@ where
             following_active: false,
             show_feed_tabs: true,
             viewer_profile: Some(&viewer_profile),
-            unread_count: unread_badge_count(state.storage.as_ref(), &did),
+            unread_count: unread_badge_count_web(Arc::clone(&state.storage), did.clone()).await,
             allow_more: None,
         },
     ))
@@ -9261,7 +9407,9 @@ where
     F: OAuthFlow,
     S: Storage + 'static,
 {
-    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+    let Some(did) =
+        verified_cookie_did_web(&state.public, &headers, Arc::clone(&state.storage)).await
+    else {
         return Redirect::to("/login").into_response();
     };
     let term = query
@@ -9274,11 +9422,11 @@ where
         .get("cursor")
         .map(|value| value.trim())
         .filter(|value| !value.is_empty());
-    let viewer_profile = viewer_profile_view(state.storage.as_ref(), &did);
+    let viewer_profile = viewer_profile_view_web(Arc::clone(&state.storage), did.clone()).await;
     let tabs = pinned_feeds_for_layout(
         &state.flow,
         &did,
-        verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()),
+        verified_cookie_feed_access_web(&state.public, &headers, Arc::clone(&state.storage)).await,
     )
     .await;
     let options = PageShellOptions {
@@ -9287,14 +9435,14 @@ where
         following_active: false,
         show_feed_tabs: false,
         viewer_profile: Some(&viewer_profile),
-        unread_count: unread_badge_count(state.storage.as_ref(), &did),
+        unread_count: unread_badge_count_web(Arc::clone(&state.storage), did.clone()).await,
         allow_more: None,
     };
     let heading = "<header class=\"page-heading\"><p class=\"eyebrow\">Find posts and people</p><h1>Search</h1></header>";
     let form = render_search_form(term.as_deref(), people);
     let Some(term) = term else {
         let recent = if people {
-            match render_recent_profiles(state.storage.as_ref(), &did) {
+            match render_recent_profiles_web(Arc::clone(&state.storage), did.clone()).await {
                 Ok(recent) => recent,
                 Err(error) => {
                     tracing::error!(%error, viewer_did = %did, "could not load recent search profiles");
@@ -9318,7 +9466,7 @@ where
             Err(failure) => return search_unavailable_response(&failure, heading, &form, options),
         };
         let hidden_actors =
-            match timeline_hidden_actor_dids(&state.flow, state.storage.as_ref(), &did).await {
+            match timeline_hidden_actor_dids(&state.flow, Arc::clone(&state.storage), &did).await {
                 Ok(hidden) => hidden,
                 Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
             };
@@ -9327,7 +9475,15 @@ where
             .iter()
             .filter(|actor| !hidden_actors.contains(&actor.did))
             .collect::<Vec<_>>();
-        if let Err(error) = persist_search_actor_profiles(state.storage.as_ref(), &visible_actors) {
+        if let Err(error) = persist_search_actor_profiles_web(
+            Arc::clone(&state.storage),
+            visible_actors
+                .iter()
+                .map(|actor| (*actor).clone())
+                .collect(),
+        )
+        .await
+        {
             tracing::error!(%error, viewer_did = %did, "could not persist searched public profiles");
             return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
         }
@@ -9356,7 +9512,8 @@ where
             Err(failure) => {
                 return anonymous_posts_search_failure_response(
                     &failure, cursor, &state, &headers, heading, &form, options,
-                );
+                )
+                .await;
             }
         },
         Err(error) => {
@@ -9371,15 +9528,24 @@ where
                 Err(failure) => {
                     return anonymous_posts_search_failure_response(
                         &failure, cursor, &state, &headers, heading, &form, options,
-                    );
+                    )
+                    .await;
                 }
             }
         }
     };
-    if let Err(error) = persist_public_profiles(
-        state.storage.as_ref(),
-        page.posts.iter().filter_map(|post| post.author.clone()),
-    ) {
+    let public_profiles = page
+        .posts
+        .iter()
+        .filter_map(|post| post.author.clone())
+        .collect::<Vec<_>>();
+    if let Err(error) = web_storage_call(
+        Arc::clone(&state.storage),
+        "persist_search_post_profiles",
+        move |storage| persist_public_profiles(storage, public_profiles),
+    )
+    .await
+    {
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
     let records = page
@@ -9388,7 +9554,7 @@ where
         .map(|post| &post.record)
         .collect::<Vec<_>>();
     let hidden_actors =
-        match timeline_hidden_actor_dids(&state.flow, state.storage.as_ref(), &did).await {
+        match timeline_hidden_actor_dids(&state.flow, Arc::clone(&state.storage), &did).await {
             Ok(hidden) => hidden,
             Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
         };
@@ -9441,30 +9607,38 @@ where
             return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
         }
     };
-    if let Err(error) = queue_missing_parent_authors(state.storage.as_ref(), &parents) {
+    if let Err(error) =
+        queue_missing_parent_authors_web(Arc::clone(&state.storage), parents.clone()).await
+    {
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
-    let rights = verified_cookie_form_rights(&state.public, &headers, state.storage.as_ref());
+    let rights =
+        verified_cookie_form_rights_web(&state.public, &headers, Arc::clone(&state.storage)).await;
     let interaction_uris = quote_records
         .iter()
         .map(|record| record.uri.clone())
         .collect::<Vec<_>>();
     let page_interactions =
         load_page_interactions(&state.storage, &interaction_uris, Some(&did)).await;
-    let posts = render_timeline_post_items(
-        state.storage.as_ref(),
-        &visible,
-        &[],
-        &parents,
-        &TimelineRenderContext {
-            viewer_did: &did,
+    let posts = match render_timeline_post_items_web(
+        Arc::clone(&state.storage),
+        TimelinePostRenderJob {
+            records: visible.iter().map(|record| (*record).clone()).collect(),
+            preludes: Vec::new(),
+            parents: parents.clone(),
+            viewer_did: did.clone(),
             rights,
-            quote_index: &hydration.quote_index,
-            page_interactions: &page_interactions,
-            list_blocks: &HashMap::new(),
-            render: &WebRenderContext::default(),
+            quote_index: hydration.quote_index.clone(),
+            page_interactions,
+            list_blocks: HashMap::new(),
+            render: Arc::new(WebRenderContext::default()),
         },
-    );
+    )
+    .await
+    {
+        Ok(posts) => posts,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
     let posts = if posts.is_empty() {
         "<li class=\"empty-state\">No posts matched that search.</li>".to_owned()
     } else {
@@ -9491,10 +9665,19 @@ where
     if !same_origin_request(&headers, &state.public.public_url) {
         return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
     }
-    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+    let Some(did) =
+        verified_cookie_did_web(&state.public, &headers, Arc::clone(&state.storage)).await
+    else {
         return Redirect::to("/login").into_response();
     };
-    if let Err(error) = state.storage.clear_recent_profiles_for_viewer(&did) {
+    let viewer = did.clone();
+    if let Err(error) = web_storage_call(
+        Arc::clone(&state.storage),
+        "clear_recent_search_profiles",
+        move |storage| storage.clear_recent_profiles_for_viewer(&viewer),
+    )
+    .await
+    {
         tracing::error!(%error, viewer_did = %did, "could not clear recent search profiles");
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
@@ -9672,7 +9855,7 @@ fn search_unavailable_response(
 /// asks for a fresh sign-in and links through the `allow_more_href` box-keeping logic (plain
 /// `/login` when the session holds no boxes). The real status and cursor-carrying URL are in
 /// SearchClient's own warning.
-fn anonymous_posts_search_failure_response<F, S>(
+async fn anonymous_posts_search_failure_response<F, S>(
     failure: &SearchCallError,
     cursor: Option<&str>,
     state: &OAuthWebState<F, S>,
@@ -9687,7 +9870,8 @@ where
 {
     if cursor.is_some() && failure.status == Some(403) {
         let href = html_escape(
-            &verified_cookie_allow_more(&state.public, headers, state.storage.as_ref())
+            &verified_cookie_allow_more_web(&state.public, headers, Arc::clone(&state.storage))
+                .await
                 .unwrap_or_else(|| "/login".to_owned()),
         );
         return Html(page_shell_with_options(
@@ -9726,13 +9910,15 @@ where
     F: OAuthFlow,
     S: Storage + 'static,
 {
-    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+    let Some(did) =
+        verified_cookie_did_web(&state.public, &headers, Arc::clone(&state.storage)).await
+    else {
         return Redirect::to("/login").into_response();
     };
     let tabs = pinned_feeds_for_layout(
         &state.flow,
         &did,
-        verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()),
+        verified_cookie_feed_access_web(&state.public, &headers, Arc::clone(&state.storage)).await,
     )
     .await;
     let lists = subscribed_block_lists_for_page(&state.flow, &state.block_lists, &did).await;
@@ -9746,7 +9932,7 @@ where
     } else {
         entries
     };
-    let viewer_profile = viewer_profile_view(state.storage.as_ref(), &did);
+    let viewer_profile = viewer_profile_view_web(Arc::clone(&state.storage), did.clone()).await;
     Html(page_shell_with_options(
         "Block lists",
         &format!(
@@ -9759,7 +9945,7 @@ where
             following_active: false,
             show_feed_tabs: true,
             viewer_profile: Some(&viewer_profile),
-            unread_count: unread_badge_count(state.storage.as_ref(), &did),
+            unread_count: unread_badge_count_web(Arc::clone(&state.storage), did.clone()).await,
             allow_more: None,
         },
     ))
@@ -9777,17 +9963,27 @@ where
 {
     let mut page_timing = WebPageTiming::new("feed");
     let session_started = std::time::Instant::now();
-    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+    let Some(did) =
+        verified_cookie_did_web(&state.public, &headers, Arc::clone(&state.storage)).await
+    else {
         return Redirect::to("/login").into_response();
     };
     page_timing.session_token_refresh_ms = session_started.elapsed().as_millis() as u64;
-    if !verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()) {
+    if !verified_cookie_feed_access_web(&state.public, &headers, Arc::clone(&state.storage)).await {
         return feed_reauthorization_page();
     }
     let Some(uri) = query.get("uri").filter(|uri| !uri.is_empty()) else {
         return oauth_error(StatusCode::BAD_REQUEST, "feed uri is required");
     };
-    if let Err(error) = state.storage.set_last_active_feed_tab(&did, uri) {
+    let viewer = did.clone();
+    let tab = uri.to_owned();
+    if let Err(error) = web_storage_call(
+        Arc::clone(&state.storage),
+        "remember_active_feed_tab",
+        move |storage| storage.set_last_active_feed_tab(&viewer, &tab),
+    )
+    .await
+    {
         tracing::warn!(%error, viewer_did = %did, feed_uri = %uri, "could not remember the active feed tab; showing the page anyway");
     }
     let page_key = (
@@ -9825,11 +10021,12 @@ where
                 if crate::feeds::feed_is_gone(&error) {
                     return unavailable_feed_page(
                         uri,
-                        verified_cookie_preferences_access(
+                        verified_cookie_preferences_access_web(
                             &state.public,
                             &headers,
-                            state.storage.as_ref(),
-                        ),
+                            Arc::clone(&state.storage),
+                        )
+                        .await,
                     );
                 }
                 return oauth_error(StatusCode::BAD_GATEWAY, &error);
@@ -9864,7 +10061,7 @@ where
     }
     let mutes_started = std::time::Instant::now();
     let hidden_actors_result =
-        timeline_hidden_actor_dids(&state.flow, state.storage.as_ref(), &did).await;
+        timeline_hidden_actor_dids(&state.flow, Arc::clone(&state.storage), &did).await;
     page_timing.mutes_ms = mutes_started.elapsed().as_millis() as u64;
     let hidden_actors = match hidden_actors_result {
         Ok(hidden) => hidden,
@@ -9939,12 +10136,15 @@ where
         }
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
-    if let Err(error) = queue_missing_parent_authors(state.storage.as_ref(), &parents) {
+    if let Err(error) =
+        queue_missing_parent_authors_web(Arc::clone(&state.storage), parents.clone()).await
+    {
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
-    let rights = verified_cookie_form_rights(&state.public, &headers, state.storage.as_ref());
+    let rights =
+        verified_cookie_form_rights_web(&state.public, &headers, Arc::clone(&state.storage)).await;
     let render_started = std::time::Instant::now();
-    let render = WebRenderContext::default();
+    let render = Arc::new(WebRenderContext::default());
     let feed_preludes = feed_items
         .iter()
         .map(|post| {
@@ -9967,20 +10167,28 @@ where
     let page_interactions =
         load_page_interactions(&state.storage, &interaction_uris, Some(&did)).await;
     render.add_interactions(interactions_started.elapsed());
-    let posts = render_timeline_post_items(
-        state.storage.as_ref(),
-        &feed_records,
-        &feed_preludes,
-        &parents,
-        &TimelineRenderContext {
-            viewer_did: &did,
+    let posts = match render_timeline_post_items_web(
+        Arc::clone(&state.storage),
+        TimelinePostRenderJob {
+            records: feed_records
+                .iter()
+                .map(|record| (*record).clone())
+                .collect(),
+            preludes: feed_preludes,
+            parents: parents.clone(),
+            viewer_did: did.clone(),
             rights,
-            quote_index: &quote_index,
-            page_interactions: &page_interactions,
-            list_blocks: &list_blocks,
-            render: &render,
+            quote_index: quote_index.clone(),
+            page_interactions,
+            list_blocks: list_blocks.clone(),
+            render: Arc::clone(&render),
         },
-    );
+    )
+    .await
+    {
+        Ok(posts) => posts,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
     let posts = if posts.is_empty() {
         "<li class=\"empty-state\">This feed has no available posts on this page.</li>".to_owned()
     } else {
@@ -10013,8 +10221,9 @@ where
     page_timing.preferences_ms = tabs.preferences_ms;
     page_timing.tabs_ms = tabs.tabs_ms;
     let shell_render_started = std::time::Instant::now();
-    let viewer_profile = render.viewer_identity(state.storage.as_ref(), &did);
-    let allow_more = verified_cookie_allow_more(&state.public, &headers, state.storage.as_ref());
+    let viewer_profile = viewer_profile_view_web(Arc::clone(&state.storage), did.clone()).await;
+    let allow_more =
+        verified_cookie_allow_more_web(&state.public, &headers, Arc::clone(&state.storage)).await;
     let response = Html(page_shell_with_options(
         &page.generator.display_name,
         &format!(
@@ -10029,7 +10238,7 @@ where
             following_active: false,
             show_feed_tabs: true,
             viewer_profile: Some(&viewer_profile),
-            unread_count: unread_badge_count(state.storage.as_ref(), &did),
+            unread_count: unread_badge_count_web(Arc::clone(&state.storage), did.clone()).await,
             allow_more: allow_more.as_deref(),
         },
     ))
@@ -10572,7 +10781,14 @@ fn notification_count_stream<S: Storage + 'static>(
                         (None, receiver, heartbeat, storage, did, shutdown, _guard),
                     )),
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let count = storage.unread_notification_count(&did).unwrap_or_default();
+                        let viewer = did.clone();
+                        let count = web_storage_call(
+                            Arc::clone(&storage),
+                            "notification_stream_resync",
+                            move |storage| storage.unread_notification_count(&viewer),
+                        )
+                        .await
+                        .unwrap_or_default();
                         Some((
                             Ok(unread_count_event(count)),
                             (None, receiver, heartbeat, storage, did, shutdown, _guard),
@@ -10596,10 +10812,19 @@ where
     if !same_origin_event_request(&headers, &state.public.public_url) {
         return oauth_error(StatusCode::FORBIDDEN, "request must be same-origin");
     }
-    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+    let Some(did) =
+        verified_cookie_did_web(&state.public, &headers, Arc::clone(&state.storage)).await
+    else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    match state.storage.unread_notification_count(&did) {
+    let viewer = did.clone();
+    match web_storage_call(
+        Arc::clone(&state.storage),
+        "notification_unread_count",
+        move |storage| storage.unread_notification_count(&viewer),
+    )
+    .await
+    {
         Ok(count) => Json(json!({"count":count})).into_response(),
         Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     }
@@ -10616,7 +10841,9 @@ where
     if !same_origin_event_request(&headers, &state.public.public_url) {
         return oauth_error(StatusCode::FORBIDDEN, "request must be same-origin");
     }
-    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+    let Some(did) =
+        verified_cookie_did_web(&state.public, &headers, Arc::clone(&state.storage)).await
+    else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
     let Some(guard) = NotificationStreamGuard::acquire(
@@ -10629,8 +10856,25 @@ where
             "too many notification streams for this viewer",
         );
     };
-    let receiver = state.storage.subscribe_notification_counts(&did);
-    let initial_count = match state.storage.unread_notification_count(&did) {
+    let viewer = did.clone();
+    let receiver = match web_storage_call(
+        Arc::clone(&state.storage),
+        "notification_count_subscribe",
+        move |storage| Ok(storage.subscribe_notification_counts(&viewer)),
+    )
+    .await
+    {
+        Ok(receiver) => receiver,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    let viewer = did.clone();
+    let initial_count = match web_storage_call(
+        Arc::clone(&state.storage),
+        "notification_initial_count",
+        move |storage| storage.unread_notification_count(&viewer),
+    )
+    .await
+    {
         Ok(count) => count,
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
@@ -10693,7 +10937,9 @@ where
 {
     let mut page_timing = WebPageTiming::new("notifications");
     let session_started = std::time::Instant::now();
-    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+    let Some(did) =
+        verified_cookie_did_web(&state.public, &headers, Arc::clone(&state.storage)).await
+    else {
         return Redirect::to("/login").into_response();
     };
     page_timing.session_token_refresh_ms = session_started.elapsed().as_millis() as u64;
@@ -10701,7 +10947,7 @@ where
     let tabs = pinned_feeds_for_layout(
         &state.flow,
         &did,
-        verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()),
+        verified_cookie_feed_access_web(&state.public, &headers, Arc::clone(&state.storage)).await,
     )
     .await;
     page_timing.saved_feeds_ms = saved_feeds_started.elapsed().as_millis() as u64;
@@ -10715,7 +10961,14 @@ where
     let before = query
         .get("cursor")
         .and_then(|cursor| NotificationCursor::parse(cursor));
-    let last_seen_us = match state.storage.notification_last_seen(&did) {
+    let viewer = did.clone();
+    let last_seen_us = match web_storage_call(
+        Arc::clone(&state.storage),
+        "notification_last_seen",
+        move |storage| storage.notification_last_seen(&viewer),
+    )
+    .await
+    {
         Ok(time_us) => time_us,
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
@@ -10724,34 +10977,37 @@ where
         .unwrap_or_default()
         .as_micros()
         .min(u64::MAX as u128) as u64;
-    if let Err(error) = state.storage.mark_notifications_seen(&did, now_us) {
+    let viewer = did.clone();
+    if let Err(error) = web_storage_call(
+        Arc::clone(&state.storage),
+        "mark_notifications_seen",
+        move |storage| storage.mark_notifications_seen(&viewer, now_us),
+    )
+    .await
+    {
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
     let timeline_started = std::time::Instant::now();
     let page_storage = Arc::clone(&state.storage);
     let page_did = did.clone();
     let page_cursor = before.clone();
-    let notification_page = match tokio::task::spawn_blocking(move || {
-        notification_window_page(
-            page_storage.as_ref(),
-            &page_did,
-            page_cursor.as_ref(),
-            limit,
-            last_seen_us,
-        )
-    })
-    .await
-    {
-        Ok(Ok(page)) => page,
-        Ok(Err(error)) => {
-            tracing::warn!(%error, viewer = %did, "notification page read failed");
-            return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
-        }
-        Err(error) => {
-            tracing::warn!(%error, viewer = %did, "notification page read task panicked");
-            return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
-        }
-    };
+    let notification_page =
+        match web_storage_call(page_storage, "notification_page", move |storage| {
+            notification_window_page(
+                storage,
+                &page_did,
+                page_cursor.as_ref(),
+                limit,
+                last_seen_us,
+            )
+        })
+        .await
+        {
+            Ok(page) => page,
+            Err(error) => {
+                return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+            }
+        };
     page_timing.timeline_fetch_index_ms = timeline_started.elapsed().as_millis() as u64;
     page_timing.notification_events_read = notification_page.events_read;
     page_timing.notification_records_loaded = notification_page.records_loaded;
@@ -10766,13 +11022,27 @@ where
         .iter()
         .flat_map(|group| group.author_dids.iter().cloned())
         .collect::<Vec<_>>();
-    for group in &notification_page.groups {
-        if let Some(uri) = group.reason_subject.as_deref()
-            && let Ok(Some(post)) = state.storage.record_by_uri("app.bsky.feed.post", uri)
-        {
-            leading_authors.push(post.did);
-        }
-    }
+    let reason_subjects = notification_page
+        .groups
+        .iter()
+        .filter_map(|group| group.reason_subject.clone())
+        .collect::<Vec<_>>();
+    let subject_records = match web_storage_call(
+        Arc::clone(&state.storage),
+        "notification_subject_authors",
+        move |storage| {
+            reason_subjects
+                .iter()
+                .map(|uri| storage.record_by_uri("app.bsky.feed.post", uri))
+                .collect::<Result<Vec<_>, _>>()
+        },
+    )
+    .await
+    {
+        Ok(records) => records,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    leading_authors.extend(subject_records.into_iter().flatten().map(|post| post.did));
     let content_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
     let content_authors = page_content_authors(&notification_records, leading_authors);
     let account_data_hydration = fetch_page_account_data(
@@ -10824,24 +11094,25 @@ where
         }
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
-    if let Err(error) = queue_missing_parent_authors(state.storage.as_ref(), &parents) {
+    if let Err(error) =
+        queue_missing_parent_authors_web(Arc::clone(&state.storage), parents.clone()).await
+    {
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
     let render_started = std::time::Instant::now();
-    let render = WebRenderContext::default();
-    let items = notification_page
-        .groups
-        .iter()
-        .map(|group| {
-            render_web_notification_group(
-                state.storage.as_ref(),
-                group,
-                &quote_index,
-                &parents,
-                &render,
-            )
-        })
-        .collect::<String>();
+    let render = Arc::new(WebRenderContext::default());
+    let items = match render_notification_groups_web(
+        Arc::clone(&state.storage),
+        notification_page.groups.clone(),
+        quote_index.clone(),
+        parents.clone(),
+        Arc::clone(&render),
+    )
+    .await
+    {
+        Ok(items) => items,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
     let items = if items.is_empty() {
         "<li class=\"empty-state\">No notifications yet.</li>".to_owned()
     } else {
@@ -10861,8 +11132,9 @@ where
     } else {
         String::new()
     };
-    let viewer_profile = viewer_profile_view(state.storage.as_ref(), &did);
-    let allow_more = verified_cookie_allow_more(&state.public, &headers, state.storage.as_ref());
+    let viewer_profile = viewer_profile_view_web(Arc::clone(&state.storage), did.clone()).await;
+    let allow_more =
+        verified_cookie_allow_more_web(&state.public, &headers, Arc::clone(&state.storage)).await;
     let response = Html(page_shell_with_options(
         "Notifications",
         &format!(
@@ -10875,7 +11147,7 @@ where
             following_active: false,
             show_feed_tabs: true,
             viewer_profile: Some(&viewer_profile),
-            unread_count: unread_badge_count(state.storage.as_ref(), &did),
+            unread_count: unread_badge_count_web(Arc::clone(&state.storage), did.clone()).await,
             allow_more: allow_more.as_deref(),
         },
     ))
@@ -10883,6 +11155,24 @@ where
     page_timing.render_ms = render_started.elapsed().as_millis() as u64;
     render.finish_into(&mut page_timing);
     response
+}
+
+async fn render_notification_groups_web<S: Storage + 'static>(
+    storage: Arc<S>,
+    groups: Vec<NotificationWindowGroup>,
+    quote_index: QuoteRenderIndex,
+    parents: PageParentIndex,
+    render: Arc<WebRenderContext>,
+) -> Result<String, StorageError> {
+    web_storage_call(storage, "render_notification_groups", move |storage| {
+        Ok(groups
+            .iter()
+            .map(|group| {
+                render_web_notification_group(storage, group, &quote_index, &parents, &render)
+            })
+            .collect())
+    })
+    .await
 }
 
 fn render_web_notification_group<'a, S: Storage, G: NotificationGroupView<'a>>(
@@ -10940,9 +11230,16 @@ fn render_web_notification_group<'a, S: Storage, G: NotificationGroupView<'a>>(
     );
     let age = notification_age(newest.record.time_us);
     let snippet = if matches!(view.reason, "like" | "repost") {
-        view.reason_subject
-            .and_then(|uri| storage.record_by_uri("app.bsky.feed.post", uri).ok().flatten())
-            .and_then(|post| {
+        let post = view.reason_subject.and_then(|uri| {
+            match storage.record_by_uri("app.bsky.feed.post", uri) {
+                Ok(post) => post,
+                Err(error) => {
+                    tracing::warn!(%error, uri, "could not load a notification subject post");
+                    None
+                }
+            }
+        });
+        post.and_then(|post| {
                 let text = post.record.get("text").and_then(Value::as_str)?;
                 let text = text.chars().take(300).collect::<String>();
                 let target = url::form_urlencoded::byte_serialize(
@@ -10954,7 +11251,7 @@ fn render_web_notification_group<'a, S: Storage, G: NotificationGroupView<'a>>(
                     html_escape(&text)
                 ))
             })
-            .unwrap_or_default()
+        .unwrap_or_default()
     } else {
         String::new()
     };
@@ -11207,24 +11504,36 @@ fn render_account_label_chips(
     )
 }
 
-async fn profile_action_panel<F: OAuthFlow, S: Storage>(
+async fn profile_action_panel<F: OAuthFlow, S: Storage + 'static>(
     flow: &F,
     public: &OAuthPublic,
     headers: &HeaderMap,
-    storage: &S,
+    storage: Arc<S>,
     viewer_did: &str,
     subject_did: &str,
     timing: &mut ProfileActionTiming,
 ) -> Result<String, String> {
-    let projected_following = storage
-        .is_following(viewer_did, subject_did)
-        .map_err(|error| error.to_string())?;
-    // The viewer's own follow records are the source of truth: an emptied or
-    // stale `follows` projection must not flip a real follow back to "Follow".
-    let following = projected_following
-        || storage
-            .has_follow_record(viewer_did, subject_did)
-            .map_err(|error| error.to_string())?;
+    let viewer = viewer_did.to_owned();
+    let subject = subject_did.to_owned();
+    let (projected_following, following, blocked) = web_storage_call(
+        Arc::clone(&storage),
+        "profile_action_state",
+        move |storage| {
+            let projected = storage.is_following(&viewer, &subject)?;
+            // The viewer's own follow records are the source of truth: an emptied or
+            // stale `follows` projection must not flip a real follow back to "Follow".
+            let following = projected || storage.has_follow_record(&viewer, &subject)?;
+            let blocked = storage
+                .records_for_actor_collection(&viewer, "app.bsky.graph.block", 10_000)?
+                .iter()
+                .any(|record| {
+                    record.record.get("subject").and_then(Value::as_str) == Some(&subject)
+                });
+            Ok((projected, following, blocked))
+        },
+    )
+    .await
+    .map_err(|error| error.to_string())?;
     if following && !projected_following {
         tracing::debug!(
             viewer = %viewer_did,
@@ -11232,15 +11541,14 @@ async fn profile_action_panel<F: OAuthFlow, S: Storage>(
             "Follow state answered from the viewer's own follow records; the follows row was missing",
         );
     }
-    let blocked = storage
-        .records_for_actor_collection(viewer_did, "app.bsky.graph.block", 10_000)
-        .map_err(|error| error.to_string())?
-        .iter()
-        .any(|record| record.record.get("subject").and_then(Value::as_str) == Some(subject_did));
-    let follow_access = verified_cookie_follow_access(public, headers, storage);
-    let block_access = verified_cookie_block_access(public, headers, storage);
-    let mute_access = verified_cookie_mute_access(public, headers, storage);
-    let list_access = verified_cookie_list_access(public, headers, storage);
+    let permissions = verified_cookie_session_web(public, headers, storage)
+        .await
+        .map(|(_, _, _, permissions)| permissions)
+        .unwrap_or_default();
+    let follow_access = permissions.follow;
+    let block_access = permissions.block;
+    let mute_access = permissions.mute;
+    let list_access = permissions.list;
     let mutes_started = std::time::Instant::now();
     let muted_result = if mute_access {
         Some(flow.muted_actor_dids(viewer_did).await)
@@ -11450,9 +11758,15 @@ where
     S: Storage + 'static,
 {
     let started = std::time::Instant::now();
-    let stored = storage
-        .is_following(subject, viewer)
-        .map_err(|error| error.to_string())?;
+    let stored_viewer = viewer.to_owned();
+    let stored_subject = subject.to_owned();
+    let stored = web_storage_call(
+        Arc::clone(&storage),
+        "profile_follows_you_stored",
+        move |storage| storage.is_following(&stored_subject, &stored_viewer),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
     let mut answer = stored;
     let mut label = "none";
     if relationships.relationships_available() {
@@ -11484,13 +11798,24 @@ where
                             .await
                             {
                                 Ok(Ok(state)) => {
-                                    match relationships.apply_relationship(
-                                        storage.as_ref(),
-                                        &viewer,
-                                        &subject,
-                                        state,
-                                    ) {
-                                        Ok(rows) => {
+                                    let relationship_viewer = viewer.clone();
+                                    let relationship_subject = subject.clone();
+                                    let relationship_client = relationships.clone();
+                                    match web_storage_call(
+                                        storage,
+                                        "profile_relationship_background_apply",
+                                        move |storage| {
+                                            Ok(relationship_client.apply_relationship(
+                                                storage,
+                                                &relationship_viewer,
+                                                &relationship_subject,
+                                                state,
+                                            ))
+                                        },
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(rows)) => {
                                             relationships
                                                 .record_confirmation(&viewer, &subject, state.followed_by);
                                             tracing::debug!(
@@ -11500,11 +11825,17 @@ where
                                                 "follows-you relationship refreshed in the background"
                                             );
                                         }
-                                        Err(error) => tracing::warn!(
+                                        Ok(Err(error)) => tracing::warn!(
                                             viewer = %viewer,
                                             subject = %subject,
                                             error = %error,
                                             "follows-you background relationship rows failed; keeping the stored answer"
+                                        ),
+                                        Err(error) => tracing::warn!(
+                                            viewer = %viewer,
+                                            subject = %subject,
+                                            error = %error,
+                                            "follows-you background relationship storage task failed; keeping the stored answer"
                                         ),
                                     }
                                 }
@@ -11535,12 +11866,23 @@ where
                 .await
                 {
                     Ok(Ok(state)) => {
-                        let rows = relationships.apply_relationship(
-                            storage.as_ref(),
-                            viewer,
-                            subject,
-                            state,
-                        )?;
+                        let relationship_viewer = viewer.to_owned();
+                        let relationship_subject = subject.to_owned();
+                        let relationship_client = relationships.clone();
+                        let rows = web_storage_call(
+                            Arc::clone(&storage),
+                            "profile_relationship_apply",
+                            move |storage| {
+                                Ok(relationship_client.apply_relationship(
+                                    storage,
+                                    &relationship_viewer,
+                                    &relationship_subject,
+                                    state,
+                                ))
+                            },
+                        )
+                        .await
+                        .map_err(|error| error.to_string())??;
                         relationships.record_confirmation(viewer, subject, state.followed_by);
                         timing.relationship_rows_written += rows;
                         label = "confirmed";
@@ -11584,7 +11926,9 @@ where
 {
     let mut page_timing = WebPageTiming::new("profile");
     let session_started = std::time::Instant::now();
-    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+    let Some(did) =
+        verified_cookie_did_web(&state.public, &headers, Arc::clone(&state.storage)).await
+    else {
         return Redirect::to("/login").into_response();
     };
     page_timing.session_token_refresh_ms = session_started.elapsed().as_millis() as u64;
@@ -11592,7 +11936,7 @@ where
     let tabs = pinned_feeds_for_layout(
         &state.flow,
         &did,
-        verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()),
+        verified_cookie_feed_access_web(&state.public, &headers, Arc::clone(&state.storage)).await,
     )
     .await;
     page_timing.saved_feeds_ms = saved_feeds_started.elapsed().as_millis() as u64;
@@ -11601,7 +11945,13 @@ where
     let subject = query.get("did").map(String::as_str).unwrap_or(&did);
     if query.get("from").map(String::as_str) == Some("search")
         && query.contains_key("did")
-        && let Err(error) = state.storage.remember_recent_profile(&did, subject)
+        && let Err(error) =
+            web_storage_call(Arc::clone(&state.storage), "remember_recent_profile", {
+                let viewer = did.clone();
+                let subject = subject.to_owned();
+                move |storage| storage.remember_recent_profile(&viewer, &subject)
+            })
+            .await
     {
         tracing::warn!(%error, viewer_did = %did, profile_did = %subject, "could not remember a search profile visit; showing the page anyway");
     }
@@ -11614,16 +11964,20 @@ where
         .get("cursor")
         .and_then(|cursor| RecordCursor::parse(cursor));
     let timeline_started = std::time::Instant::now();
-    let mut page_records =
-        match state
-            .storage
-            .author_posts(subject, cursor.as_ref(), limit + 1, true)
-        {
-            Ok(records) => records,
-            Err(error) => {
-                return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
-            }
-        };
+    let subject_owned = subject.to_owned();
+    let page_cursor = cursor.clone();
+    let mut page_records = match web_storage_call(
+        Arc::clone(&state.storage),
+        "profile_author_posts",
+        move |storage| storage.author_posts(&subject_owned, page_cursor.as_ref(), limit + 1, true),
+    )
+    .await
+    {
+        Ok(records) => records,
+        Err(error) => {
+            return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+        }
+    };
     page_timing.timeline_fetch_index_ms = timeline_started.elapsed().as_millis() as u64;
     let mut has_more = page_records.len() > limit;
     let mut records = page_records.iter().take(limit).collect::<Vec<_>>();
@@ -11631,8 +11985,27 @@ where
     // cache is fresh or its last fetch is inside the retry backoff (owner
     // 2026-11-01: "should load their posts ... in a worker" / "And cache").
     // The page renders what is local right now and never waits.
-    let recent_posts_visit =
-        crate::recent_posts::on_profile_visit(state.storage.as_ref(), subject, records.len());
+    let subject_owned = subject.to_owned();
+    let local_count = records.len();
+    let recent_posts_visit = match web_storage_call(
+        Arc::clone(&state.storage),
+        "profile_recent_posts_status",
+        move |storage| {
+            Ok(crate::recent_posts::on_profile_visit(
+                storage,
+                &subject_owned,
+                local_count,
+            ))
+        },
+    )
+    .await
+    {
+        Ok(visit) => visit,
+        Err(_) => crate::recent_posts::RecentPostsVisit {
+            label: "cached",
+            show_loading_note: false,
+        },
+    };
     page_timing.profile_recent_posts = recent_posts_visit.label;
     // Older posts while scrolling (owner 2026-11-01, lane av75q step 3): when
     // the visitor paged to an OLDER page and the local store could not even
@@ -11662,7 +12035,7 @@ where
         let older_started = std::time::Instant::now();
         match crate::recent_posts::older_posts_while_scrolling(
             &state.flow,
-            state.storage.as_ref(),
+            Arc::clone(&state.storage),
             subject,
             oldest_local_rkey.as_deref(),
         )
@@ -11679,19 +12052,22 @@ where
                 page_timing.profile_older_posts = "ok";
                 page_timing.profile_older_posts_fetched = stored as u64;
                 page_timing.profile_older_posts_ms = older_started.elapsed().as_millis() as u64;
-                page_records =
-                    match state
-                        .storage
-                        .author_posts(subject, cursor.as_ref(), limit + 1, true)
-                    {
-                        Ok(records) => records,
-                        Err(error) => {
-                            return oauth_error(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                &error.to_string(),
-                            );
-                        }
-                    };
+                let subject_owned = subject.to_owned();
+                let page_cursor = cursor.clone();
+                page_records = match web_storage_call(
+                    Arc::clone(&state.storage),
+                    "profile_author_posts_after_fetch",
+                    move |storage| {
+                        storage.author_posts(&subject_owned, page_cursor.as_ref(), limit + 1, true)
+                    },
+                )
+                .await
+                {
+                    Ok(records) => records,
+                    Err(error) => {
+                        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+                    }
+                };
                 has_more = page_records.len() > limit;
                 records = page_records.iter().take(limit).collect::<Vec<_>>();
             }
@@ -11751,13 +12127,23 @@ where
         }
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
-    if let Err(error) = queue_missing_parent_authors(state.storage.as_ref(), &parents) {
+    if let Err(error) =
+        queue_missing_parent_authors_web(Arc::clone(&state.storage), parents.clone()).await
+    {
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
-    let mut profile = match profile_view_from_storage(state.storage.as_ref(), subject) {
-        Ok(profile) => profile,
-        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
-    };
+    let subject_owned = subject.to_owned();
+    let mut profile =
+        match web_storage_call(Arc::clone(&state.storage), "profile_view", move |storage| {
+            profile_view_from_storage(storage, &subject_owned)
+        })
+        .await
+        {
+            Ok(profile) => profile,
+            Err(error) => {
+                return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+            }
+        };
     let profile_counts_started = std::time::Instant::now();
     let counts = state.profile_counts.get_counts(subject).await;
     page_timing.profile_counts_ms = profile_counts_started.elapsed().as_millis() as u64;
@@ -11797,7 +12183,7 @@ where
             &state.flow,
             &state.public,
             &headers,
-            state.storage.as_ref(),
+            Arc::clone(&state.storage),
             &did,
             subject,
             &mut action_timing,
@@ -11830,9 +12216,10 @@ where
     .into_iter()
     .flatten()
     .collect::<String>();
-    let rights = verified_cookie_form_rights(&state.public, &headers, state.storage.as_ref());
+    let rights =
+        verified_cookie_form_rights_web(&state.public, &headers, Arc::clone(&state.storage)).await;
     let render_started = std::time::Instant::now();
-    let render = WebRenderContext::default();
+    let render = Arc::new(WebRenderContext::default());
     let no_list_blocks = HashMap::new();
     let interaction_uris = quote_records
         .iter()
@@ -11842,20 +12229,25 @@ where
     let page_interactions =
         load_page_interactions(&state.storage, &interaction_uris, Some(&did)).await;
     render.add_interactions(interactions_started.elapsed());
-    let posts = render_timeline_post_items(
-        state.storage.as_ref(),
-        &records,
-        &vec![String::new(); records.len()],
-        &parents,
-        &TimelineRenderContext {
-            viewer_did: &did,
+    let posts = match render_timeline_post_items_web(
+        Arc::clone(&state.storage),
+        TimelinePostRenderJob {
+            records: records.iter().map(|record| (*record).clone()).collect(),
+            preludes: vec![String::new(); records.len()],
+            parents: parents.clone(),
+            viewer_did: did.clone(),
             rights,
-            quote_index: &quote_index,
-            page_interactions: &page_interactions,
-            list_blocks: &no_list_blocks,
-            render: &render,
+            quote_index: quote_index.clone(),
+            page_interactions,
+            list_blocks: no_list_blocks,
+            render: Arc::clone(&render),
         },
-    );
+    )
+    .await
+    {
+        Ok(posts) => posts,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
     let posts = if posts.is_empty() {
         "<li class=\"empty-state\">No indexed posts yet.</li>".to_owned()
     } else {
@@ -11880,7 +12272,12 @@ where
     // fetch was attempted and the page came out empty — the request's own
     // cursor, so a failed fetch can be retried. No anchor, no link.
     let history_open = has_more
-        || match state.storage.older_posts_state(subject) {
+        || match web_storage_call(Arc::clone(&state.storage), "older_posts_state", {
+            let subject = subject.to_owned();
+            move |storage| storage.older_posts_state(&subject)
+        })
+        .await
+        {
             Ok(state) => !state.is_some_and(|state| state.exhausted),
             Err(error) => {
                 tracing::warn!(
@@ -11932,8 +12329,9 @@ where
         posts: &posts,
         older: &older,
     });
-    let viewer_profile = render.viewer_identity(state.storage.as_ref(), &did);
-    let allow_more = verified_cookie_allow_more(&state.public, &headers, state.storage.as_ref());
+    let viewer_profile = viewer_profile_view_web(Arc::clone(&state.storage), did.clone()).await;
+    let allow_more =
+        verified_cookie_allow_more_web(&state.public, &headers, Arc::clone(&state.storage)).await;
     let response = Html(page_shell_with_options(
         display_name,
         &content,
@@ -11944,7 +12342,7 @@ where
             following_active: false,
             show_feed_tabs: true,
             viewer_profile: Some(&viewer_profile),
-            unread_count: unread_badge_count(state.storage.as_ref(), &did),
+            unread_count: unread_badge_count_web(Arc::clone(&state.storage), did.clone()).await,
             allow_more: allow_more.as_deref(),
         },
     ))
@@ -12083,7 +12481,8 @@ where
     F: OAuthFlow,
     S: Storage + 'static,
 {
-    let Some(viewer_did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref())
+    let Some(viewer_did) =
+        verified_cookie_did_web(&state.public, &headers, Arc::clone(&state.storage)).await
     else {
         return Redirect::to("/login").into_response();
     };
@@ -12099,20 +12498,31 @@ where
             "profile actions are unavailable on your own profile",
         );
     }
-    let handle = match profile_card_view_from_storage(state.storage.as_ref(), subject_did) {
+    let subject = subject_did.to_owned();
+    let handle = match web_storage_call(
+        Arc::clone(&state.storage),
+        "block_confirm_profile",
+        move |storage| profile_card_view_from_storage(storage, &subject),
+    )
+    .await
+    {
         Ok(profile) => profile_handle(&profile, subject_did),
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
-    let content = if verified_cookie_block_access(&state.public, &headers, state.storage.as_ref()) {
-        render_profile_block_confirm_content(&handle, subject_did)
-    } else {
-        format!(
-            "<section class=\"block-confirm-card\"><h1>Block @{}</h1>{}</section>",
-            html_escape(&handle),
-            permission_reauthorization_link("block")
-        )
-    };
-    let viewer_profile = viewer_profile_view(state.storage.as_ref(), &viewer_did);
+    let content =
+        if verified_cookie_block_access_web(&state.public, &headers, Arc::clone(&state.storage))
+            .await
+        {
+            render_profile_block_confirm_content(&handle, subject_did)
+        } else {
+            format!(
+                "<section class=\"block-confirm-card\"><h1>Block @{}</h1>{}</section>",
+                html_escape(&handle),
+                permission_reauthorization_link("block")
+            )
+        };
+    let viewer_profile =
+        viewer_profile_view_web(Arc::clone(&state.storage), viewer_did.clone()).await;
     Html(page_shell(
         "Confirm block",
         &content,
@@ -12143,7 +12553,8 @@ where
     if !same_origin_request(&headers, &state.public.public_url) {
         return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
     }
-    let Some(viewer_did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref())
+    let Some(viewer_did) =
+        verified_cookie_did_web(&state.public, &headers, Arc::clone(&state.storage)).await
     else {
         return Redirect::to("/login").into_response();
     };
@@ -12165,19 +12576,23 @@ where
     };
     let (allowed, permission_name) = match action {
         "follow" | "unfollow" => (
-            verified_cookie_follow_access(&state.public, &headers, state.storage.as_ref()),
+            verified_cookie_follow_access_web(&state.public, &headers, Arc::clone(&state.storage))
+                .await,
             action,
         ),
         "block" | "unblock" => (
-            verified_cookie_block_access(&state.public, &headers, state.storage.as_ref()),
+            verified_cookie_block_access_web(&state.public, &headers, Arc::clone(&state.storage))
+                .await,
             action,
         ),
         "mute" | "unmute" => (
-            verified_cookie_mute_access(&state.public, &headers, state.storage.as_ref()),
+            verified_cookie_mute_access_web(&state.public, &headers, Arc::clone(&state.storage))
+                .await,
             action,
         ),
         "list_add" | "list_remove" | "list_toggle" => (
-            verified_cookie_list_access(&state.public, &headers, state.storage.as_ref()),
+            verified_cookie_list_access_web(&state.public, &headers, Arc::clone(&state.storage))
+                .await,
             "lists",
         ),
         _ => return oauth_error(StatusCode::BAD_REQUEST, "unknown profile action"),
@@ -12543,7 +12958,7 @@ where
             &state.flow,
             &state.public,
             &headers,
-            state.storage.as_ref(),
+            Arc::clone(&state.storage),
             &viewer_did,
             subject_did,
             &mut action_timing,
@@ -12576,7 +12991,8 @@ where
 {
     let mut page_timing = WebPageTiming::new("thread");
     let session_started = std::time::Instant::now();
-    let Some(viewer_did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref())
+    let Some(viewer_did) =
+        verified_cookie_did_web(&state.public, &headers, Arc::clone(&state.storage)).await
     else {
         return Redirect::to("/login").into_response();
     };
@@ -12585,7 +13001,7 @@ where
     let tabs = pinned_feeds_for_layout(
         &state.flow,
         &viewer_did,
-        verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()),
+        verified_cookie_feed_access_web(&state.public, &headers, Arc::clone(&state.storage)).await,
     )
     .await;
     page_timing.saved_feeds_ms = saved_feeds_started.elapsed().as_millis() as u64;
@@ -12596,9 +13012,13 @@ where
         return oauth_error(StatusCode::BAD_REQUEST, "uri is required");
     };
     let record_started = std::time::Instant::now();
-    let record_result =
-        load_post_record_with_source_until(&state.flow, state.storage.as_ref(), uri, page_deadline)
-            .await;
+    let record_result = load_post_record_with_source_until(
+        &state.flow,
+        Arc::clone(&state.storage),
+        uri,
+        page_deadline,
+    )
+    .await;
     let record_elapsed_ms = record_started.elapsed().as_millis() as u64;
     let (record, record_was_live) = match record_result {
         Ok(Some(record)) => record,
@@ -12616,7 +13036,8 @@ where
     } else {
         page_timing.timeline_fetch_index_ms += record_elapsed_ms;
     }
-    let rights = verified_cookie_form_rights(&state.public, &headers, state.storage.as_ref());
+    let rights =
+        verified_cookie_form_rights_web(&state.public, &headers, Arc::clone(&state.storage)).await;
     let parent_height = query
         .get("parentHeight")
         .and_then(|value| value.parse::<usize>().ok())
@@ -12630,7 +13051,7 @@ where
     let ancestors_started = std::time::Instant::now();
     let ancestors_result = thread_ancestors(
         &state.flow,
-        state.storage.as_ref(),
+        Arc::clone(&state.storage),
         &record,
         parent_height,
         page_deadline,
@@ -12652,17 +13073,22 @@ where
     } else {
         page_timing.timeline_fetch_index_ms += ancestors_ms;
     }
-    let mut thread_reply_records = Vec::new();
-    let mut author_reply_budget = 100;
-    if let Err(error) = collect_thread_reply_records(
-        state.storage.as_ref(),
-        &record,
-        depth,
-        &mut author_reply_budget,
-        &mut thread_reply_records,
-    ) {
-        return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
-    }
+    let reply_root = record.clone();
+    let thread_reply_records = match web_storage_call(
+        Arc::clone(&state.storage),
+        "thread_reply_records",
+        move |storage| {
+            let mut records = Vec::new();
+            let mut budget = 100;
+            collect_thread_reply_records(storage, &reply_root, depth, &mut budget, &mut records)?;
+            Ok(records)
+        },
+    )
+    .await
+    {
+        Ok(records) => records,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
     let page_records = ancestors
         .iter()
         .chain(std::iter::once(&record))
@@ -12719,7 +13145,7 @@ where
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
     let render_started = std::time::Instant::now();
-    let render = WebRenderContext::default();
+    let render = Arc::new(WebRenderContext::default());
     let interaction_uris = page_records
         .iter()
         .map(|record| record.uri.clone())
@@ -12728,92 +13154,128 @@ where
     let page_interactions =
         load_page_interactions(&state.storage, &interaction_uris, Some(&viewer_did)).await;
     render.add_interactions(interactions_started.elapsed());
-    let thread_ancestor_cards = thread_ancestor_display(&record, &parents, parent_height);
-    let ancestors_html = thread_ancestor_cards
-        .iter()
-        .enumerate()
-        .map(|(index, ancestor)| {
-            let card = match ancestor {
-                ThreadAncestorDisplay::Found(ancestor) => render_web_post(
-                    state.storage.as_ref(),
-                    ancestor,
-                    WebPostRenderOptions {
-                        viewer_did: &viewer_did,
-                        rights,
-                        link_text_to_thread: false,
-                        eager_avatar: index < 6,
-                        quote_index: &quote_index,
-                        page_interactions: &page_interactions,
-                        render: &render,
-                    },
-                ),
-                ThreadAncestorDisplay::Deferred(uri) => render_deferred_parent(uri, true),
+    let blob_access = if rights.post {
+        verified_cookie_blob_access_web(&state.public, &headers, Arc::clone(&state.storage)).await
+    } else {
+        false
+    };
+    let video_access = if rights.post {
+        verified_cookie_video_access_web(&state.public, &headers, Arc::clone(&state.storage)).await
+    } else {
+        false
+    };
+    let render_storage = Arc::clone(&state.storage);
+    let render_record = record.clone();
+    let render_replies = thread_reply_records.clone();
+    let render_parents = parents.clone();
+    let render_quotes = quote_index.clone();
+    let render_interactions = page_interactions.clone();
+    let render_viewer = viewer_did.clone();
+    let render_context = Arc::clone(&render);
+    let (ancestors_html, replies_html, reply_composer, reply_bar, viewer_profile, focus_html) =
+        match web_storage_call(render_storage, "render_thread_page", move |storage| {
+            let thread_ancestor_cards =
+                thread_ancestor_display(&render_record, &render_parents, parent_height);
+            let ancestors_html = thread_ancestor_cards
+                .iter()
+                .enumerate()
+                .map(|(index, ancestor)| {
+                    let card = match ancestor {
+                        ThreadAncestorDisplay::Found(ancestor) => render_web_post(
+                            storage,
+                            ancestor,
+                            WebPostRenderOptions {
+                                viewer_did: &render_viewer,
+                                rights,
+                                link_text_to_thread: false,
+                                eager_avatar: index < 6,
+                                quote_index: &render_quotes,
+                                page_interactions: &render_interactions,
+                                render: &render_context,
+                            },
+                        ),
+                        ThreadAncestorDisplay::Deferred(uri) => render_deferred_parent(uri, true),
+                    };
+                    format!("<li class=\"post-item\">{card}</li>")
+                })
+                .collect::<String>();
+            let thread_continuations = render_replies
+                .windows(2)
+                .filter(|pair| pair[0].did == pair[1].did)
+                .map(|pair| pair[0].uri.clone())
+                .collect::<HashSet<_>>();
+            let reply_options = ThreadReplyRenderOptions {
+                viewer_did: &render_viewer,
+                rights,
+                thread_continuations: &thread_continuations,
+                quote_index: &render_quotes,
+                page_interactions: &render_interactions,
+                render: &render_context,
             };
-            format!("<li class=\"post-item\">{card}</li>")
+            let mut reply_budget = 100;
+            let replies_html = render_thread_replies(
+                storage,
+                &render_record,
+                &reply_options,
+                depth,
+                &mut reply_budget,
+            )?;
+            let reply_composer = if rights.post {
+                render_reply_composer(
+                    storage,
+                    &render_viewer,
+                    &render_record,
+                    blob_access,
+                    video_access,
+                    &render_context,
+                )
+            } else {
+                String::new()
+            };
+            let reply_bar = if rights.post {
+                render_thread_reply_bar(storage, &render_viewer, &render_context)
+            } else {
+                String::new()
+            };
+            let viewer_profile = render_context.viewer_identity(storage, &render_viewer);
+            let focus_html = render_thread_focus(
+                storage,
+                &render_record,
+                &render_viewer,
+                rights,
+                true,
+                &render_quotes,
+                &render_context,
+            );
+            Ok((
+                ancestors_html,
+                replies_html,
+                reply_composer,
+                reply_bar,
+                viewer_profile,
+                focus_html,
+            ))
         })
-        .collect::<String>();
-    let mut reply_budget = 100;
-    let thread_continuations = thread_reply_records
-        .windows(2)
-        .filter(|pair| pair[0].did == pair[1].did)
-        .map(|pair| pair[0].uri.clone())
-        .collect::<HashSet<_>>();
-    let reply_options = ThreadReplyRenderOptions {
-        viewer_did: &viewer_did,
-        rights,
-        thread_continuations: &thread_continuations,
-        quote_index: &quote_index,
-        page_interactions: &page_interactions,
-        render: &render,
-    };
-    let replies_html = match render_thread_replies(
-        state.storage.as_ref(),
-        &record,
-        &reply_options,
-        depth,
-        &mut reply_budget,
-    ) {
-        Ok(replies) => replies,
-        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
-    };
+        .await
+        {
+            Ok(rendered) => rendered,
+            Err(error) => {
+                return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+            }
+        };
     let read_only_message = if rights.any() {
         String::new()
     } else {
         "<p role=\"status\">Read-only: write permissions were not granted.</p>".to_owned()
     };
-    let reply_composer = if rights.post {
-        render_reply_composer(
-            state.storage.as_ref(),
-            &viewer_did,
-            &record,
-            verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref()),
-            verified_cookie_video_access(&state.public, &headers, state.storage.as_ref()),
-            &render,
-        )
-    } else {
-        String::new()
-    };
-    let reply_bar = if rights.post {
-        render_thread_reply_bar(state.storage.as_ref(), &viewer_did, &render)
-    } else {
-        String::new()
-    };
-    let badge_count = unread_badge_count(state.storage.as_ref(), &viewer_did);
-    let viewer_profile = render.viewer_identity(state.storage.as_ref(), &viewer_did);
-    let allow_more = verified_cookie_allow_more(&state.public, &headers, state.storage.as_ref());
+    let badge_count = unread_badge_count_web(Arc::clone(&state.storage), viewer_did.clone()).await;
+    let allow_more =
+        verified_cookie_allow_more_web(&state.public, &headers, Arc::clone(&state.storage)).await;
     let response = Html(page_shell_with_options(
         "Thread",
         &format!(
             "<header class=\"thread-topbar\"><a href=\"/app\" aria-label=\"Back to timeline\">←</a><h1>Post</h1></header>{read_only_message}<section class=\"thread-ancestors\" aria-label=\"Earlier posts in this thread\"><ol class=\"post-list\">{ancestors_html}</ol></section><section class=\"thread-focus\" aria-label=\"Selected post\">{}</section><section class=\"thread-replies\" aria-label=\"Replies\">{replies_html}</section>{reply_composer}{reply_bar}",
-            render_thread_focus(
-                state.storage.as_ref(),
-                &record,
-                &viewer_did,
-                rights,
-                true,
-                &quote_index,
-                &render,
-            )
+            focus_html
         ),
         true,
         PageShellOptions {
@@ -12841,7 +13303,8 @@ where
     F: OAuthFlow,
     S: Storage + 'static,
 {
-    let Some(viewer_did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref())
+    let Some(viewer_did) =
+        verified_cookie_did_web(&state.public, &headers, Arc::clone(&state.storage)).await
     else {
         return Redirect::to("/login").into_response();
     };
@@ -12851,7 +13314,7 @@ where
     if post_uri_did(quote_uri).is_none() {
         return oauth_error(StatusCode::BAD_REQUEST, "quote_uri is not a post URI");
     }
-    let quoted = match load_post_record(&state.flow, state.storage.as_ref(), quote_uri).await {
+    let quoted = match load_post_record(&state.flow, Arc::clone(&state.storage), quote_uri).await {
         Ok(Some(record)) => record,
         Ok(None) => return oauth_error(StatusCode::NOT_FOUND, "quoted post not found"),
         Err(error) => return oauth_error(StatusCode::BAD_GATEWAY, &error),
@@ -12874,21 +13337,35 @@ where
         }
         Err(_) => PageAccountData::default(),
     };
-    if let Err(error) = hydrate_page_profiles(
-        state.storage.as_ref(),
-        std::iter::once(quoted.did.clone()),
-        profile_data.profiles,
-    ) {
+    let authors = vec![quoted.did.clone()];
+    if let Err(error) = web_storage_call(
+        Arc::clone(&state.storage),
+        "quote_profile_hydration",
+        move |storage| hydrate_page_profiles(storage, authors, profile_data.profiles),
+    )
+    .await
+    {
         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
-    let rights = verified_cookie_form_rights(&state.public, &headers, state.storage.as_ref());
+    let rights =
+        verified_cookie_form_rights_web(&state.public, &headers, Arc::clone(&state.storage)).await;
     let composer = if rights.post {
         let blob_access =
-            verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref());
+            verified_cookie_blob_access_web(&state.public, &headers, Arc::clone(&state.storage))
+                .await;
         let video_access =
-            verified_cookie_video_access(&state.public, &headers, state.storage.as_ref());
-        let profile = profile_card_view_from_storage(state.storage.as_ref(), &viewer_did)
+            verified_cookie_video_access_web(&state.public, &headers, Arc::clone(&state.storage))
+                .await;
+        let profile = profile_card_view_web(Arc::clone(&state.storage), viewer_did.clone())
+            .await
             .unwrap_or_else(|_| json!({"did":viewer_did,"handle":viewer_did}));
+        let quote_preview =
+            match render_quote_preview_web(Arc::clone(&state.storage), quoted.clone()).await {
+                Ok(preview) => preview,
+                Err(error) => {
+                    return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+                }
+            };
         render_composer(ComposerSpec {
             form_attributes: "",
             classes: "quote-composer media-composer",
@@ -12905,22 +13382,30 @@ where
             context: "",
             media_picker: render_media_picker(blob_access, video_access, "quote-media"),
             link_picker: render_link_picker("quote-text-link"),
-            trailing: &render_quote_preview(state.storage.as_ref(), &quoted),
+            trailing: &quote_preview,
             media_access: blob_access || video_access,
         })
     } else {
+        let quote_preview =
+            match render_quote_preview_web(Arc::clone(&state.storage), quoted.clone()).await {
+                Ok(preview) => preview,
+                Err(error) => {
+                    return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+                }
+            };
         format!(
             "<p role=\"status\">Read-only: write permissions were not granted.</p>{}",
-            render_quote_preview(state.storage.as_ref(), &quoted)
+            quote_preview
         )
     };
     let tabs = pinned_feeds_for_layout(
         &state.flow,
         &viewer_did,
-        verified_cookie_feed_access(&state.public, &headers, state.storage.as_ref()),
+        verified_cookie_feed_access_web(&state.public, &headers, Arc::clone(&state.storage)).await,
     )
     .await;
-    let viewer_profile = viewer_profile_view(state.storage.as_ref(), &viewer_did);
+    let viewer_profile =
+        viewer_profile_view_web(Arc::clone(&state.storage), viewer_did.clone()).await;
     Html(page_shell_with_options(
         "Quote post",
         &format!("<header class=\"page-heading\"><h1>Quote post</h1></header>{composer}"),
@@ -12931,7 +13416,8 @@ where
             following_active: false,
             show_feed_tabs: true,
             viewer_profile: Some(&viewer_profile),
-            unread_count: unread_badge_count(state.storage.as_ref(), &viewer_did),
+            unread_count: unread_badge_count_web(Arc::clone(&state.storage), viewer_did.clone())
+                .await,
             allow_more: None,
         },
     ))
@@ -12947,13 +13433,16 @@ where
     F: OAuthFlow,
     S: Storage + 'static,
 {
-    if verified_cookie_did(&state.public, &headers, state.storage.as_ref()).is_none() {
+    if verified_cookie_did_web(&state.public, &headers, Arc::clone(&state.storage))
+        .await
+        .is_none()
+    {
         return (StatusCode::UNAUTHORIZED, "sign in to load this quoted post").into_response();
     }
     let Some(uri) = query.get("uri").filter(|uri| post_uri_did(uri).is_some()) else {
         return oauth_error(StatusCode::BAD_REQUEST, "uri must identify a post");
     };
-    let record = match load_post_record(&state.flow, state.storage.as_ref(), uri).await {
+    let record = match load_post_record(&state.flow, Arc::clone(&state.storage), uri).await {
         Ok(Some(record)) => record,
         Ok(None) => return (StatusCode::NOT_FOUND, "quoted post not found").into_response(),
         Err(error) => {
@@ -12964,14 +13453,24 @@ where
     let mut index = QuoteRenderIndex::default();
     index.insert(uri.clone(), QuoteRenderState::Found(record));
     let embed = json!({"$type":"app.bsky.embed.record","record":{"record":{"uri":uri}}});
-    Html(render_web_quote(
-        &WebRenderContext::default(),
-        state.storage.as_ref(),
-        &embed,
-        &index,
-        0,
-    ))
-    .into_response()
+    match web_storage_call(
+        Arc::clone(&state.storage),
+        "render_quote_fragment",
+        move |storage| {
+            Ok(render_web_quote(
+                &WebRenderContext::default(),
+                storage,
+                &embed,
+                &index,
+                0,
+            ))
+        },
+    )
+    .await
+    {
+        Ok(html) => Html(html).into_response(),
+        Err(error) => oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    }
 }
 
 async fn parent_fragment<F, S>(
@@ -12983,14 +13482,22 @@ where
     F: OAuthFlow,
     S: Storage + 'static,
 {
-    let Some(viewer_did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref())
+    let Some(viewer_did) =
+        verified_cookie_did_web(&state.public, &headers, Arc::clone(&state.storage)).await
     else {
         return (StatusCode::UNAUTHORIZED, "sign in to load this parent post").into_response();
     };
     let Some(uri) = query.get("uri").filter(|uri| post_uri_did(uri).is_some()) else {
         return oauth_error(StatusCode::BAD_REQUEST, "uri must identify a post");
     };
-    let record = match state.storage.record_by_uri("app.bsky.feed.post", uri) {
+    let lookup_uri = uri.to_owned();
+    let record = match web_storage_call(
+        Arc::clone(&state.storage),
+        "parent_fragment_record",
+        move |storage| storage.record_by_uri("app.bsky.feed.post", &lookup_uri),
+    )
+    .await
+    {
         Ok(Some(record)) => record,
         Ok(None) => match tokio::time::timeout(
             Duration::from_secs(10),
@@ -13032,35 +13539,46 @@ where
             return (StatusCode::BAD_GATEWAY, "parent post could not be loaded").into_response();
         }
     };
-    let render = WebRenderContext::default();
-    let card = if query.get("view").is_some_and(|view| view == "thread") {
-        let mut quote_index = QuoteRenderIndex::default();
-        if let Some(embed) = record.record.get("embed")
-            && let Some(reference) = quoted_record_ref(embed)
-            && !reference.unavailable
-            && at_uri_collection(&reference.uri) == Some("app.bsky.feed.post")
-        {
-            quote_index.insert(reference.uri, QuoteRenderState::Pending);
-        }
-        render_web_post(
-            state.storage.as_ref(),
-            &record,
-            WebPostRenderOptions {
-                viewer_did: &viewer_did,
-                rights: verified_cookie_form_rights(
-                    &state.public,
-                    &headers,
-                    state.storage.as_ref(),
-                ),
-                link_text_to_thread: true,
-                eager_avatar: false,
-                quote_index: &quote_index,
-                page_interactions: &PageInteractionIndex::new(),
-                render: &render,
-            },
-        )
-    } else {
-        render_reply_parent_card(&render, state.storage.as_ref(), &record)
+    let thread_view = query.get("view").is_some_and(|view| view == "thread");
+    let rights =
+        verified_cookie_form_rights_web(&state.public, &headers, Arc::clone(&state.storage)).await;
+    let card = match web_storage_call(
+        Arc::clone(&state.storage),
+        "render_parent_fragment",
+        move |storage| {
+            let render = WebRenderContext::default();
+            let card = if thread_view {
+                let mut quote_index = QuoteRenderIndex::default();
+                if let Some(embed) = record.record.get("embed")
+                    && let Some(reference) = quoted_record_ref(embed)
+                    && !reference.unavailable
+                    && at_uri_collection(&reference.uri) == Some("app.bsky.feed.post")
+                {
+                    quote_index.insert(reference.uri, QuoteRenderState::Pending);
+                }
+                render_web_post(
+                    storage,
+                    &record,
+                    WebPostRenderOptions {
+                        viewer_did: &viewer_did,
+                        rights,
+                        link_text_to_thread: true,
+                        eager_avatar: false,
+                        quote_index: &quote_index,
+                        page_interactions: &PageInteractionIndex::new(),
+                        render: &render,
+                    },
+                )
+            } else {
+                render_reply_parent_card(&render, storage, &record)
+            };
+            Ok(card)
+        },
+    )
+    .await
+    {
+        Ok(card) => card,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
     };
     Html(card).into_response()
 }
@@ -13081,7 +13599,8 @@ where
     F: OAuthFlow,
     S: Storage + 'static,
 {
-    let Some(viewer_did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref())
+    let Some(viewer_did) =
+        verified_cookie_did_web(&state.public, &headers, Arc::clone(&state.storage)).await
     else {
         return (StatusCode::UNAUTHORIZED, "sign in to load these profiles").into_response();
     };
@@ -13116,42 +13635,61 @@ where
             PageAccountData::default()
         }
     };
-    if let Err(error) = hydrate_page_profiles(
-        state.storage.as_ref(),
-        dids.iter().cloned(),
-        account_data.profiles,
-    ) {
+    let authors = dids.clone();
+    if let Err(error) = web_storage_call(
+        Arc::clone(&state.storage),
+        "profile_fragment_hydration",
+        move |storage| hydrate_page_profiles(storage, authors, account_data.profiles),
+    )
+    .await
+    {
         tracing::debug!(%error, "profile fragment could not store the fetched profiles");
     }
-    let mut profiles = serde_json::Map::new();
-    for did in dids {
-        let Ok(profile) = profile_card_view_from_storage(state.storage.as_ref(), &did) else {
-            continue;
-        };
-        let handle = profile_handle(&profile, &did);
-        let display_name = profile
-            .get("displayName")
-            .and_then(Value::as_str)
-            .filter(|name| !name.is_empty());
-        let avatar = safe_avatar_url(&profile).and_then(avatar_thumbnail_url);
-        if handle == did && display_name.is_none() && avatar.is_none() {
-            continue;
-        }
-        let mut entry = serde_json::Map::new();
-        if handle != did {
-            entry.insert("handle".to_owned(), Value::String(handle));
-        }
-        if let Some(display_name) = display_name {
-            entry.insert(
-                "displayName".to_owned(),
-                Value::String(display_name.to_owned()),
-            );
-        }
-        if let Some(avatar) = avatar {
-            entry.insert("avatar".to_owned(), Value::String(avatar));
-        }
-        profiles.insert(did, Value::Object(entry));
-    }
+    let profiles_result = web_storage_call(
+        Arc::clone(&state.storage),
+        "profile_fragment_render",
+        move |storage| {
+            let mut profiles = serde_json::Map::new();
+            for did in dids {
+                let profile = match profile_card_view_from_storage(storage, &did) {
+                    Ok(profile) => profile,
+                    Err(error) => {
+                        tracing::warn!(%error, %did, "could not render profile fragment identity");
+                        continue;
+                    }
+                };
+                let handle = profile_handle(&profile, &did);
+                let display_name = profile
+                    .get("displayName")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty());
+                let avatar = safe_avatar_url(&profile).and_then(avatar_thumbnail_url);
+                if handle == did && display_name.is_none() && avatar.is_none() {
+                    continue;
+                }
+                let mut entry = serde_json::Map::new();
+                if handle != did {
+                    entry.insert("handle".to_owned(), Value::String(handle));
+                }
+                if let Some(display_name) = display_name {
+                    entry.insert(
+                        "displayName".to_owned(),
+                        Value::String(display_name.to_owned()),
+                    );
+                }
+                if let Some(avatar) = avatar {
+                    entry.insert("avatar".to_owned(), Value::String(avatar));
+                }
+                profiles.insert(did, Value::Object(entry));
+            }
+            Ok(profiles)
+        },
+    )
+    .await;
+    let profiles = match profiles_result {
+        Ok(profiles) => profiles,
+        Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
     Json(json!({"profiles": Value::Object(profiles)})).into_response()
 }
 
@@ -13186,9 +13724,29 @@ fn render_quote_preview<S: Storage>(storage: &S, quoted: &IndexedRecord) -> Stri
     )
 }
 
-async fn thread_ancestors<F: OAuthFlow, S: Storage>(
+async fn profile_card_view_web<S: Storage + 'static>(
+    storage: Arc<S>,
+    did: String,
+) -> Result<Value, StorageError> {
+    web_storage_call(storage, "profile_card_view", move |storage| {
+        profile_card_view_from_storage(storage, &did)
+    })
+    .await
+}
+
+async fn render_quote_preview_web<S: Storage + 'static>(
+    storage: Arc<S>,
+    quoted: IndexedRecord,
+) -> Result<String, StorageError> {
+    web_storage_call(storage, "render_quote_preview", move |storage| {
+        Ok(render_quote_preview(storage, &quoted))
+    })
+    .await
+}
+
+async fn thread_ancestors<F: OAuthFlow, S: Storage + 'static>(
     _flow: &F,
-    storage: &S,
+    storage: Arc<S>,
     record: &IndexedRecord,
     parent_height: usize,
     _deadline: tokio::time::Instant,
@@ -13218,9 +13776,14 @@ async fn thread_ancestors<F: OAuthFlow, S: Storage>(
     {
         initial_uris.push(root.clone());
     }
-    let mut records = storage
-        .records_by_uri("app.bsky.feed.post", &initial_uris)
-        .map_err(|error| error.to_string())?;
+    let uris = initial_uris.clone();
+    let mut records = web_storage_call(
+        Arc::clone(&storage),
+        "thread_initial_ancestors",
+        move |storage| storage.records_by_uri("app.bsky.feed.post", &uris),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
     for _ in 0..parent_height {
         let Some(uri) = parent_uri else { break };
         if !visited.insert(uri.clone()) {
@@ -13228,10 +13791,15 @@ async fn thread_ancestors<F: OAuthFlow, S: Storage>(
         }
         let parent = match records.remove(&uri) {
             Some(parent) => parent,
-            None => match storage
-                .records_by_uri("app.bsky.feed.post", std::slice::from_ref(&uri))
-                .map_err(|error| error.to_string())?
-                .remove(&uri)
+            None => match web_storage_call(Arc::clone(&storage), "thread_parent_lookup", {
+                let uri = uri.clone();
+                move |storage| {
+                    storage.records_by_uri("app.bsky.feed.post", std::slice::from_ref(&uri))
+                }
+            })
+            .await
+            .map_err(|error| error.to_string())?
+            .remove(&uri)
             {
                 Some(parent) => parent,
                 None => break,
@@ -13253,9 +13821,9 @@ async fn thread_ancestors<F: OAuthFlow, S: Storage>(
     Ok((ancestors, stats))
 }
 
-async fn load_post_record<F: OAuthFlow, S: Storage>(
+async fn load_post_record<F: OAuthFlow, S: Storage + 'static>(
     flow: &F,
-    storage: &S,
+    storage: Arc<S>,
     uri: &str,
 ) -> Result<Option<IndexedRecord>, String> {
     load_post_record_until(
@@ -13267,9 +13835,9 @@ async fn load_post_record<F: OAuthFlow, S: Storage>(
     .await
 }
 
-async fn load_post_record_until<F: OAuthFlow, S: Storage>(
+async fn load_post_record_until<F: OAuthFlow, S: Storage + 'static>(
     flow: &F,
-    storage: &S,
+    storage: Arc<S>,
     uri: &str,
     deadline: tokio::time::Instant,
 ) -> Result<Option<IndexedRecord>, String> {
@@ -13280,15 +13848,18 @@ async fn load_post_record_until<F: OAuthFlow, S: Storage>(
     )
 }
 
-async fn load_post_record_with_source_until<F: OAuthFlow, S: Storage>(
+async fn load_post_record_with_source_until<F: OAuthFlow, S: Storage + 'static>(
     flow: &F,
-    storage: &S,
+    storage: Arc<S>,
     uri: &str,
     deadline: tokio::time::Instant,
 ) -> Result<Option<(IndexedRecord, bool)>, String> {
-    if let Some(record) = storage
-        .record_by_uri("app.bsky.feed.post", uri)
-        .map_err(|error| error.to_string())?
+    let uri_owned = uri.to_owned();
+    if let Some(record) = web_storage_call(storage, "post_record_lookup", move |storage| {
+        storage.record_by_uri("app.bsky.feed.post", &uri_owned)
+    })
+    .await
+    .map_err(|error| error.to_string())?
     {
         return Ok(Some((record, false)));
     }
@@ -13451,10 +14022,14 @@ fn render_thread_focus<S: Storage>(
         .and_then(Value::as_str)
         .map(thread_date_label)
         .unwrap_or_else(|| "time unavailable".to_owned());
-    let threadgate = storage
-        .get_record(&record.did, "app.bsky.feed.threadgate", &record.rkey)
-        .ok()
-        .flatten();
+    let threadgate = match storage.get_record(&record.did, "app.bsky.feed.threadgate", &record.rkey)
+    {
+        Ok(threadgate) => threadgate,
+        Err(error) => {
+            tracing::warn!(%error, uri = %record.uri, "could not read the post threadgate");
+            None
+        }
+    };
     let reply_policy = if threadgate.is_none() {
         " · Everybody can reply"
     } else {
@@ -13463,7 +14038,10 @@ fn render_thread_focus<S: Storage>(
     let interactions = render.timed_interactions(|| {
         storage
             .post_interaction_summary(&record.uri, Some(viewer_did))
-            .unwrap_or_default()
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, uri = %record.uri, "could not read thread post interactions; rendering zeros");
+                Default::default()
+            })
     });
     let stats = [
         (interactions.repost_count, "repost", "reposts"),
@@ -14294,13 +14872,16 @@ where
     if !same_origin_request(&headers, &state.public.public_url) {
         return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
     }
-    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+    let Some(did) =
+        verified_cookie_did_web(&state.public, &headers, Arc::clone(&state.storage)).await
+    else {
         return Redirect::to("/login").into_response();
     };
-    if !verified_cookie_post_access(&state.public, &headers, state.storage.as_ref()) {
+    if !verified_cookie_post_access_web(&state.public, &headers, Arc::clone(&state.storage)).await {
         return write_permission_page("post videos", "post");
     }
-    if !verified_cookie_video_access(&state.public, &headers, state.storage.as_ref()) {
+    if !verified_cookie_video_access_web(&state.public, &headers, Arc::clone(&state.storage)).await
+    {
         return oauth_error(StatusCode::FORBIDDEN, "sign in again to post videos");
     }
     let submission = match parse_video_submission(request, &state).await {
@@ -14328,21 +14909,22 @@ where
         if post_uri_did(parent_uri).is_none() {
             return oauth_error(StatusCode::BAD_REQUEST, "parent_uri is not a post URI");
         }
-        let parent = match load_post_record(&state.flow, state.storage.as_ref(), parent_uri).await {
-            Ok(Some(record)) => record,
-            Ok(None) => return oauth_error(StatusCode::NOT_FOUND, "parent post not found"),
-            Err(error) => {
-                return web_write_response(
-                    &state.public,
-                    &headers,
-                    "video",
-                    "video post",
-                    &did,
-                    StatusCode::BAD_GATEWAY,
-                    &error,
-                );
-            }
-        };
+        let parent =
+            match load_post_record(&state.flow, Arc::clone(&state.storage), parent_uri).await {
+                Ok(Some(record)) => record,
+                Ok(None) => return oauth_error(StatusCode::NOT_FOUND, "parent post not found"),
+                Err(error) => {
+                    return web_write_response(
+                        &state.public,
+                        &headers,
+                        "video",
+                        "video post",
+                        &did,
+                        StatusCode::BAD_GATEWAY,
+                        &error,
+                    );
+                }
+            };
         let Some(parent_cid) = parent.cid.as_deref().filter(|cid| !cid.is_empty()) else {
             return oauth_error(StatusCode::BAD_REQUEST, "parent post has no CID");
         };
@@ -14373,21 +14955,22 @@ where
         if post_uri_did(quote_uri).is_none() {
             return oauth_error(StatusCode::BAD_REQUEST, "quote_uri is not a post URI");
         }
-        let quoted = match load_post_record(&state.flow, state.storage.as_ref(), quote_uri).await {
-            Ok(Some(record)) => record,
-            Ok(None) => return oauth_error(StatusCode::NOT_FOUND, "quoted post not found"),
-            Err(error) => {
-                return web_write_response(
-                    &state.public,
-                    &headers,
-                    "video",
-                    "video post",
-                    &did,
-                    StatusCode::BAD_GATEWAY,
-                    &error,
-                );
-            }
-        };
+        let quoted =
+            match load_post_record(&state.flow, Arc::clone(&state.storage), quote_uri).await {
+                Ok(Some(record)) => record,
+                Ok(None) => return oauth_error(StatusCode::NOT_FOUND, "quoted post not found"),
+                Err(error) => {
+                    return web_write_response(
+                        &state.public,
+                        &headers,
+                        "video",
+                        "video post",
+                        &did,
+                        StatusCode::BAD_GATEWAY,
+                        &error,
+                    );
+                }
+            };
         let Some(cid) = quoted.cid.as_deref().filter(|cid| !cid.is_empty()) else {
             return oauth_error(StatusCode::BAD_REQUEST, "quoted post has no CID");
         };
@@ -14466,10 +15049,13 @@ where
     if !same_origin_request(&headers, &state.public.public_url) {
         return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
     }
-    if verified_cookie_did(&state.public, &headers, state.storage.as_ref()).is_none() {
+    if verified_cookie_did_web(&state.public, &headers, Arc::clone(&state.storage))
+        .await
+        .is_none()
+    {
         return Redirect::to("/login").into_response();
     }
-    if !verified_cookie_post_access(&state.public, &headers, state.storage.as_ref()) {
+    if !verified_cookie_post_access_web(&state.public, &headers, Arc::clone(&state.storage)).await {
         return oauth_error(StatusCode::FORBIDDEN, "write permissions were not granted");
     }
     match state.link_card_fetcher.fetch(&input.url).await {
@@ -14490,10 +15076,12 @@ where
     if !same_origin_request(&headers, &state.public.public_url) {
         return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
     }
-    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+    let Some(did) =
+        verified_cookie_did_web(&state.public, &headers, Arc::clone(&state.storage)).await
+    else {
         return Redirect::to("/login").into_response();
     };
-    if !verified_cookie_post_access(&state.public, &headers, state.storage.as_ref()) {
+    if !verified_cookie_post_access_web(&state.public, &headers, Arc::clone(&state.storage)).await {
         return write_permission_page("post", "post");
     }
     let submission = match parse_post_submission(request, &state).await {
@@ -14501,7 +15089,8 @@ where
         Err((status, message)) => return oauth_error(status, &message),
     };
     if !submission.images.is_empty()
-        && !verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref())
+        && !verified_cookie_blob_access_web(&state.public, &headers, Arc::clone(&state.storage))
+            .await
     {
         return oauth_error(
             StatusCode::FORBIDDEN,
@@ -14528,7 +15117,8 @@ where
     if external
         .as_ref()
         .is_some_and(|link| link.thumbnail.is_some())
-        && !verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref())
+        && !verified_cookie_blob_access_web(&state.public, &headers, Arc::clone(&state.storage))
+            .await
     {
         return oauth_error(
             StatusCode::FORBIDDEN,
@@ -14627,10 +15217,12 @@ where
     if !same_origin_request(&headers, &state.public.public_url) {
         return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
     }
-    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+    let Some(did) =
+        verified_cookie_did_web(&state.public, &headers, Arc::clone(&state.storage)).await
+    else {
         return Redirect::to("/login").into_response();
     };
-    if !verified_cookie_post_access(&state.public, &headers, state.storage.as_ref()) {
+    if !verified_cookie_post_access_web(&state.public, &headers, Arc::clone(&state.storage)).await {
         return write_permission_page("quote a post", "post");
     }
     let submission = match parse_post_submission(request, &state).await {
@@ -14638,7 +15230,8 @@ where
         Err((status, message)) => return oauth_error(status, &message),
     };
     if !submission.images.is_empty()
-        && !verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref())
+        && !verified_cookie_blob_access_web(&state.public, &headers, Arc::clone(&state.storage))
+            .await
     {
         return oauth_error(
             StatusCode::FORBIDDEN,
@@ -14659,7 +15252,7 @@ where
     else {
         return oauth_error(StatusCode::BAD_REQUEST, "quote_uri is required");
     };
-    let quoted = match load_post_record(&state.flow, state.storage.as_ref(), quote_uri).await {
+    let quoted = match load_post_record(&state.flow, Arc::clone(&state.storage), quote_uri).await {
         Ok(Some(record)) => record,
         Ok(None) => return oauth_error(StatusCode::NOT_FOUND, "quoted post not found"),
         Err(error) => {
@@ -14694,7 +15287,8 @@ where
     if external
         .as_ref()
         .is_some_and(|link| link.thumbnail.is_some())
-        && !verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref())
+        && !verified_cookie_blob_access_web(&state.public, &headers, Arc::clone(&state.storage))
+            .await
     {
         return oauth_error(
             StatusCode::FORBIDDEN,
@@ -14755,10 +15349,12 @@ where
     if !same_origin_request(&headers, &state.public.public_url) {
         return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
     }
-    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+    let Some(did) =
+        verified_cookie_did_web(&state.public, &headers, Arc::clone(&state.storage)).await
+    else {
         return Redirect::to("/login").into_response();
     };
-    if !verified_cookie_post_access(&state.public, &headers, state.storage.as_ref()) {
+    if !verified_cookie_post_access_web(&state.public, &headers, Arc::clone(&state.storage)).await {
         return write_permission_page("reply", "post");
     }
     let submission = match parse_post_submission(request, &state).await {
@@ -14766,7 +15362,8 @@ where
         Err((status, message)) => return oauth_error(status, &message),
     };
     if !submission.images.is_empty()
-        && !verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref())
+        && !verified_cookie_blob_access_web(&state.public, &headers, Arc::clone(&state.storage))
+            .await
     {
         return oauth_error(
             StatusCode::FORBIDDEN,
@@ -14787,7 +15384,7 @@ where
     else {
         return oauth_error(StatusCode::BAD_REQUEST, "parent_uri is required");
     };
-    let parent = match load_post_record(&state.flow, state.storage.as_ref(), parent_uri).await {
+    let parent = match load_post_record(&state.flow, Arc::clone(&state.storage), parent_uri).await {
         Ok(Some(parent)) => parent,
         Ok(None) => return oauth_error(StatusCode::NOT_FOUND, "parent post not found"),
         Err(error) => {
@@ -14849,7 +15446,8 @@ where
     if external
         .as_ref()
         .is_some_and(|link| link.thumbnail.is_some())
-        && !verified_cookie_blob_access(&state.public, &headers, state.storage.as_ref())
+        && !verified_cookie_blob_access_web(&state.public, &headers, Arc::clone(&state.storage))
+            .await
     {
         return oauth_error(
             StatusCode::FORBIDDEN,
@@ -15250,10 +15848,12 @@ where
     if !same_origin_request(&headers, &state.public.public_url) {
         return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
     }
-    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+    let Some(did) =
+        verified_cookie_did_web(&state.public, &headers, Arc::clone(&state.storage)).await
+    else {
         return Redirect::to("/login").into_response();
     };
-    if !verified_cookie_like_access(&state.public, &headers, state.storage.as_ref()) {
+    if !verified_cookie_like_access_web(&state.public, &headers, Arc::clone(&state.storage)).await {
         return write_permission_page("like posts", "like");
     }
     let (Some(uri), Some(cid)) = (form.get("uri"), form.get("cid")) else {
@@ -15267,7 +15867,15 @@ where
     // summary can no longer see it when the response goes out.
     let pending_key = ("app.bsky.feed.like".to_owned(), did.clone(), uri.to_owned());
     if form.get("intent").is_some_and(|intent| intent == "delete") {
-        let summary = match state.storage.post_interaction_summary(uri, Some(&did)) {
+        let target_uri = uri.to_owned();
+        let viewer = did.clone();
+        let summary = match web_storage_call(
+            Arc::clone(&state.storage),
+            "unlike_post_interaction_summary",
+            move |storage| storage.post_interaction_summary(&target_uri, Some(&viewer)),
+        )
+        .await
+        {
             Ok(summary) => summary,
             Err(error) => {
                 tracing::warn!(error = %error, "could not read the post summary for the unlike");
@@ -15334,10 +15942,28 @@ where
             ),
         };
     }
-    let summary = state
-        .storage
-        .post_interaction_summary(uri, Some(&did))
-        .unwrap_or_default();
+    let target_uri = uri.to_owned();
+    let viewer = did.clone();
+    let summary = match web_storage_call(
+        Arc::clone(&state.storage),
+        "like_post_interaction_summary",
+        move |storage| storage.post_interaction_summary(&target_uri, Some(&viewer)),
+    )
+    .await
+    {
+        Ok(summary) => summary,
+        Err(error) => {
+            return web_write_response(
+                &state.public,
+                &headers,
+                "like",
+                "like",
+                &did,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &error.to_string(),
+            );
+        }
+    };
     if summary.viewer_like.is_some() {
         // The index already has this like: a click on a stale page must not make
         // a second PDS like.
@@ -15424,10 +16050,13 @@ where
     if !same_origin_request(&headers, &state.public.public_url) {
         return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
     }
-    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+    let Some(did) =
+        verified_cookie_did_web(&state.public, &headers, Arc::clone(&state.storage)).await
+    else {
         return Redirect::to("/login").into_response();
     };
-    if !verified_cookie_repost_access(&state.public, &headers, state.storage.as_ref()) {
+    if !verified_cookie_repost_access_web(&state.public, &headers, Arc::clone(&state.storage)).await
+    {
         return write_permission_page("repost", "repost");
     }
     let (Some(uri), Some(cid)) = (form.get("uri"), form.get("cid")) else {
@@ -15438,10 +16067,28 @@ where
     }
     // Same answer-on-PDS-OK shape as the like: the count is the page's count read
     // before the write, adjusted here, because the index row lands in the background.
-    let summary = state
-        .storage
-        .post_interaction_summary(uri, Some(&did))
-        .unwrap_or_default();
+    let target_uri = uri.to_owned();
+    let viewer = did.clone();
+    let summary = match web_storage_call(
+        Arc::clone(&state.storage),
+        "repost_post_interaction_summary",
+        move |storage| storage.post_interaction_summary(&target_uri, Some(&viewer)),
+    )
+    .await
+    {
+        Ok(summary) => summary,
+        Err(error) => {
+            return web_write_response(
+                &state.public,
+                &headers,
+                "repost",
+                "repost",
+                &did,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &error.to_string(),
+            );
+        }
+    };
     let pending_key = (
         "app.bsky.feed.repost".to_owned(),
         did.clone(),
@@ -15519,28 +16166,80 @@ where
     }
 }
 
-fn verified_cookie_did<S: Storage>(
+async fn verified_cookie_session_web<S: Storage + 'static>(
     public: &OAuthPublic,
     headers: &HeaderMap,
-    storage: &S,
-) -> Option<String> {
-    verified_cookie_session(public, headers, storage).map(|(did, _, _, _)| did)
+    storage: Arc<S>,
+) -> Option<(String, String, u64, SessionPermissions)> {
+    let public = public.clone();
+    let headers = headers.clone();
+    web_storage_call(storage, "web_session", move |storage| {
+        verify_cookie_session(&public, &headers, storage)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
-/// The per-activity form rights a signed-in viewer holds, read once so every feed/thread control
-/// can be gated on its own box.
-fn verified_cookie_form_rights<S: Storage>(
+async fn verified_cookie_did_web<S: Storage + 'static>(
     public: &OAuthPublic,
     headers: &HeaderMap,
-    storage: &S,
+    storage: Arc<S>,
+) -> Option<String> {
+    verified_cookie_session_web(public, headers, storage)
+        .await
+        .map(|(did, _, _, _)| did)
+}
+
+macro_rules! cookie_permission_web {
+    ($name:ident, $field:ident) => {
+        async fn $name<S: Storage + 'static>(
+            public: &OAuthPublic,
+            headers: &HeaderMap,
+            storage: Arc<S>,
+        ) -> bool {
+            verified_cookie_session_web(public, headers, storage)
+                .await
+                .is_some_and(|(_, _, _, permissions)| permissions.$field)
+        }
+    };
+}
+
+cookie_permission_web!(verified_cookie_post_access_web, post);
+cookie_permission_web!(verified_cookie_like_access_web, like);
+cookie_permission_web!(verified_cookie_repost_access_web, repost);
+cookie_permission_web!(verified_cookie_blob_access_web, blob);
+cookie_permission_web!(verified_cookie_video_access_web, video);
+cookie_permission_web!(verified_cookie_feed_access_web, feed);
+cookie_permission_web!(verified_cookie_preferences_access_web, preferences);
+cookie_permission_web!(verified_cookie_follow_access_web, follow);
+cookie_permission_web!(verified_cookie_block_access_web, block);
+cookie_permission_web!(verified_cookie_mute_access_web, mute);
+cookie_permission_web!(verified_cookie_list_access_web, list);
+
+async fn verified_cookie_form_rights_web<S: Storage + 'static>(
+    public: &OAuthPublic,
+    headers: &HeaderMap,
+    storage: Arc<S>,
 ) -> FormRights {
-    verified_cookie_session(public, headers, storage)
+    verified_cookie_session_web(public, headers, storage)
+        .await
         .map(|(_, _, _, permissions)| FormRights {
             post: permissions.post,
             repost: permissions.repost,
             like: permissions.like,
         })
         .unwrap_or_default()
+}
+
+async fn verified_cookie_allow_more_web<S: Storage + 'static>(
+    public: &OAuthPublic,
+    headers: &HeaderMap,
+    storage: Arc<S>,
+) -> Option<String> {
+    verified_cookie_session_web(public, headers, storage)
+        .await
+        .and_then(|(_, _, _, permissions)| allow_more_href(&permissions))
 }
 
 /// The sign-in link that lets a session add boxes without losing the ones it already holds: it
@@ -15570,133 +16269,28 @@ fn allow_more_href(permissions: &SessionPermissions) -> Option<String> {
     }
 }
 
-fn verified_cookie_allow_more<S: Storage>(
+fn verify_cookie_session<S: Storage>(
     public: &OAuthPublic,
     headers: &HeaderMap,
     storage: &S,
-) -> Option<String> {
-    verified_cookie_session(public, headers, storage)
-        .and_then(|(_, _, _, permissions)| allow_more_href(&permissions))
-}
-
-fn verified_cookie_post_access<S: Storage>(
-    public: &OAuthPublic,
-    headers: &HeaderMap,
-    storage: &S,
-) -> bool {
-    verified_cookie_session(public, headers, storage)
-        .is_some_and(|(_, _, _, permissions)| permissions.post)
-}
-
-fn verified_cookie_like_access<S: Storage>(
-    public: &OAuthPublic,
-    headers: &HeaderMap,
-    storage: &S,
-) -> bool {
-    verified_cookie_session(public, headers, storage)
-        .is_some_and(|(_, _, _, permissions)| permissions.like)
-}
-
-fn verified_cookie_repost_access<S: Storage>(
-    public: &OAuthPublic,
-    headers: &HeaderMap,
-    storage: &S,
-) -> bool {
-    verified_cookie_session(public, headers, storage)
-        .is_some_and(|(_, _, _, permissions)| permissions.repost)
-}
-
-fn verified_cookie_blob_access<S: Storage>(
-    public: &OAuthPublic,
-    headers: &HeaderMap,
-    storage: &S,
-) -> bool {
-    verified_cookie_session(public, headers, storage)
-        .is_some_and(|(_, _, _, permissions)| permissions.blob)
-}
-
-fn verified_cookie_video_access<S: Storage>(
-    public: &OAuthPublic,
-    headers: &HeaderMap,
-    storage: &S,
-) -> bool {
-    verified_cookie_session(public, headers, storage)
-        .is_some_and(|(_, _, _, permissions)| permissions.video)
-}
-
-fn verified_cookie_feed_access<S: Storage>(
-    public: &OAuthPublic,
-    headers: &HeaderMap,
-    storage: &S,
-) -> bool {
-    verified_cookie_session(public, headers, storage)
-        .is_some_and(|(_, _, _, permissions)| permissions.feed)
-}
-
-fn verified_cookie_preferences_access<S: Storage>(
-    public: &OAuthPublic,
-    headers: &HeaderMap,
-    storage: &S,
-) -> bool {
-    verified_cookie_session(public, headers, storage)
-        .is_some_and(|(_, _, _, permissions)| permissions.preferences)
-}
-
-fn verified_cookie_follow_access<S: Storage>(
-    public: &OAuthPublic,
-    headers: &HeaderMap,
-    storage: &S,
-) -> bool {
-    verified_cookie_session(public, headers, storage)
-        .is_some_and(|(_, _, _, permissions)| permissions.follow)
-}
-
-fn verified_cookie_block_access<S: Storage>(
-    public: &OAuthPublic,
-    headers: &HeaderMap,
-    storage: &S,
-) -> bool {
-    verified_cookie_session(public, headers, storage)
-        .is_some_and(|(_, _, _, permissions)| permissions.block)
-}
-
-fn verified_cookie_mute_access<S: Storage>(
-    public: &OAuthPublic,
-    headers: &HeaderMap,
-    storage: &S,
-) -> bool {
-    verified_cookie_session(public, headers, storage)
-        .is_some_and(|(_, _, _, permissions)| permissions.mute)
-}
-
-fn verified_cookie_list_access<S: Storage>(
-    public: &OAuthPublic,
-    headers: &HeaderMap,
-    storage: &S,
-) -> bool {
-    verified_cookie_session(public, headers, storage)
-        .is_some_and(|(_, _, _, permissions)| permissions.list)
-}
-
-fn verified_cookie_session<S: Storage>(
-    public: &OAuthPublic,
-    headers: &HeaderMap,
-    storage: &S,
-) -> Option<(String, String, u64, SessionPermissions)> {
+) -> Result<Option<(String, String, u64, SessionPermissions)>, StorageError> {
     let (did, session_id, generation, permissions) =
-        cookie_value(headers).and_then(|value| public.verify_session_cookie(value))?;
+        match cookie_value(headers).and_then(|value| public.verify_session_cookie(value)) {
+            Some(session) => session,
+            None => return Ok(None),
+        };
     if !public.login_is_allowed(&did) {
-        if let Err(error) = storage.delete_web_session(&did, &session_id) {
-            tracing::warn!(%error, did = %did, "could not remove a disallowed web session");
-        }
-        return None;
+        storage.delete_web_session(&did, &session_id)?;
+        return Ok(None);
     }
-    (storage
-        .web_session_generation(&did, &session_id)
-        .ok()
-        .flatten()
-        == Some(generation))
-    .then_some((did, session_id, generation, permissions))
+    Ok(
+        (storage.web_session_generation(&did, &session_id)? == Some(generation)).then_some((
+            did,
+            session_id,
+            generation,
+            permissions,
+        )),
+    )
 }
 
 /// The like script asks with `x-appview-fetch: 1` and gets the new state as JSON instead of a page.
@@ -15930,7 +16524,9 @@ where
     if !same_origin_request(&headers, &state.public.public_url) {
         return oauth_error(StatusCode::FORBIDDEN, "request must come from this origin");
     }
-    let Some(did) = verified_cookie_did(&state.public, &headers, state.storage.as_ref()) else {
+    let Some(did) =
+        verified_cookie_did_web(&state.public, &headers, Arc::clone(&state.storage)).await
+    else {
         return Redirect::to("/login").into_response();
     };
     let Some(uri) = form
@@ -15939,7 +16535,9 @@ where
     else {
         return oauth_error(StatusCode::BAD_REQUEST, "a feed generator uri is required");
     };
-    if !verified_cookie_preferences_access(&state.public, &headers, state.storage.as_ref()) {
+    if !verified_cookie_preferences_access_web(&state.public, &headers, Arc::clone(&state.storage))
+        .await
+    {
         return unavailable_feed_page(uri, false);
     }
     match state.flow.remove_saved_feed(&did, uri).await {
@@ -17046,6 +17644,42 @@ fn render_timeline_post_items<S: Storage>(
     html
 }
 
+struct TimelinePostRenderJob {
+    records: Vec<IndexedRecord>,
+    preludes: Vec<String>,
+    parents: PageParentIndex,
+    viewer_did: String,
+    rights: FormRights,
+    quote_index: QuoteRenderIndex,
+    page_interactions: PageInteractionIndex,
+    list_blocks: HashMap<String, ListBlockMark>,
+    render: Arc<WebRenderContext>,
+}
+
+async fn render_timeline_post_items_web<S: Storage + 'static>(
+    storage: Arc<S>,
+    job: TimelinePostRenderJob,
+) -> Result<String, StorageError> {
+    web_storage_call(storage, "render_timeline_posts", move |storage| {
+        let records = job.records.iter().collect::<Vec<_>>();
+        Ok(render_timeline_post_items(
+            storage,
+            &records,
+            &job.preludes,
+            &job.parents,
+            &TimelineRenderContext {
+                viewer_did: &job.viewer_did,
+                rights: job.rights,
+                quote_index: &job.quote_index,
+                page_interactions: &job.page_interactions,
+                list_blocks: &job.list_blocks,
+                render: &job.render,
+            },
+        ))
+    })
+    .await
+}
+
 fn render_timeline_post_item<S: Storage>(
     storage: &S,
     record: &IndexedRecord,
@@ -17376,7 +18010,13 @@ fn render_web_quote<S: Storage>(
             QuoteRenderState::Other(record) => record.clone(),
             _ => None,
         });
-        let cached = indexed.or_else(|| storage.record_by_uri(collection, uri).ok().flatten());
+        let cached = indexed.or_else(|| match storage.record_by_uri(collection, uri) {
+            Ok(record) => record,
+            Err(error) => {
+                tracing::warn!(%error, uri, collection, "could not read quoted record metadata");
+                None
+            }
+        });
         let record_name = cached
             .as_ref()
             .and_then(|record| {
@@ -17393,12 +18033,14 @@ fn render_web_quote<S: Storage>(
         );
     }
     let state = quote_index.get(uri).cloned().unwrap_or_else(|| {
-        storage
-            .record_by_uri(collection, uri)
-            .ok()
-            .flatten()
-            .map(QuoteRenderState::Found)
-            .unwrap_or(QuoteRenderState::Pending)
+        match storage.record_by_uri(collection, uri) {
+            Ok(Some(record)) => QuoteRenderState::Found(record),
+            Ok(None) => QuoteRenderState::Pending,
+            Err(error) => {
+                tracing::warn!(%error, uri, collection, "could not load quoted post from the local index");
+                QuoteRenderState::Pending
+            }
+        }
     });
     let quoted = match state {
         QuoteRenderState::Found(record) => record,
@@ -22711,7 +23353,11 @@ mod tests {
         );
         let login = tokio::time::timeout(
             Duration::from_millis(250),
-            app.oneshot(axum::http::Request::get("/login").body(Body::empty()).unwrap()),
+            app.oneshot(
+                axum::http::Request::get("/login")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
         )
         .await
         .expect("the cheap login request must remain responsive")

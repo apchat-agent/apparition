@@ -1,7 +1,9 @@
 use crate::{
     http_security,
     identity::IdentityBackend,
-    ingest::{IndexedRecord, NotificationCursor, RecordCursor, Storage, StorageError},
+    ingest::{
+        IndexedRecord, NotificationCursor, RecordCursor, Storage, StorageError, web_storage_call,
+    },
     jwt::{ServiceClaims, ServiceJwtVerifier},
     profile_counts::{ProfileCountsClient, apply_profile_counts},
 };
@@ -26,14 +28,14 @@ const REPOST: &str = "app.bsky.feed.repost";
 const FOLLOW: &str = "app.bsky.graph.follow";
 const MAX_XRPC_PAGE_SIZE: usize = 100;
 
-struct ApiState<S: Storage, B: IdentityBackend> {
+struct ApiState<S: Storage + 'static, B: IdentityBackend> {
     storage: Arc<S>,
     jwt: Arc<ServiceJwtVerifier<B>>,
     appview_did: String,
     profile_counts: ProfileCountsClient,
 }
 
-impl<S: Storage, B: IdentityBackend> Clone for ApiState<S, B> {
+impl<S: Storage + 'static, B: IdentityBackend> Clone for ApiState<S, B> {
     fn clone(&self) -> Self {
         Self {
             storage: self.storage.clone(),
@@ -81,6 +83,21 @@ impl ApiError {
             message: "storage operation failed".into(),
         }
     }
+}
+
+async fn api_storage_call<S, T, F>(
+    storage: Arc<S>,
+    operation: &'static str,
+    call: F,
+) -> Result<T, ApiError>
+where
+    S: Storage + 'static,
+    T: Send + 'static,
+    F: FnOnce(&S) -> Result<T, StorageError> + Send + 'static,
+{
+    web_storage_call(storage, operation, call)
+        .await
+        .map_err(|_| ApiError::internal())
 }
 
 impl IntoResponse for ApiError {
@@ -199,7 +216,7 @@ where
     http_security::protect(router, public_https)
 }
 
-async fn did_document<S: Storage, B: IdentityBackend>(
+async fn did_document<S: Storage + 'static, B: IdentityBackend>(
     State(state): State<ApiState<S, B>>,
 ) -> Json<Value> {
     let host = state
@@ -215,22 +232,37 @@ async fn did_document<S: Storage, B: IdentityBackend>(
     }))
 }
 
-async fn get_profile<S: Storage, B: IdentityBackend>(
+async fn get_profile<S: Storage + 'static, B: IdentityBackend>(
     State(state): State<ApiState<S, B>>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, ApiError> {
     let _ = authorize(&state, &headers, "app.bsky.actor.getProfile", false).await?;
-    let actor = required(&query, "actor")?;
-    let did = actor_to_did(&state, actor)?;
-    let mut profile = profile_view(&state, &did)?;
+    let actor = required(&query, "actor")?.to_owned();
+    let did = if actor.starts_with("did:") {
+        actor
+    } else {
+        api_storage_call(
+            Arc::clone(&state.storage),
+            "profile_actor_handle",
+            move |storage| storage.did_by_verified_handle(&actor),
+        )
+        .await?
+        .ok_or_else(|| ApiError::not_found("actor not found"))?
+    };
+    let profile_did = did.clone();
+    let mut profile =
+        api_storage_call(Arc::clone(&state.storage), "profile_view", move |storage| {
+            profile_view_from_storage(storage, &profile_did)
+        })
+        .await?;
     if let Some(counts) = state.profile_counts.get_counts(&did).await {
         apply_profile_counts(&mut profile, counts);
     }
     Ok(Json(profile))
 }
 
-async fn get_profiles<S: Storage, B: IdentityBackend>(
+async fn get_profiles<S: Storage + 'static, B: IdentityBackend>(
     State(state): State<ApiState<S, B>>,
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
@@ -240,14 +272,28 @@ async fn get_profiles<S: Storage, B: IdentityBackend>(
     if actors.is_empty() {
         return Err(ApiError::bad_request("missing query parameter actors"));
     }
-    let mut profile_dids = Vec::new();
-    let mut profiles = Vec::new();
-    for actor in actors.iter().take(25) {
-        if let Ok(did) = actor_to_did(&state, actor) {
-            profiles.push(profile_view(&state, &did)?);
-            profile_dids.push(did);
-        }
-    }
+    let actors = actors.into_iter().take(25).collect::<Vec<_>>();
+    let (profile_dids, mut profiles) = api_storage_call(
+        Arc::clone(&state.storage),
+        "profiles_view",
+        move |storage| {
+            let mut profile_dids = Vec::new();
+            let mut profiles = Vec::new();
+            for actor in actors {
+                let did = if actor.starts_with("did:") {
+                    Some(actor)
+                } else {
+                    storage.did_by_verified_handle(&actor)?
+                };
+                if let Some(did) = did {
+                    profiles.push(profile_view_from_storage(storage, &did)?);
+                    profile_dids.push(did);
+                }
+            }
+            Ok((profile_dids, profiles))
+        },
+    )
+    .await?;
     let remote_counts = state.profile_counts.get_counts_many(&profile_dids).await;
     for (did, profile) in profile_dids.iter().zip(&mut profiles) {
         if let Some(counts) = remote_counts.get(did) {
@@ -257,13 +303,24 @@ async fn get_profiles<S: Storage, B: IdentityBackend>(
     Ok(Json(json!({"profiles":profiles})))
 }
 
-async fn get_author_feed<S: Storage, B: IdentityBackend>(
+async fn get_author_feed<S: Storage + 'static, B: IdentityBackend>(
     State(state): State<ApiState<S, B>>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, ApiError> {
     let claims = authorize(&state, &headers, "app.bsky.feed.getAuthorFeed", false).await?;
-    let actor = actor_to_did(&state, required(&query, "actor")?)?;
+    let actor = required(&query, "actor")?.to_owned();
+    let actor = if actor.starts_with("did:") {
+        actor
+    } else {
+        api_storage_call(
+            Arc::clone(&state.storage),
+            "author_feed_actor_handle",
+            move |storage| storage.did_by_verified_handle(&actor),
+        )
+        .await?
+        .ok_or_else(|| ApiError::not_found("actor not found"))?
+    };
     let limit = query_limit(&query, 50);
     let cursor = query
         .get("cursor")
@@ -271,38 +328,43 @@ async fn get_author_feed<S: Storage, B: IdentityBackend>(
     let include_replies = query
         .get("filter")
         .is_none_or(|filter| filter != "posts_no_replies");
-    let page_records = state
-        .storage
-        .author_posts(&actor, cursor.as_ref(), limit + 1, include_replies)
-        .map_err(|_| ApiError::internal())?;
-    let feed = page_records
-        .iter()
-        .take(limit)
-        .map(|record| {
-            post_view(
-                &state,
-                record,
-                claims.as_ref().map(|claims| claims.iss.as_str()),
-            )
-            .map(|post| json!({"post":post}))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let viewer = claims.map(|claims| claims.iss);
+    let (feed, next_cursor) = api_storage_call(
+        Arc::clone(&state.storage),
+        "author_feed_page",
+        move |storage| {
+            let page_records =
+                storage.author_posts(&actor, cursor.as_ref(), limit + 1, include_replies)?;
+            let feed = page_records
+                .iter()
+                .take(limit)
+                .map(|record| {
+                    post_view(storage, record, viewer.as_deref()).map(|post| json!({"post":post}))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let next_cursor = if page_records.len() > limit {
+                page_records.get(limit - 1).map(|last| {
+                    RecordCursor {
+                        time_us: last.time_us,
+                        uri: last.uri.clone(),
+                    }
+                    .encode()
+                })
+            } else {
+                None
+            };
+            Ok((feed, next_cursor))
+        },
+    )
+    .await?;
     let mut result = json!({"feed":feed});
-    if page_records.len() > limit
-        && let Some(last) = page_records.get(limit - 1)
-    {
-        result["cursor"] = json!(
-            RecordCursor {
-                time_us: last.time_us,
-                uri: last.uri.clone(),
-            }
-            .encode()
-        );
+    if let Some(cursor) = next_cursor {
+        result["cursor"] = json!(cursor);
     }
     Ok(Json(result))
 }
 
-async fn get_posts<S: Storage, B: IdentityBackend>(
+async fn get_posts<S: Storage + 'static, B: IdentityBackend>(
     State(state): State<ApiState<S, B>>,
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
@@ -312,41 +374,32 @@ async fn get_posts<S: Storage, B: IdentityBackend>(
     if uris.is_empty() {
         return Err(ApiError::bad_request("missing query parameter uris"));
     }
-    let mut records = Vec::new();
-    for uri in uris.iter().take(25) {
-        if let Some(record) = state
-            .storage
-            .record_by_uri(POST, uri)
-            .map_err(|_| ApiError::internal())?
-        {
-            records.push(record);
+    let uris = uris.into_iter().take(25).collect::<Vec<_>>();
+    let viewer = claims.map(|claims| claims.iss);
+    let posts = api_storage_call(Arc::clone(&state.storage), "posts_by_uri", move |storage| {
+        let mut records = Vec::new();
+        for uri in uris {
+            if let Some(record) = storage.record_by_uri(POST, &uri)? {
+                records.push(record);
+            }
         }
-    }
-    let posts = records
-        .iter()
-        .map(|record| {
-            post_view(
-                &state,
-                record,
-                claims.as_ref().map(|claims| claims.iss.as_str()),
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        records
+            .iter()
+            .map(|record| post_view(storage, record, viewer.as_deref()))
+            .collect::<Result<Vec<_>, _>>()
+    })
+    .await?;
     Ok(Json(json!({"posts":posts})))
 }
 
-async fn get_post_thread<S: Storage, B: IdentityBackend>(
+async fn get_post_thread<S: Storage + 'static, B: IdentityBackend>(
     State(state): State<ApiState<S, B>>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, ApiError> {
     let claims = authorize(&state, &headers, "app.bsky.feed.getPostThread", false).await?;
     let uri = required(&query, "uri")?;
-    let post = state
-        .storage
-        .record_by_uri(POST, uri)
-        .map_err(|_| ApiError::internal())?
-        .ok_or_else(|| ApiError::not_found("post not found"))?;
+    let uri = uri.to_owned();
     let depth = query
         .get("depth")
         .and_then(|value| value.parse::<usize>().ok())
@@ -357,29 +410,37 @@ async fn get_post_thread<S: Storage, B: IdentityBackend>(
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(80)
         .min(20);
-    let viewer_did = claims.as_ref().map(|claims| claims.iss.as_str());
-    let mut budget = 100;
-    let thread = thread_view(
-        &state,
-        &post,
-        depth,
-        parent_height,
-        viewer_did,
-        &mut HashSet::new(),
-        &mut budget,
-    )?;
+    let viewer_did = claims.map(|claims| claims.iss);
+    let thread = api_storage_call(Arc::clone(&state.storage), "post_thread", move |storage| {
+        let Some(post) = storage.record_by_uri(POST, &uri)? else {
+            return Ok(None);
+        };
+        let mut budget = 100;
+        thread_view(
+            storage,
+            &post,
+            depth,
+            parent_height,
+            viewer_did.as_deref(),
+            &mut HashSet::new(),
+            &mut budget,
+        )
+        .map(Some)
+    })
+    .await?
+    .ok_or_else(|| ApiError::not_found("post not found"))?;
     Ok(Json(json!({"thread":thread})))
 }
 
-fn thread_view<S: Storage, B: IdentityBackend>(
-    state: &ApiState<S, B>,
+fn thread_view<S: Storage>(
+    storage: &S,
     record: &IndexedRecord,
     depth: usize,
     parent_height: usize,
     viewer_did: Option<&str>,
     visited: &mut HashSet<String>,
     budget: &mut usize,
-) -> Result<Value, ApiError> {
+) -> Result<Value, StorageError> {
     if *budget == 0 {
         return Ok(Value::Null);
     }
@@ -387,7 +448,7 @@ fn thread_view<S: Storage, B: IdentityBackend>(
     if !visited.insert(record.uri.clone()) {
         return Ok(json!({
             "$type":"app.bsky.feed.defs#threadViewPost",
-            "post":post_view(state, record, viewer_did)?,
+            "post":post_view(storage, record, viewer_did)?,
             "parent":null,"replies":[],"threadContext":null
         }));
     }
@@ -397,13 +458,10 @@ fn thread_view<S: Storage, B: IdentityBackend>(
             .pointer("/reply/parent/uri")
             .and_then(Value::as_str)
         {
-            let parent = state
-                .storage
-                .record_by_uri(POST, parent_uri)
-                .map_err(|_| ApiError::internal())?;
+            let parent = storage.record_by_uri(POST, parent_uri)?;
             if let Some(parent) = parent {
                 Some(thread_view(
-                    state,
+                    storage,
                     &parent,
                     0,
                     parent_height - 1,
@@ -422,17 +480,14 @@ fn thread_view<S: Storage, B: IdentityBackend>(
     }
     .unwrap_or(Value::Null);
     let replies = if depth > 0 && *budget > 0 {
-        let candidates = state
-            .storage
-            .replies_to(&record.uri, (*budget).min(MAX_XRPC_PAGE_SIZE))
-            .map_err(|_| ApiError::internal())?;
+        let candidates = storage.replies_to(&record.uri, (*budget).min(MAX_XRPC_PAGE_SIZE))?;
         let mut replies = Vec::new();
         for reply in candidates {
             if *budget == 0 {
                 break;
             }
             replies.push(thread_view(
-                state,
+                storage,
                 &reply,
                 depth - 1,
                 0,
@@ -448,14 +503,14 @@ fn thread_view<S: Storage, B: IdentityBackend>(
     visited.remove(&record.uri);
     Ok(json!({
         "$type":"app.bsky.feed.defs#threadViewPost",
-        "post":post_view(state, record, viewer_did)?,
+        "post":post_view(storage, record, viewer_did)?,
         "parent":parent,
         "replies":replies,
         "threadContext":null
     }))
 }
 
-async fn get_timeline<S: Storage, B: IdentityBackend>(
+async fn get_timeline<S: Storage + 'static, B: IdentityBackend>(
     State(state): State<ApiState<S, B>>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
@@ -468,26 +523,36 @@ async fn get_timeline<S: Storage, B: IdentityBackend>(
     let cursor = query
         .get("cursor")
         .and_then(|cursor| RecordCursor::parse(cursor));
-    let page_records = state
-        .storage
-        .timeline_posts(&actor, cursor.as_ref(), limit + 1)
-        .map_err(|_| ApiError::internal())?;
-    let feed = page_records
-        .iter()
-        .take(limit)
-        .map(|record| post_view(&state, record, Some(&actor)).map(|post| json!({"post":post})))
-        .collect::<Result<Vec<_>, _>>()?;
+    let (feed, next_cursor) = api_storage_call(
+        Arc::clone(&state.storage),
+        "timeline_page",
+        move |storage| {
+            let page_records = storage.timeline_posts(&actor, cursor.as_ref(), limit + 1)?;
+            let feed = page_records
+                .iter()
+                .take(limit)
+                .map(|record| {
+                    post_view(storage, record, Some(&actor)).map(|post| json!({"post":post}))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let next_cursor = if page_records.len() > limit {
+                page_records.get(limit - 1).map(|last| {
+                    RecordCursor {
+                        time_us: last.time_us,
+                        uri: last.uri.clone(),
+                    }
+                    .encode()
+                })
+            } else {
+                None
+            };
+            Ok((feed, next_cursor))
+        },
+    )
+    .await?;
     let mut result = json!({"feed":feed});
-    if page_records.len() > limit
-        && let Some(last) = page_records.get(limit - 1)
-    {
-        result["cursor"] = json!(
-            RecordCursor {
-                time_us: last.time_us,
-                uri: last.uri.clone(),
-            }
-            .encode()
-        );
+    if let Some(cursor) = next_cursor {
+        result["cursor"] = json!(cursor);
     }
     Ok(Json(result))
 }
@@ -509,85 +574,126 @@ pub fn timeline_records<'a>(
         .collect()
 }
 
-async fn get_likes<S: Storage, B: IdentityBackend>(
+async fn get_likes<S: Storage + 'static, B: IdentityBackend>(
     State(state): State<ApiState<S, B>>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, ApiError> {
     let _ = authorize(&state, &headers, "app.bsky.feed.getLikes", false).await?;
     let uri = required(&query, "uri")?;
-    let likes = state.storage.records_for_subject(LIKE, uri, query_limit(&query, 50))
-        .map_err(|_| ApiError::internal())?.iter().map(|record| json!({
-            "actor":profile_view(&state, &record.did).unwrap_or_else(|_| json!({"did":record.did,"handle":"handle.invalid"})),
-            "createdAt":record.record.get("createdAt").cloned().unwrap_or(Value::Null),
-            "indexedAt":record.record.get("createdAt").cloned().unwrap_or(Value::Null)
-        })).collect::<Vec<_>>();
+    let subject_uri = uri.to_owned();
+    let limit = query_limit(&query, 50);
+    let likes = api_storage_call(
+        Arc::clone(&state.storage),
+        "likes_page",
+        move |storage| {
+            Ok(storage.records_for_subject(LIKE, &subject_uri, limit)?.iter().map(|record| json!({
+                "actor":profile_view_from_storage(storage, &record.did).unwrap_or_else(|_| json!({"did":record.did,"handle":"handle.invalid"})),
+                "createdAt":record.record.get("createdAt").cloned().unwrap_or(Value::Null),
+                "indexedAt":record.record.get("createdAt").cloned().unwrap_or(Value::Null)
+            })).collect::<Vec<_>>())
+        },
+    ).await?;
     Ok(Json(json!({"uri":uri,"likes":likes,"cursor":null})))
 }
 
-async fn get_reposted_by<S: Storage, B: IdentityBackend>(
+async fn get_reposted_by<S: Storage + 'static, B: IdentityBackend>(
     State(state): State<ApiState<S, B>>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, ApiError> {
     let _ = authorize(&state, &headers, "app.bsky.feed.getRepostedBy", false).await?;
     let uri = required(&query, "uri")?;
-    let reposts = state
-        .storage
-        .records_for_subject(REPOST, uri, query_limit(&query, 50))
-        .map_err(|_| ApiError::internal())?;
-    let reposted_by = reposts
-        .iter()
-        .map(|record| profile_view(&state, &record.did))
-        .collect::<Result<Vec<_>, _>>()?;
+    let subject_uri = uri.to_owned();
+    let limit = query_limit(&query, 50);
+    let reposted_by = api_storage_call(
+        Arc::clone(&state.storage),
+        "reposted_by_page",
+        move |storage| {
+            storage
+                .records_for_subject(REPOST, &subject_uri, limit)?
+                .iter()
+                .map(|record| profile_view_from_storage(storage, &record.did))
+                .collect::<Result<Vec<_>, _>>()
+        },
+    )
+    .await?;
     Ok(Json(
         json!({"uri":uri,"repostedBy":reposted_by,"cursor":null}),
     ))
 }
 
-async fn get_follows<S: Storage, B: IdentityBackend>(
+async fn get_follows<S: Storage + 'static, B: IdentityBackend>(
     State(state): State<ApiState<S, B>>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, ApiError> {
     let _ = authorize(&state, &headers, "app.bsky.graph.getFollows", false).await?;
-    let actor = actor_to_did(&state, required(&query, "actor")?)?;
-    let records = state
-        .storage
-        .follows_for_actor(&actor, query_limit(&query, 50))
-        .map_err(|_| ApiError::internal())?;
-    let follows = records
-        .iter()
-        .filter_map(|record| record.record.get("subject").and_then(Value::as_str))
-        .take(query_limit(&query, 50))
-        .map(|did| profile_view(&state, did))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Json(
-        json!({"subject":profile_view(&state, &actor)?,"follows":follows,"cursor":null}),
-    ))
+    let actor_query = required(&query, "actor")?.to_owned();
+    let limit = query_limit(&query, 50);
+    let result = api_storage_call(Arc::clone(&state.storage), "follows_page", move |storage| {
+        let actor = if actor_query.starts_with("did:") {
+            actor_query
+        } else {
+            let Some(actor) = storage.did_by_verified_handle(&actor_query)? else {
+                return Ok(None);
+            };
+            actor
+        };
+        let subject = profile_view_from_storage(storage, &actor)?;
+        let follows = storage
+            .follows_for_actor(&actor, limit)?
+            .iter()
+            .filter_map(|record| record.record.get("subject").and_then(Value::as_str))
+            .take(limit)
+            .map(|did| profile_view_from_storage(storage, did))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(
+            json!({"subject":subject,"follows":follows,"cursor":null}),
+        ))
+    })
+    .await?
+    .ok_or_else(|| ApiError::not_found("actor not found"))?;
+    Ok(Json(result))
 }
 
-async fn get_followers<S: Storage, B: IdentityBackend>(
+async fn get_followers<S: Storage + 'static, B: IdentityBackend>(
     State(state): State<ApiState<S, B>>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, ApiError> {
     let _ = authorize(&state, &headers, "app.bsky.graph.getFollowers", false).await?;
-    let actor = actor_to_did(&state, required(&query, "actor")?)?;
-    let records = state
-        .storage
-        .followers_for_did(&actor, query_limit(&query, 50))
-        .map_err(|_| ApiError::internal())?;
-    let followers = records
-        .iter()
-        .map(|record| profile_view(&state, &record.did))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Json(
-        json!({"subject":profile_view(&state, &actor)?,"followers":followers,"cursor":null}),
-    ))
+    let actor_query = required(&query, "actor")?.to_owned();
+    let limit = query_limit(&query, 50);
+    let result = api_storage_call(
+        Arc::clone(&state.storage),
+        "followers_page",
+        move |storage| {
+            let actor = if actor_query.starts_with("did:") {
+                actor_query
+            } else {
+                let Some(actor) = storage.did_by_verified_handle(&actor_query)? else {
+                    return Ok(None);
+                };
+                actor
+            };
+            let subject = profile_view_from_storage(storage, &actor)?;
+            let followers = storage
+                .followers_for_did(&actor, limit)?
+                .iter()
+                .map(|record| profile_view_from_storage(storage, &record.did))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Some(
+                json!({"subject":subject,"followers":followers,"cursor":null}),
+            ))
+        },
+    )
+    .await?
+    .ok_or_else(|| ApiError::not_found("actor not found"))?;
+    Ok(Json(result))
 }
 
-async fn list_notifications<S: Storage, B: IdentityBackend>(
+async fn list_notifications<S: Storage + 'static, B: IdentityBackend>(
     State(state): State<ApiState<S, B>>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
@@ -605,34 +711,37 @@ async fn list_notifications<S: Storage, B: IdentityBackend>(
     let before = query
         .get("cursor")
         .and_then(|cursor| NotificationCursor::parse(cursor));
-    let page = state
-        .storage
-        .notifications_for(&actor, before.as_ref(), limit + 1)
-        .map_err(|_| ApiError::internal())?;
-    let has_more = page.len() > limit;
-    let notifications = page.iter().take(limit).map(|notice| {
-        let record = &notice.record;
-        json!({
-        "$type":"app.bsky.notification.listNotifications#notification",
-        "uri":record.uri,"cid":record.cid,"author":profile_view(&state, &record.did).unwrap_or_else(|_| json!({"did":record.did,"handle":"handle.invalid"})),
-        "reason":notice.reason,"reasonSubject":notice.reason_subject,"record":record.record,"isRead":false,
-        "indexedAt":record.record.get("createdAt").cloned().unwrap_or_else(|| json!(timestamp_us_to_rfc3339(record.time_us)))
-    })}).collect::<Vec<_>>();
+    let (notifications, next_cursor) = api_storage_call(
+        Arc::clone(&state.storage),
+        "notifications_page",
+        move |storage| {
+            let page = storage.notifications_for(&actor, before.as_ref(), limit + 1)?;
+            let notifications = page.iter().take(limit).map(|notice| {
+                let record = &notice.record;
+                json!({
+                "$type":"app.bsky.notification.listNotifications#notification",
+                "uri":record.uri,"cid":record.cid,"author":profile_view_from_storage(storage, &record.did).unwrap_or_else(|_| json!({"did":record.did,"handle":"handle.invalid"})),
+                "reason":notice.reason,"reasonSubject":notice.reason_subject,"record":record.record,"isRead":false,
+                "indexedAt":record.record.get("createdAt").cloned().unwrap_or_else(|| json!(timestamp_us_to_rfc3339(record.time_us)))
+            })}).collect::<Vec<_>>();
+            let next_cursor = if page.len() > limit {
+                page.get(limit - 1).map(|last| NotificationCursor {
+                    time_us: last.record.time_us,
+                    uri: last.record.uri.clone(),
+                    reason: last.reason.clone(),
+                }.encode())
+            } else { None };
+            Ok((notifications, next_cursor))
+        },
+    ).await?;
     let mut result = json!({"notifications":notifications,"seenAt":now_rfc3339()});
-    if has_more && let Some(last) = page.get(limit - 1) {
-        result["cursor"] = json!(
-            NotificationCursor {
-                time_us: last.record.time_us,
-                uri: last.record.uri.clone(),
-                reason: last.reason.clone(),
-            }
-            .encode()
-        );
+    if let Some(cursor) = next_cursor {
+        result["cursor"] = json!(cursor);
     }
     Ok(Json(result))
 }
 
-async fn get_unread_count<S: Storage, B: IdentityBackend>(
+async fn get_unread_count<S: Storage + 'static, B: IdentityBackend>(
     State(state): State<ApiState<S, B>>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
@@ -645,14 +754,16 @@ async fn get_unread_count<S: Storage, B: IdentityBackend>(
     .await?
     .ok_or_else(|| ApiError::unauthorized("service JWT required"))?;
     let actor = claims.iss;
-    let count = state
-        .storage
-        .unread_notification_count(&actor)
-        .map_err(|_| ApiError::internal())?;
+    let count = api_storage_call(
+        Arc::clone(&state.storage),
+        "unread_notification_count",
+        move |storage| storage.unread_notification_count(&actor),
+    )
+    .await?;
     Ok(Json(json!({"count":count})))
 }
 
-async fn authorize<S: Storage, B: IdentityBackend>(
+async fn authorize<S: Storage + 'static, B: IdentityBackend>(
     state: &ApiState<S, B>,
     headers: &HeaderMap,
     lexicon: &str,
@@ -703,27 +814,6 @@ fn query_limit(query: &HashMap<String, String>, default: usize) -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(default)
         .clamp(1, MAX_XRPC_PAGE_SIZE)
-}
-
-fn actor_to_did<S: Storage, B: IdentityBackend>(
-    state: &ApiState<S, B>,
-    actor: &str,
-) -> Result<String, ApiError> {
-    if actor.starts_with("did:") {
-        return Ok(actor.to_owned());
-    }
-    state
-        .storage
-        .did_by_verified_handle(actor)
-        .map_err(|_| ApiError::internal())?
-        .ok_or_else(|| ApiError::not_found("actor not found"))
-}
-
-fn profile_view<S: Storage, B: IdentityBackend>(
-    state: &ApiState<S, B>,
-    did: &str,
-) -> Result<Value, ApiError> {
-    profile_view_from_storage(state.storage.as_ref(), did).map_err(|_| ApiError::internal())
 }
 
 pub(crate) fn profile_view_from_storage<S: Storage>(
@@ -818,17 +908,14 @@ fn blob_url(did: &str, blob: &Value, kind: &str) -> Option<String> {
     Some(format!("https://cdn.bsky.app/img/{kind}/plain/{did}/{cid}"))
 }
 
-fn post_view<S: Storage, B: IdentityBackend>(
-    state: &ApiState<S, B>,
+fn post_view<S: Storage>(
+    storage: &S,
     record: &IndexedRecord,
     viewer_did: Option<&str>,
-) -> Result<Value, ApiError> {
-    let interactions = state
-        .storage
-        .post_interaction_summary(&record.uri, viewer_did)
-        .map_err(|_| ApiError::internal())?;
+) -> Result<Value, StorageError> {
+    let interactions = storage.post_interaction_summary(&record.uri, viewer_did)?;
     let mut post = json!({
-        "uri":record.uri,"cid":record.cid,"author":profile_view(state, &record.did).unwrap_or_else(|_| json!({"did":record.did,"handle":"handle.invalid"})),
+        "uri":record.uri,"cid":record.cid,"author":profile_view_from_storage(storage, &record.did).unwrap_or_else(|_| json!({"did":record.did,"handle":"handle.invalid"})),
         "record":record.record,
         "replyCount":interactions.reply_count,"repostCount":interactions.repost_count,"likeCount":interactions.like_count,"quoteCount":interactions.quote_count,"bookmarkCount":0,"labels":[]
     });

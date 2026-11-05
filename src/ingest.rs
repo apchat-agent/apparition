@@ -380,6 +380,33 @@ pub enum StorageError {
     BlockingTask(String),
 }
 
+/// Run a synchronous Storage operation away from Tokio's async worker threads.
+/// Web handlers use this for all reads and writes that touch the index database.
+pub async fn web_storage_call<S, T, F>(
+    storage: Arc<S>,
+    operation: &'static str,
+    call: F,
+) -> Result<T, StorageError>
+where
+    S: Storage + 'static,
+    T: Send + 'static,
+    F: FnOnce(&S) -> Result<T, StorageError> + Send + 'static,
+{
+    let result = tokio::task::spawn_blocking(move || call(&storage)).await;
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => {
+            tracing::warn!(operation, %error, "web storage operation failed");
+            Err(error)
+        }
+        Err(error) => {
+            let error = StorageError::BlockingTask(error.to_string());
+            tracing::error!(operation, %error, "web storage blocking task failed");
+            Err(error)
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct TrackedSet {
     registered: HashSet<String>,

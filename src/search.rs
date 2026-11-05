@@ -28,7 +28,7 @@ pub struct SearchPostsPage {
     pub cursor: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SearchActor {
     pub did: String,
     pub handle: Option<String>,
