@@ -252,6 +252,12 @@ enum LivePostCacheValue {
 
 type LivePostCache =
     tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, LivePostCacheValue)>>;
+type InFlightPostFetches = tokio::sync::Mutex<
+    HashMap<
+        String,
+        Arc<tokio::sync::OnceCell<(HashMap<String, FetchedPublicPost>, PostRouteStats)>>,
+    >,
+>;
 
 fn unix_time_us() -> u64 {
     std::time::SystemTime::now()
@@ -540,6 +546,7 @@ pub struct FeedClient<B: IdentityBackend> {
     public_appview_base: String,
     generator_cache: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, ResolvedFeed)>>,
     live_post_cache: LivePostCache,
+    in_flight_post_fetches: InFlightPostFetches,
     // Failed resolutions are remembered too: the layout resolves every pinned feed on every page,
     // so an uncached failure would repeat its full network cost on each request.
     generator_failures: tokio::sync::Mutex<HashMap<String, (tokio::time::Instant, String)>>,
@@ -556,6 +563,7 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
             public_appview_base: crate::profile_counts::PUBLIC_APPVIEW_BASE.to_owned(),
             generator_cache: tokio::sync::Mutex::new(HashMap::new()),
             live_post_cache: tokio::sync::Mutex::new(HashMap::new()),
+            in_flight_post_fetches: tokio::sync::Mutex::new(HashMap::new()),
             generator_failures: tokio::sync::Mutex::new(HashMap::new()),
             cache_store: None,
             background_resolutions: tokio::sync::Mutex::new(HashSet::new()),
@@ -972,6 +980,49 @@ impl<B: IdentityBackend + 'static> FeedClient<B> {
     /// and falls back to the anonymous public AppView, and anything still unanswered falls
     /// back to its author's PDS exactly as before. Neither fallback loses or reorders posts.
     pub async fn fetch_posts(
+        &self,
+        proxy: Option<Arc<dyn ProxiedPostsFetcher>>,
+        uris: &[String],
+    ) -> (HashMap<String, FetchedPublicPost>, PostRouteStats) {
+        if uris.is_empty() {
+            return (HashMap::new(), PostRouteStats::default());
+        }
+
+        let proxy_id = proxy
+            .as_ref()
+            .map_or(0, |proxy| Arc::as_ptr(proxy) as *const () as usize);
+        let mut unique_uris = uris.to_vec();
+        unique_uris.sort_unstable();
+        unique_uris.dedup();
+        let mut key = format!("{proxy_id}:");
+        for uri in unique_uris {
+            key.push_str(&uri.len().to_string());
+            key.push(':');
+            key.push_str(&uri);
+        }
+
+        let cell = {
+            let mut in_flight = self.in_flight_post_fetches.lock().await;
+            in_flight
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+                .clone()
+        };
+        let result = cell
+            .get_or_init(|| async { self.fetch_posts_uncached(proxy, uris).await })
+            .await
+            .clone();
+        let mut in_flight = self.in_flight_post_fetches.lock().await;
+        if in_flight
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, &cell))
+        {
+            in_flight.remove(&key);
+        }
+        result
+    }
+
+    async fn fetch_posts_uncached(
         &self,
         proxy: Option<Arc<dyn ProxiedPostsFetcher>>,
         uris: &[String],
