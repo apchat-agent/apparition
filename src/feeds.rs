@@ -2018,6 +2018,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn identical_concurrent_feed_skeleton_requests_share_one_generator_call() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let route_requests = requests.clone();
+        let app = Router::new().route(
+            "/fg/xrpc/app.bsky.feed.getFeedSkeleton",
+            get(move || {
+                let requests = route_requests.clone();
+                async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    axum::Json(json!({"feed":[],"cursor":"next"}))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = client(resolver("".to_owned(), "".to_owned()));
+        let feed = ResolvedFeed {
+            uri: "at://did:plc:creator/app.bsky.feed.generator/pinned".to_owned(),
+            display_name: "Example".to_owned(),
+            description: None,
+            avatar: None,
+            service_did: "did:plc:generator".to_owned(),
+            endpoint: format!("http://localhost:{port}/fg"),
+            unavailable: false,
+        };
+        let (first, second) = tokio::join!(
+            client.get_skeleton(&feed, Some("cursor"), Some("synthetic-jwt")),
+            client.get_skeleton(&feed, Some("cursor"), Some("synthetic-jwt")),
+        );
+
+        assert!(first.is_ok());
+        assert!(second.is_ok());
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "identical feed page loads should share the in-flight getFeedSkeleton request"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn feed_tabs_fall_back_during_slow_resolution_and_survive_client_restart() {
         use futures_util::future::join_all;
         let (pds, server) = fake_pds_with_generator_delay(Duration::from_secs(5)).await;
