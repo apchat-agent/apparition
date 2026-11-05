@@ -8349,6 +8349,57 @@ impl<S: Storage + 'static> JetstreamSupervisor<S> {
 }
 
 #[cfg(test)]
+mod web_read_timeout_tests {
+    use super::*;
+
+    async fn web_storage_call_with_budget<S, T, F>(
+        storage: Arc<S>,
+        operation: &'static str,
+        _budget: Duration,
+        call: F,
+    ) -> Result<T, StorageError>
+    where
+        S: Storage + 'static,
+        T: Send + 'static,
+        F: FnOnce(&S) -> Result<T, StorageError> + Send + 'static,
+    {
+        web_storage_call(storage, operation, call).await
+    }
+
+    #[tokio::test]
+    async fn a_slow_web_sqlite_read_is_interrupted_at_its_budget() {
+        let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
+        let started = Instant::now();
+        let result = web_storage_call_with_budget(
+            storage,
+            "slow_read_test",
+            Duration::from_millis(20),
+            |storage| {
+                let connection = storage.read_conn()?;
+                Ok(connection.query_row(
+                    "WITH RECURSIVE sequence(value) AS (
+                         VALUES(0) UNION ALL SELECT value + 1 FROM sequence WHERE value < 10000000
+                     ) SELECT sum(value) FROM sequence",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?)
+            },
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a 10-million-step SQLite read exceeded its 20ms web budget but returned {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the interrupted web read took {:?}",
+            started.elapsed()
+        );
+    }
+}
+
+#[cfg(test)]
 mod backfill_resource_tests {
     use super::*;
 
