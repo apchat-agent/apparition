@@ -601,6 +601,85 @@ impl SafeHttpClient {
             .map(|(response, _)| response)
     }
 
+    /// Send a streamed POST body through the same safety, host-gating, and accounting path as
+    /// ordinary outbound requests. This is used for large uploads that cannot be buffered.
+    pub async fn post_stream(
+        &self,
+        url: &Url,
+        headers: http::HeaderMap,
+        body: reqwest::Body,
+        max_response_bytes: usize,
+    ) -> Result<http::Response<Vec<u8>>, String> {
+        let started = Instant::now();
+        let mut call_timer = OutboundCallTimer::new(&http::Method::POST, url, started);
+        let host = url
+            .host_str()
+            .ok_or_else(|| "outbound URL has no host".to_owned())?;
+        let host_gate = outbound_host_gate(host);
+        let result = async {
+            let _request_permit = request_pool(self.background)
+                .acquire_owned()
+                .await
+                .map_err(|_| "outbound request capacity is unavailable".to_owned())?;
+            let _host_permit = host_gate.acquire_request_permit().await?;
+            let addresses = self.resolve_safe(url).await?;
+            let client = self.client_for(host, &addresses)?;
+            timeout(REQUEST_TIMEOUT, async {
+                let response = client
+                    .post(url.clone())
+                    .headers(headers)
+                    .body(body)
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        format!("outbound HTTP request failed: {}", error.without_url())
+                    })?;
+                call_timer.status = Some(response.status().as_u16());
+                host_gate.observe_response(
+                    response.status(),
+                    response.headers().get(http::header::RETRY_AFTER),
+                );
+                if response
+                    .content_length()
+                    .is_some_and(|length| length > max_response_bytes as u64)
+                {
+                    return Err("outbound response exceeds size limit".to_owned());
+                }
+                let status = response.status();
+                let version = response.version();
+                let response_headers = response.headers().clone();
+                let mut bytes = Vec::new();
+                let mut response = response;
+                while let Some(chunk) = response.chunk().await.map_err(|error| {
+                    format!("outbound response read failed: {}", error.without_url())
+                })? {
+                    if bytes
+                        .len()
+                        .checked_add(chunk.len())
+                        .is_none_or(|length| length > max_response_bytes)
+                    {
+                        return Err("outbound response exceeds size limit".to_owned());
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                let mut builder = http::Response::builder().status(status).version(version);
+                for (name, value) in &response_headers {
+                    builder = builder.header(name, value);
+                }
+                builder
+                    .body(bytes)
+                    .map_err(|_| "outbound HTTP response is invalid".to_owned())
+            })
+            .await
+            .map_err(|_| "outbound request timed out".to_owned())?
+        }
+        .await;
+        if let Err(error) = &result {
+            call_timer.error = Some(error.clone());
+        }
+        result
+    }
+
     /// Send a GET request with an explicit redirect, response-size, and total-time budget.
     /// The final URL is returned so callers can resolve page-relative metadata safely.
     pub async fn get_with_limits(

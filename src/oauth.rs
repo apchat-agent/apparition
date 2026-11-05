@@ -12,7 +12,7 @@ use crate::{
     },
     link_card::{LinkCard, LinkCardFetcher, LinkThumbnail},
     net::{
-        OutboundCallSnapshot, OutboundCallTimer, RequestOutboundAccounting, SafeHttpClient,
+        OutboundCallSnapshot, RequestOutboundAccounting, SafeHttpClient,
         current_outbound_call_snapshot, with_request_outbound_accounting,
     },
     profile_counts::{
@@ -555,20 +555,12 @@ where
     Err("Video processing did not finish in time.".to_owned())
 }
 
-async fn read_video_service_response(response: reqwest::Response) -> Result<Value, String> {
+async fn read_video_service_response(response: http::Response<Vec<u8>>) -> Result<Value, String> {
     const MAX_RESPONSE_BYTES: usize = 64 * 1024;
     let status = response.status();
-    let mut response = response;
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| format!("video service response could not be read: {error}"))?
-    {
-        if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
-            return Err("video service returned an unexpectedly large response".to_owned());
-        }
-        bytes.extend_from_slice(&chunk);
+    let bytes = response.into_body();
+    if bytes.len() > MAX_RESPONSE_BYTES {
+        return Err("video service returned an unexpectedly large response".to_owned());
     }
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|_| format!("video service returned invalid JSON ({status})"))?;
@@ -2226,7 +2218,6 @@ pub struct AtriumOAuthFlow<B: crate::identity::IdentityBackend = HttpIdentityBac
     public_appview_base: String,
     /// Base for `refresh_account_actor_data`'s getProfiles only; see LABELLED_APPVIEW_BASE.
     labelled_appview_base: String,
-    video_http_client: reqwest::Client,
     video_service_url: String,
     session_cache: OAuthSessionCache,
     session_restores: OAuthSessionRestores,
@@ -2255,7 +2246,6 @@ impl<B: crate::identity::IdentityBackend> Clone for AtriumOAuthFlow<B> {
             http_client: self.http_client.clone(),
             public_appview_base: self.public_appview_base.clone(),
             labelled_appview_base: self.labelled_appview_base.clone(),
-            video_http_client: self.video_http_client.clone(),
             video_service_url: self.video_service_url.clone(),
             session_cache: self.session_cache.clone(),
             session_restores: self.session_restores.clone(),
@@ -2941,10 +2931,6 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             http_client: retained_http_client,
             public_appview_base: public_appview_base.to_owned(),
             labelled_appview_base: LABELLED_APPVIEW_BASE.to_owned(),
-            video_http_client: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .map_err(|error| error.to_string())?,
             video_service_url: VIDEO_SERVICE_URL.to_owned(),
             session_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             session_restores: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -4434,18 +4420,19 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         url.set_path(&format!("/xrpc/{lexicon}"));
         url.query_pairs_mut()
             .extend_pairs(parameters.iter().copied());
-        let call_timer =
-            OutboundCallTimer::new(&axum::http::Method::GET, &url, std::time::Instant::now());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).map_err(|error| {
+                format!("video service authorization header is invalid: {error}")
+            })?,
+        );
         let response = self
-            .video_http_client
-            .get(url)
-            .bearer_auth(token)
-            .send()
+            .http_client
+            .get(&url, headers, 64 * 1024)
             .await
             .map_err(|error| format!("video service {lexicon} request failed: {error}"))?;
-        let result = read_video_service_response(response).await;
-        drop(call_timer);
-        result
+        read_video_service_response(response).await
     }
 
     async fn upload_video_blob(&self, did: &str, video: &PostVideo) -> Result<Value, String> {
@@ -4468,21 +4455,29 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             .await
             .map_err(|error| format!("temporary video file could not be reopened: {error}"))?;
         let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
-        let call_timer =
-            OutboundCallTimer::new(&axum::http::Method::POST, &url, std::time::Instant::now());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).map_err(|error| {
+                format!("video upload authorization header is invalid: {error}")
+            })?,
+        );
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_str(&video.mime_type)
+                .map_err(|error| format!("video upload content type is invalid: {error}"))?,
+        );
+        headers.insert(
+            header::CONTENT_LENGTH,
+            HeaderValue::from_str(&video.size_bytes.to_string())
+                .map_err(|error| format!("video upload size is invalid: {error}"))?,
+        );
         let response = self
-            .video_http_client
-            .post(url)
-            .bearer_auth(&token)
-            .header(header::CONTENT_TYPE, &video.mime_type)
-            .header(header::CONTENT_LENGTH, video.size_bytes)
-            .body(body)
-            .send()
+            .http_client
+            .post_stream(&url, headers, body, 64 * 1024)
             .await
             .map_err(|error| format!("video service upload request failed: {error}"))?;
-        let initial_result = read_video_service_response(response).await;
-        drop(call_timer);
-        let initial = initial_result?;
+        let initial = read_video_service_response(response).await?;
         let initial_status = job_status_value(&initial);
         let state = initial_status
             .get("state")
