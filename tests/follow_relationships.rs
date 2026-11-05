@@ -433,7 +433,8 @@ async fn a_failed_relationship_lookup_keeps_the_page_and_rows_and_warns() {
     let store = SqliteOAuthStore::open(":memory:").unwrap();
     let app = build_router(
         storage.clone(),
-        relationship_client(&base, Duration::from_secs(2), store),
+        // Failed 5xx calls back off for 1s then 2s; leave margin for all three page attempts.
+        relationship_client(&base, Duration::from_secs(6), store),
     );
     let cookie = login(&app).await;
 

@@ -1676,6 +1676,9 @@ type SavedFeedRefreshes = Arc<tokio::sync::Mutex<HashSet<String>>>;
 // Keyed by (viewer DID, service DID, XRPC method).
 type ServiceAuthCache =
     Arc<tokio::sync::Mutex<HashMap<(String, String, String), (tokio::time::Instant, String)>>>;
+type ServiceAuthFlights = Arc<
+    tokio::sync::Mutex<HashMap<(String, String, String), Arc<OnceCell<Result<String, String>>>>>,
+>;
 // Keyed by (viewer DID, feed URI, cursor); switching between feed tabs reuses a page for a minute.
 type FeedPageCache = Arc<
     tokio::sync::Mutex<HashMap<(String, String, String), (tokio::time::Instant, FeedTimeline)>>,
@@ -2225,6 +2228,7 @@ pub struct AtriumOAuthFlow<B: crate::identity::IdentityBackend = HttpIdentityBac
     saved_feed_cache: SavedFeedCache,
     saved_feed_refreshes: SavedFeedRefreshes,
     service_auth_cache: ServiceAuthCache,
+    service_auth_flights: ServiceAuthFlights,
     feed_page_cache: FeedPageCache,
     feed_skeleton_cache: FeedSkeletonCache,
     muted_actor_cache: MutedActorCache,
@@ -2253,6 +2257,7 @@ impl<B: crate::identity::IdentityBackend> Clone for AtriumOAuthFlow<B> {
             saved_feed_cache: self.saved_feed_cache.clone(),
             saved_feed_refreshes: self.saved_feed_refreshes.clone(),
             service_auth_cache: self.service_auth_cache.clone(),
+            service_auth_flights: self.service_auth_flights.clone(),
             feed_page_cache: self.feed_page_cache.clone(),
             feed_skeleton_cache: self.feed_skeleton_cache.clone(),
             muted_actor_cache: self.muted_actor_cache.clone(),
@@ -2938,6 +2943,7 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
             saved_feed_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             saved_feed_refreshes: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             service_auth_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            service_auth_flights: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             feed_page_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             feed_skeleton_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             muted_actor_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -4335,23 +4341,64 @@ impl<B: crate::identity::IdentityBackend + 'static> AtriumOAuthFlow<B> {
         {
             return Ok(token);
         }
-        let token = self
-            .fetch_service_auth_token(viewer_did, service_did, lexicon)
-            .await?;
+
+        let flight = {
+            let mut flights = self.service_auth_flights.lock().await;
+            if let Some(flight) = flights.get(&key) {
+                Some(flight.clone())
+            } else if flights.len() < 4096 {
+                let flight = Arc::new(OnceCell::new());
+                flights.insert(key.clone(), flight.clone());
+                Some(flight)
+            } else {
+                None
+            }
+        };
+
+        let Some(flight) = flight else {
+            let token = self
+                .fetch_service_auth_token(viewer_did, service_did, lexicon)
+                .await?;
+            self.cache_service_auth_token(&key, &token).await;
+            return Ok(token);
+        };
+
+        let result = flight
+            .get_or_init(|| async {
+                let token = self
+                    .fetch_service_auth_token(viewer_did, service_did, lexicon)
+                    .await?;
+                self.cache_service_auth_token(&key, &token).await;
+                Ok(token)
+            })
+            .await
+            .clone();
+
+        let mut flights = self.service_auth_flights.lock().await;
+        if flights
+            .get(&key)
+            .is_some_and(|existing| Arc::ptr_eq(existing, &flight))
+        {
+            // Failures are shared only among concurrent callers, so a later request retries.
+            flights.remove(&key);
+        }
+        result
+    }
+
+    async fn cache_service_auth_token(&self, key: &(String, String, String), token: &str) {
         let mut cache = self.service_auth_cache.lock().await;
         cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
         if cache.len() < 4096 {
             // Reuse until a minute before the expiry we asked for.
             cache.insert(
-                key,
+                key.clone(),
                 (
                     tokio::time::Instant::now()
                         + Duration::from_secs(SERVICE_AUTH_LIFETIME_SECS - 60),
-                    token.clone(),
+                    token.to_owned(),
                 ),
             );
         }
-        Ok(token)
     }
 
     async fn fetch_service_auth_token(
