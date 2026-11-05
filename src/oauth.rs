@@ -25966,7 +25966,7 @@ mod tests {
     #[tokio::test]
     async fn video_upload_observes_host_retry_after_backoff() {
         let (mut flow, state, server) = feed_test_flow(false).await;
-        flow.video_service_url = state.lock().unwrap().pds_url.clone();
+        let pds_url = reqwest::Url::parse(&state.lock().unwrap().pds_url).unwrap();
         let pds_audience = flow.pds_service_did(FEED_VIEWER_DID).await.unwrap();
         flow.service_auth_token(
             FEED_VIEWER_DID,
@@ -25982,11 +25982,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let backoff_url = reqwest::Url::parse(&format!(
-            "{}/xrpc/video-rate-limit",
-            state.lock().unwrap().pds_url
-        ))
-        .unwrap();
+        flow.http_client = SafeHttpClient::new().with_http_test_hosts(["localhost".to_owned()]);
+        flow.video_service_url = format!("http://localhost:{}", pds_url.port().unwrap());
+        let backoff_url =
+            reqwest::Url::parse(&format!("{}/xrpc/video-rate-limit", flow.video_service_url))
+                .unwrap();
         let response = flow
             .http_client
             .get(&backoff_url, HeaderMap::new(), 1024)
