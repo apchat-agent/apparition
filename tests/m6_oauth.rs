@@ -7939,6 +7939,23 @@ async fn callback_rejects_sessions_without_the_required_atproto_scope() {
 }
 
 #[tokio::test]
+async fn profile_page_does_not_queue_recent_posts_for_a_handle_identifier() {
+    let handle = "apparition-test.bsky.social";
+    let storage = Arc::new(MemoryStorage::default());
+    let app = OAuthPublic::new("https://appview.example")
+        .unwrap()
+        .router_with_flow(FakeOAuthFlow::default(), storage.clone());
+    let cookie = finish_login(&app).await;
+
+    let _html = get_html(&app, &format!("/profile?did={handle}"), &cookie).await;
+    let queued = storage.pending_recent_posts_fetches(10).unwrap();
+    assert!(
+        !queued.iter().any(|did| did == handle),
+        "the profile route passed handle {handle} into the DID-only recent-posts queue: {queued:?}"
+    );
+}
+
+#[tokio::test]
 async fn profile_page_shows_relationship_and_actions_for_other_accounts_only() {
     let storage = Arc::new(MemoryStorage::default());
     storage
