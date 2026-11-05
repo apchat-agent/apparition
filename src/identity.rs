@@ -18,7 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 use thiserror::Error;
-use tokio::sync::{Mutex, RwLock, watch};
+use tokio::sync::{Mutex, OnceCell, RwLock, watch};
 use url::Url;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -126,6 +126,41 @@ pub trait IdentityBackend: Send + Sync {
         &self,
         handle: &str,
     ) -> impl Future<Output = Result<Option<String>, ResolutionError>> + Send;
+}
+
+const MAX_IDENTITY_INFLIGHT: usize = 1024;
+type IdentityFlights<T> = Mutex<HashMap<String, Arc<OnceCell<T>>>>;
+
+async fn identity_singleflight<T, F, Fut>(flights: &IdentityFlights<T>, key: &str, fetch: F) -> T
+where
+    T: Clone + Send + Sync,
+    F: FnOnce() -> Fut + Send,
+    Fut: Future<Output = T> + Send,
+{
+    let cell = {
+        let mut pending = flights.lock().await;
+        if pending.len() >= MAX_IDENTITY_INFLIGHT {
+            pending.retain(|_, cell| Arc::strong_count(cell) > 1);
+        }
+        if let Some(cell) = pending.get(key) {
+            Arc::clone(cell)
+        } else if pending.len() < MAX_IDENTITY_INFLIGHT {
+            let cell = Arc::new(OnceCell::new());
+            pending.insert(key.to_owned(), Arc::clone(&cell));
+            cell
+        } else {
+            Arc::new(OnceCell::new())
+        }
+    };
+    let result = cell.get_or_init(fetch).await.clone();
+    let mut pending = flights.lock().await;
+    if pending
+        .get(key)
+        .is_some_and(|current| Arc::ptr_eq(current, &cell))
+    {
+        pending.remove(key);
+    }
+    result
 }
 
 #[derive(Clone)]
@@ -493,6 +528,9 @@ pub struct IdentityResolver<B> {
     ttl: Duration,
     cache: RwLock<HashMap<String, CachedIdentity>>,
     persistent_cache: Option<Arc<SqliteIdentityCache>>,
+    handle_flights: IdentityFlights<Result<Identity, ResolutionError>>,
+    did_flights: IdentityFlights<Result<Identity, ResolutionError>>,
+    document_flights: IdentityFlights<Result<DidDocument, ResolutionError>>,
 }
 
 impl<B: IdentityBackend> IdentityResolver<B> {
@@ -502,6 +540,9 @@ impl<B: IdentityBackend> IdentityResolver<B> {
             ttl,
             cache: RwLock::new(HashMap::new()),
             persistent_cache: None,
+            handle_flights: Mutex::new(HashMap::new()),
+            did_flights: Mutex::new(HashMap::new()),
+            document_flights: Mutex::new(HashMap::new()),
         }
     }
 
@@ -524,56 +565,65 @@ impl<B: IdentityBackend> IdentityResolver<B> {
             return Ok(identity);
         }
 
-        let mut resolved_did = None;
-        let result = async {
-            let did = self.resolve_handle_assertion(&handle).await?;
-            resolved_did = Some(did.clone());
-            let doc = self.resolve_did_document(&did).await?;
-            if doc.id != did
-                || !doc
-                    .also_known_as
-                    .iter()
-                    .any(|uri| uri == &format!("at://{handle}"))
-            {
-                return Err(ResolutionError::UnverifiedHandle(handle.clone()));
+        let flight_key = key.clone();
+        let flight_handle = handle.clone();
+        identity_singleflight(&self.handle_flights, &key, || async move {
+            let mut resolved_did = None;
+            let result = async {
+                let did = self.resolve_handle_assertion(&flight_handle).await?;
+                resolved_did = Some(did.clone());
+                let doc = self.resolve_did_document(&did).await?;
+                if doc.id != did
+                    || !doc
+                        .also_known_as
+                        .iter()
+                        .any(|uri| uri == &format!("at://{flight_handle}"))
+                {
+                    return Err(ResolutionError::UnverifiedHandle(flight_handle.clone()));
+                }
+                Ok((
+                    Identity {
+                        did,
+                        handle: Some(flight_handle.clone()),
+                    },
+                    doc,
+                ))
             }
-            Ok((
-                Identity {
-                    did,
-                    handle: Some(handle.clone()),
-                },
-                doc,
-            ))
-        }
-        .await;
-        match result {
-            Ok((identity, document)) => {
-                self.insert(key.clone(), identity.clone()).await;
-                self.persist_success(
-                    &key,
-                    &identity.did,
-                    Some(identity.clone()),
-                    Some(document.clone()),
-                );
-                self.persist_success(
-                    &format!("did-document:{}", identity.did),
-                    &identity.did,
-                    None,
-                    Some(document),
-                );
-                self.persist_success(
-                    &format!("did-identity:{}", identity.did),
-                    &identity.did,
-                    Some(identity.clone()),
-                    None,
-                );
-                Ok(identity)
+            .await;
+            match result {
+                Ok((identity, document)) => {
+                    self.insert(flight_key.clone(), identity.clone()).await;
+                    self.persist_success(
+                        &flight_key,
+                        &identity.did,
+                        Some(identity.clone()),
+                        Some(document.clone()),
+                    );
+                    self.persist_success(
+                        &format!("did-document:{}", identity.did),
+                        &identity.did,
+                        None,
+                        Some(document),
+                    );
+                    self.persist_success(
+                        &format!("did-identity:{}", identity.did),
+                        &identity.did,
+                        Some(identity.clone()),
+                        None,
+                    );
+                    Ok(identity)
+                }
+                Err(error) => {
+                    self.persist_failure(
+                        &flight_key,
+                        resolved_did.as_deref().unwrap_or(""),
+                        error.clone(),
+                    );
+                    Err(error)
+                }
             }
-            Err(error) => {
-                self.persist_failure(&key, resolved_did.as_deref().unwrap_or(""), error.clone());
-                Err(error)
-            }
-        }
+        })
+        .await
     }
 
     pub async fn resolve_did_document(&self, did: &str) -> Result<DidDocument, ResolutionError> {
@@ -592,31 +642,36 @@ impl<B: IdentityBackend> IdentityResolver<B> {
             return Ok(document);
         }
 
-        let result = async {
-            let document = self
-                .backend
-                .did_document(did)
-                .await?
-                .ok_or_else(|| ResolutionError::DidNotFound(did.to_owned()))?;
-            if document.id != did {
-                return Err(ResolutionError::DidDocumentMismatch {
-                    actual: document.id,
-                    requested: did.to_owned(),
-                });
-            }
-            Ok(document)
-        }
-        .await;
-        match result {
-            Ok(document) => {
-                self.persist_success(&key, did, None, Some(document.clone()));
+        let flight_key = key.clone();
+        let flight_did = did.to_owned();
+        identity_singleflight(&self.document_flights, &key, || async move {
+            let result = async {
+                let document = self
+                    .backend
+                    .did_document(&flight_did)
+                    .await?
+                    .ok_or_else(|| ResolutionError::DidNotFound(flight_did.clone()))?;
+                if document.id != flight_did {
+                    return Err(ResolutionError::DidDocumentMismatch {
+                        actual: document.id,
+                        requested: flight_did.clone(),
+                    });
+                }
                 Ok(document)
             }
-            Err(error) => {
-                self.persist_failure(&key, did, error.clone());
-                Err(error)
+            .await;
+            match result {
+                Ok(document) => {
+                    self.persist_success(&flight_key, &flight_did, None, Some(document.clone()));
+                    Ok(document)
+                }
+                Err(error) => {
+                    self.persist_failure(&flight_key, &flight_did, error.clone());
+                    Err(error)
+                }
             }
-        }
+        })
+        .await
     }
 
     pub async fn verified_handle_for_document(
@@ -654,26 +709,37 @@ impl<B: IdentityBackend> IdentityResolver<B> {
             return Ok(identity);
         }
 
-        let result: Result<Identity, ResolutionError> = async {
-            let doc = self.resolve_did_document(did).await?;
-            let verified_handle = self.verified_handle_for_document(&doc).await?;
-            Ok(Identity {
-                did: did.to_owned(),
-                handle: verified_handle,
-            })
-        }
-        .await;
-        match result {
-            Ok(identity) => {
-                self.insert(key, identity.clone()).await;
-                self.persist_success(&persistent_key, did, Some(identity.clone()), None);
-                Ok(identity)
+        let flight_key = key.clone();
+        let flight_persistent_key = persistent_key.clone();
+        let flight_did = did.to_owned();
+        identity_singleflight(&self.did_flights, &key, || async move {
+            let result: Result<Identity, ResolutionError> = async {
+                let doc = self.resolve_did_document(&flight_did).await?;
+                let verified_handle = self.verified_handle_for_document(&doc).await?;
+                Ok(Identity {
+                    did: flight_did.clone(),
+                    handle: verified_handle,
+                })
             }
-            Err(error) => {
-                self.persist_failure(&persistent_key, did, error.clone());
-                Err(error)
+            .await;
+            match result {
+                Ok(identity) => {
+                    self.insert(flight_key, identity.clone()).await;
+                    self.persist_success(
+                        &flight_persistent_key,
+                        &flight_did,
+                        Some(identity.clone()),
+                        None,
+                    );
+                    Ok(identity)
+                }
+                Err(error) => {
+                    self.persist_failure(&flight_persistent_key, &flight_did, error.clone());
+                    Err(error)
+                }
             }
-        }
+        })
+        .await
     }
 
     async fn persistent_result(
