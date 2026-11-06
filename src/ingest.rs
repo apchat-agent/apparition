@@ -64,6 +64,9 @@ const SQLITE_WRITER_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// today's. 256 MiB also stays above the 192 MiB pressure-skip bound, so shrink
 /// rounds run under read pressure without needing the bypass at defaults.
 const WAL_FORCE_SHRINK_DEFAULT_BYTES: u64 = 256 * 1024 * 1024;
+// The pressure-skip claim above, enforced: lowering the default below the
+// pressure bound would make shrink rounds depend on the bypass again.
+const _: () = assert!(WAL_FORCE_SHRINK_DEFAULT_BYTES > WAL_PRESSURE_CHECKPOINT_BYTES);
 /// MINIMUM gap between forced-shrink attempts, not a fixed cadence: with the
 /// threshold above the trigger is the WAL size, checked every 2 s round, and
 /// this floor only bounds the retry rate after a busy/error attempt (av89's
@@ -10684,6 +10687,22 @@ mod sqlite_writer_tests {
             drop((checkpointer, writer));
             remove_database(&path);
         }
+    }
+
+    #[test]
+    fn enter_if_unset_keeps_an_outer_label() {
+        let outer = SqliteOperationKindGuard::enter("backfill");
+        {
+            let _inner = SqliteOperationKindGuard::enter_if_unset("record_put");
+            assert_eq!(current_sqlite_operation_kind("writer_call"), "backfill");
+        }
+        assert_eq!(current_sqlite_operation_kind("writer_call"), "backfill");
+        drop(outer);
+        {
+            let _inner = SqliteOperationKindGuard::enter_if_unset("record_put");
+            assert_eq!(current_sqlite_operation_kind("writer_call"), "record_put");
+        }
+        assert_eq!(current_sqlite_operation_kind("writer_call"), "writer_call");
     }
 
     #[test]
