@@ -95,7 +95,7 @@ use std::{
     pin::Pin,
     sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     thread::JoinHandle,
@@ -12733,13 +12733,21 @@ where
                 .await
             {
                 Ok(created) => {
-                    queue_created_record(
+                    queue_created_record_with_binding(
                         state.storage.clone(),
                         &viewer_did,
                         "app.bsky.graph.follow",
                         created,
                         "profile action",
                         None,
+                        Some((
+                            state.pending_writes.clone(),
+                            graph_record_pending_key(
+                                "app.bsky.graph.follow",
+                                &viewer_did,
+                                subject_did,
+                            ),
+                        )),
                     );
                     Ok(())
                 }
@@ -12752,15 +12760,25 @@ where
             } else {
                 ("app.bsky.graph.block", subject_did)
             };
-            let record =
+            let pending_key = graph_record_pending_key(collection, &viewer_did, expected_subject);
+            let record_uri =
                 match state
                     .storage
                     .records_for_actor_collection(&viewer_did, collection, 10_000)
                 {
-                    Ok(records) => records.into_iter().find(|record| {
-                        record.record.get("subject").and_then(Value::as_str)
-                            == Some(expected_subject)
-                    }),
+                    Ok(records) => records
+                        .into_iter()
+                        .find(|record| {
+                            record.record.get("subject").and_then(Value::as_str)
+                                == Some(expected_subject)
+                        })
+                        .map(|record| record.uri)
+                        .or_else(|| {
+                            state
+                                .pending_writes
+                                .consult(&pending_key)
+                                .map(|entry| entry.uri)
+                        }),
                     Err(error) => {
                         return web_write_response(
                             &state.public,
@@ -12773,12 +12791,12 @@ where
                         );
                     }
                 };
-            let Some(record) = record else {
+            let Some(record_uri) = record_uri else {
                 return oauth_error(StatusCode::BAD_REQUEST, "relationship record was not found");
             };
             match state
                 .flow
-                .delete_profile_graph_record(&viewer_did, collection, &record.uri)
+                .delete_profile_graph_record(&viewer_did, collection, &record_uri)
                 .await
             {
                 Ok(()) => {
@@ -12786,9 +12804,10 @@ where
                         state.storage.clone(),
                         &viewer_did,
                         collection,
-                        &record.uri,
+                        &record_uri,
                         "profile action",
                         (action == "unfollow").then_some(subject_did),
+                        Some((state.pending_writes.clone(), pending_key)),
                     );
                     Ok(())
                 }
@@ -12807,13 +12826,21 @@ where
                 .await
             {
                 Ok(created) => {
-                    queue_created_record(
+                    queue_created_record_with_binding(
                         state.storage.clone(),
                         &viewer_did,
                         "app.bsky.graph.block",
                         created,
                         "profile action",
                         None,
+                        Some((
+                            state.pending_writes.clone(),
+                            graph_record_pending_key(
+                                "app.bsky.graph.block",
+                                &viewer_did,
+                                subject_did,
+                            ),
+                        )),
                     );
                     Ok(())
                 }
@@ -12881,13 +12908,17 @@ where
                 .await
             {
                 Ok(created) => {
-                    queue_created_record(
+                    queue_created_record_with_binding(
                         state.storage.clone(),
                         &viewer_did,
                         "app.bsky.graph.listitem",
                         created,
                         "profile action",
                         None,
+                        Some((
+                            state.pending_writes.clone(),
+                            list_item_pending_key(&viewer_did, list_uri, subject_did),
+                        )),
                     );
                     Ok(())
                 }
@@ -12937,6 +12968,12 @@ where
                     "list item does not match this account",
                 );
             }
+            let list_uri = lists
+                .iter()
+                .find(|list| list.item_uri.as_deref() == Some(item_uri))
+                .map(|list| list.uri.clone())
+                .expect("the matching list item was checked above");
+            let pending_key = list_item_pending_key(&viewer_did, &list_uri, subject_did);
             match state
                 .flow
                 .delete_profile_graph_record(&viewer_did, "app.bsky.graph.listitem", item_uri)
@@ -12950,6 +12987,7 @@ where
                         item_uri,
                         "profile action",
                         None,
+                        Some((state.pending_writes.clone(), pending_key)),
                     );
                     Ok(())
                 }
@@ -13019,6 +13057,10 @@ where
                             item_uri,
                             "profile action",
                             None,
+                            Some((
+                                state.pending_writes.clone(),
+                                list_item_pending_key(&viewer_did, list_uri, subject_did),
+                            )),
                         );
                         Ok(())
                     }
@@ -13037,13 +13079,17 @@ where
                     .await
                 {
                     Ok(created) => {
-                        queue_created_record(
+                        queue_created_record_with_binding(
                             state.storage.clone(),
                             &viewer_did,
                             "app.bsky.graph.listitem",
                             created,
                             "profile action",
                             None,
+                            Some((
+                                state.pending_writes.clone(),
+                                list_item_pending_key(&viewer_did, list_uri, subject_did),
+                            )),
                         );
                         Ok(())
                     }
@@ -15638,8 +15684,7 @@ struct PendingWebPosts {
 }
 
 impl PendingWebPosts {
-    fn prune(records: &mut HashMap<String, VecDeque<(Instant, IndexedRecord)>>) {
-        let now = Instant::now();
+    fn prune_at(records: &mut HashMap<String, VecDeque<(Instant, IndexedRecord)>>, now: Instant) {
         records.retain(|_, actor_records| {
             while actor_records
                 .front()
@@ -15652,15 +15697,19 @@ impl PendingWebPosts {
     }
 
     fn register(&self, record: IndexedRecord) {
+        self.register_at(record, Instant::now());
+    }
+
+    fn register_at(&self, record: IndexedRecord, now: Instant) {
         let Ok(mut records) = self.records.lock() else {
             return;
         };
-        Self::prune(&mut records);
+        Self::prune_at(&mut records, now);
         let actor = record.did.clone();
         {
             let actor_records = records.entry(actor.clone()).or_default();
             actor_records.retain(|(_, existing)| existing.uri != record.uri);
-            actor_records.push_back((Instant::now(), record));
+            actor_records.push_back((now, record));
             while actor_records.len() > MAX_PENDING_WEB_POSTS_PER_ACTOR {
                 actor_records.pop_front();
             }
@@ -15700,10 +15749,14 @@ impl PendingWebPosts {
     }
 
     fn for_actor(&self, did: &str) -> Vec<IndexedRecord> {
+        self.for_actor_at(did, Instant::now())
+    }
+
+    fn for_actor_at(&self, did: &str, now: Instant) -> Vec<IndexedRecord> {
         let Ok(mut records) = self.records.lock() else {
             return Vec::new();
         };
-        Self::prune(&mut records);
+        Self::prune_at(&mut records, now);
         records
             .get(did)
             .into_iter()
@@ -15834,13 +15887,15 @@ fn hand_off_index_write<S: Storage + 'static>(
         };
         let mut backoff = INDEX_WRITE_FIRST_BACKOFF;
         for attempt in 1..=INDEX_WRITE_ATTEMPTS {
-            if matches!(&write, IndexWrite::Put { .. })
-                && pending
-                    .as_ref()
-                    .is_some_and(|binding| binding.entry.cancelled.load(Ordering::Relaxed))
+            let _write_guard = if let Some(binding) = pending.as_ref() {
+                Some(binding.operation_lock.clone().lock_owned().await)
+            } else {
+                None
+            };
+            if pending
+                .as_ref()
+                .is_some_and(|binding| binding.entry.cancelled.load(Ordering::Relaxed))
             {
-                // An unlike answered while this write was in flight; the unlike
-                // already handed the delete to the writer, so do not put it back.
                 tracing::info!(
                     route,
                     uri = %write.target(),
@@ -15859,26 +15914,9 @@ fn hand_off_index_write<S: Storage + 'static>(
             .map_err(|error| format!("index write task failed: {error}"));
             match result {
                 Ok(Ok(())) => {
+                    drop(_write_guard);
                     if let Some(binding) = &pending {
-                        binding.writes.complete(&binding.key);
-                        if binding.entry.cancelled.load(Ordering::Relaxed)
-                            && let IndexWrite::Put { record, .. } = &write
-                        {
-                            // The row landed after the unlike asked to cancel: delete
-                            // it again so the unlike can never leave a stale row.
-                            hand_off_index_write(
-                                storage.clone(),
-                                IndexWrite::Delete {
-                                    did: record.did.clone(),
-                                    collection: record.collection.clone(),
-                                    rkey: record.rkey.clone(),
-                                    follow_subject: None,
-                                },
-                                route,
-                                Arc::new(AtomicU8::new(INDEX_WRITE_UNSET)),
-                                None,
-                            );
-                        }
+                        binding.writes.complete(&binding.key, &binding.entry);
                     }
                     mark(INDEX_WRITE_DONE);
                     tracing::info!(
@@ -15893,6 +15931,7 @@ fn hand_off_index_write<S: Storage + 'static>(
                 Ok(Err(error))
                     if attempt < INDEX_WRITE_ATTEMPTS && sqlite_lock_error(&error.to_string()) =>
                 {
+                    drop(_write_guard);
                     tracing::warn!(
                         route,
                         uri = %write.target(),
@@ -15905,11 +15944,13 @@ fn hand_off_index_write<S: Storage + 'static>(
                     backoff = (backoff * 2).min(INDEX_WRITE_MAX_BACKOFF);
                 }
                 Ok(Err(error)) => {
+                    drop(_write_guard);
                     mark(INDEX_WRITE_FAILED);
                     count_failed_index_write(route, &write.target(), attempt, &error.to_string());
                     return;
                 }
                 Err(error) => {
+                    drop(_write_guard);
                     mark(INDEX_WRITE_FAILED);
                     count_failed_index_write(route, &write.target(), attempt, &error);
                     return;
@@ -15950,6 +15991,26 @@ fn queue_created_record<S: Storage + 'static>(
     route: &'static str,
     pending_posts: Option<Arc<PendingWebPosts>>,
 ) {
+    queue_created_record_with_binding(
+        storage,
+        did,
+        collection,
+        created,
+        route,
+        pending_posts,
+        None,
+    );
+}
+
+fn queue_created_record_with_binding<S: Storage + 'static>(
+    storage: Arc<S>,
+    did: &str,
+    collection: &str,
+    created: PdsCreatedRecord,
+    route: &'static str,
+    pending_posts: Option<Arc<PendingWebPosts>>,
+    pending_write: Option<(Arc<PendingIndexWrites>, PendingWriteKey)>,
+) {
     let outcome = index_write_outcome_slot();
     match indexed_created_record(did, collection, &created) {
         Ok(record) => {
@@ -15958,6 +16019,9 @@ fn queue_created_record<S: Storage + 'static>(
             {
                 pending_posts.register(record.clone());
             }
+            let pending = pending_write.map(|(writes, key)| {
+                pending_index_write_binding(writes, key, record.uri.clone(), true, 0)
+            });
             hand_off_index_write(
                 storage,
                 IndexWrite::Put {
@@ -15966,7 +16030,7 @@ fn queue_created_record<S: Storage + 'static>(
                 },
                 route,
                 outcome,
-                None,
+                pending,
             );
         }
         Err(error) => report_index_hand_off_failure(route, &created.uri, &error, &outcome),
@@ -15982,21 +16046,27 @@ fn queue_deleted_record<S: Storage + 'static>(
     uri: &str,
     route: &'static str,
     follow_subject: Option<&str>,
+    pending_write: Option<(Arc<PendingIndexWrites>, PendingWriteKey)>,
 ) {
     let outcome = index_write_outcome_slot();
     match record_index_rkey(did, collection, uri) {
-        Ok(rkey) => hand_off_index_write(
-            storage,
-            IndexWrite::Delete {
-                did: did.to_owned(),
-                collection: collection.to_owned(),
-                rkey,
-                follow_subject: follow_subject.map(str::to_owned),
-            },
-            route,
-            outcome,
-            None,
-        ),
+        Ok(rkey) => {
+            let pending = pending_write.map(|(writes, key)| {
+                pending_index_write_binding(writes, key, uri.to_owned(), false, 0)
+            });
+            hand_off_index_write(
+                storage,
+                IndexWrite::Delete {
+                    did: did.to_owned(),
+                    collection: collection.to_owned(),
+                    rkey,
+                    follow_subject: follow_subject.map(str::to_owned),
+                },
+                route,
+                outcome,
+                pending,
+            );
+        }
         Err(error) => report_index_hand_off_failure(route, uri, &error, &outcome),
     }
 }
@@ -16004,6 +16074,18 @@ fn queue_deleted_record<S: Storage + 'static>(
 /// `(collection, viewer, subject)` — the key of a like/repost the viewer just
 /// made whose index write has not landed yet.
 type PendingWriteKey = (String, String, String);
+
+fn graph_record_pending_key(collection: &str, actor: &str, subject: &str) -> PendingWriteKey {
+    (collection.to_owned(), actor.to_owned(), subject.to_owned())
+}
+
+fn list_item_pending_key(actor: &str, list_uri: &str, subject: &str) -> PendingWriteKey {
+    graph_record_pending_key(
+        "app.bsky.graph.listitem",
+        actor,
+        &format!("{list_uri}\n{subject}"),
+    )
+}
 
 /// A pending entry outlives one writer stall (live transaction max ~20 s) and
 /// a full retry window; after it expires a repeat click may reach the PDS
@@ -16027,6 +16109,7 @@ struct PendingWriteEntry {
 #[derive(Default)]
 struct PendingIndexWrites {
     entries: Mutex<HashMap<PendingWriteKey, PendingWriteEntry>>,
+    operation_locks: Mutex<HashMap<PendingWriteKey, Weak<tokio::sync::Mutex<()>>>>,
 }
 
 impl PendingIndexWrites {
@@ -16037,9 +16120,17 @@ impl PendingIndexWrites {
         (!entry.cancelled.load(Ordering::Relaxed)).then(|| entry.clone())
     }
 
-    fn register(&self, key: PendingWriteKey, entry: PendingWriteEntry) {
+    fn register(
+        &self,
+        key: PendingWriteKey,
+        entry: PendingWriteEntry,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let operation_lock = self.operation_lock(&key);
         if let Ok(mut entries) = self.entries.lock() {
             Self::prune(&mut entries);
+            if let Some(previous) = entries.get(&key) {
+                previous.cancelled.store(true, Ordering::Relaxed);
+            }
             if entries.len() >= MAX_PENDING_INDEX_WRITES
                 && let Some(oldest) = entries
                     .iter()
@@ -16050,24 +16141,32 @@ impl PendingIndexWrites {
             }
             entries.insert(key, entry);
         }
+        operation_lock
     }
 
     /// The index write landed: later clicks must reach the PDS again (the row
     /// they see is now authoritative).
-    fn complete(&self, key: &PendingWriteKey) {
-        if let Ok(mut entries) = self.entries.lock() {
+    fn complete(&self, key: &PendingWriteKey, completed: &PendingWriteEntry) {
+        if let Ok(mut entries) = self.entries.lock()
+            && entries
+                .get(key)
+                .is_some_and(|current| Arc::ptr_eq(&current.cancelled, &completed.cancelled))
+        {
             entries.remove(key);
         }
     }
 
-    /// A delete answered for this write (unlike right after the like): stop the
-    /// pending index write from re-adding the row the user just removed.
-    fn cancel(&self, key: &PendingWriteKey) -> Option<PendingWriteEntry> {
-        let entry = self.entries.lock().ok()?.remove(key);
-        if let Some(entry) = entry.as_ref() {
-            entry.cancelled.store(true, Ordering::Relaxed);
+    fn operation_lock(&self, key: &PendingWriteKey) -> Arc<tokio::sync::Mutex<()>> {
+        let Ok(mut locks) = self.operation_locks.lock() else {
+            return Arc::new(tokio::sync::Mutex::new(()));
+        };
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(key).and_then(Weak::upgrade) {
+            return lock;
         }
-        entry
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(key.clone(), Arc::downgrade(&lock));
+        lock
     }
 
     fn prune(entries: &mut HashMap<PendingWriteKey, PendingWriteEntry>) {
@@ -16082,6 +16181,31 @@ struct PendingIndexWriteBinding {
     writes: Arc<PendingIndexWrites>,
     key: PendingWriteKey,
     entry: PendingWriteEntry,
+    operation_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+fn pending_index_write_binding(
+    writes: Arc<PendingIndexWrites>,
+    key: PendingWriteKey,
+    uri: String,
+    state_after: bool,
+    count_after: u64,
+) -> PendingIndexWriteBinding {
+    let entry = PendingWriteEntry {
+        uri,
+        expires_at: Instant::now() + PENDING_INDEX_WRITE_TTL,
+        cancelled: Arc::new(AtomicBool::new(false)),
+        phase: Arc::new(AtomicU8::new(INDEX_WRITE_QUEUED)),
+        state_after,
+        count_after,
+    };
+    let operation_lock = writes.register(key.clone(), entry.clone());
+    PendingIndexWriteBinding {
+        writes,
+        key,
+        entry,
+        operation_lock,
+    }
 }
 
 async fn write_like<F, S>(
@@ -16153,21 +16277,29 @@ where
         };
         return match state.flow.delete_like(&did, &like_uri).await {
             Ok(()) => {
-                state.pending_writes.cancel(&pending_key);
                 let outcome = index_write_outcome_slot();
                 match record_index_rkey(&did, "app.bsky.feed.like", &like_uri) {
-                    Ok(rkey) => hand_off_index_write(
-                        state.storage.clone(),
-                        IndexWrite::Delete {
-                            did: did.clone(),
-                            collection: "app.bsky.feed.like".to_owned(),
-                            rkey,
-                            follow_subject: None,
-                        },
-                        "like",
-                        outcome,
-                        None,
-                    ),
+                    Ok(rkey) => {
+                        let pending = pending_index_write_binding(
+                            state.pending_writes.clone(),
+                            pending_key.clone(),
+                            like_uri.clone(),
+                            false,
+                            summary.like_count.saturating_sub(1) as u64,
+                        );
+                        hand_off_index_write(
+                            state.storage.clone(),
+                            IndexWrite::Delete {
+                                did: did.clone(),
+                                collection: "app.bsky.feed.like".to_owned(),
+                                rkey,
+                                follow_subject: None,
+                            },
+                            "like",
+                            outcome,
+                            Some(pending),
+                        );
+                    }
                     Err(error) => {
                         report_index_hand_off_failure("like", &like_uri, &error, &outcome)
                     }
@@ -16242,17 +16374,13 @@ where
             let outcome = index_write_outcome_slot();
             match indexed_created_record(&did, "app.bsky.feed.like", &created) {
                 Ok(record) => {
-                    let entry = PendingWriteEntry {
-                        uri: record.uri.clone(),
-                        expires_at: Instant::now() + PENDING_INDEX_WRITE_TTL,
-                        cancelled: Arc::new(AtomicBool::new(false)),
-                        phase: Arc::new(AtomicU8::new(INDEX_WRITE_QUEUED)),
-                        state_after: true,
-                        count_after: (summary.like_count + 1) as u64,
-                    };
-                    state
-                        .pending_writes
-                        .register(pending_key.clone(), entry.clone());
+                    let pending = pending_index_write_binding(
+                        state.pending_writes.clone(),
+                        pending_key.clone(),
+                        record.uri.clone(),
+                        true,
+                        (summary.like_count + 1) as u64,
+                    );
                     hand_off_index_write(
                         state.storage.clone(),
                         IndexWrite::Put {
@@ -16261,11 +16389,7 @@ where
                         },
                         "like",
                         outcome,
-                        Some(PendingIndexWriteBinding {
-                            writes: state.pending_writes.clone(),
-                            key: pending_key.clone(),
-                            entry,
-                        }),
+                        Some(pending),
                     );
                 }
                 Err(error) => report_index_hand_off_failure("like", &created.uri, &error, &outcome),
@@ -16371,17 +16495,13 @@ where
             let outcome = index_write_outcome_slot();
             match indexed_created_record(&did, "app.bsky.feed.repost", &created) {
                 Ok(record) => {
-                    let entry = PendingWriteEntry {
-                        uri: record.uri.clone(),
-                        expires_at: Instant::now() + PENDING_INDEX_WRITE_TTL,
-                        cancelled: Arc::new(AtomicBool::new(false)),
-                        phase: Arc::new(AtomicU8::new(INDEX_WRITE_QUEUED)),
-                        state_after: true,
-                        count_after: (summary.repost_count + 1) as u64,
-                    };
-                    state
-                        .pending_writes
-                        .register(pending_key.clone(), entry.clone());
+                    let pending = pending_index_write_binding(
+                        state.pending_writes.clone(),
+                        pending_key.clone(),
+                        record.uri.clone(),
+                        true,
+                        (summary.repost_count + 1) as u64,
+                    );
                     hand_off_index_write(
                         state.storage.clone(),
                         IndexWrite::Put {
@@ -16390,11 +16510,7 @@ where
                         },
                         "repost",
                         outcome,
-                        Some(PendingIndexWriteBinding {
-                            writes: state.pending_writes.clone(),
-                            key: pending_key.clone(),
-                            entry,
-                        }),
+                        Some(pending),
                     );
                 }
                 Err(error) => {
@@ -18694,6 +18810,44 @@ fn create_key_file(path: &Path) -> Result<fs::File, std::io::Error> {
 #[cfg(test)]
 mod oauth_store_writer_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn oauth_writer_counts_a_busy_call() {
+        let path = std::env::temp_dir().join(format!(
+            "appview-rs-oauth-busy-{}-{}.sqlite3",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let connection = Connection::open(&path).unwrap();
+        connection.busy_timeout(Duration::from_millis(1)).unwrap();
+        connection
+            .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE busy_test(value INTEGER);")
+            .unwrap();
+        let writer = OAuthStoreWriter::new(connection).unwrap();
+        let holder = Connection::open(&path).unwrap();
+        holder
+            .execute_batch("PRAGMA busy_timeout=5000; BEGIN IMMEDIATE;")
+            .unwrap();
+
+        let error = writer
+            .call(|connection| {
+                connection.execute("INSERT INTO busy_test VALUES (1)", [])?;
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert!(oauth_sqlite_busy_error(&error), "unexpected error: {error}");
+        assert_eq!(writer.metrics.sqlite_busy.load(Ordering::Relaxed), 1);
+
+        holder.execute_batch("COMMIT;").unwrap();
+        drop((holder, writer));
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(format!("{}-wal", path.display()));
+        let _ = fs::remove_file(format!("{}-shm", path.display()));
+    }
 
     #[tokio::test]
     async fn oauth_cache_writer_flushes_pending_writes_when_store_drops() {
@@ -29657,6 +29811,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pending_web_post_overlay_expires_at_the_five_minute_ttl() {
+        let pending = PendingWebPosts::default();
+        let now = Instant::now();
+        let record = test_web_post("did:plc:av85-ttl-author", "ttl-r1", 1, "pending post", None);
+        pending.register_at(record.clone(), now);
+
+        assert_eq!(pending.for_actor_at(&record.did, now).len(), 1);
+        assert_eq!(
+            pending
+                .for_actor_at(
+                    &record.did,
+                    now + PENDING_WEB_POST_TTL - Duration::from_nanos(1)
+                )
+                .len(),
+            1,
+            "the pending overlay remains visible immediately before its TTL"
+        );
+        assert!(
+            pending
+                .for_actor_at(&record.did, now + PENDING_WEB_POST_TTL)
+                .is_empty(),
+            "the pending overlay expires at its five-minute TTL"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_retried_follow_must_not_resurrect_after_unfollow() {
         // The follow write backs off on a lock while Jetstream indexes the
@@ -29696,7 +29876,10 @@ mod tests {
                 record: json!({"$type":"app.bsky.graph.follow","subject":subject}),
             })
             .unwrap();
-        storage.inner.set_follow(ANSWER_VIEWER, subject, true).unwrap();
+        storage
+            .inner
+            .set_follow(ANSWER_VIEWER, subject, true)
+            .unwrap();
 
         let response = post_web_form(
             &app,
@@ -29716,6 +29899,143 @@ mod tests {
             rows.is_empty() && !following,
             "unfollowed relationship came back: row={} following={following}",
             !rows.is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unfollow_clears_follow_state_after_the_queued_delete_lands() {
+        let storage = Arc::new(FlakyPutStorage {
+            inner: MemoryStorage::default(),
+            lock_failures: AtomicUsize::new(0),
+            delete_lock_failures: AtomicUsize::new(0),
+        });
+        let subject = "did:plc:av85-state-subject";
+        let follow = IndexedRecord {
+            did: ANSWER_VIEWER.to_owned(),
+            collection: "app.bsky.graph.follow".to_owned(),
+            rkey: "state-follow-r1".to_owned(),
+            uri: format!("at://{ANSWER_VIEWER}/app.bsky.graph.follow/state-follow-r1"),
+            cid: Some("state-follow-cid-r1".to_owned()),
+            time_us: 1,
+            record: json!({"$type":"app.bsky.graph.follow","subject":subject}),
+        };
+        storage.inner.put_record(&follow).unwrap();
+        storage
+            .inner
+            .set_follow(ANSWER_VIEWER, subject, true)
+            .unwrap();
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        let app = public.router_with_flow(AnswerFlow::default(), storage.clone());
+        let cookie = answer_session_cookie(&public, storage.as_ref(), ANSWER_VIEWER);
+
+        let response = post_web_form(
+            &app,
+            &cookie,
+            "/profile/action",
+            format!("subject={}&action=unfollow", form_encoded(subject)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(
+            wait_until(
+                || {
+                    storage
+                        .record_by_uri("app.bsky.graph.follow", &follow.uri)
+                        .is_ok_and(|record| record.is_none())
+                        && storage
+                            .is_following(ANSWER_VIEWER, subject)
+                            .is_ok_and(|following| !following)
+                },
+                Duration::from_secs(2)
+            )
+            .await,
+            "the queued unfollow must clear the follow row and state"
+        );
+        assert!(!storage.is_following(ANSWER_VIEWER, subject).unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_profile_route_retries_a_locked_index_write() {
+        let storage = Arc::new(FlakyPutStorage {
+            inner: MemoryStorage::default(),
+            lock_failures: AtomicUsize::new(1),
+            delete_lock_failures: AtomicUsize::new(0),
+        });
+        let subject = "did:plc:av85-retry-subject";
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        let app = public.router_with_flow(AnswerFlow::default(), storage.clone());
+        let cookie = answer_session_cookie(&public, storage.as_ref(), ANSWER_VIEWER);
+
+        let response = post_web_form(
+            &app,
+            &cookie,
+            "/profile/action",
+            format!("subject={}&action=follow", form_encoded(subject)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(
+            wait_until(
+                || {
+                    storage
+                        .records_for_actor_collection(ANSWER_VIEWER, "app.bsky.graph.follow", 10)
+                        .is_ok_and(|records| !records.is_empty())
+                        && storage
+                            .is_following(ANSWER_VIEWER, subject)
+                            .is_ok_and(|following| following)
+                },
+                Duration::from_secs(2)
+            )
+            .await,
+            "a profile route write must survive one SQLite lock failure"
+        );
+        assert_eq!(storage.lock_failures.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unfollow_can_cancel_a_follow_before_its_index_row_lands() {
+        let storage = Arc::new(FlakyPutStorage {
+            inner: MemoryStorage::default(),
+            lock_failures: AtomicUsize::new(3),
+            delete_lock_failures: AtomicUsize::new(0),
+        });
+        let subject = "did:plc:av85-pending-subject";
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        let app = public.router_with_flow(AnswerFlow::default(), storage.clone());
+        let cookie = answer_session_cookie(&public, storage.as_ref(), ANSWER_VIEWER);
+
+        let follow = post_web_form(
+            &app,
+            &cookie,
+            "/profile/action",
+            format!("subject={}&action=follow", form_encoded(subject)),
+        )
+        .await;
+        assert_eq!(follow.status(), StatusCode::SEE_OTHER);
+        let unfollow = post_web_form(
+            &app,
+            &cookie,
+            "/profile/action",
+            format!("subject={}&action=unfollow", form_encoded(subject)),
+        )
+        .await;
+        assert_eq!(
+            unfollow.status(),
+            StatusCode::SEE_OTHER,
+            "the pending PDS follow supplies the URI for the unfollow"
+        );
+        assert!(
+            wait_until(
+                || storage
+                    .records_for_actor_collection(ANSWER_VIEWER, "app.bsky.graph.follow", 10,)
+                    .is_ok_and(|records| records.is_empty())
+                    && storage
+                        .is_following(ANSWER_VIEWER, subject)
+                        .is_ok_and(|following| !following),
+                Duration::from_secs(2)
+            )
+            .await,
+            "an unfollow of a pending follow must leave no local relationship"
         );
     }
 
