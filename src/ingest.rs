@@ -3167,33 +3167,32 @@ impl WalMetrics {
         checkpointed: u64,
         reset: bool,
     ) {
-        let size_reset_observed = self.observe_file(path, file_bytes);
-        if reset && !size_reset_observed {
-            self.resets.fetch_add(1, Ordering::Relaxed);
-        }
-        let reset_observed = size_reset_observed || reset;
+        let reset_observed = self.observe_file(path, file_bytes, reset);
         self.frames.store(frames, Ordering::Relaxed);
         self.checkpointed.store(checkpointed, Ordering::Relaxed);
-        self.reset.store(reset_observed, Ordering::Relaxed);
+        self.reset.fetch_or(reset_observed, Ordering::Release);
     }
 
     fn record_skipped_checkpoint(&self, path: &Path, file_bytes: u64) {
-        let reset_observed = self.observe_file(path, file_bytes);
-        self.reset.store(reset_observed, Ordering::Relaxed);
+        let reset_observed = self.observe_file(path, file_bytes, false);
+        self.reset.fetch_or(reset_observed, Ordering::Release);
     }
 
-    fn observe_file(&self, path: &Path, file_bytes: u64) -> bool {
-        let previous = self.file_bytes.swap(file_bytes, Ordering::Relaxed);
-        self.file_bytes_max.fetch_max(file_bytes, Ordering::Relaxed);
+    fn observe_file(&self, path: &Path, file_bytes: u64, reported_reset: bool) -> bool {
+        let previous = self.file_bytes.load(Ordering::Acquire);
         let size_reset = previous > file_bytes;
         let generation_reset = wal_file_generation(path).is_some_and(|generation| {
             let old = self.wal_generation.swap(generation, Ordering::Relaxed);
             old != 0 && old != generation
         });
-        let reset_observed = size_reset || generation_reset;
+        let reset_observed = size_reset || generation_reset || reported_reset;
         if reset_observed {
-            self.resets.fetch_add(1, Ordering::Relaxed);
+            self.resets.fetch_add(1, Ordering::Release);
         }
+        // Publish the smaller size only after the minute counter includes the
+        // reset, so a report cannot pair a shrunk WAL with a zero reset count.
+        self.file_bytes.store(file_bytes, Ordering::Release);
+        self.file_bytes_max.fetch_max(file_bytes, Ordering::Relaxed);
         reset_observed
     }
 }
@@ -3296,12 +3295,12 @@ impl SqliteWriterMetrics {
             read_wait_count = read_metrics.waits.swap(0, Ordering::Relaxed),
             read_wait_max_ms =
                 read_metrics.wait_max_ns.swap(0, Ordering::Relaxed) as f64 / 1_000_000.0,
-            wal_bytes = wal_metrics.file_bytes.load(Ordering::Relaxed),
+            wal_bytes = wal_metrics.file_bytes.load(Ordering::Acquire),
             wal_file_bytes_max = wal_metrics.file_bytes_max.swap(0, Ordering::Relaxed),
             wal_frames = wal_metrics.frames.load(Ordering::Relaxed),
             ckpt_frames = wal_metrics.checkpointed.load(Ordering::Relaxed),
-            wal_reset = wal_metrics.reset.load(Ordering::Relaxed),
-            wal_resets = wal_metrics.resets.swap(0, Ordering::Relaxed),
+            wal_reset = wal_metrics.reset.swap(false, Ordering::AcqRel),
+            wal_resets = wal_metrics.resets.swap(0, Ordering::AcqRel),
             backfill_wait_ms =
                 wal_metrics.backfill_wait_ns.swap(0, Ordering::Relaxed) as f64 / 1_000_000.0,
             recent_posts_queued,
@@ -9751,6 +9750,7 @@ mod sqlite_writer_tests {
         read_metrics.record_wait(Duration::from_millis(3));
         let wal_metrics = WalMetrics::default();
         wal_metrics.record_checkpoint(Path::new(":memory:"), 8_192, 3, 2, true);
+        wal_metrics.record_checkpoint(Path::new(":memory:"), 8_192, 3, 2, false);
         wal_metrics.sqlite_busy.store(1, Ordering::Relaxed);
         wal_metrics.slow_txn.store(2, Ordering::Relaxed);
         wal_metrics
@@ -9767,6 +9767,8 @@ mod sqlite_writer_tests {
         metrics.slow_txn.store(3, Ordering::Relaxed);
         metrics.jetstream_lock_retries.store(7, Ordering::Relaxed);
         metrics.report(&read_metrics, &wal_metrics);
+        wal_metrics.record_checkpoint(Path::new(":memory:"), 8_192, 3, 3, false);
+        metrics.report(&read_metrics, &wal_metrics);
 
         let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
         assert!(text.contains("SQLite writer minute metrics"), "{text}");
@@ -9782,9 +9784,25 @@ mod sqlite_writer_tests {
         assert!(text.contains("ckpt_passive_ms_max=10"), "{text}");
         assert!(text.contains("ckpt_truncate_ms_max=250"), "{text}");
         assert!(text.contains("jetstream_lock_retries=7"), "{text}");
-        assert!(text.contains("wal_reset=true"), "{text}");
-        assert!(text.contains("wal_resets=1"), "{text}");
+        let lines = text.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2, "expected one line per report: {text}");
+        assert!(lines[0].contains("wal_reset=true"), "{}", lines[0]);
+        assert!(lines[0].contains("wal_resets=1"), "{}", lines[0]);
+        assert!(lines[1].contains("wal_reset=false"), "{}", lines[1]);
+        assert!(lines[1].contains("wal_resets=0"), "{}", lines[1]);
         assert!(text.contains("backfill_wait_ms=1.5"), "{text}");
+    }
+
+    #[test]
+    fn a_reported_wal_shrink_is_counted_once_with_the_smaller_size() {
+        let path = Path::new(":memory:");
+        let metrics = WalMetrics::default();
+        metrics.record_checkpoint(path, 8_192, 3, 3, false);
+        metrics.record_checkpoint(path, 4_096, 1, 1, true);
+
+        assert_eq!(metrics.file_bytes.load(Ordering::Acquire), 4_096);
+        assert_eq!(metrics.resets.load(Ordering::Acquire), 1);
+        assert!(metrics.reset.load(Ordering::Acquire));
     }
 
     #[test]
