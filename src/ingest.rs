@@ -51,6 +51,9 @@ const SQLITE_WRITER_BATCH_DELAY: Duration = Duration::from_millis(5);
 const WAL_JOURNAL_SIZE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 const WAL_PRESSURE_CHECKPOINT_BYTES: u64 = WAL_JOURNAL_SIZE_LIMIT_BYTES * 3;
 const CHECKPOINT_BUSY_TIMEOUT: Duration = Duration::from_millis(50);
+const WAL_FORCE_SHRINK_DEFAULT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const WAL_FORCE_SHRINK_DEFAULT_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const WAL_FORCE_SHRINK_DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const SQLITE_WRITER_METRICS_INTERVAL: Duration = Duration::from_secs(60);
 const SQLITE_SLOW_WRITE_THRESHOLD: Duration = Duration::from_secs(1);
 const CHECKPOINT_NONE: usize = 0;
@@ -3135,6 +3138,12 @@ struct WalMetrics {
     slow_txn: AtomicU64,
     ckpt_passive_max_ns: AtomicU64,
     ckpt_truncate_max_ns: AtomicU64,
+    wal_force_shrink_attempts: AtomicU64,
+    wal_force_shrink_ok: AtomicU64,
+    wal_force_shrink_busy: AtomicU64,
+    wal_force_shrink_ms_max_ns: AtomicU64,
+    wal_force_shrink_bytes_before: AtomicU64,
+    wal_force_shrink_bytes_after: AtomicU64,
     active_checkpoint: AtomicUsize,
     passive_checkpoint_generation: AtomicU64,
     truncate_checkpoint_generation: AtomicU64,
@@ -3306,6 +3315,19 @@ impl SqliteWriterMetrics {
                 wal_metrics.ckpt_passive_max_ns.swap(0, Ordering::Relaxed) as f64 / 1_000_000.0,
             ckpt_truncate_ms_max =
                 wal_metrics.ckpt_truncate_max_ns.swap(0, Ordering::Relaxed) as f64 / 1_000_000.0,
+            wal_force_shrink_attempts =
+                wal_metrics.wal_force_shrink_attempts.swap(0, Ordering::Relaxed),
+            wal_force_shrink_ok = wal_metrics.wal_force_shrink_ok.swap(0, Ordering::Relaxed),
+            wal_force_shrink_busy =
+                wal_metrics.wal_force_shrink_busy.swap(0, Ordering::Relaxed),
+            wal_force_shrink_ms_max = wal_metrics
+                .wal_force_shrink_ms_max_ns
+                .swap(0, Ordering::Relaxed) as f64
+                / 1_000_000.0,
+            wal_bytes_before =
+                wal_metrics.wal_force_shrink_bytes_before.load(Ordering::Relaxed),
+            wal_bytes_after =
+                wal_metrics.wal_force_shrink_bytes_after.load(Ordering::Relaxed),
             jetstream_lock_retries = self.jetstream_lock_retries.swap(0, Ordering::Relaxed),
             dropped_count = self.dropped.swap(0, Ordering::Relaxed),
             failed_write_count = self.failed_writes.swap(0, Ordering::Relaxed),
@@ -4203,6 +4225,255 @@ fn checkpoint_wal(
     checkpoint_wal_with(connection, path, metrics, run_checkpoint_pragma)
 }
 
+#[derive(Clone, Copy, Debug)]
+struct WalForceShrinkConfig {
+    threshold_bytes: u64,
+    interval: Duration,
+    busy_timeout: Duration,
+}
+
+impl WalForceShrinkConfig {
+    fn from_env() -> Self {
+        Self {
+            threshold_bytes: env_u64_or(
+                "APPVIEW_WAL_FORCE_SHRINK_BYTES",
+                WAL_FORCE_SHRINK_DEFAULT_BYTES,
+            ),
+            interval: Duration::from_secs(env_u64_or(
+                "APPVIEW_WAL_FORCE_SHRINK_INTERVAL_SECS",
+                WAL_FORCE_SHRINK_DEFAULT_INTERVAL.as_secs(),
+            )),
+            busy_timeout: Duration::from_secs(env_u64_or(
+                "APPVIEW_WAL_FORCE_SHRINK_BUSY_TIMEOUT_SECS",
+                WAL_FORCE_SHRINK_DEFAULT_TIMEOUT.as_secs(),
+            )),
+        }
+    }
+}
+
+fn env_u64_or(name: &'static str, default: u64) -> u64 {
+    match std::env::var(name) {
+        Ok(value) => match value.parse() {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                tracing::warn!(knob = name, value, %error, default, "invalid SQLite WAL setting; using default");
+                default
+            }
+        },
+        Err(std::env::VarError::NotPresent) => default,
+        Err(error) => {
+            tracing::warn!(knob = name, %error, default, "could not read SQLite WAL setting; using default");
+            default
+        }
+    }
+}
+
+/// Runs the ordinary PASSIVE checkpoint first. A caught-up oversized WAL may
+/// then be truncated, but failed attempts consume the interval too so a pinned
+/// reader cannot turn the two-second checkpointer loop into a retry storm.
+fn checkpoint_wal_with_force_shrink(
+    connection: &Connection,
+    path: &Path,
+    metrics: &WalMetrics,
+    config: WalForceShrinkConfig,
+    last_attempt: &mut Instant,
+    now: Instant,
+    mut before_truncate: impl FnMut(),
+) -> rusqlite::Result<CheckpointResult> {
+    let wal_bytes_before_passive = wal_file_bytes(path);
+    let result = checkpoint_wal(connection, path, metrics)?;
+    if config.threshold_bytes == 0
+        || wal_bytes_before_passive <= config.threshold_bytes
+        || result.busy != 0
+        || result.frames != result.checkpointed
+        || now.saturating_duration_since(*last_attempt) <= config.interval
+    {
+        return Ok(result);
+    }
+
+    let bytes_before = wal_file_bytes(path);
+    force_shrink_wal(
+        connection,
+        path,
+        metrics,
+        config.busy_timeout,
+        bytes_before,
+        (last_attempt, now),
+        &mut before_truncate,
+    );
+    Ok(result)
+}
+
+fn force_shrink_wal(
+    connection: &Connection,
+    path: &Path,
+    metrics: &WalMetrics,
+    busy_timeout: Duration,
+    bytes_before: u64,
+    attempt_clock: (&mut Instant, Instant),
+    before_truncate: &mut impl FnMut(),
+) {
+    metrics
+        .wal_force_shrink_attempts
+        .fetch_add(1, Ordering::Relaxed);
+    metrics
+        .wal_force_shrink_bytes_before
+        .store(bytes_before, Ordering::Relaxed);
+    let (last_attempt, now) = attempt_clock;
+    *last_attempt = now;
+
+    if let Err(error) = set_bounded_checkpoint_busy_timeout(connection, busy_timeout) {
+        let bytes_after = wal_file_bytes(path);
+        metrics
+            .wal_force_shrink_bytes_after
+            .store(bytes_after, Ordering::Relaxed);
+        tracing::info!(
+            wal_bytes_before = bytes_before,
+            wal_bytes_after = bytes_after,
+            duration_ms = 0.0_f64,
+            result = "error",
+            error = %error,
+            "SQLite forced WAL shrink attempt"
+        );
+        if let Err(restore_error) = connection.busy_timeout(CHECKPOINT_BUSY_TIMEOUT) {
+            tracing::error!(%restore_error, "could not restore SQLite checkpoint busy timeout after failed WAL shrink setup");
+        }
+        return;
+    }
+
+    let _checkpoint = metrics.checkpoint_activity(CHECKPOINT_TRUNCATE);
+    before_truncate();
+    let started = Instant::now();
+    let truncate_result = run_checkpoint_pragma(connection, CHECKPOINT_TRUNCATE);
+    let elapsed = started.elapsed();
+    clear_checkpoint_busy_deadline();
+    let restore_result = connection.busy_timeout(CHECKPOINT_BUSY_TIMEOUT);
+    let bytes_after = wal_file_bytes(path);
+    let elapsed_ns = duration_ns(elapsed);
+    metrics
+        .ckpt_truncate_max_ns
+        .fetch_max(elapsed_ns, Ordering::Relaxed);
+    metrics
+        .wal_force_shrink_ms_max_ns
+        .fetch_max(elapsed_ns, Ordering::Relaxed);
+    metrics
+        .wal_force_shrink_bytes_after
+        .store(bytes_after, Ordering::Relaxed);
+
+    let mut pragma_busy = None;
+    let mut pragma_frames = None;
+    let mut pragma_checkpointed = None;
+    let (result_label, error_message) = match truncate_result {
+        Err(error) => {
+            if is_rusqlite_busy_error(&error) {
+                metrics
+                    .wal_force_shrink_busy
+                    .fetch_add(1, Ordering::Relaxed);
+                metrics.sqlite_busy.fetch_add(1, Ordering::Relaxed);
+            }
+            ("error", Some(error.to_string()))
+        }
+        Ok((busy, frames, checkpointed)) if busy != 0 || frames != checkpointed => {
+            pragma_busy = Some(busy);
+            pragma_frames = Some(frames);
+            pragma_checkpointed = Some(checkpointed);
+            metrics
+                .wal_force_shrink_busy
+                .fetch_add(1, Ordering::Relaxed);
+            record_checkpoint_busy(metrics, "checkpoint_TRUNCATE", busy, frames, checkpointed);
+            ("busy", None)
+        }
+        Ok((busy, frames, checkpointed)) => {
+            pragma_busy = Some(busy);
+            pragma_frames = Some(frames);
+            pragma_checkpointed = Some(checkpointed);
+            metrics.wal_force_shrink_ok.fetch_add(1, Ordering::Relaxed);
+            ("ok", None)
+        }
+    };
+
+    let restore_error = restore_result.err();
+    if let Some(error) = &restore_error {
+        tracing::error!(%error, "could not restore SQLite checkpoint busy timeout after WAL TRUNCATE");
+    }
+    let error_message = error_message.or_else(|| restore_error.map(|error| error.to_string()));
+    tracing::info!(
+        wal_bytes_before = bytes_before,
+        wal_bytes_after = bytes_after,
+        duration_ms = elapsed.as_secs_f64() * 1_000.0,
+        result = result_label,
+        sqlite_busy = ?pragma_busy,
+        wal_frames = ?pragma_frames,
+        ckpt_frames = ?pragma_checkpointed,
+        error = error_message.as_deref().unwrap_or("none"),
+        "SQLite forced WAL shrink attempt"
+    );
+}
+
+/// A SQLite busy timeout can restart for separate lock acquisitions during a
+/// checkpoint. Use one deadline for the entire TRUNCATE call so those waits do
+/// not add up beyond the configured bound.
+fn set_bounded_checkpoint_busy_timeout(
+    connection: &Connection,
+    timeout: Duration,
+) -> rusqlite::Result<()> {
+    let started = Instant::now();
+    CHECKPOINT_BUSY_DEADLINE.with(|deadline| deadline.set(Some((started, timeout))));
+    if let Err(error) = connection.busy_handler(Some(bounded_checkpoint_busy_handler)) {
+        CHECKPOINT_BUSY_DEADLINE.with(|deadline| deadline.set(None));
+        return Err(error);
+    }
+    Ok(())
+}
+
+thread_local! {
+    static CHECKPOINT_BUSY_DEADLINE: Cell<Option<(Instant, Duration)>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+static FORCE_SHRINK_TEST_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_SHRINK_CHECKPOINT_BUSY: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_SHRINK_WRITER_BUSY: AtomicBool = AtomicBool::new(false);
+
+fn bounded_checkpoint_busy_handler(_attempt: i32) -> bool {
+    #[cfg(test)]
+    if FORCE_SHRINK_TEST_ACTIVE.load(Ordering::SeqCst) {
+        FORCE_SHRINK_CHECKPOINT_BUSY.store(true, Ordering::SeqCst);
+    }
+    CHECKPOINT_BUSY_DEADLINE.with(|deadline| {
+        let Some((started, timeout)) = deadline.get() else {
+            return false;
+        };
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            return false;
+        }
+        std::thread::sleep(
+            timeout
+                .saturating_sub(elapsed)
+                .min(Duration::from_millis(5)),
+        );
+        started.elapsed() < timeout
+    })
+}
+
+fn clear_checkpoint_busy_deadline() {
+    CHECKPOINT_BUSY_DEADLINE.with(|deadline| deadline.set(None));
+}
+
+fn is_rusqlite_busy_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if matches!(
+                failure.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
 fn checkpoint_wal_with(
     connection: &Connection,
     path: &Path,
@@ -4315,6 +4586,8 @@ fn spawn_checkpointer(
     connection.execute_batch(&format!(
         "PRAGMA journal_size_limit = {WAL_JOURNAL_SIZE_LIMIT_BYTES};"
     ))?;
+    let force_shrink = WalForceShrinkConfig::from_env();
+    let mut last_force_shrink = Instant::now();
     let worker = std::thread::Builder::new()
         .name("sqlite-checkpoint".to_owned())
         .spawn(move || {
@@ -4327,13 +4600,27 @@ fn spawn_checkpointer(
                 // and the last small number would let the backfill pile on meanwhile.
                 backlog.store(u64::MAX, Ordering::Relaxed);
                 let file_bytes = wal_file_bytes(&path);
-                if should_skip_checkpoint_for_pressure(pressure.is_active(), file_bytes) {
+                let now = Instant::now();
+                let force_shrink_due = force_shrink.threshold_bytes > 0
+                    && file_bytes > force_shrink.threshold_bytes
+                    && now.saturating_duration_since(last_force_shrink) > force_shrink.interval;
+                if should_skip_checkpoint_for_pressure(pressure.is_active(), file_bytes)
+                    && !force_shrink_due
+                {
                     // PASSIVE has no page-count budget. Skip while interactive work is
                     // queued, then run every round after the WAL reaches 3x the limit.
                     wal_metrics.record_skipped_checkpoint(&path, file_bytes);
                     continue;
                 }
-                match checkpoint_wal(&connection, &path, &wal_metrics) {
+                match checkpoint_wal_with_force_shrink(
+                    &connection,
+                    &path,
+                    &wal_metrics,
+                    force_shrink,
+                    &mut last_force_shrink,
+                    now,
+                    || {},
+                ) {
                     Ok(result) => {
                         let file_bytes = wal_file_bytes(&path);
                         wal_metrics.record_checkpoint(
@@ -9271,8 +9558,50 @@ mod sqlite_writer_tests {
         let _ = fs::remove_file(format!("{}-shm", path.display()));
     }
 
+    fn seed_force_shrink_wal(path: &Path, rows: usize) -> Connection {
+        let writer = Connection::open(path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA wal_autocheckpoint=0;
+                 PRAGMA journal_size_limit=65536;
+                 CREATE TABLE t(value BLOB);",
+            )
+            .unwrap();
+        for _ in 0..rows {
+            writer
+                .execute("INSERT INTO t VALUES (zeroblob(32768))", [])
+                .unwrap();
+        }
+        writer
+    }
+
+    fn force_shrink_config(
+        threshold_bytes: u64,
+        interval: Duration,
+        busy_timeout: Duration,
+    ) -> WalForceShrinkConfig {
+        WalForceShrinkConfig {
+            threshold_bytes,
+            interval,
+            busy_timeout,
+        }
+    }
+
+    fn overdue_force_shrink_clock(interval: Duration) -> (Instant, Instant) {
+        let now = Instant::now();
+        (now - interval - Duration::from_millis(1), now)
+    }
+
     static CHECKPOINT_BUSY_CALLS: AtomicU64 = AtomicU64::new(0);
     static WRITER_BUSY_WAIT_STARTED: AtomicBool = AtomicBool::new(false);
+
+    fn record_busy_during_forced_shrink(_attempt: i32) -> bool {
+        if FORCE_SHRINK_TEST_ACTIVE.load(Ordering::SeqCst) {
+            FORCE_SHRINK_WRITER_BUSY.store(true, Ordering::SeqCst);
+        }
+        false
+    }
 
     fn count_busy_call(_attempt: i32) -> bool {
         CHECKPOINT_BUSY_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -9344,6 +9673,378 @@ mod sqlite_writer_tests {
             })
             .unwrap();
         assert_eq!(limit, WAL_JOURNAL_SIZE_LIMIT_BYTES as i64);
+        drop(storage);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn forced_shrink_truncates_large_wal_once_and_honors_the_interval() {
+        let path = test_path("forced-shrink-interval");
+        remove_database(&path);
+        let writer = seed_force_shrink_wal(&path, 64);
+        let checkpointer = Connection::open(&path).unwrap();
+        checkpointer.busy_timeout(CHECKPOINT_BUSY_TIMEOUT).unwrap();
+        checkpointer
+            .execute_batch("PRAGMA journal_size_limit=65536;")
+            .unwrap();
+        let metrics = WalMetrics::default();
+        let threshold = 32_768;
+        let interval = Duration::from_secs(10);
+        let config = force_shrink_config(threshold, interval, Duration::from_millis(150));
+        let (mut last_attempt, first_now) = overdue_force_shrink_clock(interval);
+        let mut bytes_before_truncate = 0;
+
+        let before = wal_file_bytes(&path);
+        assert!(before > threshold, "WAL only had {before} bytes");
+        checkpoint_wal_with_force_shrink(
+            &checkpointer,
+            &path,
+            &metrics,
+            config,
+            &mut last_attempt,
+            first_now,
+            || bytes_before_truncate = wal_file_bytes(&path),
+        )
+        .unwrap();
+        let after = wal_file_bytes(&path);
+        assert!(
+            after <= 65_536,
+            "TRUNCATE left a {after}-byte WAL above journal_size_limit"
+        );
+        assert_eq!(metrics.wal_force_shrink_attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.wal_force_shrink_ok.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.wal_force_shrink_busy.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics
+                .wal_force_shrink_bytes_before
+                .load(Ordering::Relaxed),
+            bytes_before_truncate
+        );
+        assert_eq!(
+            metrics.wal_force_shrink_bytes_after.load(Ordering::Relaxed),
+            after
+        );
+
+        for _ in 0..4 {
+            writer
+                .execute("INSERT INTO t VALUES (zeroblob(32768))", [])
+                .unwrap();
+        }
+        let second_round_before = wal_file_bytes(&path);
+        assert!(
+            second_round_before > threshold,
+            "second round was not above threshold: {second_round_before}"
+        );
+        checkpoint_wal_with_force_shrink(
+            &checkpointer,
+            &path,
+            &metrics,
+            config,
+            &mut last_attempt,
+            first_now + Duration::from_secs(1),
+            || {},
+        )
+        .unwrap();
+        assert_eq!(metrics.wal_force_shrink_attempts.load(Ordering::Relaxed), 1);
+
+        drop((checkpointer, writer));
+        remove_database(&path);
+    }
+
+    #[test]
+    fn forced_shrink_skips_small_wals_and_zero_threshold_disables_it() {
+        let interval = Duration::from_secs(5);
+        let (mut last_attempt, now) = overdue_force_shrink_clock(interval);
+
+        let small_path = test_path("forced-shrink-below-threshold");
+        remove_database(&small_path);
+        let small_writer = seed_force_shrink_wal(&small_path, 1);
+        let small_checkpointer = Connection::open(&small_path).unwrap();
+        let small_bytes = wal_file_bytes(&small_path);
+        assert!(small_bytes > 0 && small_bytes < 1_000_000, "{small_bytes}");
+        let small_metrics = WalMetrics::default();
+        checkpoint_wal_with_force_shrink(
+            &small_checkpointer,
+            &small_path,
+            &small_metrics,
+            force_shrink_config(1_000_000, interval, Duration::from_millis(150)),
+            &mut last_attempt,
+            now,
+            || {},
+        )
+        .unwrap();
+        assert_eq!(
+            small_metrics
+                .wal_force_shrink_attempts
+                .load(Ordering::Relaxed),
+            0
+        );
+        drop((small_checkpointer, small_writer));
+        remove_database(&small_path);
+
+        let disabled_path = test_path("forced-shrink-disabled");
+        remove_database(&disabled_path);
+        let disabled_writer = seed_force_shrink_wal(&disabled_path, 64);
+        let disabled_checkpointer = Connection::open(&disabled_path).unwrap();
+        assert!(wal_file_bytes(&disabled_path) > 32_768);
+        let disabled_metrics = WalMetrics::default();
+        let (mut disabled_last_attempt, disabled_now) = overdue_force_shrink_clock(interval);
+        checkpoint_wal_with_force_shrink(
+            &disabled_checkpointer,
+            &disabled_path,
+            &disabled_metrics,
+            force_shrink_config(0, interval, Duration::from_millis(150)),
+            &mut disabled_last_attempt,
+            disabled_now,
+            || {},
+        )
+        .unwrap();
+        assert_eq!(
+            disabled_metrics
+                .wal_force_shrink_attempts
+                .load(Ordering::Relaxed),
+            0
+        );
+        drop((disabled_checkpointer, disabled_writer));
+        remove_database(&disabled_path);
+    }
+
+    #[test]
+    fn forced_shrink_busy_wait_is_bounded_restores_timeout_and_consumes_interval() {
+        let path = test_path("forced-shrink-busy-timeout");
+        remove_database(&path);
+        let writer = seed_force_shrink_wal(&path, 64);
+        let checkpointer = Connection::open(&path).unwrap();
+        checkpointer.busy_timeout(CHECKPOINT_BUSY_TIMEOUT).unwrap();
+        let metrics = WalMetrics::default();
+        let interval = Duration::from_secs(10);
+        let timeout = Duration::from_millis(200);
+        let config = force_shrink_config(1_024, interval, timeout);
+        let (mut last_attempt, first_now) = overdue_force_shrink_clock(interval);
+        let reader_path = path.clone();
+        let (start_reader, reader_started) = mpsc::channel();
+        let (reader_ready, wait_until_ready) = mpsc::channel();
+        let (release_reader, wait_for_release) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let reader = Connection::open(reader_path).unwrap();
+            reader_started.recv().unwrap();
+            reader.execute_batch("BEGIN;").unwrap();
+            let _: i64 = reader
+                .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+                .unwrap();
+            reader_ready.send(()).unwrap();
+            // Keep the real SQLite read snapshot beyond the configured timeout.
+            let _ = wait_for_release.recv_timeout(Duration::from_secs(5));
+            reader.execute_batch("COMMIT;").unwrap();
+        });
+
+        let started = Instant::now();
+        checkpoint_wal_with_force_shrink(
+            &checkpointer,
+            &path,
+            &metrics,
+            config,
+            &mut last_attempt,
+            first_now,
+            || {
+                start_reader.send(()).unwrap();
+                wait_until_ready.recv().unwrap();
+                writer
+                    .execute("INSERT INTO t VALUES (zeroblob(32768))", [])
+                    .unwrap();
+            },
+        )
+        .unwrap();
+        let helper_elapsed = started.elapsed();
+        release_reader.send(()).unwrap();
+        reader.join().unwrap();
+        let truncate_ms =
+            metrics.wal_force_shrink_ms_max_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+        assert_eq!(metrics.wal_force_shrink_attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.wal_force_shrink_busy.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.wal_force_shrink_ok.load(Ordering::Relaxed), 0);
+        assert!(
+            (140.0..700.0).contains(&truncate_ms),
+            "TRUNCATE duration {truncate_ms:.1}ms did not reflect its {timeout:?} bound"
+        );
+        let restored_timeout_ms: i64 = checkpointer
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            restored_timeout_ms,
+            CHECKPOINT_BUSY_TIMEOUT.as_millis() as i64
+        );
+
+        // The failed attempt still starts the interval. Once the reader is
+        // gone, a caught-up oversized WAL in the next round must not retry.
+        checkpoint_wal_with_force_shrink(
+            &checkpointer,
+            &path,
+            &metrics,
+            config,
+            &mut last_attempt,
+            first_now + Duration::from_secs(1),
+            || {},
+        )
+        .unwrap();
+        assert_eq!(metrics.wal_force_shrink_attempts.load(Ordering::Relaxed), 1);
+
+        // Verify the normal busy handler was restored, not just the PRAGMA's
+        // displayed value: a new real writer lock should wait about 50 ms.
+        let holder = Connection::open(&path).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let normal_wait_started = Instant::now();
+        let error = checkpointer
+            .execute("INSERT INTO t VALUES (zeroblob(1))", [])
+            .unwrap_err();
+        let normal_wait = normal_wait_started.elapsed();
+        assert!(is_rusqlite_busy_error(&error), "unexpected error: {error}");
+        assert!(
+            (Duration::from_millis(30)..Duration::from_secs(1)).contains(&normal_wait),
+            "normal timeout after forced shrink was {normal_wait:?}"
+        );
+        holder.execute_batch("COMMIT;").unwrap();
+        eprintln!(
+            "forced TRUNCATE with a reader-pinned new frame: truncate_ms={truncate_ms:.1}, helper_ms={:.1}, bounded_timeout_ms={}, restored_busy_ms={:.1}",
+            helper_elapsed.as_secs_f64() * 1_000.0,
+            timeout.as_millis(),
+            normal_wait.as_secs_f64() * 1_000.0
+        );
+
+        drop((checkpointer, writer));
+        remove_database(&path);
+    }
+
+    #[tokio::test]
+    async fn jetstream_retries_a_busy_write_overlapping_forced_shrink() {
+        let path = test_path("forced-shrink-jetstream-retry");
+        remove_database(&path);
+        let storage = Arc::new(SqliteStorage::open(&path).unwrap());
+        FORCE_SHRINK_TEST_ACTIVE.store(false, Ordering::SeqCst);
+        FORCE_SHRINK_CHECKPOINT_BUSY.store(false, Ordering::SeqCst);
+        FORCE_SHRINK_WRITER_BUSY.store(false, Ordering::SeqCst);
+        storage
+            .writer
+            .call(|connection| {
+                connection.busy_timeout(Duration::from_millis(1))?;
+                connection.execute_batch(
+                    "PRAGMA wal_autocheckpoint=0;
+                     PRAGMA journal_size_limit=65536;
+                     CREATE TABLE lane_force_shrink(value BLOB);",
+                )?;
+                for _ in 0..64 {
+                    connection
+                        .execute("INSERT INTO lane_force_shrink VALUES (zeroblob(32768))", [])?;
+                }
+                connection.busy_handler(Some(record_busy_during_forced_shrink))?;
+                Ok(())
+            })
+            .unwrap();
+        let checkpointer = Connection::open(&path).unwrap();
+        checkpointer.busy_timeout(CHECKPOINT_BUSY_TIMEOUT).unwrap();
+        let metrics = Arc::clone(&storage.wal_metrics);
+        let interval = Duration::from_secs(10);
+        let config = force_shrink_config(1_024, interval, Duration::from_millis(180));
+        let (mut last_attempt, first_now) = overdue_force_shrink_clock(interval);
+        let blocker_slot = Arc::new(Mutex::new(None::<Connection>));
+        let callback_slot = Arc::clone(&blocker_slot);
+        let (truncate_ready, ready_for_writer) = mpsc::channel();
+        let checkpoint_path = path.clone();
+        let checkpoint_metrics = Arc::clone(&metrics);
+        let checkpoint = std::thread::spawn(move || {
+            let result = checkpoint_wal_with_force_shrink(
+                &checkpointer,
+                &checkpoint_path,
+                &checkpoint_metrics,
+                config,
+                &mut last_attempt,
+                first_now,
+                || {
+                    FORCE_SHRINK_TEST_ACTIVE.store(true, Ordering::SeqCst);
+                    let blocker = Connection::open(&checkpoint_path).unwrap();
+                    blocker
+                        .execute_batch("PRAGMA busy_timeout=1000; BEGIN IMMEDIATE;")
+                        .unwrap();
+                    *callback_slot.lock().unwrap() = Some(blocker);
+                    truncate_ready.send(()).unwrap();
+                },
+            );
+            FORCE_SHRINK_TEST_ACTIVE.store(false, Ordering::SeqCst);
+            result.unwrap();
+        });
+        ready_for_writer.recv().unwrap();
+        let busy_wait_started = Instant::now();
+        while !FORCE_SHRINK_CHECKPOINT_BUSY.load(Ordering::SeqCst) {
+            assert!(
+                busy_wait_started.elapsed() < Duration::from_secs(1),
+                "real TRUNCATE did not reach SQLite's busy handler"
+            );
+            std::thread::yield_now();
+        }
+        let blocker_to_release = Arc::clone(&blocker_slot);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(260));
+            blocker_to_release
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .execute_batch("COMMIT;")
+                .unwrap();
+        });
+
+        let consumer = JetstreamConsumer::new(
+            Ingestor::new(storage.clone(), ScopeMode::Full),
+            Duration::from_millis(1),
+        )
+        .with_event_timeout(Duration::from_secs(3));
+        let event = r#"{"did":"did:plc:av89-force-shrink","time_us":123456,"kind":"commit","commit":{"operation":"create","collection":"app.bsky.feed.post","rkey":"retry-r1","cid":"cid-retry-r1","record":{"$type":"app.bsky.feed.post","text":"retry after forced WAL shrink"}}}"#;
+        let ingest_started = Instant::now();
+        consumer
+            .process_event_batch(vec![event.to_owned()])
+            .await
+            .unwrap();
+        let ingest_elapsed = ingest_started.elapsed();
+        checkpoint.join().unwrap();
+        release.join().unwrap();
+        assert!(
+            storage
+                .writer
+                .metrics
+                .jetstream_lock_retries
+                .load(Ordering::Relaxed)
+                > 0,
+            "the event did not take the SQLITE_BUSY retry path"
+        );
+        assert_eq!(metrics.wal_force_shrink_attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.wal_force_shrink_busy.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.wal_force_shrink_ok.load(Ordering::Relaxed), 0);
+        assert!(
+            FORCE_SHRINK_WRITER_BUSY.load(Ordering::SeqCst),
+            "writer SQLITE_BUSY did not overlap the real forced TRUNCATE call"
+        );
+        assert!(
+            storage
+                .record_by_uri(
+                    "app.bsky.feed.post",
+                    "at://did:plc:av89-force-shrink/app.bsky.feed.post/retry-r1"
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(storage.cursor().unwrap(), Some(123456));
+        eprintln!(
+            "forced-shrink concurrent writer retry: retries={} ingest_ms={:.1} truncate_ms={:.1} shrink_busy={}",
+            storage
+                .writer
+                .metrics
+                .jetstream_lock_retries
+                .load(Ordering::Relaxed),
+            ingest_elapsed.as_secs_f64() * 1_000.0,
+            metrics.wal_force_shrink_ms_max_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            metrics.wal_force_shrink_busy.load(Ordering::Relaxed)
+        );
+
         drop(storage);
         remove_database(&path);
     }
@@ -9777,6 +10478,22 @@ mod sqlite_writer_tests {
             .ckpt_truncate_max_ns
             .store(250_000_000, Ordering::Relaxed);
         wal_metrics
+            .wal_force_shrink_attempts
+            .store(3, Ordering::Relaxed);
+        wal_metrics.wal_force_shrink_ok.store(2, Ordering::Relaxed);
+        wal_metrics
+            .wal_force_shrink_busy
+            .store(1, Ordering::Relaxed);
+        wal_metrics
+            .wal_force_shrink_ms_max_ns
+            .store(22_500_000, Ordering::Relaxed);
+        wal_metrics
+            .wal_force_shrink_bytes_before
+            .store(9_000_000, Ordering::Relaxed);
+        wal_metrics
+            .wal_force_shrink_bytes_after
+            .store(65_536, Ordering::Relaxed);
+        wal_metrics
             .backfill_wait_ns
             .store(1_500_000, Ordering::Relaxed);
         let metrics = SqliteWriterMetrics::default();
@@ -9800,6 +10517,12 @@ mod sqlite_writer_tests {
         assert!(text.contains("slow_txn=5"), "{text}");
         assert!(text.contains("ckpt_passive_ms_max=10"), "{text}");
         assert!(text.contains("ckpt_truncate_ms_max=250"), "{text}");
+        assert!(text.contains("wal_force_shrink_attempts=3"), "{text}");
+        assert!(text.contains("wal_force_shrink_ok=2"), "{text}");
+        assert!(text.contains("wal_force_shrink_busy=1"), "{text}");
+        assert!(text.contains("wal_force_shrink_ms_max=22.5"), "{text}");
+        assert!(text.contains("wal_bytes_before=9000000"), "{text}");
+        assert!(text.contains("wal_bytes_after=65536"), "{text}");
         assert!(text.contains("jetstream_lock_retries=7"), "{text}");
         let lines = text.lines().collect::<Vec<_>>();
         assert_eq!(lines.len(), 2, "expected one line per report: {text}");
