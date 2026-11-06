@@ -105,33 +105,215 @@ fn passive_catches_up_and_reuses_wal_with_short_readers() {
 }
 
 #[test]
-fn passive_checkpoint_can_leave_wal_above_four_journal_limits() {
-    let path = temp_db("bound");
+fn periodic_passive_checkpoints_bound_continuous_writes_without_truncate() {
+    const JOURNAL_LIMIT: u64 = 65_536;
+    const WRITES_PER_BATCH: usize = 128;
+    const BATCHES: usize = 8;
+
+    let path = temp_db("passive-bound");
     let connection = Connection::open(&path).unwrap();
-    connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA journal_size_limit=65536; CREATE TABLE t(k INTEGER PRIMARY KEY, v BLOB);").unwrap();
-    for index in 0..128 {
-        connection
-            .execute("INSERT INTO t VALUES (?1, zeroblob(32768))", [index])
+    connection
+        .execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+             PRAGMA journal_size_limit=65536; CREATE TABLE t(k INTEGER PRIMARY KEY, v BLOB);",
+        )
+        .unwrap();
+    let wal_path = PathBuf::from(format!("{}-wal", path.display()));
+    let mut peak_bytes = 0_u64;
+    let mut resets_after_checkpoint = 0_u64;
+    let mut caught_up_rounds = 0_u64;
+
+    for batch in 0..BATCHES {
+        for offset in 0..WRITES_PER_BATCH {
+            let index = (batch * WRITES_PER_BATCH + offset) as i64;
+            connection
+                .execute("INSERT INTO t VALUES (?1, zeroblob(2048))", [index])
+                .unwrap();
+            peak_bytes = peak_bytes.max(std::fs::metadata(&wal_path).unwrap().len());
+        }
+        let checkpoint: (i64, i64, i64) = connection
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
             .unwrap();
+        assert_eq!(checkpoint.0, 0, "PASSIVE returned busy: {checkpoint:?}");
+        assert_eq!(
+            checkpoint.1, checkpoint.2,
+            "PASSIVE did not catch up: {checkpoint:?}"
+        );
+        caught_up_rounds += 1;
+        let after_passive = std::fs::metadata(&wal_path).unwrap().len();
+        assert!(
+            after_passive > JOURNAL_LIMIT,
+            "fixture did not exceed the journal limit before reset: {after_passive}"
+        );
+
+        // A writer beginning after a completed checkpoint resets the WAL and
+        // applies journal_size_limit. This is the steady-state truncation path.
+        let reset_key = (BATCHES * WRITES_PER_BATCH + batch) as i64;
+        connection
+            .execute("INSERT INTO t VALUES (?1, zeroblob(2048))", [reset_key])
+            .unwrap();
+        let after_next_write = std::fs::metadata(&wal_path).unwrap().len();
+        peak_bytes = peak_bytes.max(after_next_write);
+        assert!(
+            after_next_write <= JOURNAL_LIMIT,
+            "WAL did not reset to journal_size_limit after PASSIVE: {after_next_write}"
+        );
+        resets_after_checkpoint += 1;
     }
-    let checkpoint: (i64, i64, i64) = connection
+
+    let final_checkpoint: (i64, i64, i64) = connection
         .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })
         .unwrap();
-    let wal_path = PathBuf::from(format!("{}-wal", path.display()));
-    let wal_bytes = std::fs::metadata(&wal_path).unwrap().len();
+    assert_eq!(
+        final_checkpoint.1, final_checkpoint.2,
+        "{final_checkpoint:?}"
+    );
+    connection
+        .execute(
+            "INSERT INTO t VALUES (?1, zeroblob(2048))",
+            [(BATCHES * WRITES_PER_BATCH + BATCHES) as i64],
+        )
+        .unwrap();
+    let final_wal_bytes = std::fs::metadata(&wal_path).unwrap().len();
     eprintln!(
-        "PASSIVE-only measurement: checkpoint={checkpoint:?} wal_bytes={wal_bytes} bound_bytes={}",
-        4 * 65_536_u64
+        "PASSIVE-only continuous-write measurement: batches={BATCHES} writes={} caught_up_rounds={caught_up_rounds} resets_after_checkpoint={resets_after_checkpoint} peak_bytes={peak_bytes} final_wal_bytes={final_wal_bytes} journal_limit={JOURNAL_LIMIT}",
+        BATCHES * WRITES_PER_BATCH
     );
     drop(connection);
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(wal_path);
-    assert_eq!(checkpoint.1, checkpoint.2);
     assert!(
-        wal_bytes > 4 * 65_536,
-        "fixture did not grow beyond four journal limits: {wal_bytes}"
+        peak_bytes < 4 * 1024 * 1024,
+        "periodic PASSIVE did not keep WAL growth bounded: peak={peak_bytes}"
+    );
+    assert_eq!(resets_after_checkpoint, BATCHES as u64);
+    assert!(final_wal_bytes <= JOURNAL_LIMIT, "{final_wal_bytes}");
+}
+
+#[test]
+fn passive_checkpoint_latency_is_measured_for_smaller_write_batches() {
+    const TOTAL_WRITES: usize = 256;
+    for writes_per_checkpoint in [16_usize, 64] {
+        let path = temp_db(&format!("batch-size-{writes_per_checkpoint}"));
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+                 PRAGMA journal_size_limit=65536; CREATE TABLE t(k INTEGER PRIMARY KEY, v BLOB);",
+            )
+            .unwrap();
+        let mut total_checkpoint_ns = 0_u128;
+        let mut max_checkpoint_ns = 0_u128;
+        let mut total_frames = 0_i64;
+        let mut rounds = 0_u64;
+        for index in 0..TOTAL_WRITES {
+            connection
+                .execute("INSERT INTO t VALUES (?1, zeroblob(2048))", [index as i64])
+                .unwrap();
+            if (index + 1) % writes_per_checkpoint == 0 {
+                let started = std::time::Instant::now();
+                let checkpoint: (i64, i64, i64) = connection
+                    .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .unwrap();
+                let elapsed_ns = started.elapsed().as_nanos();
+                assert_eq!(checkpoint.0, 0, "{checkpoint:?}");
+                assert_eq!(checkpoint.1, checkpoint.2, "{checkpoint:?}");
+                total_checkpoint_ns += elapsed_ns;
+                max_checkpoint_ns = max_checkpoint_ns.max(elapsed_ns);
+                total_frames += checkpoint.1;
+                rounds += 1;
+            }
+        }
+        eprintln!(
+            "PASSIVE batch-size measurement: writes_per_checkpoint={writes_per_checkpoint} rounds={rounds} avg_ms={:.3} max_ms={:.3} avg_frames={:.1}",
+            total_checkpoint_ns as f64 / rounds as f64 / 1_000_000.0,
+            max_checkpoint_ns as f64 / 1_000_000.0,
+            total_frames as f64 / rounds as f64,
+        );
+        drop(connection);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+}
+
+#[test]
+fn a_long_lived_reader_allows_growth_then_passive_recovers_and_resets_the_wal() {
+    const JOURNAL_LIMIT: u64 = 65_536;
+    let path = temp_db("reader-pinned");
+    let writer = Connection::open(&path).unwrap();
+    writer
+        .execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+             PRAGMA journal_size_limit=65536; CREATE TABLE t(k INTEGER PRIMARY KEY, v BLOB);",
+        )
+        .unwrap();
+    let reader = Connection::open(&path).unwrap();
+    reader.execute_batch("BEGIN;").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+        .unwrap();
+
+    let wal_path = PathBuf::from(format!("{}-wal", path.display()));
+    let mut peak_bytes = 0_u64;
+    let mut blocked_rounds = 0_u64;
+    for index in 0..1_000_i64 {
+        writer
+            .execute("INSERT INTO t VALUES (?1, zeroblob(2048))", [index])
+            .unwrap();
+        peak_bytes = peak_bytes.max(std::fs::metadata(&wal_path).unwrap().len());
+        if index % 25 == 24 {
+            let checkpoint: (i64, i64, i64) = writer
+                .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .unwrap();
+            assert_eq!(checkpoint.0, 0, "PASSIVE returned busy: {checkpoint:?}");
+            assert!(
+                checkpoint.1 > checkpoint.2,
+                "held snapshot did not pin the checkpoint: {checkpoint:?}"
+            );
+            blocked_rounds += 1;
+        }
+    }
+    let while_reader_open = std::fs::metadata(&wal_path).unwrap().len();
+    assert!(while_reader_open > 4 * JOURNAL_LIMIT);
+    reader.execute_batch("COMMIT;").unwrap();
+    drop(reader);
+
+    let recovered: (i64, i64, i64) = writer
+        .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .unwrap();
+    assert_eq!(recovered.0, 0, "PASSIVE returned busy: {recovered:?}");
+    assert_eq!(
+        recovered.1, recovered.2,
+        "reader release did not recover: {recovered:?}"
+    );
+    let after_recovery_passive = std::fs::metadata(&wal_path).unwrap().len();
+    writer
+        .execute("INSERT INTO t VALUES (1001, zeroblob(2048))", [])
+        .unwrap();
+    let after_next_write = std::fs::metadata(&wal_path).unwrap().len();
+    eprintln!(
+        "long-reader WAL measurement: blocked_rounds={blocked_rounds} peak_bytes={peak_bytes} while_reader_open={while_reader_open} recovered={recovered:?} after_recovery_passive={after_recovery_passive} after_next_write={after_next_write} journal_limit={JOURNAL_LIMIT}"
+    );
+    drop(writer);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&wal_path);
+    assert!(blocked_rounds >= 10);
+    assert!(peak_bytes >= while_reader_open);
+    assert!(after_recovery_passive > JOURNAL_LIMIT);
+    assert!(
+        after_next_write <= JOURNAL_LIMIT,
+        "WAL did not return to the configured limit after reader release: {after_next_write}"
     );
 }
 
