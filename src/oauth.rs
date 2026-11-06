@@ -16472,8 +16472,9 @@ fn list_item_pending_key(actor: &str, list_uri: &str, subject: &str) -> PendingW
 }
 
 /// A pending entry outlives one writer stall (live transaction max ~20 s) and
-/// a full retry window; after it expires a repeat click may reach the PDS
-/// again, which is the safe direction (the map only ever suppresses writes).
+/// a full retry window. In-flight index writes stay retained beyond the TTL
+/// until they settle; after a terminal entry expires, a repeat click may
+/// reach the PDS again.
 const PENDING_INDEX_WRITE_TTL: Duration = Duration::from_secs(60);
 const MAX_PENDING_INDEX_WRITES: usize = 4_096;
 
