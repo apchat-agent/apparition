@@ -9253,6 +9253,7 @@ where
     .await
     {
         Ok(page) => page,
+        Err(StorageError::WebReadTimeout { .. }) => return web_read_timeout_page(),
         Err(error) => {
             return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
         }
@@ -17203,6 +17204,19 @@ fn oauth_error(status: StatusCode, message: &str) -> Response {
         .into_response()
 }
 
+fn web_read_timeout_page() -> Response {
+    (
+        StatusCode::GATEWAY_TIMEOUT,
+        Html(page_shell(
+            "Page taking too long",
+            "<section class=\"error-card\"><p class=\"eyebrow\">Page not ready</p><h1>The server was slow</h1><p>This page took too long to load. Reload the page to try again.</p><a class=\"primary-link\" href=\"/app\">Reload page</a></section>",
+            false,
+            None,
+        )),
+    )
+        .into_response()
+}
+
 /// A sign-in that lacks an activity's right must never see a raw JSON 403 for that write: this
 /// page explains the missing permission and links to a sign-in that pre-ticks exactly the box the
 /// activity lives in (`/login?allow=<box>`, owner msgd 2026-10-31).
@@ -24999,6 +25013,31 @@ mod tests {
                 .status(),
             StatusCode::OK
         );
+    }
+
+    #[tokio::test]
+    async fn app_budget_timeout_shows_a_slow_server_reload_page() {
+        let storage = Arc::new(MemoryStorage::default());
+        storage.force_home_timeline_timeout_for_test();
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        let viewer = "did:plc:av88-timeout-viewer";
+        let generation = storage
+            .rotate_web_session(viewer, "av88-timeout-session")
+            .unwrap();
+        let token = public.issue_session_cookie(
+            viewer,
+            "av88-timeout-session",
+            generation,
+            read_only_session_permissions(),
+        );
+        let app = public.router_with_flow(DisabledOAuthFlow, storage);
+
+        let (status, body) = get_web_page(&app, &format!("{SESSION_COOKIE}={token}"), "/app").await;
+
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert!(body.contains("The server was slow"), "{body}");
+        assert!(body.contains("Reload the page to try again"), "{body}");
+        assert!(!body.contains("internal server error"), "{body}");
     }
 
     #[derive(Clone)]

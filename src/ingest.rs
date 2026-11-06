@@ -1415,6 +1415,8 @@ pub struct MemoryStorage {
     #[cfg(test)]
     timeline_post_time_delay_ms: AtomicU64,
     #[cfg(test)]
+    force_home_timeline_timeout: AtomicBool,
+    #[cfg(test)]
     notification_window_read_delay_ms: AtomicU64,
     cursor_lock_failures: AtomicUsize,
     #[cfg(test)]
@@ -1556,6 +1558,12 @@ impl MemoryStorage {
             delay.as_millis().min(u64::MAX as u128) as u64,
             Ordering::Relaxed,
         );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_home_timeline_timeout_for_test(&self) {
+        self.force_home_timeline_timeout
+            .store(true, Ordering::Relaxed);
     }
 
     pub(crate) fn set_record_uri_batch_delay(&self, delay: Duration) {
@@ -2493,6 +2501,15 @@ impl Storage for MemoryStorage {
             let delay = self.timeline_post_time_delay_ms.load(Ordering::Relaxed);
             if delay > 0 {
                 std::thread::sleep(Duration::from_millis(delay));
+            }
+            if self
+                .force_home_timeline_timeout
+                .swap(false, Ordering::Relaxed)
+            {
+                return Err(StorageError::WebReadTimeout {
+                    operation: "home_timeline",
+                    elapsed: Duration::from_secs(10),
+                });
             }
         }
         let inner = self.inner.lock().map_err(|_| StorageError::Poisoned)?;
