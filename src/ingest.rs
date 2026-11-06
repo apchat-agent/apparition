@@ -9422,6 +9422,103 @@ mod sqlite_writer_tests {
         remove_database(&path);
     }
 
+    static N5C_BUSY_WAIT_STARTED: AtomicBool = AtomicBool::new(false);
+    static N5C_BUSY_WAIT_RELEASED: AtomicBool = AtomicBool::new(false);
+
+    fn n5c_hold_writer_busy_for_test(_attempt: i32) -> bool {
+        N5C_BUSY_WAIT_STARTED.store(true, Ordering::SeqCst);
+        while !N5C_BUSY_WAIT_RELEASED.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        false
+    }
+
+    #[test]
+    fn writer_call_uses_the_checkpoint_holder_observed_before_its_write() {
+        struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for CaptureWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        struct CaptureMakeWriter(Arc<Mutex<Vec<u8>>>);
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureMakeWriter {
+            type Writer = CaptureWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                CaptureWriter(Arc::clone(&self.0))
+            }
+        }
+
+        let path = test_path("writer-call-checkpoint-holder");
+        remove_database(&path);
+        let storage = SqliteStorage::open(&path).unwrap();
+        N5C_BUSY_WAIT_STARTED.store(false, Ordering::SeqCst);
+        N5C_BUSY_WAIT_RELEASED.store(false, Ordering::SeqCst);
+        storage
+            .writer
+            .call(|connection| {
+                connection.busy_handler(Some(n5c_hold_writer_busy_for_test))?;
+                Ok(())
+            })
+            .unwrap();
+        let holder = Connection::open(&path).unwrap();
+        holder
+            .execute_batch("PRAGMA busy_timeout=5000; BEGIN IMMEDIATE;")
+            .unwrap();
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let _capture = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(CaptureMakeWriter(Arc::clone(&output)))
+                .finish(),
+        );
+        tracing::callsite::rebuild_interest_cache();
+
+        let record = IndexedRecord {
+            did: "did:plc:av87-writer-call-holder".to_owned(),
+            collection: "app.bsky.feed.post".to_owned(),
+            rkey: "writer-call-holder-r1".to_owned(),
+            uri: "at://did:plc:av87-writer-call-holder/app.bsky.feed.post/writer-call-holder-r1"
+                .to_owned(),
+            cid: Some("av87-writer-call-holder-cid".to_owned()),
+            time_us: 1,
+            record: serde_json::json!({"$type":"app.bsky.feed.post","text":"busy"}),
+        };
+        let checkpoint = storage.wal_metrics.checkpoint_activity(CHECKPOINT_RESTART);
+        let error = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while !N5C_BUSY_WAIT_STARTED.load(Ordering::SeqCst) {
+                    if Instant::now() >= deadline {
+                        N5C_BUSY_WAIT_RELEASED.store(true, Ordering::SeqCst);
+                        panic!("write did not reach SQLite busy handler");
+                    }
+                    std::thread::yield_now();
+                }
+                drop(checkpoint);
+                N5C_BUSY_WAIT_RELEASED.store(true, Ordering::SeqCst);
+            });
+            storage.put_record(&record).unwrap_err()
+        });
+        assert!(is_sqlite_busy_error(&error), "unexpected error: {error}");
+        let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(
+            text.contains("lock_holder=\"checkpoint_RESTART\""),
+            "writer.call did not attribute the holder observed before its write: {text}"
+        );
+
+        holder.execute_batch("COMMIT;").unwrap();
+        drop((holder, storage));
+        remove_database(&path);
+    }
+
     #[test]
     fn a_checkpoint_that_is_behind_never_waits_for_readers() {
         let path = test_path("behind-no-truncate");

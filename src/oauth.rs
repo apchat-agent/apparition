@@ -16267,6 +16267,9 @@ fn hand_off_index_write<S: Storage + 'static>(
                 .as_ref()
                 .is_some_and(|binding| binding.entry.cancelled.load(Ordering::Relaxed))
             {
+                if let Some(binding) = &pending {
+                    binding.writes.complete(&binding.key, &binding.entry);
+                }
                 tracing::info!(
                     route,
                     uri = %write.target(),
@@ -16317,18 +16320,27 @@ fn hand_off_index_write<S: Storage + 'static>(
                 Ok(Err(error)) => {
                     drop(_write_guard);
                     mark(INDEX_WRITE_FAILED);
+                    if let Some(binding) = &pending {
+                        binding.writes.complete(&binding.key, &binding.entry);
+                    }
                     count_failed_index_write(route, &write.target(), attempt, &error.to_string());
                     return;
                 }
                 Err(error) => {
                     drop(_write_guard);
                     mark(INDEX_WRITE_FAILED);
+                    if let Some(binding) = &pending {
+                        binding.writes.complete(&binding.key, &binding.entry);
+                    }
                     count_failed_index_write(route, &write.target(), attempt, &error);
                     return;
                 }
             }
         }
         mark(INDEX_WRITE_FAILED);
+        if let Some(binding) = &pending {
+            binding.writes.complete(&binding.key, &binding.entry);
+        }
         count_failed_index_write(
             route,
             &write.target(),
@@ -16470,6 +16482,7 @@ struct PendingWriteEntry {
     expires_at: Instant,
     cancelled: Arc<AtomicBool>,
     phase: Arc<AtomicU8>,
+    in_flight: Arc<AtomicBool>,
     state_after: bool,
     count_after: u64,
 }
@@ -16505,6 +16518,7 @@ impl PendingIndexWrites {
             if entries.len() >= MAX_PENDING_INDEX_WRITES
                 && let Some(oldest) = entries
                     .iter()
+                    .filter(|(_, held)| !held.in_flight.load(Ordering::Relaxed))
                     .min_by_key(|(_, held)| held.expires_at)
                     .map(|(key, _)| key.clone())
             {
@@ -16518,6 +16532,7 @@ impl PendingIndexWrites {
     /// The index write landed: later clicks must reach the PDS again (the row
     /// they see is now authoritative).
     fn complete(&self, key: &PendingWriteKey, completed: &PendingWriteEntry) {
+        completed.in_flight.store(false, Ordering::Relaxed);
         if let Ok(mut entries) = self.entries.lock()
             && entries
                 .get(key)
@@ -16542,7 +16557,8 @@ impl PendingIndexWrites {
 
     fn prune(entries: &mut HashMap<PendingWriteKey, PendingWriteEntry>) {
         entries.retain(|_, entry| {
-            entry.expires_at > Instant::now() && !entry.cancelled.load(Ordering::Relaxed)
+            entry.in_flight.load(Ordering::Relaxed)
+                || (entry.expires_at > Instant::now() && !entry.cancelled.load(Ordering::Relaxed))
         });
     }
 }
@@ -16567,6 +16583,7 @@ fn pending_index_write_binding(
         expires_at: Instant::now() + PENDING_INDEX_WRITE_TTL,
         cancelled: Arc::new(AtomicBool::new(false)),
         phase: Arc::new(AtomicU8::new(INDEX_WRITE_QUEUED)),
+        in_flight: Arc::new(AtomicBool::new(true)),
         state_after,
         count_after,
     };
@@ -24748,6 +24765,93 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn app_route_keeps_pending_overlay_deduplicated_and_pages_contiguous() {
+        let storage = Arc::new(FlakyPutStorage {
+            inner: MemoryStorage::default(),
+            lock_failures: AtomicUsize::new(0),
+            delete_lock_failures: AtomicUsize::new(0),
+        });
+        let ordinary = (1..=4)
+            .map(|number| {
+                test_web_post(
+                    ANSWER_VIEWER,
+                    &format!("av87-ordinary-{number}"),
+                    100 - number,
+                    &format!("av87 ordinary page {number}"),
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        for record in &ordinary {
+            storage.inner.put_record(record).unwrap();
+        }
+        let pending_uri = format!("at://{ANSWER_VIEWER}/app.bsky.feed.post/answer-post-r1");
+        let (put_started, release_put, _delete_landed, put_landed) =
+            install_gated_index_write(&storage, &pending_uri);
+        let flow = AnswerFlow::default();
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        let app = public.router_with_flow(flow, storage.clone());
+        let cookie = answer_session_cookie(&public, storage.as_ref(), ANSWER_VIEWER);
+
+        let posted = post_web_form(
+            &app,
+            &cookie,
+            "/post",
+            "text=av87+pending+timeline+post".to_owned(),
+        )
+        .await;
+        assert_eq!(posted.status(), StatusCode::SEE_OTHER);
+        await_gate_event(put_started, "pending timeline post write").await;
+
+        // The PDS write is pending and not yet indexed. The first page starts
+        // with the overlay, while its cursor must still come from indexed row 2.
+        let (status, first) = get_web_page(&app, &cookie, "/app?limit=2").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(first.contains("av87 pending timeline post"), "{first}");
+        assert!(first.contains("av87 ordinary page 1"), "{first}");
+        assert!(first.contains("av87 ordinary page 2"), "{first}");
+        let older = older_link_href(&first).expect("first route page has an Older link");
+        let (_, second) = get_web_page(&app, &cookie, &older).await;
+        assert!(second.contains("av87 ordinary page 3"), "{second}");
+        assert!(second.contains("av87 ordinary page 4"), "{second}");
+        assert!(
+            !second.contains("av87 ordinary page 2"),
+            "the previous indexed post repeated on page 2: {second}"
+        );
+
+        // A Jetstream write can index the same PDS post before the web worker
+        // gets its turn. The overlay still renders once, then only on page 1.
+        let indexed_pending = test_web_post(
+            ANSWER_VIEWER,
+            "answer-post-r1",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_micros() as u64,
+            "av87 pending timeline post",
+            None,
+        );
+        storage.inner.put_record(&indexed_pending).unwrap();
+        let (_, indexed_first) = get_web_page(&app, &cookie, "/app?limit=2").await;
+        assert_eq!(
+            indexed_first.matches("av87 pending timeline post").count(),
+            1,
+            "the pending overlay and indexed row must deduplicate"
+        );
+        let indexed_older =
+            older_link_href(&indexed_first).expect("indexed first page has an Older link");
+        let (_, indexed_second) = get_web_page(&app, &cookie, &indexed_older).await;
+        assert!(
+            !indexed_second.contains("av87 pending timeline post"),
+            "the pending overlay was added to a later page: {indexed_second}"
+        );
+
+        release_put.send(()).unwrap();
+        await_gate_event(put_landed, "pending timeline post index write").await;
+        clear_gated_index_write(&storage);
+    }
+
     fn fixed_visibility_test_dates() -> (u64, String, String) {
         let now = OffsetDateTime::parse("2026-11-05T00:00:00Z", &Rfc3339).unwrap();
         let now_us = (now.unix_timestamp_nanos() / 1_000) as u64;
@@ -29988,6 +30092,59 @@ mod tests {
 
     /// A storage whose `put_record` answers "database is locked" for the first N attempts
     /// (`usize::MAX` = always) so the writer-behind case can be reproduced without SQLite.
+    struct GatedIndexWrite {
+        uri: String,
+        put_started: SyncSender<()>,
+        put_landed: SyncSender<()>,
+        delete_landed: SyncSender<()>,
+        release_put: Mutex<Receiver<()>>,
+    }
+
+    static GATED_INDEX_WRITES: OnceLock<Mutex<HashMap<usize, Arc<GatedIndexWrite>>>> =
+        OnceLock::new();
+
+    fn gated_index_writes() -> &'static Mutex<HashMap<usize, Arc<GatedIndexWrite>>> {
+        GATED_INDEX_WRITES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn install_gated_index_write(
+        storage: &Arc<FlakyPutStorage>,
+        uri: &str,
+    ) -> (Receiver<()>, SyncSender<()>, Receiver<()>, Receiver<()>) {
+        let (put_started, put_started_rx) = mpsc::sync_channel(1);
+        let (put_landed, put_landed_rx) = mpsc::sync_channel(1);
+        let (delete_landed, delete_landed_rx) = mpsc::sync_channel(1);
+        let (release_put, release_put_rx) = mpsc::sync_channel(1);
+        let storage_id = Arc::as_ptr(storage) as usize;
+        gated_index_writes().lock().unwrap().insert(
+            storage_id,
+            Arc::new(GatedIndexWrite {
+                uri: uri.to_owned(),
+                put_started,
+                put_landed,
+                delete_landed,
+                release_put: Mutex::new(release_put_rx),
+            }),
+        );
+        (put_started_rx, release_put, delete_landed_rx, put_landed_rx)
+    }
+
+    fn gated_index_write_for(storage_id: usize, uri: &str) -> Option<Arc<GatedIndexWrite>> {
+        gated_index_writes()
+            .lock()
+            .ok()?
+            .get(&storage_id)
+            .filter(|gate| gate.uri == uri)
+            .cloned()
+    }
+
+    fn clear_gated_index_write(storage: &Arc<FlakyPutStorage>) {
+        gated_index_writes()
+            .lock()
+            .unwrap()
+            .remove(&(Arc::as_ptr(storage) as usize));
+    }
+
     struct FlakyPutStorage {
         inner: MemoryStorage,
         lock_failures: AtomicUsize,
@@ -30005,11 +30162,21 @@ mod tests {
 
     impl Storage for FlakyPutStorage {
         fn put_record(&self, record: &IndexedRecord) -> Result<(), StorageError> {
+            if let Some(gate) = gated_index_write_for(self as *const Self as usize, &record.uri) {
+                let _ = gate.put_started.send(());
+                if let Ok(release) = gate.release_put.lock() {
+                    let _ = release.recv_timeout(Duration::from_secs(30));
+                }
+            }
             if self.lock_failures.load(Ordering::SeqCst) > 0 {
                 self.lock_failures.fetch_sub(1, Ordering::SeqCst);
                 return Err(Self::lock_failure("database is locked"));
             }
-            self.inner.put_record(record)
+            self.inner.put_record(record)?;
+            if let Some(gate) = gated_index_write_for(self as *const Self as usize, &record.uri) {
+                let _ = gate.put_landed.send(());
+            }
+            Ok(())
         }
 
         fn delete_record(
@@ -30022,7 +30189,12 @@ mod tests {
                 self.delete_lock_failures.fetch_sub(1, Ordering::SeqCst);
                 return Err(Self::lock_failure("database is locked"));
             }
-            self.inner.delete_record(did, collection, rkey)
+            self.inner.delete_record(did, collection, rkey)?;
+            let uri = format!("at://{did}/{collection}/{rkey}");
+            if let Some(gate) = gated_index_write_for(self as *const Self as usize, &uri) {
+                let _ = gate.delete_landed.send(());
+            }
+            Ok(())
         }
 
         fn apply_jetstream_batch(
@@ -30513,6 +30685,45 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    async fn get_web_page(app: &Router, cookie: &str, uri: &str) -> (StatusCode, String) {
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(uri)
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    async fn await_gate_event(receiver: Receiver<()>, event: &str) {
+        tokio::task::spawn_blocking(move || receiver.recv_timeout(Duration::from_secs(3)))
+            .await
+            .unwrap()
+            .unwrap_or_else(|error| panic!("timed out waiting for {event}: {error}"));
+    }
+
+    async fn gate_event_arrived(receiver: &Receiver<()>, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            match receiver.try_recv() {
+                Ok(()) => return true,
+                Err(mpsc::TryRecvError::Disconnected) => return false,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     async fn post_video_form(app: &Router, cookie: &str) -> Response {
@@ -31124,6 +31335,136 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn operation_lock_orders_a_blocked_like_put_before_its_unlike_delete() {
+        let like_uri = format!("at://{ANSWER_VIEWER}/app.bsky.feed.like/answer-like-r1");
+        let storage = Arc::new(FlakyPutStorage {
+            inner: MemoryStorage::default(),
+            lock_failures: AtomicUsize::new(0),
+            delete_lock_failures: AtomicUsize::new(0),
+        });
+        let post = test_web_post(
+            "did:plc:av87-race-author",
+            "race-post",
+            7,
+            "gate like put",
+            None,
+        );
+        storage.inner.put_record(&post).unwrap();
+        let (put_started, release_put, delete_landed, put_landed) =
+            install_gated_index_write(&storage, &like_uri);
+        let flow = AnswerFlow::default();
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        let app = public.router_with_flow(flow, storage.clone());
+        let cookie = answer_session_cookie(&public, storage.as_ref(), ANSWER_VIEWER);
+
+        let like = post_like(&app, &cookie, like_form_body(&post.uri), true).await;
+        assert_eq!(like.status(), StatusCode::OK);
+        await_gate_event(put_started, "blocked like put").await;
+        let unlike = post_like(
+            &app,
+            &cookie,
+            format!("{}&intent=delete", like_form_body(&post.uri)),
+            true,
+        )
+        .await;
+        assert_eq!(unlike.status(), StatusCode::OK);
+        drop(json_response(unlike).await);
+
+        let delete_won_race = gate_event_arrived(&delete_landed, Duration::from_millis(150)).await;
+        release_put.send(()).unwrap();
+        await_gate_event(put_landed, "like put landing").await;
+        let delete_followed = gate_event_arrived(&delete_landed, Duration::from_secs(2)).await;
+        clear_gated_index_write(&storage);
+
+        assert!(
+            !delete_won_race,
+            "the delete must wait while the matching put is between its cancel check and storage write"
+        );
+        assert!(
+            delete_followed,
+            "the delete must run after the put releases the key lock"
+        );
+        assert!(
+            storage
+                .inner
+                .record_by_uri("app.bsky.feed.like", &like_uri)
+                .unwrap()
+                .is_none(),
+            "delete-before-put would leave a resurrected like row"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn list_item_remove_shares_the_pending_add_operation_lock() {
+        let list_uri = format!("at://{ANSWER_VIEWER}/app.bsky.graph.list/answers");
+        let item_uri = format!("at://{ANSWER_VIEWER}/app.bsky.graph.listitem/answer-graph-1");
+        let storage = Arc::new(FlakyPutStorage {
+            inner: MemoryStorage::default(),
+            lock_failures: AtomicUsize::new(0),
+            delete_lock_failures: AtomicUsize::new(0),
+        });
+        let (put_started, release_put, delete_landed, put_landed) =
+            install_gated_index_write(&storage, &item_uri);
+        let flow = AnswerFlow::default();
+        let flow_state = flow.state.clone();
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        let app = public.router_with_flow(flow, storage.clone());
+        let cookie = answer_session_cookie(&public, storage.as_ref(), ANSWER_VIEWER);
+        let subject = "did:plc:av87-list-subject";
+
+        let added = post_web_form(
+            &app,
+            &cookie,
+            "/profile/action",
+            format!(
+                "subject={}&action=list_add&list_uri={}",
+                form_encoded(subject),
+                form_encoded(&list_uri)
+            ),
+        )
+        .await;
+        assert_eq!(added.status(), StatusCode::SEE_OTHER);
+        await_gate_event(put_started, "blocked list-item add").await;
+        flow_state.lock().unwrap().list_item_uri = Some(item_uri.clone());
+
+        let removed = post_web_form(
+            &app,
+            &cookie,
+            "/profile/action",
+            format!(
+                "subject={}&action=list_remove&item_uri={}&confirm=yes",
+                form_encoded(subject),
+                form_encoded(&item_uri)
+            ),
+        )
+        .await;
+        assert_eq!(removed.status(), StatusCode::SEE_OTHER);
+
+        let delete_won_race = gate_event_arrived(&delete_landed, Duration::from_millis(150)).await;
+        release_put.send(()).unwrap();
+        await_gate_event(put_landed, "list-item put landing").await;
+        let delete_followed = gate_event_arrived(&delete_landed, Duration::from_secs(2)).await;
+        clear_gated_index_write(&storage);
+
+        assert!(
+            !delete_won_race,
+            "list-item removal must carry the same key binding as the pending add"
+        );
+        assert!(
+            delete_followed,
+            "the queued removal must land after the add"
+        );
+        assert!(
+            storage
+                .inner
+                .records_for_actor_collection(ANSWER_VIEWER, "app.bsky.graph.listitem", 10)
+                .unwrap()
+                .is_empty(),
+            "the list-item add must not resurrect after removal"
+        );
+    }
+
     #[test]
     fn pending_web_post_overlay_expires_at_the_five_minute_ttl() {
         let pending = PendingWebPosts::default();
@@ -31136,7 +31477,7 @@ mod tests {
             pending
                 .for_actor_at(
                     &record.did,
-                    now + PENDING_WEB_POST_TTL - Duration::from_nanos(1)
+                    now + Duration::from_secs(300) - Duration::from_nanos(1)
                 )
                 .len(),
             1,
@@ -31144,9 +31485,118 @@ mod tests {
         );
         assert!(
             pending
-                .for_actor_at(&record.did, now + PENDING_WEB_POST_TTL)
+                .for_actor_at(&record.did, now + Duration::from_secs(300))
                 .is_empty(),
             "the pending overlay expires at its five-minute TTL"
+        );
+    }
+
+    #[test]
+    fn pending_web_post_overlay_is_removed_when_its_index_write_lands() {
+        let storage = MemoryStorage::default();
+        let pending = Arc::new(PendingWebPosts::default());
+        let record = test_web_post(
+            "did:plc:av87-overlay-write",
+            "overlay-write-r1",
+            1,
+            "indexed post",
+            None,
+        );
+        pending.register(record.clone());
+        assert_eq!(pending.for_actor(&record.did).len(), 1);
+
+        IndexWrite::Put {
+            record: Box::new(record.clone()),
+            pending_posts: Some(Arc::clone(&pending)),
+        }
+        .apply(&storage)
+        .unwrap();
+
+        assert!(
+            pending.for_actor(&record.did).is_empty(),
+            "the pending copy must disappear after the indexed row is authoritative"
+        );
+        assert!(
+            storage
+                .get_record(&record.did, &record.collection, &record.rkey)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn in_flight_index_write_survives_ttl_pruning_and_pending_write_cap() {
+        let writes = PendingIndexWrites::default();
+        let key = graph_record_pending_key(
+            "app.bsky.graph.follow",
+            "did:plc:av87-pending-viewer",
+            "did:plc:av87-pending-subject",
+        );
+        let mut entry = PendingWriteEntry {
+            uri: "at://did:plc:av87-pending-viewer/app.bsky.graph.follow/in-flight".to_owned(),
+            expires_at: Instant::now() - Duration::from_secs(1),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            phase: Arc::new(AtomicU8::new(INDEX_WRITE_QUEUED)),
+            in_flight: Arc::new(AtomicBool::new(true)),
+            state_after: true,
+            count_after: 1,
+        };
+        writes
+            .entries
+            .lock()
+            .unwrap()
+            .insert(key.clone(), entry.clone());
+        assert_eq!(
+            writes.consult(&key).map(|pending| pending.uri),
+            Some(entry.uri.clone()),
+            "an expired entry stays available while its index write is retrying"
+        );
+
+        for index in 0..(MAX_PENDING_INDEX_WRITES - 1) {
+            let filler_key = graph_record_pending_key(
+                "app.bsky.graph.like",
+                &format!("did:plc:av87-cap-{index}"),
+                "did:plc:av87-cap-subject",
+            );
+            entry = PendingWriteEntry {
+                uri: format!("at://did:plc:av87-cap/{index}"),
+                expires_at: Instant::now() + Duration::from_secs(600),
+                cancelled: Arc::new(AtomicBool::new(false)),
+                phase: Arc::new(AtomicU8::new(INDEX_WRITE_DONE)),
+                in_flight: Arc::new(AtomicBool::new(false)),
+                state_after: true,
+                count_after: 1,
+            };
+            writes.entries.lock().unwrap().insert(filler_key, entry);
+        }
+        assert_eq!(
+            writes.entries.lock().unwrap().len(),
+            MAX_PENDING_INDEX_WRITES
+        );
+
+        let replacement_key = graph_record_pending_key(
+            "app.bsky.graph.like",
+            "did:plc:av87-cap-replacement",
+            "did:plc:av87-cap-subject",
+        );
+        entry = PendingWriteEntry {
+            uri: "at://did:plc:av87-cap/replacement".to_owned(),
+            expires_at: Instant::now() + Duration::from_secs(600),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            phase: Arc::new(AtomicU8::new(INDEX_WRITE_QUEUED)),
+            in_flight: Arc::new(AtomicBool::new(false)),
+            state_after: true,
+            count_after: 1,
+        };
+        writes.register(replacement_key, entry);
+        assert_eq!(
+            writes.entries.lock().unwrap().len(),
+            MAX_PENDING_INDEX_WRITES
+        );
+        assert_eq!(
+            writes.consult(&key).map(|pending| pending.uri),
+            Some("at://did:plc:av87-pending-viewer/app.bsky.graph.follow/in-flight".to_owned()),
+            "cap eviction must retain the expired write that is still in flight"
         );
     }
 
