@@ -52,8 +52,24 @@ const WAL_JOURNAL_SIZE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 const WAL_PRESSURE_CHECKPOINT_BYTES: u64 = WAL_JOURNAL_SIZE_LIMIT_BYTES * 3;
 const CHECKPOINT_BUSY_TIMEOUT: Duration = Duration::from_millis(50);
 const SQLITE_WRITER_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const WAL_FORCE_SHRINK_DEFAULT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-const WAL_FORCE_SHRINK_DEFAULT_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// A forced TRUNCATE holds the write lock while it copies the WAL frames PASSIVE
+/// left behind and fsyncs the database; av89 production showed 14.9-19.4 s
+/// (3.0-4.0 ms per MiB) for the ~4.8 GB that grew between hourly attempts.
+/// Lane measurements (REPORT-av90.md, this machine, synchronous=FULL): 64 MiB
+/// ~50 ms, 256 MiB ~212 ms, 512 MiB ~250 ms, 1 GiB 1.8-2.4 s. At the ~4.8 GB/h
+/// production write rate the WAL refills this threshold every ~3.2 min and adds
+/// at most 80 MiB during the 60 s minimum attempt interval, so an attempt faces
+/// <= ~336 MiB uncheckpointed: <= ~1.4 s on the slowest production sample
+/// (2x-10x margin under the 3 s busy bound) and locks ~10-15x shorter than
+/// today's. 256 MiB also stays above the 192 MiB pressure-skip bound, so shrink
+/// rounds run under read pressure without needing the bypass at defaults.
+const WAL_FORCE_SHRINK_DEFAULT_BYTES: u64 = 256 * 1024 * 1024;
+/// MINIMUM gap between forced-shrink attempts, not a fixed cadence: with the
+/// threshold above the trigger is the WAL size, checked every 2 s round, and
+/// this floor only bounds the retry rate after a busy/error attempt (av89's
+/// hourly floor made one failed attempt wait an hour; here it costs <= 80 MiB
+/// of extra WAL at 4.8 GB/h, keeping the worst-case lock ~1.4 s on the host).
+const WAL_FORCE_SHRINK_DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 const WAL_FORCE_SHRINK_DEFAULT_TIMEOUT: Duration = Duration::from_secs(3);
 const SQLITE_WRITER_METRICS_INTERVAL: Duration = Duration::from_secs(60);
 const SQLITE_SLOW_WRITE_THRESHOLD: Duration = Duration::from_secs(1);
@@ -80,6 +96,17 @@ pub(crate) struct SqliteOperationKindGuard(Option<&'static str>);
 impl SqliteOperationKindGuard {
     pub(crate) fn enter(kind: &'static str) -> Self {
         Self(SQLITE_OPERATION_KIND.with(|current| current.replace(Some(kind))))
+    }
+
+    /// Labels the current task only if nothing more specific has already labelled
+    /// it, so the storage primitives never overwrite a caller's `backfill`,
+    /// `web_write` or `post_sort_backfill` label. Returns `None` (no guard, no
+    /// restore) when a label is already set.
+    pub(crate) fn enter_if_unset(kind: &'static str) -> Option<Self> {
+        SQLITE_OPERATION_KIND.with(|current| match current.get() {
+            Some(_) => None,
+            None => Some(Self(current.replace(Some(kind)))),
+        })
     }
 }
 
@@ -3554,6 +3581,7 @@ impl SqliteWriter {
     }
 
     fn flush(&self) -> Result<(), StorageError> {
+        let _kind = SqliteOperationKindGuard::enter_if_unset("writer_barrier");
         self.call(|_| Ok(()))
     }
 
@@ -4018,6 +4046,7 @@ impl Drop for SqliteStorage {
             }
         }
         if self.path != Path::new(":memory:") {
+            let _kind = SqliteOperationKindGuard::enter_if_unset("storage_shutdown");
             let database_path = self.path.clone();
             let wal_metrics = Arc::clone(&self.wal_metrics);
             let shutdown_checkpoint = self.writer.call(move |connection| {
@@ -4231,8 +4260,12 @@ fn checkpoint_wal(
 
 #[derive(Clone, Copy, Debug)]
 struct WalForceShrinkConfig {
+    /// A forced shrink runs when the WAL file passes this size (0 disables it).
     threshold_bytes: u64,
-    interval: Duration,
+    /// Minimum gap between attempts; the trigger itself is the size threshold.
+    /// `APPVIEW_WAL_FORCE_SHRINK_INTERVAL_SECS` keeps its name and meaning
+    /// (av89 already used it as the minimum gap; only its default shrank).
+    min_interval: Duration,
     busy_timeout: Duration,
 }
 
@@ -4240,14 +4273,14 @@ impl WalForceShrinkConfig {
     fn from_env() -> Self {
         let defaults = Self {
             threshold_bytes: WAL_FORCE_SHRINK_DEFAULT_BYTES,
-            interval: WAL_FORCE_SHRINK_DEFAULT_INTERVAL,
+            min_interval: WAL_FORCE_SHRINK_DEFAULT_INTERVAL,
             busy_timeout: WAL_FORCE_SHRINK_DEFAULT_TIMEOUT,
         };
         Self {
             threshold_bytes: env_u64_or("APPVIEW_WAL_FORCE_SHRINK_BYTES", defaults.threshold_bytes),
-            interval: Duration::from_secs(env_u64_or(
+            min_interval: Duration::from_secs(env_u64_or(
                 "APPVIEW_WAL_FORCE_SHRINK_INTERVAL_SECS",
-                defaults.interval.as_secs(),
+                defaults.min_interval.as_secs(),
             )),
             busy_timeout: bounded_force_shrink_timeout(
                 Duration::from_secs(env_u64_or(
@@ -4292,9 +4325,11 @@ fn env_u64_or(name: &'static str, default: u64) -> u64 {
     }
 }
 
-/// Runs the ordinary PASSIVE checkpoint first. A caught-up oversized WAL may
-/// then be truncated, but failed attempts consume the interval too so a pinned
-/// reader cannot turn the two-second checkpointer loop into a retry storm.
+/// Runs the ordinary PASSIVE checkpoint first. A caught-up WAL that has passed
+/// the size threshold may then be truncated, on any 2 s round at least
+/// `min_interval` after the previous attempt: the threshold is the trigger and
+/// the interval is only the floor. Failed attempts consume the floor too so a
+/// pinned reader cannot turn the loop into a retry storm.
 fn checkpoint_wal_with_force_shrink(
     connection: &Connection,
     path: &Path,
@@ -4310,7 +4345,7 @@ fn checkpoint_wal_with_force_shrink(
         || wal_bytes_before_passive <= config.threshold_bytes
         || result.busy != 0
         || result.frames != result.checkpointed
-        || now.saturating_duration_since(*last_attempt) <= config.interval
+        || now.saturating_duration_since(*last_attempt) <= config.min_interval
     {
         return Ok(result);
     }
@@ -4337,6 +4372,35 @@ fn force_shrink_wal(
     attempt_clock: (&mut Instant, Instant),
     before_truncate: &mut impl FnMut(),
 ) {
+    force_shrink_wal_with(
+        connection,
+        path,
+        metrics,
+        busy_timeout,
+        bytes_before,
+        attempt_clock,
+        before_truncate,
+        set_bounded_checkpoint_busy_timeout,
+        run_checkpoint_pragma,
+    );
+}
+
+/// The TRUNCATE body with the busy-handler setup and the checkpoint pragma
+/// injectable, so tests can drive the setup-failure and non-busy error paths
+/// of the `wal_force_shrink_error` counter that real SQLite will not produce
+/// on demand.
+#[allow(clippy::too_many_arguments)]
+fn force_shrink_wal_with(
+    connection: &Connection,
+    path: &Path,
+    metrics: &WalMetrics,
+    busy_timeout: Duration,
+    bytes_before: u64,
+    attempt_clock: (&mut Instant, Instant),
+    before_truncate: &mut impl FnMut(),
+    mut run_setup: impl FnMut(&Connection, Duration) -> rusqlite::Result<()>,
+    mut run_truncate: impl FnMut(&Connection, usize) -> rusqlite::Result<(i64, i64, i64)>,
+) {
     let wall_started = Instant::now();
     metrics
         .wal_force_shrink_attempts
@@ -4347,7 +4411,7 @@ fn force_shrink_wal(
     let (last_attempt, now) = attempt_clock;
     *last_attempt = now;
 
-    if let Err(error) = set_bounded_checkpoint_busy_timeout(connection, busy_timeout) {
+    if let Err(error) = run_setup(connection, busy_timeout) {
         let bytes_after = wal_file_bytes(path);
         metrics
             .wal_force_shrink_bytes_after
@@ -4373,7 +4437,7 @@ fn force_shrink_wal(
     let _checkpoint = metrics.checkpoint_activity(CHECKPOINT_TRUNCATE);
     before_truncate();
     let started = Instant::now();
-    let truncate_result = run_checkpoint_pragma(connection, CHECKPOINT_TRUNCATE);
+    let truncate_result = run_truncate(connection, CHECKPOINT_TRUNCATE);
     let elapsed = started.elapsed();
     clear_checkpoint_busy_deadline();
     let restore_result = connection.busy_timeout(CHECKPOINT_BUSY_TIMEOUT);
@@ -4464,18 +4528,84 @@ thread_local! {
     static CHECKPOINT_BUSY_DEADLINE: Cell<Option<(Instant, Duration)>> = const { Cell::new(None) };
 }
 
+/// Observation hooks for the forced-shrink tests (av90). The old design shared
+/// one global "test active" flag: two forced-shrink tests running in parallel
+/// could set, wait on, or clear each other's flags. Each test now registers its
+/// own hook for the duration of the test, and only reacts to handler calls while
+/// ITS OWN TRUNCATE is between `begin_truncate` and `end_truncate`.
 #[cfg(test)]
-static FORCE_SHRINK_TEST_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[derive(Default)]
+struct ForceShrinkTestHooks {
+    truncate_running: AtomicBool,
+    checkpoint_busy: AtomicBool,
+    writer_busy: AtomicBool,
+}
+
 #[cfg(test)]
-static FORCE_SHRINK_CHECKPOINT_BUSY: AtomicBool = AtomicBool::new(false);
+static FORCE_SHRINK_HOOKS: Mutex<Vec<Arc<ForceShrinkTestHooks>>> = Mutex::new(Vec::new());
+
 #[cfg(test)]
-static FORCE_SHRINK_WRITER_BUSY: AtomicBool = AtomicBool::new(false);
+impl ForceShrinkTestHooks {
+    fn begin_truncate(&self) {
+        self.truncate_running.store(true, Ordering::SeqCst);
+    }
+
+    fn end_truncate(&self) {
+        self.truncate_running.store(false, Ordering::SeqCst);
+    }
+
+    fn checkpoint_busy(&self) -> bool {
+        self.checkpoint_busy.load(Ordering::SeqCst)
+    }
+
+    fn writer_busy(&self) -> bool {
+        self.writer_busy.load(Ordering::SeqCst)
+    }
+
+    fn note_checkpoint_busy() {
+        for hooks in FORCE_SHRINK_HOOKS.lock().unwrap().iter() {
+            if hooks.truncate_running.load(Ordering::SeqCst) {
+                hooks.checkpoint_busy.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    fn note_writer_busy() {
+        for hooks in FORCE_SHRINK_HOOKS.lock().unwrap().iter() {
+            if hooks.truncate_running.load(Ordering::SeqCst) {
+                hooks.writer_busy.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+/// Keeps one `ForceShrinkTestHooks` registered for the lifetime of the test.
+#[cfg(test)]
+struct ForceShrinkTestHook(Arc<ForceShrinkTestHooks>);
+
+#[cfg(test)]
+impl ForceShrinkTestHook {
+    fn register() -> Self {
+        let hooks = Arc::new(ForceShrinkTestHooks::default());
+        FORCE_SHRINK_HOOKS.lock().unwrap().push(Arc::clone(&hooks));
+        Self(hooks)
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceShrinkTestHook {
+    fn drop(&mut self) {
+        let own = Arc::clone(&self.0);
+        FORCE_SHRINK_HOOKS
+            .lock()
+            .unwrap()
+            .retain(|registered| !Arc::ptr_eq(registered, &own));
+    }
+}
 
 fn bounded_checkpoint_busy_handler(_attempt: i32) -> bool {
     #[cfg(test)]
-    if FORCE_SHRINK_TEST_ACTIVE.load(Ordering::SeqCst) {
-        FORCE_SHRINK_CHECKPOINT_BUSY.store(true, Ordering::SeqCst);
-    }
+    ForceShrinkTestHooks::note_checkpoint_busy();
     CHECKPOINT_BUSY_DEADLINE.with(|deadline| {
         let Some((started, timeout)) = deadline.get() else {
             return false;
@@ -4621,14 +4751,17 @@ fn spawn_checkpointer(
     backlog: Arc<AtomicU64>,
     wal_metrics: Arc<WalMetrics>,
     pressure: Arc<StoragePressure>,
+    force_shrink: WalForceShrinkConfig,
 ) -> Result<std::thread::JoinHandle<()>, StorageError> {
     let connection = Connection::open(&path)?;
     connection.busy_timeout(CHECKPOINT_BUSY_TIMEOUT)?;
     connection.execute_batch(&format!(
         "PRAGMA journal_size_limit = {WAL_JOURNAL_SIZE_LIMIT_BYTES};"
     ))?;
-    let force_shrink = WalForceShrinkConfig::from_env();
-    let mut last_force_shrink = initial_force_shrink_attempt(force_shrink.interval);
+    // Fresh (not overdue) startup clock wired HERE: a checkpointer that starts
+    // while its WAL is already oversized must still wait out `min_interval`
+    // before its first forced attempt (test: the_spawned_checkpointer...).
+    let mut last_force_shrink = initial_force_shrink_attempt(force_shrink.min_interval);
     let worker = std::thread::Builder::new()
         .name("sqlite-checkpoint".to_owned())
         .spawn(move || {
@@ -4644,7 +4777,7 @@ fn spawn_checkpointer(
                 let now = Instant::now();
                 let force_shrink_due = force_shrink.threshold_bytes > 0
                     && file_bytes > force_shrink.threshold_bytes
-                    && now.saturating_duration_since(last_force_shrink) > force_shrink.interval;
+                    && now.saturating_duration_since(last_force_shrink) > force_shrink.min_interval;
                 if should_skip_checkpoint_for_pressure(pressure.is_active(), file_bytes)
                     && !force_shrink_due
                 {
@@ -5084,6 +5217,7 @@ impl SqliteStorage {
                 Arc::clone(&backlog),
                 Arc::clone(&wal_metrics),
                 Arc::clone(&pressure),
+                WalForceShrinkConfig::from_env(),
             )?)
         } else {
             None
@@ -5116,6 +5250,7 @@ impl SqliteStorage {
 
     /// The main connection's automatic-checkpoint threshold (0 = off).
     pub fn wal_autocheckpoint(&self) -> Result<i64, StorageError> {
+        let _kind = SqliteOperationKindGuard::enter_if_unset("wal_config_probe");
         self.writer.call(|connection| {
             Ok(connection.query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))?)
         })
@@ -5158,6 +5293,7 @@ impl SqliteStorage {
         did: &str,
         entry: ProfileIndexEntry,
     ) -> Result<(), StorageError> {
+        let _kind = SqliteOperationKindGuard::enter_if_unset("profile_index");
         let writer_did = did.to_owned();
         self.writer.call(move |connection| {
             connection.execute(
@@ -5278,6 +5414,7 @@ impl SqliteStorage {
     /// installs its tracer, and binds the sink to the writer thread's local,
     /// so only this storage's writes land in the recorder.
     pub fn trace_writer_statements(&self) -> Result<StatementTrace, StorageError> {
+        let _kind = SqliteOperationKindGuard::enter_if_unset("writer_trace");
         let trace = StatementTrace::default();
         let sink = trace.clone();
         self.writer.call(move |connection| {
@@ -5786,6 +5923,7 @@ impl SqliteStorage {
         write_started: Instant,
         records_written: &mut u64,
     ) -> Result<(), StorageError> {
+        let _kind = SqliteOperationKindGuard::enter_if_unset("repo_snapshot");
         loop {
             self.wait_for_backfill_batch();
             let writer_did = did.to_owned();
@@ -5827,6 +5965,7 @@ impl SqliteStorage {
         write_started: Instant,
         records_written: &mut u64,
     ) -> Result<(), StorageError> {
+        let _kind = SqliteOperationKindGuard::enter_if_unset("repo_snapshot");
         loop {
             self.wait_for_backfill_batch();
             let writer_did = did.to_owned();
@@ -5884,6 +6023,7 @@ impl SqliteStorage {
         records_per_second: Option<u64>,
         window_start_us: Option<i64>,
     ) -> Result<(), StorageError> {
+        let _kind = SqliteOperationKindGuard::enter_if_unset("repo_snapshot");
         let record_json = records
             .iter()
             .map(|record| serde_json::to_string(&record.record))
@@ -6159,6 +6299,7 @@ impl Storage for SqliteStorage {
     }
 
     fn put_record(&self, record: &IndexedRecord) -> Result<(), StorageError> {
+        let _kind = SqliteOperationKindGuard::enter_if_unset("record_put");
         let affected = notification_edges(record)
             .into_iter()
             .map(|(_, subject_did, _, _)| subject_did)
@@ -6302,6 +6443,7 @@ impl Storage for SqliteStorage {
         &self,
         updates: &[JetstreamStorageUpdate],
     ) -> Result<BatchApplyTiming, StorageError> {
+        let _kind = SqliteOperationKindGuard::enter_if_unset("ingest_batch");
         if updates.is_empty() {
             return Ok(BatchApplyTiming::default());
         }
@@ -6488,6 +6630,7 @@ impl Storage for SqliteStorage {
     }
 
     fn record_skipped_window(&self, from: u64, to: u64) -> Result<(), StorageError> {
+        let _kind = SqliteOperationKindGuard::enter_if_unset("skipped_window");
         self.writer.call(move |connection| {
             let transaction = connection.transaction()?;
             let stored: Option<String> = transaction
@@ -6630,6 +6773,7 @@ impl Storage for SqliteStorage {
     }
 
     fn delete_record(&self, did: &str, collection: &str, rkey: &str) -> Result<(), StorageError> {
+        let _kind = SqliteOperationKindGuard::enter_if_unset("record_delete");
         let affected = {
             let connection = self.read_conn()?;
             let mut statement = connection.prepare(
@@ -6897,6 +7041,7 @@ impl Storage for SqliteStorage {
     }
 
     fn complete_profile_fetch(&self, did: &str) -> Result<(), StorageError> {
+        let _kind = SqliteOperationKindGuard::enter_if_unset("profile_fetch");
         let writer_did = did.to_owned();
         self.writer.call(move |connection| {
             connection.execute("DELETE FROM profile_fetch_queue WHERE did=?1", [writer_did])?;
@@ -7078,6 +7223,7 @@ impl Storage for SqliteStorage {
         cursor: Option<&str>,
         exhausted: bool,
     ) -> Result<(), StorageError> {
+        let _kind = SqliteOperationKindGuard::enter_if_unset("recent_posts");
         let writer_did = did.to_owned();
         let writer_cursor = cursor.map(str::to_owned);
         self.writer.call(move |connection| {
@@ -7624,6 +7770,7 @@ impl Storage for SqliteStorage {
     }
 
     fn set_cursor(&self, cursor: u64) -> Result<(), StorageError> {
+        let _kind = SqliteOperationKindGuard::enter_if_unset("cursor_save");
         self.writer.call(move |connection| {
             connection.execute(
                 "INSERT INTO appview_state(key,value) VALUES('jetstream_cursor',?1)
@@ -7635,6 +7782,7 @@ impl Storage for SqliteStorage {
     }
 
     fn register_user(&self, did: &str) -> Result<(), StorageError> {
+        let _kind = SqliteOperationKindGuard::enter_if_unset("user_register");
         let writer_did = did.to_owned();
         let (was_registered, active_subjects) = self.writer.call(move |connection| {
             let transaction = connection.transaction()?;
@@ -7733,6 +7881,7 @@ impl Storage for SqliteStorage {
     }
 
     fn unregister_user(&self, did: &str) -> Result<(), StorageError> {
+        let _kind = SqliteOperationKindGuard::enter_if_unset("user_unregister");
         let writer_did = did.to_owned();
         let (was_registered, active_subjects) = self.writer.call(move |connection| {
             let transaction = connection.transaction()?;
@@ -7785,6 +7934,7 @@ impl Storage for SqliteStorage {
     }
 
     fn set_follow(&self, actor: &str, subject: &str, following: bool) -> Result<(), StorageError> {
+        let _kind = SqliteOperationKindGuard::enter_if_unset("follow_state");
         let writer_actor = actor.to_owned();
         let writer_subject = subject.to_owned();
         let (actor_is_registered, was_following) = self.writer.call(move |connection| {
@@ -7855,6 +8005,7 @@ impl Storage for SqliteStorage {
     }
 
     fn enqueue_backfill(&self, did: &str) -> Result<(), StorageError> {
+        let _kind = SqliteOperationKindGuard::enter_if_unset("backfill_enqueue");
         let writer_did = did.to_owned();
         self.writer.call(move |connection| {
             let transaction = connection.transaction()?;
@@ -7880,6 +8031,7 @@ impl Storage for SqliteStorage {
     }
 
     fn enqueue_backfill_for(&self, owner_did: &str, did: &str) -> Result<(), StorageError> {
+        let _kind = SqliteOperationKindGuard::enter_if_unset("backfill_enqueue");
         let writer_owner = owner_did.to_owned();
         let writer_did = did.to_owned();
         self.writer.call(move |connection| {
@@ -7927,6 +8079,7 @@ impl Storage for SqliteStorage {
     }
 
     fn complete_backfill(&self, did: &str) -> Result<(), StorageError> {
+        let _kind = SqliteOperationKindGuard::enter_if_unset("backfill_complete");
         let writer_did = did.to_owned();
         self.writer.call(move |connection| {
             let transaction = connection.transaction()?;
@@ -7943,6 +8096,7 @@ impl Storage for SqliteStorage {
     }
 
     fn record_backfill_failure(&self, did: &str) -> Result<Duration, StorageError> {
+        let _kind = SqliteOperationKindGuard::enter_if_unset("backfill_retry");
         let writer_did = did.to_owned();
         self.writer.call(move |connection| {
             let transaction = connection.transaction()?;
@@ -7991,6 +8145,7 @@ impl Storage for SqliteStorage {
     }
 
     fn set_verified_handle(&self, did: &str, handle: &str) -> Result<(), StorageError> {
+        let _kind = SqliteOperationKindGuard::enter_if_unset("handle_refresh");
         let writer_did = did.to_owned();
         let writer_handle = handle.to_owned();
         self.writer.call(move |connection| {
@@ -8007,6 +8162,7 @@ impl Storage for SqliteStorage {
     }
 
     fn clear_verified_handle(&self, did: &str) -> Result<(), StorageError> {
+        let _kind = SqliteOperationKindGuard::enter_if_unset("handle_refresh");
         let writer_did = did.to_owned();
         self.writer.call(move |connection| {
             let transaction = connection.transaction()?;
@@ -8041,6 +8197,7 @@ impl Storage for SqliteStorage {
     }
 
     fn rotate_web_session(&self, did: &str, session_id: &str) -> Result<u64, StorageError> {
+        let _kind = SqliteOperationKindGuard::enter_if_unset("web_session");
         let writer_did = did.to_owned();
         let writer_session_id = session_id.to_owned();
         self.writer.call(move |connection| {
@@ -8223,6 +8380,7 @@ impl Storage for SqliteStorage {
     }
 
     fn complete_handle_refresh(&self, did: &str) -> Result<(), StorageError> {
+        let _kind = SqliteOperationKindGuard::enter_if_unset("handle_refresh");
         let writer_did = did.to_owned();
         self.writer.call(move |connection| {
             connection.execute(
@@ -8278,6 +8436,7 @@ impl Storage for SqliteStorage {
     }
 
     fn clear_recent_profiles_for_viewer(&self, viewer_did: &str) -> Result<(), StorageError> {
+        let _kind = SqliteOperationKindGuard::enter_if_unset("recent_profiles");
         let viewer_did = viewer_did.to_owned();
         self.writer.call(move |connection| {
             connection.execute(
@@ -9620,12 +9779,12 @@ mod sqlite_writer_tests {
 
     fn force_shrink_config(
         threshold_bytes: u64,
-        interval: Duration,
+        min_interval: Duration,
         busy_timeout: Duration,
     ) -> WalForceShrinkConfig {
         WalForceShrinkConfig {
             threshold_bytes,
-            interval,
+            min_interval,
             busy_timeout,
         }
     }
@@ -9659,9 +9818,7 @@ mod sqlite_writer_tests {
     static WRITER_BUSY_WAIT_STARTED: AtomicBool = AtomicBool::new(false);
 
     fn record_busy_during_forced_shrink(_attempt: i32) -> bool {
-        if FORCE_SHRINK_TEST_ACTIVE.load(Ordering::SeqCst) {
-            FORCE_SHRINK_WRITER_BUSY.store(true, Ordering::SeqCst);
-        }
+        ForceShrinkTestHooks::note_writer_busy();
         false
     }
 
@@ -10105,8 +10262,8 @@ mod sqlite_writer_tests {
             reader.execute_batch("COMMIT;").unwrap();
         });
 
-        FORCE_SHRINK_TEST_ACTIVE.store(true, Ordering::SeqCst);
-        FORCE_SHRINK_CHECKPOINT_BUSY.store(false, Ordering::SeqCst);
+        let hook = ForceShrinkTestHook::register();
+        let checkpoint_hooks = Arc::clone(&hook.0);
         let checkpoint_path = path.clone();
         let checkpoint_metrics = Arc::clone(&metrics);
         let checkpoint_storage = Arc::clone(&storage);
@@ -10119,6 +10276,7 @@ mod sqlite_writer_tests {
                 &mut last_attempt,
                 now,
                 || {
+                    checkpoint_hooks.begin_truncate();
                     start_reader.send(()).unwrap();
                     wait_for_reader.recv().unwrap();
                     checkpoint_storage
@@ -10133,12 +10291,12 @@ mod sqlite_writer_tests {
                         .unwrap();
                 },
             );
-            FORCE_SHRINK_TEST_ACTIVE.store(false, Ordering::SeqCst);
+            checkpoint_hooks.end_truncate();
             result.unwrap();
         });
 
         let busy_wait_started = Instant::now();
-        while !FORCE_SHRINK_CHECKPOINT_BUSY.load(Ordering::SeqCst) {
+        while !hook.0.checkpoint_busy() {
             assert!(
                 busy_wait_started.elapsed() < Duration::from_secs(2),
                 "TRUNCATE did not wait on the pinned reader"
@@ -10193,9 +10351,8 @@ mod sqlite_writer_tests {
         let path = test_path("forced-shrink-jetstream-retry");
         remove_database(&path);
         let storage = Arc::new(SqliteStorage::open(&path).unwrap());
-        FORCE_SHRINK_TEST_ACTIVE.store(false, Ordering::SeqCst);
-        FORCE_SHRINK_CHECKPOINT_BUSY.store(false, Ordering::SeqCst);
-        FORCE_SHRINK_WRITER_BUSY.store(false, Ordering::SeqCst);
+        let hook = ForceShrinkTestHook::register();
+        let checkpoint_hooks = Arc::clone(&hook.0);
         storage
             .writer
             .call(|connection| {
@@ -10233,7 +10390,7 @@ mod sqlite_writer_tests {
                 &mut last_attempt,
                 first_now,
                 || {
-                    FORCE_SHRINK_TEST_ACTIVE.store(true, Ordering::SeqCst);
+                    checkpoint_hooks.begin_truncate();
                     let blocker = Connection::open(&checkpoint_path).unwrap();
                     blocker
                         .execute_batch("PRAGMA busy_timeout=1000; BEGIN IMMEDIATE;")
@@ -10242,12 +10399,12 @@ mod sqlite_writer_tests {
                     truncate_ready.send(()).unwrap();
                 },
             );
-            FORCE_SHRINK_TEST_ACTIVE.store(false, Ordering::SeqCst);
+            checkpoint_hooks.end_truncate();
             result.unwrap();
         });
         ready_for_writer.recv().unwrap();
         let busy_wait_started = Instant::now();
-        while !FORCE_SHRINK_CHECKPOINT_BUSY.load(Ordering::SeqCst) {
+        while !hook.0.checkpoint_busy() {
             assert!(
                 busy_wait_started.elapsed() < Duration::from_secs(1),
                 "real TRUNCATE did not reach SQLite's busy handler"
@@ -10293,7 +10450,7 @@ mod sqlite_writer_tests {
         assert_eq!(metrics.wal_force_shrink_busy.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.wal_force_shrink_ok.load(Ordering::Relaxed), 0);
         assert!(
-            FORCE_SHRINK_WRITER_BUSY.load(Ordering::SeqCst),
+            hook.0.writer_busy(),
             "writer SQLITE_BUSY did not overlap the real forced TRUNCATE call"
         );
         assert!(
@@ -10319,6 +10476,407 @@ mod sqlite_writer_tests {
         );
 
         drop(storage);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn the_spawned_checkpointer_starts_its_clock_fresh() {
+        // Wires the startup clock at the real call site: mutant
+        // `Instant::now() - min_interval` in spawn_checkpointer makes the first
+        // 2 s round force-shrink the oversized WAL and this test fails.
+        let path = test_path("forced-shrink-spawn-clock");
+        remove_database(&path);
+        let writer = seed_force_shrink_wal(&path, 64);
+        let metrics = Arc::new(WalMetrics::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let backlog = Arc::new(AtomicU64::new(0));
+        let pressure = Arc::new(StoragePressure::default());
+        let config =
+            force_shrink_config(1_024, Duration::from_secs(30), Duration::from_millis(150));
+        let worker = spawn_checkpointer(
+            path.clone(),
+            Arc::clone(&stop),
+            Arc::clone(&backlog),
+            Arc::clone(&metrics),
+            pressure,
+            config,
+        )
+        .unwrap();
+        let started = Instant::now();
+        while metrics.frames.load(Ordering::Relaxed) == 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "the spawned checkpointer never completed a PASSIVE round"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        stop.store(true, Ordering::Relaxed);
+        worker.thread().unpark();
+        worker.join().unwrap();
+        assert_eq!(
+            metrics.wal_force_shrink_attempts.load(Ordering::Relaxed),
+            0,
+            "a fresh checkpointer must not force-shrink its pre-existing WAL before its minimum interval"
+        );
+        drop(writer);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn the_spawned_checkpointer_runs_a_due_forced_shrink_under_pressure() {
+        // Mutant `force_shrink_due = false` in the pressure gate makes every
+        // round skip (2 MiB WAL < 192 MiB pressure bound, pressure active) and
+        // the wait below times out.
+        let path = test_path("forced-shrink-pressure-bypass");
+        remove_database(&path);
+        let writer = seed_force_shrink_wal(&path, 64);
+        let metrics = Arc::new(WalMetrics::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let backlog = Arc::new(AtomicU64::new(0));
+        let pressure = Arc::new(StoragePressure::default());
+        pressure.waiting_reads.fetch_add(1, Ordering::Relaxed);
+        let config = force_shrink_config(
+            1_024,
+            Duration::from_millis(200),
+            Duration::from_millis(150),
+        );
+        let worker = spawn_checkpointer(
+            path.clone(),
+            Arc::clone(&stop),
+            Arc::clone(&backlog),
+            Arc::clone(&metrics),
+            Arc::clone(&pressure),
+            config,
+        )
+        .unwrap();
+        let started = Instant::now();
+        while metrics.wal_force_shrink_attempts.load(Ordering::Relaxed) == 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "a due forced shrink must bypass the pressure gate"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        stop.store(true, Ordering::Relaxed);
+        worker.thread().unpark();
+        worker.join().unwrap();
+        assert_eq!(metrics.wal_force_shrink_ok.load(Ordering::Relaxed), 1);
+        pressure.waiting_reads.fetch_sub(1, Ordering::Relaxed);
+        drop(writer);
+        remove_database(&path);
+    }
+
+    fn injected_sqlite_failure(code: rusqlite::ErrorCode, message: &str) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code,
+                extended_code: 1,
+            },
+            Some(message.to_owned()),
+        )
+    }
+
+    #[test]
+    fn a_forced_shrink_setup_failure_counts_the_error_counter() {
+        let path = test_path("forced-shrink-setup-error");
+        remove_database(&path);
+        let writer = seed_force_shrink_wal(&path, 64);
+        let checkpointer = Connection::open(&path).unwrap();
+        checkpointer.busy_timeout(Duration::from_secs(5)).unwrap();
+        let metrics = WalMetrics::default();
+        let interval = Duration::from_secs(10);
+        let (mut last_attempt, now) = overdue_force_shrink_clock(interval);
+        let bytes_before = wal_file_bytes(&path);
+
+        force_shrink_wal_with(
+            &checkpointer,
+            &path,
+            &metrics,
+            Duration::from_millis(150),
+            bytes_before,
+            (&mut last_attempt, now),
+            &mut || {},
+            |_, _| {
+                Err(injected_sqlite_failure(
+                    rusqlite::ErrorCode::DatabaseBusy,
+                    "injected setup failure",
+                ))
+            },
+            |_, _| unreachable!("a failed busy-handler setup must skip the TRUNCATE"),
+        );
+
+        let attempts = metrics.wal_force_shrink_attempts.load(Ordering::Relaxed);
+        let ok = metrics.wal_force_shrink_ok.load(Ordering::Relaxed);
+        let busy = metrics.wal_force_shrink_busy.load(Ordering::Relaxed);
+        let error = metrics.wal_force_shrink_error.load(Ordering::Relaxed);
+        assert_eq!((attempts, ok, busy, error), (1, 0, 0, 1));
+        assert_eq!(
+            last_attempt, now,
+            "the failed attempt still starts the interval"
+        );
+        assert_eq!(
+            metrics.wal_force_shrink_bytes_after.load(Ordering::Relaxed),
+            wal_file_bytes(&path),
+            "bytes_after must reflect the untouched WAL"
+        );
+        let restored_ms: i64 = checkpointer
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(restored_ms, CHECKPOINT_BUSY_TIMEOUT.as_millis() as i64);
+        drop((checkpointer, writer));
+        remove_database(&path);
+    }
+
+    #[test]
+    fn forced_shrink_truncate_errors_split_busy_from_error() {
+        for (injected_code, expect_busy) in [
+            (rusqlite::ErrorCode::DatabaseCorrupt, false),
+            (rusqlite::ErrorCode::DatabaseBusy, true),
+        ] {
+            let path = test_path("forced-shrink-truncate-error");
+            remove_database(&path);
+            let writer = seed_force_shrink_wal(&path, 64);
+            let checkpointer = Connection::open(&path).unwrap();
+            checkpointer.busy_timeout(Duration::from_secs(5)).unwrap();
+            let metrics = WalMetrics::default();
+            let interval = Duration::from_secs(10);
+            let (mut last_attempt, now) = overdue_force_shrink_clock(interval);
+            let bytes_before = wal_file_bytes(&path);
+
+            force_shrink_wal_with(
+                &checkpointer,
+                &path,
+                &metrics,
+                Duration::from_millis(150),
+                bytes_before,
+                (&mut last_attempt, now),
+                &mut || {},
+                |_, _| Ok(()),
+                move |_, kind| {
+                    assert_eq!(kind, CHECKPOINT_TRUNCATE);
+                    Err(injected_sqlite_failure(
+                        injected_code,
+                        "injected TRUNCATE failure",
+                    ))
+                },
+            );
+
+            let attempts = metrics.wal_force_shrink_attempts.load(Ordering::Relaxed);
+            let ok = metrics.wal_force_shrink_ok.load(Ordering::Relaxed);
+            let busy = metrics.wal_force_shrink_busy.load(Ordering::Relaxed);
+            let error = metrics.wal_force_shrink_error.load(Ordering::Relaxed);
+            assert_eq!(
+                (attempts, ok, busy, error),
+                (1, 0, u64::from(expect_busy), u64::from(!expect_busy)),
+                "injected {injected_code:?} must land on the {} counter",
+                if expect_busy { "busy" } else { "error" }
+            );
+            assert_eq!(
+                metrics.sqlite_busy.load(Ordering::Relaxed),
+                u64::from(expect_busy),
+                "only a busy TRUNCATE failure feeds the shared sqlite_busy counter"
+            );
+            assert_eq!(attempts, ok + busy + error, "counters must stay balanced");
+            let restored_ms: i64 = checkpointer
+                .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(restored_ms, CHECKPOINT_BUSY_TIMEOUT.as_millis() as i64);
+            drop((checkpointer, writer));
+            remove_database(&path);
+        }
+    }
+
+    #[test]
+    fn every_labelled_writer_path_logs_its_label_on_sqlite_busy() {
+        struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for CaptureWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        struct CaptureMakeWriter(Arc<Mutex<Vec<u8>>>);
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureMakeWriter {
+            type Writer = CaptureWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                CaptureWriter(Arc::clone(&self.0))
+            }
+        }
+
+        let path = test_path("labelled-busy-kinds");
+        remove_database(&path);
+        let storage = Arc::new(SqliteStorage::open(&path).unwrap());
+        storage
+            .writer
+            .call(|connection| {
+                connection.busy_timeout(Duration::from_millis(1))?;
+                Ok(())
+            })
+            .unwrap();
+        let holder = Connection::open(&path).unwrap();
+        holder
+            .execute_batch("PRAGMA busy_timeout=5000; BEGIN IMMEDIATE;")
+            .unwrap();
+
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let _capture = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(CaptureMakeWriter(Arc::clone(&output)))
+                .finish(),
+        );
+        tracing::callsite::rebuild_interest_cache();
+
+        let did = "did:plc:av90-labels";
+        type LabelledBusyCase = (&'static str, Box<dyn Fn() -> Result<(), StorageError>>);
+        let record = IndexedRecord {
+            did: did.to_owned(),
+            collection: "app.bsky.feed.post".to_owned(),
+            rkey: "label-r1".to_owned(),
+            uri: format!("at://{did}/app.bsky.feed.post/label-r1"),
+            cid: Some("label-cid".to_owned()),
+            time_us: 1,
+            record: serde_json::json!({"$type":"app.bsky.feed.post","text":"busy label"}),
+        };
+        let labelled: Vec<LabelledBusyCase> = vec![
+            ("record_put", {
+                let storage = Arc::clone(&storage);
+                let record = record.clone();
+                Box::new(move || storage.put_record(&record))
+            }),
+            ("record_delete", {
+                let storage = Arc::clone(&storage);
+                let record = record.clone();
+                Box::new(move || {
+                    storage.delete_record(&record.did, &record.collection, &record.rkey)
+                })
+            }),
+            ("ingest_batch", {
+                let storage = Arc::clone(&storage);
+                let update = JetstreamStorageUpdate {
+                    time_us: 7,
+                    upsert: Some(record.clone()),
+                    delete: None,
+                    follows: Vec::new(),
+                    backfill_for: Vec::new(),
+                    handle_refresh: None,
+                };
+                Box::new(move || {
+                    storage
+                        .apply_jetstream_batch(std::slice::from_ref(&update))
+                        .map(|_| ())
+                })
+            }),
+            ("cursor_save", {
+                let storage = Arc::clone(&storage);
+                Box::new(move || storage.set_cursor(1))
+            }),
+            ("skipped_window", {
+                let storage = Arc::clone(&storage);
+                Box::new(move || storage.record_skipped_window(1, 2))
+            }),
+            ("user_register", {
+                let storage = Arc::clone(&storage);
+                Box::new(move || storage.register_user(did))
+            }),
+            ("user_unregister", {
+                let storage = Arc::clone(&storage);
+                Box::new(move || storage.unregister_user(did))
+            }),
+            ("follow_state", {
+                let storage = Arc::clone(&storage);
+                Box::new(move || storage.set_follow(did, "did:plc:av90-label-subject", true))
+            }),
+            ("backfill_enqueue", {
+                let storage = Arc::clone(&storage);
+                Box::new(move || storage.enqueue_backfill(did))
+            }),
+            ("backfill_complete", {
+                let storage = Arc::clone(&storage);
+                Box::new(move || storage.complete_backfill(did))
+            }),
+            ("backfill_retry", {
+                let storage = Arc::clone(&storage);
+                Box::new(move || storage.record_backfill_failure(did).map(|_| ()))
+            }),
+            ("repo_snapshot", {
+                let storage = Arc::clone(&storage);
+                Box::new(move || storage.replace_repo_snapshot(did, &[], &[]))
+            }),
+            ("handle_refresh", {
+                let storage = Arc::clone(&storage);
+                Box::new(move || storage.set_verified_handle(did, "labelled.invalid"))
+            }),
+            ("handle_refresh", {
+                let storage = Arc::clone(&storage);
+                Box::new(move || storage.clear_verified_handle(did))
+            }),
+            ("handle_refresh", {
+                let storage = Arc::clone(&storage);
+                Box::new(move || storage.complete_handle_refresh(did))
+            }),
+            ("web_session", {
+                let storage = Arc::clone(&storage);
+                Box::new(move || storage.rotate_web_session(did, "av90-session").map(|_| ()))
+            }),
+            ("recent_posts", {
+                let storage = Arc::clone(&storage);
+                Box::new(move || storage.record_older_posts_page(did, None, false))
+            }),
+            ("profile_fetch", {
+                let storage = Arc::clone(&storage);
+                Box::new(move || storage.complete_profile_fetch(did))
+            }),
+            ("profile_index", {
+                let storage = Arc::clone(&storage);
+                Box::new(move || {
+                    storage.write_profile_index_status(
+                        did,
+                        ProfileIndexEntry {
+                            has_profile: false,
+                            fetched_at_ms: 1,
+                        },
+                    )
+                })
+            }),
+            ("recent_profiles", {
+                let storage = Arc::clone(&storage);
+                Box::new(move || storage.clear_recent_profiles_for_viewer(did))
+            }),
+        ];
+
+        let mut busy_logged = 0_u64;
+        for (label, operation) in &labelled {
+            output.lock().unwrap().clear();
+            let error = operation().err().unwrap_or_else(|| {
+                panic!("the external lock holder did not force a busy error for {label}")
+            });
+            assert!(
+                is_sqlite_busy_error(&error),
+                "{label} unexpectedly returned a non-busy error: {error}"
+            );
+            let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+            assert!(
+                text.contains("SQLite writer received SQLITE_BUSY")
+                    && text.contains(&format!("kind=\"{label}\"")),
+                "{label} busy log line missing its label: {text}"
+            );
+            busy_logged += 1;
+        }
+        assert_eq!(busy_logged as usize, labelled.len());
+        assert_eq!(
+            storage.writer.metrics.sqlite_busy.load(Ordering::Relaxed),
+            busy_logged,
+            "every labelled busy path must feed the shared sqlite_busy counter"
+        );
+
+        holder.execute_batch("COMMIT;").unwrap();
+        drop((_capture, holder, storage));
         remove_database(&path);
     }
 
