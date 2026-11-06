@@ -9491,7 +9491,7 @@ mod sqlite_writer_tests {
             time_us: 1,
             record: serde_json::json!({"$type":"app.bsky.feed.post","text":"busy"}),
         };
-        let checkpoint = storage.wal_metrics.checkpoint_activity(CHECKPOINT_RESTART);
+        let checkpoint = storage.wal_metrics.checkpoint_activity(CHECKPOINT_TRUNCATE);
         let error = std::thread::scope(|scope| {
             scope.spawn(move || {
                 let deadline = Instant::now() + Duration::from_secs(1);
@@ -9510,7 +9510,7 @@ mod sqlite_writer_tests {
         assert!(is_sqlite_busy_error(&error), "unexpected error: {error}");
         let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
         assert!(
-            text.contains("lock_holder=\"checkpoint_RESTART\""),
+            text.contains("lock_holder=\"checkpoint_TRUNCATE\""),
             "writer.call did not attribute the holder observed before its write: {text}"
         );
 
