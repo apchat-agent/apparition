@@ -20,7 +20,7 @@ use crate::{
         RELATIONSHIP_CONFIRMATION_TTL, RelationshipClient, apply_profile_counts, now_millis,
         relationship_cache_key,
     },
-    search::{SEARCH_REQUEST_TIMEOUT, SearchActor, SearchCallError, SearchClient},
+    search::{SEARCH_REQUEST_TIMEOUT, SearchActor, SearchCallError, SearchClient, SearchPostsPage},
     timing_console::{
         TIMING_PAGE_LIMIT, TIMING_RECENT_PATH, TimingConsole, TimingRecord, new_timing_id,
         now_unix_ms,
@@ -1045,6 +1045,7 @@ pub struct OAuthWebState<F, S> {
     search: SearchClient,
     link_card_fetcher: LinkCardFetcher,
     feed_page_cache: FeedPageCache,
+    search_page_cache: SearchPageCache,
     block_lists: Arc<BlockListCache>,
     notification_streams: Arc<Mutex<HashMap<String, usize>>>,
     timing_console: Arc<TimingConsole>,
@@ -1381,6 +1382,7 @@ impl OAuthPublic {
             link_card_fetcher: LinkCardFetcher::new(),
             shutdown,
             feed_page_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            search_page_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             block_lists: Arc::new(BlockListCache::default()),
             notification_streams: Arc::new(Mutex::new(HashMap::new())),
             timing_console,
@@ -1689,6 +1691,11 @@ type ServiceAuthFlights = Arc<
 type FeedPageCache = Arc<
     tokio::sync::Mutex<HashMap<(String, String, String), (tokio::time::Instant, FeedTimeline)>>,
 >;
+type SearchPageCache = Arc<
+    tokio::sync::Mutex<HashMap<(String, String, String), (tokio::time::Instant, SearchPostsPage)>>,
+>;
+static NEXT_FEED_SPILL_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_SEARCH_SPILL_ID: AtomicU64 = AtomicU64::new(1);
 type FeedSkeletonCache = Arc<
     tokio::sync::Mutex<HashMap<(String, String, String), (tokio::time::Instant, FeedSkeletonPage)>>,
 >;
@@ -2203,6 +2210,8 @@ struct LabelValuePresentation {
 }
 const SERVICE_AUTH_LIFETIME_SECS: u64 = 30 * 60;
 const FEED_PAGE_CACHE_SECS: u64 = 60;
+/// Limit each list response to eight upstream pages, even if all eight contain only hidden posts.
+const MAX_FUTURE_REFILL_PAGES: usize = 8;
 const BSKY_APPVIEW_DID: &str = "did:web:api.bsky.app";
 const BSKY_APPVIEW_SERVICE: &str = "bsky_appview";
 const MUTED_ACTOR_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -6122,15 +6131,6 @@ async fn persist_search_actor_profiles_web<S: Storage + 'static>(
     .await
 }
 
-async fn sort_us_for_web<S: Storage + 'static>(storage: Arc<S>, record: IndexedRecord) -> u64 {
-    let fallback = record.clone();
-    web_storage_call(storage, "timeline_cursor_sort_time", move |storage| {
-        storage.sort_us_for_record(&record)
-    })
-    .await
-    .unwrap_or_else(|_| crate::ingest::post_sort_us(&fallback))
-}
-
 fn render_feed_tabs(
     feeds: &[ResolvedFeed],
     active_feed: Option<&str>,
@@ -9101,6 +9101,37 @@ fn timeline_list_block_attrs(
     }
 }
 
+fn home_timeline_page_records(
+    indexed_page: Vec<IndexedRecord>,
+    pending_posts: Option<Vec<IndexedRecord>>,
+    limit: usize,
+    now_us: u64,
+) -> Vec<IndexedRecord> {
+    let mut page = Vec::new();
+    if let Some(pending_posts) = pending_posts {
+        let mut seen = indexed_page
+            .iter()
+            .map(|record| record.uri.clone())
+            .collect::<HashSet<_>>();
+        let mut pending = pending_posts
+            .into_iter()
+            .filter(|record| !crate::ingest::post_is_too_far_in_future(record, now_us))
+            .filter(|record| seen.insert(record.uri.clone()))
+            .collect::<Vec<_>>();
+        pending.sort_by(|left, right| {
+            right
+                .time_us
+                .cmp(&left.time_us)
+                .then_with(|| right.uri.cmp(&left.uri))
+        });
+        page.extend(pending);
+    }
+    // Keep the indexed page's full limit in view after prepending transient writes. The cursor
+    // belongs to the indexed page, so this keeps the next page contiguous even with an overlay.
+    page.extend(indexed_page.into_iter().take(limit));
+    page
+}
+
 async fn app_home<F, S>(
     State(state): State<Arc<OAuthWebState<F, S>>>,
     headers: HeaderMap,
@@ -9196,50 +9227,41 @@ where
     let cursor = query
         .get("cursor")
         .and_then(|cursor| SortTimeCursor::parse(cursor));
+    let now_us = crate::ingest::visibility_now_us();
     let timeline_started = std::time::Instant::now();
     let timeline_actor = did.clone();
-    let timeline_cursor = cursor.clone();
-    let mut timeline_page = match web_storage_call(
+    let timeline_page_cursor = cursor.clone();
+    let (indexed_page, has_more, next_cursor) = match web_storage_call(
         Arc::clone(&state.storage),
         "home_timeline",
         move |storage| {
-            storage.timeline_posts_by_post_time(
-                &timeline_actor,
-                timeline_cursor.as_ref(),
-                limit + 1,
+            crate::ingest::filtered_post_page(
+                timeline_page_cursor,
+                limit,
+                now_us,
+                |cursor, batch_limit| {
+                    storage.timeline_posts_by_post_time(&timeline_actor, cursor, batch_limit)
+                },
+                |record| SortTimeCursor {
+                    sort_us: crate::ingest::post_sort_us(record),
+                    time_us: record.time_us,
+                    uri: record.uri.clone(),
+                },
             )
         },
     )
     .await
     {
-        Ok(records) => records,
+        Ok(page) => page,
         Err(error) => {
             return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
         }
     };
     page_timing.timeline_fetch_index_ms = timeline_started.elapsed().as_millis() as u64;
-    if cursor.is_none() {
-        let mut seen = timeline_page
-            .iter()
-            .map(|record| record.uri.clone())
-            .collect::<HashSet<_>>();
-        let mut pending = state
-            .pending_web_posts
-            .for_actor(&did)
-            .into_iter()
-            .filter(|record| seen.insert(record.uri.clone()))
-            .collect::<Vec<_>>();
-        pending.sort_by(|left, right| {
-            right
-                .time_us
-                .cmp(&left.time_us)
-                .then_with(|| right.uri.cmp(&left.uri))
-        });
-        pending.extend(timeline_page);
-        timeline_page = pending;
-    }
-    let has_more = timeline_page.len() > limit;
-    let next_cursor_record = timeline_page.get(limit.saturating_sub(1)).cloned();
+    let pending_posts = cursor
+        .is_none()
+        .then(|| state.pending_web_posts.for_actor(&did));
+    let timeline_page = home_timeline_page_records(indexed_page, pending_posts, limit, now_us);
     let mutes_started = std::time::Instant::now();
     let hidden_actors_result =
         timeline_hidden_actor_dids(&state.flow, Arc::clone(&state.storage), &did).await;
@@ -9248,7 +9270,7 @@ where
         Ok(hidden) => hidden,
         Err(error) => return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error),
     };
-    let mut page_records = timeline_page.into_iter().take(limit).collect::<Vec<_>>();
+    let mut page_records = timeline_page;
     page_records.retain(|record| !hidden_actors.contains(&record.did));
     let list_blocks_started = std::time::Instant::now();
     let block_lists = subscribed_block_lists_for_page(&state.flow, &state.block_lists, &did).await;
@@ -9350,7 +9372,7 @@ where
         posts
     };
     let posts_render_ms = render_started.elapsed().as_millis() as u64;
-    let indexing_status = if page_records.is_empty() && next_cursor_record.is_none() {
+    let indexing_status = if page_records.is_empty() && next_cursor.is_none() {
         let viewer = did.clone();
         let (total, done, failed) = match web_storage_call(
             Arc::clone(&state.storage),
@@ -9416,13 +9438,8 @@ where
         String::new()
     };
     let older = if has_more {
-        if let Some(last) = next_cursor_record.as_ref() {
-            let cursor = SortTimeCursor {
-                sort_us: sort_us_for_web(Arc::clone(&state.storage), last.clone()).await,
-                time_us: last.time_us,
-                uri: last.uri.clone(),
-            }
-            .encode();
+        if let Some(next_cursor) = next_cursor.as_ref() {
+            let cursor = next_cursor.encode();
             let encoded =
                 url::form_urlencoded::byte_serialize(cursor.as_bytes()).collect::<String>();
             format!(
@@ -9508,6 +9525,27 @@ where
         },
     ))
     .into_response()
+}
+
+async fn fetch_search_posts_page<F: OAuthFlow>(
+    flow: &F,
+    search: &SearchClient,
+    viewer_did: &str,
+    term: &str,
+    cursor: Option<&str>,
+) -> Result<SearchPostsPage, SearchCallError> {
+    match flow.signed_search_posts(viewer_did, term, cursor).await {
+        Ok(Some(body)) => Ok(crate::search::parse_search_posts_body(&body)),
+        Ok(None) => search.search_posts(term, cursor).await,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                did = %viewer_did,
+                "signed posts search failed; falling back to the anonymous search"
+            );
+            search.search_posts(term, cursor).await
+        }
+    }
 }
 
 async fn search_page<F, S>(
@@ -9617,35 +9655,139 @@ where
         ))
         .into_response();
     }
-    let page = match state.flow.signed_search_posts(&did, &term, cursor).await {
-        Ok(Some(body)) => crate::search::parse_search_posts_body(&body),
-        Ok(None) => match state.search.search_posts(&term, cursor).await {
+    let initial_cursor = cursor.map(str::to_owned);
+    let page_cache_key = (
+        did.clone(),
+        term.clone(),
+        initial_cursor.clone().unwrap_or_default(),
+    );
+    let cached_page = state
+        .search_page_cache
+        .lock()
+        .await
+        .get(&page_cache_key)
+        .filter(|(expires, _)| *expires > tokio::time::Instant::now())
+        .map(|(_, page)| page.clone());
+    let mut page = match cached_page {
+        Some(page) => page,
+        None => match fetch_search_posts_page(
+            &state.flow,
+            &state.search,
+            &did,
+            &term,
+            initial_cursor.as_deref(),
+        )
+        .await
+        {
             Ok(page) => page,
             Err(failure) => {
                 return anonymous_posts_search_failure_response(
-                    &failure, cursor, &state, &headers, heading, &form, options,
+                    &failure,
+                    initial_cursor.as_deref(),
+                    &state,
+                    &headers,
+                    heading,
+                    &form,
+                    options,
                 )
                 .await;
             }
         },
-        Err(error) => {
-            // Owner's logging rule: the fallback names the real underlying error.
-            tracing::warn!(
-                %error,
-                did = %did,
-                "signed posts search failed; falling back to the anonymous search"
-            );
-            match state.search.search_posts(&term, cursor).await {
-                Ok(page) => page,
-                Err(failure) => {
-                    return anonymous_posts_search_failure_response(
-                        &failure, cursor, &state, &headers, heading, &form, options,
-                    )
-                    .await;
-                }
+    };
+    let now_us = crate::ingest::visibility_now_us();
+    let mut visible_posts = Vec::new();
+    let mut spill_posts = Vec::new();
+    let mut upstream_cursor = None;
+    let mut refill_needed = initial_cursor
+        .as_deref()
+        .is_some_and(|cursor| cursor.starts_with("local-search-spill-"));
+    let mut prior_cursor = initial_cursor;
+    let mut current_page = Some(page);
+    let mut pages_read = 0usize;
+    while let Some(current) = current_page.take() {
+        pages_read += 1;
+        upstream_cursor = current.cursor.clone();
+        for post in current.posts {
+            if crate::ingest::post_is_too_far_in_future(&post.record, now_us) {
+                refill_needed = true;
+                continue;
+            }
+            if visible_posts.len() < 25 {
+                visible_posts.push(post);
+            } else {
+                spill_posts.push(post);
             }
         }
-    };
+        if visible_posts.len() >= 25
+            || pages_read >= MAX_FUTURE_REFILL_PAGES
+            || upstream_cursor.is_none()
+            || !refill_needed
+        {
+            break;
+        }
+        let next_cursor = upstream_cursor.clone().expect("checked as present");
+        if prior_cursor.as_deref() == Some(next_cursor.as_str()) {
+            tracing::warn!(
+                cursor = %next_cursor,
+                query = %term,
+                "searchPosts returned a cursor that did not advance; stopping page refill"
+            );
+            upstream_cursor = None;
+            break;
+        }
+        prior_cursor = Some(next_cursor.clone());
+        current_page = match fetch_search_posts_page(
+            &state.flow,
+            &state.search,
+            &did,
+            &term,
+            Some(&next_cursor),
+        )
+        .await
+        {
+            Ok(page) => Some(page),
+            Err(failure) => {
+                tracing::warn!(
+                    status = ?failure.status,
+                    detail = %failure.detail,
+                    query = %term,
+                    viewer_did = %did,
+                    "future-post search refill failed; serving the filtered results gathered so far"
+                );
+                break;
+            }
+        };
+    }
+    if spill_posts.is_empty() {
+        page = SearchPostsPage {
+            posts: visible_posts,
+            cursor: upstream_cursor,
+        };
+    } else {
+        let spill_cursor = format!(
+            "local-search-spill-{}",
+            NEXT_SEARCH_SPILL_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let spill_page = SearchPostsPage {
+            posts: spill_posts,
+            cursor: upstream_cursor,
+        };
+        let mut cache = state.search_page_cache.lock().await;
+        cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
+        if cache.len() < 1024 {
+            cache.insert(
+                (did.clone(), term.clone(), spill_cursor.clone()),
+                (
+                    tokio::time::Instant::now() + Duration::from_secs(FEED_PAGE_CACHE_SECS),
+                    spill_page,
+                ),
+            );
+        }
+        page = SearchPostsPage {
+            posts: visible_posts,
+            cursor: Some(spill_cursor),
+        };
+    }
     let public_profiles = page
         .posts
         .iter()
@@ -9672,6 +9814,7 @@ where
         };
     let visible = records
         .into_iter()
+        // Future posts were removed while collecting this page and its refill pages above.
         .filter(|record| !hidden_actors.contains(&record.did))
         .collect::<Vec<_>>();
     let content_deadline = tokio::time::Instant::now() + PAGE_PROFILE_BUDGET;
@@ -10104,7 +10247,7 @@ where
         query.get("cursor").cloned().unwrap_or_default(),
     );
     let timeline_started = std::time::Instant::now();
-    let page = if let Some((expires, page)) =
+    let mut page = if let Some((expires, page)) =
         state.feed_page_cache.lock().await.get(&page_key).cloned()
         && expires > tokio::time::Instant::now()
     {
@@ -10145,6 +10288,134 @@ where
             }
         }
     };
+    const CUSTOM_FEED_PAGE_SIZE: usize = 30;
+    let now_us = crate::ingest::visibility_now_us();
+    let mut visible_feed = Vec::new();
+    let mut spill_feed = Vec::new();
+    let mut upstream_cursor;
+    let mut refill_needed = query
+        .get("cursor")
+        .is_some_and(|cursor| cursor.starts_with("local-feed-spill-"));
+    let mut prior_cursor = query.get("cursor").cloned();
+    let mut pages_read = 0usize;
+    loop {
+        pages_read += 1;
+        upstream_cursor = page.timeline.cursor.clone();
+        for post in std::mem::take(&mut page.timeline.feed) {
+            if crate::ingest::post_is_too_far_in_future(&post.record, now_us) {
+                refill_needed = true;
+                continue;
+            }
+            if visible_feed.len() < CUSTOM_FEED_PAGE_SIZE {
+                visible_feed.push(post);
+            } else {
+                spill_feed.push(post);
+            }
+        }
+        if visible_feed.len() >= CUSTOM_FEED_PAGE_SIZE
+            || pages_read >= MAX_FUTURE_REFILL_PAGES
+            || upstream_cursor.is_none()
+            || !refill_needed
+        {
+            break;
+        }
+        let next_cursor = upstream_cursor.clone().expect("checked as present");
+        if prior_cursor.as_deref() == Some(next_cursor.as_str()) {
+            tracing::warn!(
+                feed_uri = %uri,
+                cursor = %next_cursor,
+                "feed generator returned a cursor that did not advance; stopping page refill"
+            );
+            upstream_cursor = None;
+            break;
+        }
+        prior_cursor = Some(next_cursor.clone());
+        let next_page = match state
+            .flow
+            .feed_timeline(&did, uri, Some(&next_cursor), state.storage.clone())
+            .await
+        {
+            Ok(page) => page,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    feed_uri = %uri,
+                    cursor = %next_cursor,
+                    "future-post custom-feed refill failed; serving the filtered results gathered so far"
+                );
+                break;
+            }
+        };
+        page.timeline.posts_local = page
+            .timeline
+            .posts_local
+            .saturating_add(next_page.timeline.posts_local);
+        page.timeline.dropped_count = page
+            .timeline
+            .dropped_count
+            .saturating_add(next_page.timeline.dropped_count);
+        page.timeline
+            .post_routes
+            .absorb(&next_page.timeline.post_routes);
+        page.timing.timeline_fetch_live_ms = page
+            .timing
+            .timeline_fetch_live_ms
+            .saturating_add(next_page.timing.timeline_fetch_live_ms);
+        page.timing.skeleton_hydration_ms = page
+            .timing
+            .skeleton_hydration_ms
+            .saturating_add(next_page.timing.skeleton_hydration_ms);
+        page.timing.session_token_refresh_ms = page
+            .timing
+            .session_token_refresh_ms
+            .saturating_add(next_page.timing.session_token_refresh_ms);
+        page.timing.posts_proxy = page
+            .timing
+            .posts_proxy
+            .saturating_add(next_page.timing.posts_proxy);
+        page.timing.posts_public = page
+            .timing
+            .posts_public
+            .saturating_add(next_page.timing.posts_public);
+        page.timing.posts_pds = page
+            .timing
+            .posts_pds
+            .saturating_add(next_page.timing.posts_pds);
+        page.timeline.cursor = next_page.timeline.cursor;
+        page.timeline.feed = next_page.timeline.feed;
+    }
+    page.timeline.feed = visible_feed;
+    if spill_feed.is_empty() {
+        page.timeline.cursor = upstream_cursor;
+    } else {
+        let spill_cursor = format!(
+            "local-feed-spill-{}",
+            NEXT_FEED_SPILL_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let spill_page = FeedTimeline {
+            generator: page.generator.clone(),
+            timeline: crate::feeds::HydratedFeedPage {
+                feed: spill_feed,
+                cursor: upstream_cursor,
+                dropped_count: 0,
+                posts_local: 0,
+                post_routes: crate::feeds::PostRouteStats::default(),
+            },
+            timing: FeedTimelineTiming::default(),
+        };
+        let mut cache = state.feed_page_cache.lock().await;
+        cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
+        if cache.len() < 1024 {
+            cache.insert(
+                (did.clone(), uri.to_owned(), spill_cursor.clone()),
+                (
+                    tokio::time::Instant::now() + Duration::from_secs(FEED_PAGE_CACHE_SECS),
+                    spill_page,
+                ),
+            );
+        }
+        page.timeline.cursor = Some(spill_cursor);
+    }
     if !page.timing.cache_hit {
         let mut cache = state.feed_page_cache.lock().await;
         cache.retain(|_, (expires, _)| *expires > tokio::time::Instant::now());
@@ -10183,6 +10454,7 @@ where
         .timeline
         .feed
         .iter()
+        // Future posts were removed while collecting this page and its refill pages above.
         .filter(|post| !hidden_actors.contains(&post.record.did))
         .collect::<Vec<_>>();
     let feed_records = feed_items
@@ -10585,6 +10857,27 @@ fn notification_window_page<S: Storage>(
     notification_window_page_with_edge(storage, viewer_did, before, limit, last_seen_us, true)
 }
 
+fn notification_targets_future_post<S: Storage>(
+    storage: &S,
+    event: &NotificationEventRow,
+    now_us: u64,
+) -> Result<bool, StorageError> {
+    if event.source_collection == "app.bsky.feed.post"
+        && storage
+            .record_by_uri(&event.source_collection, &event.source_uri)?
+            .is_some_and(|record| crate::ingest::post_is_too_far_in_future(&record, now_us))
+    {
+        return Ok(true);
+    }
+    if let Some(subject_uri) = event.reason_subject.as_deref()
+        && let Some(subject) = storage.record_by_uri("app.bsky.feed.post", subject_uri)?
+        && crate::ingest::post_is_too_far_in_future(&subject, now_us)
+    {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 fn notification_window_page_with_edge<S: Storage>(
     storage: &S,
     viewer_did: &str,
@@ -10592,6 +10885,26 @@ fn notification_window_page_with_edge<S: Storage>(
     limit: usize,
     last_seen_us: u64,
     honor_cursor_edge: bool,
+) -> Result<NotificationWindowPage, StorageError> {
+    notification_window_page_with_edge_at(
+        storage,
+        viewer_did,
+        before,
+        limit,
+        last_seen_us,
+        honor_cursor_edge,
+        crate::ingest::visibility_now_us(),
+    )
+}
+
+fn notification_window_page_with_edge_at<S: Storage>(
+    storage: &S,
+    viewer_did: &str,
+    before: Option<&NotificationCursor>,
+    limit: usize,
+    last_seen_us: u64,
+    honor_cursor_edge: bool,
+    now_us: u64,
 ) -> Result<NotificationWindowPage, StorageError> {
     struct PendingGroup {
         head: NotificationEventRow,
@@ -10615,6 +10928,9 @@ fn notification_window_page_with_edge<S: Storage>(
         let exhausted = batch.len() < NOTIFICATION_WINDOW_BATCH;
         for event in batch {
             scan_after = Some(event.cursor());
+            if notification_targets_future_post(storage, &event, now_us)? {
+                continue;
+            }
             let unread = event.time_us > last_seen_us;
             let groupable = match event.reason.as_str() {
                 "like" | "repost" => event.reason_subject.is_some(),
@@ -12027,6 +12343,28 @@ where
     Ok(answer)
 }
 
+async fn visible_author_post_page<S: Storage + 'static>(
+    storage: Arc<S>,
+    did: String,
+    cursor: Option<RecordCursor>,
+    limit: usize,
+    now_us: u64,
+) -> Result<(Vec<IndexedRecord>, bool, Option<RecordCursor>), StorageError> {
+    web_storage_call(storage, "profile_author_posts", move |storage| {
+        crate::ingest::filtered_post_page(
+            cursor,
+            limit,
+            now_us,
+            |cursor, batch_limit| storage.author_posts(&did, cursor, batch_limit, true),
+            |record| RecordCursor {
+                time_us: record.time_us,
+                uri: record.uri.clone(),
+            },
+        )
+    })
+    .await
+}
+
 async fn profile_page<F, S>(
     State(state): State<Arc<OAuthWebState<F, S>>>,
     headers: HeaderMap,
@@ -12075,13 +12413,14 @@ where
     let cursor = query
         .get("cursor")
         .and_then(|cursor| RecordCursor::parse(cursor));
+    let now_us = crate::ingest::visibility_now_us();
     let timeline_started = std::time::Instant::now();
-    let subject_owned = subject.to_owned();
-    let page_cursor = cursor.clone();
-    let mut page_records = match web_storage_call(
+    let (mut page_records, mut has_more, mut page_cursor) = match visible_author_post_page(
         Arc::clone(&state.storage),
-        "profile_author_posts",
-        move |storage| storage.author_posts(&subject_owned, page_cursor.as_ref(), limit + 1, true),
+        subject.to_owned(),
+        cursor.clone(),
+        limit,
+        now_us,
     )
     .await
     {
@@ -12091,7 +12430,6 @@ where
         }
     };
     page_timing.timeline_fetch_index_ms = timeline_started.elapsed().as_millis() as u64;
-    let mut has_more = page_records.len() > limit;
     let mut records = page_records.iter().take(limit).collect::<Vec<_>>();
     // Queue one deduplicated, bounded "recent posts" job unless this account's
     // cache is fresh or its last fetch is inside the retry backoff (owner
@@ -12164,14 +12502,12 @@ where
                 page_timing.profile_older_posts = "ok";
                 page_timing.profile_older_posts_fetched = stored as u64;
                 page_timing.profile_older_posts_ms = older_started.elapsed().as_millis() as u64;
-                let subject_owned = subject.to_owned();
-                let page_cursor = cursor.clone();
-                page_records = match web_storage_call(
+                (page_records, has_more, page_cursor) = match visible_author_post_page(
                     Arc::clone(&state.storage),
-                    "profile_author_posts_after_fetch",
-                    move |storage| {
-                        storage.author_posts(&subject_owned, page_cursor.as_ref(), limit + 1, true)
-                    },
+                    subject.to_owned(),
+                    cursor.clone(),
+                    limit,
+                    now_us,
                 )
                 .await
                 {
@@ -12180,7 +12516,6 @@ where
                         return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
                     }
                 };
-                has_more = page_records.len() > limit;
                 records = page_records.iter().take(limit).collect::<Vec<_>>();
             }
         }
@@ -12401,12 +12736,12 @@ where
             }
         };
     let older = if history_open {
-        records
-            .last()
-            .map(|last| RecordCursor {
+        page_cursor
+            .clone()
+            .or_else(|| records.last().map(|last| RecordCursor {
                 time_us: last.time_us,
                 uri: last.uri.clone(),
-            })
+            }))
             .or_else(|| older_fetch_attempted.then(|| cursor.clone()).flatten())
             .map(|anchor| {
                 let cursor = anchor.encode();
@@ -13189,13 +13524,21 @@ where
         page_timing.timeline_fetch_index_ms += ancestors_ms;
     }
     let reply_root = record.clone();
+    let now_us = crate::ingest::visibility_now_us();
     let thread_reply_records = match web_storage_call(
         Arc::clone(&state.storage),
         "thread_reply_records",
         move |storage| {
             let mut records = Vec::new();
             let mut budget = 100;
-            collect_thread_reply_records(storage, &reply_root, depth, &mut budget, &mut records)?;
+            collect_thread_reply_records(
+                storage,
+                &reply_root,
+                depth,
+                now_us,
+                &mut budget,
+                &mut records,
+            )?;
             Ok(records)
         },
     )
@@ -13287,6 +13630,7 @@ where
     let render_interactions = page_interactions.clone();
     let render_viewer = viewer_did.clone();
     let render_context = Arc::clone(&render);
+    let render_now_us = now_us;
     let (ancestors_html, replies_html, reply_composer, reply_bar, viewer_profile, focus_html) =
         match web_storage_call(render_storage, "render_thread_page", move |storage| {
             let thread_ancestor_cards =
@@ -13296,19 +13640,25 @@ where
                 .enumerate()
                 .map(|(index, ancestor)| {
                     let card = match ancestor {
-                        ThreadAncestorDisplay::Found(ancestor) => render_web_post(
-                            storage,
-                            ancestor,
-                            WebPostRenderOptions {
-                                viewer_did: &render_viewer,
-                                rights,
-                                link_text_to_thread: false,
-                                eager_avatar: index < 6,
-                                quote_index: &render_quotes,
-                                page_interactions: &render_interactions,
-                                render: &render_context,
-                            },
-                        ),
+                        ThreadAncestorDisplay::Found(ancestor) => {
+                            if crate::ingest::post_is_too_far_in_future(ancestor, render_now_us) {
+                                format!("<a class=\"quoted-post-card quoted-post-status\" href=\"/app/thread?uri={}\">Post unavailable</a>", form_encoded(&ancestor.uri))
+                            } else {
+                                render_web_post(
+                                    storage,
+                                    ancestor,
+                                    WebPostRenderOptions {
+                                        viewer_did: &render_viewer,
+                                        rights,
+                                        link_text_to_thread: false,
+                                        eager_avatar: index < 6,
+                                        quote_index: &render_quotes,
+                                        page_interactions: &render_interactions,
+                                        render: &render_context,
+                                    },
+                                )
+                            }
+                        }
                         ThreadAncestorDisplay::Deferred(uri) => render_deferred_parent(uri, true),
                     };
                     format!("<li class=\"post-item\">{card}</li>")
@@ -13333,6 +13683,7 @@ where
                 &render_record,
                 &reply_options,
                 depth,
+                render_now_us,
                 &mut reply_budget,
             )?;
             let reply_composer = if rights.post {
@@ -13655,6 +14006,7 @@ where
         }
     };
     let thread_view = query.get("view").is_some_and(|view| view == "thread");
+    let now_us = crate::ingest::visibility_now_us();
     let rights =
         verified_cookie_form_rights_web(&state.public, &headers, Arc::clone(&state.storage)).await;
     let card = match web_storage_call(
@@ -13662,7 +14014,12 @@ where
         "render_parent_fragment",
         move |storage| {
             let render = WebRenderContext::default();
-            let card = if thread_view {
+            let card = if crate::ingest::post_is_too_far_in_future(&record, now_us) {
+                format!(
+                    "<a class=\"quoted-post-card quoted-post-status\" href=\"/app/thread?uri={}\">Post unavailable</a>",
+                    form_encoded(&record.uri)
+                )
+            } else if thread_view {
                 let mut quote_index = QuoteRenderIndex::default();
                 if let Some(embed) = record.record.get("embed")
                     && let Some(reference) = quoted_record_ref(embed)
@@ -13809,6 +14166,12 @@ where
 }
 
 fn render_quote_preview<S: Storage>(storage: &S, quoted: &IndexedRecord) -> String {
+    if crate::ingest::post_is_too_far_in_future(quoted, crate::ingest::visibility_now_us()) {
+        return format!(
+            "<a class=\"quoted-post-card quoted-post-status\" href=\"/app/thread?uri={}\">Post unavailable</a>",
+            form_encoded(&quoted.uri)
+        );
+    }
     let render = WebRenderContext::default();
     let profile = render.author_identity(storage, &quoted.did);
     let handle = profile_handle(&profile, &quoted.did);
@@ -14292,6 +14655,7 @@ fn collect_thread_reply_records<S: Storage>(
     storage: &S,
     record: &IndexedRecord,
     depth: usize,
+    now_us: u64,
     budget: &mut usize,
     output: &mut Vec<IndexedRecord>,
 ) -> Result<(), StorageError> {
@@ -14303,9 +14667,12 @@ fn collect_thread_reply_records<S: Storage>(
         if *budget == 0 {
             break;
         }
+        if crate::ingest::post_is_too_far_in_future(&reply, now_us) {
+            continue;
+        }
         *budget -= 1;
         output.push(reply.clone());
-        collect_thread_reply_records(storage, &reply, depth - 1, budget, output)?;
+        collect_thread_reply_records(storage, &reply, depth - 1, now_us, budget, output)?;
     }
     Ok(())
 }
@@ -14324,6 +14691,7 @@ fn render_thread_replies<S: Storage>(
     record: &IndexedRecord,
     options: &ThreadReplyRenderOptions<'_>,
     depth: usize,
+    now_us: u64,
     budget: &mut usize,
 ) -> Result<String, StorageError> {
     if depth == 0 || *budget == 0 {
@@ -14338,8 +14706,11 @@ fn render_thread_replies<S: Storage>(
         if *budget == 0 {
             break;
         }
+        if crate::ingest::post_is_too_far_in_future(reply, now_us) {
+            continue;
+        }
         *budget -= 1;
-        let nested = render_thread_replies(storage, reply, options, depth - 1, budget)?;
+        let nested = render_thread_replies(storage, reply, options, depth - 1, now_us, budget)?;
         let continues = options.thread_continuations.contains(&reply.uri);
         html.push_str(&format!(
             "<li class=\"post-item thread-reply-item{}\">{}{nested}</li>",
@@ -17522,6 +17893,21 @@ fn render_reply_parent_card<S: Storage>(
     storage: &S,
     parent: &IndexedRecord,
 ) -> String {
+    render_reply_parent_card_at(render, storage, parent, crate::ingest::visibility_now_us())
+}
+
+fn render_reply_parent_card_at<S: Storage>(
+    render: &WebRenderContext,
+    storage: &S,
+    parent: &IndexedRecord,
+    now_us: u64,
+) -> String {
+    if crate::ingest::post_is_too_far_in_future(parent, now_us) {
+        let thread_uri = format!("/app/thread?uri={}", form_encoded(&parent.uri));
+        return format!(
+            "<a class=\"reply-parent-card reply-parent-status\" href=\"{thread_uri}\">Post unavailable</a>"
+        );
+    }
     let (profile, handle, display_name) = parent_display_identity(render, storage, &parent.did);
     let thread_uri = format!("/app/thread?uri={}", form_encoded(&parent.uri));
     let text = parent
@@ -17836,19 +18222,32 @@ fn render_timeline_post_items<S: Storage>(
                                 preludes.get(page_index).map(String::as_str).unwrap_or(""),
                             );
                         }
-                        html.push_str(&render_web_post(
-                            storage,
-                            member,
-                            WebPostRenderOptions {
-                                viewer_did: context.viewer_did,
-                                rights: context.rights,
-                                link_text_to_thread: true,
-                                eager_avatar: page_index.is_none_or(|page_index| page_index < 6),
-                                quote_index: context.quote_index,
-                                page_interactions: context.page_interactions,
-                                render: context.render,
-                            },
-                        ));
+                        if page_index.is_none()
+                            && crate::ingest::post_is_too_far_in_future(
+                                member,
+                                crate::ingest::visibility_now_us(),
+                            )
+                        {
+                            html.push_str(&format!(
+                                "<a class=\"quoted-post-card quoted-post-status\" href=\"/app/thread?uri={}\">Post unavailable</a>",
+                                form_encoded(&member.uri)
+                            ));
+                        } else {
+                            html.push_str(&render_web_post(
+                                storage,
+                                member,
+                                WebPostRenderOptions {
+                                    viewer_did: context.viewer_did,
+                                    rights: context.rights,
+                                    link_text_to_thread: true,
+                                    eager_avatar: page_index
+                                        .is_none_or(|page_index| page_index < 6),
+                                    quote_index: context.quote_index,
+                                    page_interactions: context.page_interactions,
+                                    render: context.render,
+                                },
+                            ));
+                        }
                     }
                     TimelineGroupRenderMember::Deferred(uri) => {
                         html.push_str(&render_deferred_parent(uri, true));
@@ -18234,6 +18633,24 @@ fn render_web_quote<S: Storage>(
     quote_index: &QuoteRenderIndex,
     quote_depth: usize,
 ) -> String {
+    render_web_quote_at(
+        render,
+        storage,
+        embed,
+        quote_index,
+        quote_depth,
+        crate::ingest::visibility_now_us(),
+    )
+}
+
+fn render_web_quote_at<S: Storage>(
+    render: &WebRenderContext,
+    storage: &S,
+    embed: &Value,
+    quote_index: &QuoteRenderIndex,
+    quote_depth: usize,
+    now_us: u64,
+) -> String {
     let Some(reference) = quoted_record_ref(embed) else {
         return String::new();
     };
@@ -18315,6 +18732,11 @@ fn render_web_quote<S: Storage>(
             );
         }
     };
+    if crate::ingest::post_is_too_far_in_future(&quoted, now_us) {
+        return format!(
+            "<a class=\"quoted-post-card quoted-post-status\" href=\"/app/thread?uri={encoded_uri}\">Post unavailable</a>"
+        );
+    }
     let profile = render.author_identity(storage, &quoted.did);
     let handle = profile_handle(&profile, &quoted.did);
     let display_name = profile
@@ -19969,6 +20391,411 @@ mod tests {
     }
 
     #[test]
+    fn future_quote_embed_uses_the_unavailable_post_placeholder() {
+        let storage = MemoryStorage::default();
+        let (now_us, near_date, future_date) = fixed_visibility_test_dates();
+        let mut quoted = test_web_post(
+            "did:plc:futurepost",
+            "future",
+            1_800_000_000_000_000,
+            "future post body must stay hidden",
+            None,
+        );
+        quoted.record["createdAt"] = json!(future_date);
+        let uri = quoted.uri.clone();
+        storage.put_record(&quoted).unwrap();
+
+        let mut near = test_web_post(
+            "did:plc:futurepost",
+            "near",
+            1_800_000_000_000_001,
+            "post within the visibility window remains visible",
+            None,
+        );
+        near.record["createdAt"] = json!(near_date);
+        let near_uri = near.uri.clone();
+        storage.put_record(&near).unwrap();
+
+        let rendered = render_web_quote_at(
+            &WebRenderContext::default(),
+            &storage,
+            &quote_embed(&uri),
+            &QuoteRenderIndex::default(),
+            0,
+            now_us,
+        );
+        let near_rendered = render_web_quote_at(
+            &WebRenderContext::default(),
+            &storage,
+            &quote_embed(&near_uri),
+            &QuoteRenderIndex::default(),
+            0,
+            now_us,
+        );
+
+        assert!(rendered.contains("Post unavailable"), "{rendered}");
+        assert!(
+            !rendered.contains("future post body must stay hidden"),
+            "{rendered}"
+        );
+        assert!(
+            near_rendered.contains("post within the visibility window remains visible"),
+            "{near_rendered}"
+        );
+    }
+
+    #[test]
+    fn future_quote_preview_uses_the_unavailable_post_placeholder() {
+        let storage = MemoryStorage::default();
+        let mut future = test_web_post(
+            "did:plc:future-preview-author",
+            "future-preview",
+            1_800_000_000_000_000,
+            "future quote preview body must stay hidden",
+            None,
+        );
+        future.record["createdAt"] = json!("2999-01-01T00:00:00Z");
+        let preview = render_quote_preview(&storage, &future);
+        assert!(preview.contains("Post unavailable"), "{preview}");
+        assert!(
+            !preview.contains("future quote preview body must stay hidden"),
+            "{preview}"
+        );
+    }
+
+    #[test]
+    fn future_reply_parent_card_uses_the_unavailable_placeholder_at_a_fixed_clock() {
+        let storage = MemoryStorage::default();
+        let (now_us, near_date, future_date) = fixed_visibility_test_dates();
+        let mut future = test_web_post(
+            "did:plc:parentpost",
+            "future-parent",
+            1_800_000_000_000_000,
+            "future parent body must stay hidden",
+            None,
+        );
+        future.record["createdAt"] = json!(future_date);
+        let mut near = test_web_post(
+            "did:plc:parentpost",
+            "near-parent",
+            1_800_000_000_000_001,
+            "parent within the visibility window remains visible",
+            None,
+        );
+        near.record["createdAt"] = json!(near_date);
+
+        let hidden =
+            render_reply_parent_card_at(&WebRenderContext::default(), &storage, &future, now_us);
+        let visible =
+            render_reply_parent_card_at(&WebRenderContext::default(), &storage, &near, now_us);
+        assert!(hidden.contains("Post unavailable"), "{hidden}");
+        assert!(
+            !hidden.contains("future parent body must stay hidden"),
+            "{hidden}"
+        );
+        assert!(
+            visible.contains("parent within the visibility window remains visible"),
+            "{visible}"
+        );
+    }
+
+    #[test]
+    fn web_notifications_hide_future_subject_posts_but_keep_posts_within_the_window() {
+        let storage = MemoryStorage::default();
+        let (now_us, near_date, future_date) = fixed_visibility_test_dates();
+        let viewer = "did:plc:notification-viewer";
+        let mut future = test_web_post(
+            viewer,
+            "future-notification-target",
+            1_800_000_000_000_001,
+            "future notification target",
+            None,
+        );
+        future.record["createdAt"] = json!(future_date);
+        let mut near = test_web_post(
+            viewer,
+            "near-notification-target",
+            1_800_000_000_000_002,
+            "near notification target",
+            None,
+        );
+        near.record["createdAt"] = json!(near_date);
+        storage.put_record(&future).unwrap();
+        storage.put_record(&near).unwrap();
+
+        for (index, subject_uri) in [future.uri.as_str(), near.uri.as_str()]
+            .into_iter()
+            .enumerate()
+        {
+            let author = format!("did:plc:notification-liker-{index}");
+            storage
+                .put_record(&IndexedRecord {
+                    did: author.clone(),
+                    collection: "app.bsky.feed.like".to_owned(),
+                    rkey: format!("like-{index}"),
+                    uri: format!("at://{author}/app.bsky.feed.like/like-{index}"),
+                    cid: Some(format!("cid-like-{index}")),
+                    time_us: 1_800_000_000_000_010 + index as u64,
+                    record: json!({
+                        "subject":{"uri":subject_uri,"cid":"cid-target"},
+                        "createdAt":"2026-11-04T00:00:00Z"
+                    }),
+                })
+                .unwrap();
+        }
+
+        let page =
+            notification_window_page_with_edge_at(&storage, viewer, None, 10, 0, true, now_us)
+                .unwrap();
+        assert_eq!(page.groups.len(), 1);
+        assert_eq!(
+            page.groups[0].reason_subject.as_deref(),
+            Some(near.uri.as_str())
+        );
+    }
+
+    #[test]
+    fn web_notifications_hide_a_future_post_that_is_the_notification_source() {
+        let storage = MemoryStorage::default();
+        let (now_us, _, _) = fixed_visibility_test_dates();
+        let mut future = test_web_post(
+            "did:plc:future-notice-author",
+            "future-notice",
+            1_800_000_000_000_020,
+            "future notification source must stay hidden",
+            None,
+        );
+        future.record["createdAt"] = json!("2999-01-01T00:00:00Z");
+        storage.put_record(&future).unwrap();
+        let event = NotificationEventRow {
+            source_did: future.did.clone(),
+            source_collection: future.collection.clone(),
+            source_rkey: future.rkey.clone(),
+            source_uri: future.uri.clone(),
+            reason: "mention".to_owned(),
+            reason_subject: None,
+            time_us: future.time_us,
+        };
+        assert!(notification_targets_future_post(&storage, &event, now_us).unwrap());
+    }
+
+    #[tokio::test]
+    async fn future_posts_are_removed_from_following_before_page_rendering() {
+        let storage = Arc::new(MemoryStorage::default());
+        let viewer = "did:plc:future-viewer";
+        let author = "did:plc:future-author";
+        let mut future = test_web_post(
+            author,
+            "future",
+            1_800_000_000_000_002,
+            "future timeline post must stay hidden",
+            None,
+        );
+        future.record["createdAt"] = json!("2999-01-01T00:00:00Z");
+        let ordinary = test_web_post(
+            author,
+            "ordinary",
+            1_800_000_000_000_001,
+            "ordinary timeline post remains visible",
+            None,
+        );
+        storage.put_record(&future).unwrap();
+        storage.put_record(&ordinary).unwrap();
+        storage.set_follow(viewer, author, true).unwrap();
+
+        let page = request_test_timeline_at(Arc::clone(&storage), viewer, "/app?limit=1").await;
+
+        assert!(
+            page.contains("ordinary timeline post remains visible"),
+            "{page}"
+        );
+        assert!(
+            !page.contains("future timeline post must stay hidden"),
+            "{page}"
+        );
+
+        let direct = request_test_timeline_at(
+            storage,
+            viewer,
+            &format!("/app/thread?uri={}", form_encoded(&future.uri)),
+        )
+        .await;
+        assert!(
+            direct.contains("future timeline post must stay hidden"),
+            "an exact post thread link still opens the future post: {direct}"
+        );
+    }
+
+    #[tokio::test]
+    async fn future_posts_are_removed_from_profile_lists_and_thread_replies() {
+        let storage = Arc::new(MemoryStorage::default());
+        let viewer = "did:plc:future-profile-viewer";
+        let subject = viewer;
+        let mut future_profile = test_web_post(
+            subject,
+            "profile-future",
+            1_800_000_000_000_010,
+            "future profile post must stay hidden",
+            None,
+        );
+        future_profile.record["createdAt"] = json!("2999-01-01T00:00:00Z");
+        let ordinary_profile = test_web_post(
+            subject,
+            "profile-ordinary",
+            1_800_000_000_000_009,
+            "ordinary profile post remains visible",
+            None,
+        );
+        let root = test_web_post(
+            subject,
+            "thread-root",
+            1_800_000_000_000_001,
+            "thread root",
+            None,
+        );
+        let mut future_reply = test_web_post(
+            subject,
+            "thread-future-reply",
+            1_800_000_000_000_003,
+            "future thread reply must stay hidden",
+            Some(&root.uri),
+        );
+        future_reply.record["createdAt"] = json!("2999-01-01T00:00:00Z");
+        let ordinary_reply = test_web_post(
+            subject,
+            "thread-ordinary-reply",
+            1_800_000_000_000_002,
+            "ordinary thread reply remains visible",
+            Some(&root.uri),
+        );
+        for record in [
+            &future_profile,
+            &ordinary_profile,
+            &root,
+            &future_reply,
+            &ordinary_reply,
+        ] {
+            storage.put_record(record).unwrap();
+        }
+
+        let profile = request_test_timeline_at(
+            Arc::clone(&storage),
+            viewer,
+            &format!("/profile?did={subject}&limit=1"),
+        )
+        .await;
+        assert!(
+            profile.contains("ordinary profile post remains visible"),
+            "{profile}"
+        );
+        assert!(
+            !profile.contains("future profile post must stay hidden"),
+            "{profile}"
+        );
+
+        let thread = request_test_timeline_at(
+            storage,
+            viewer,
+            &format!("/app/thread?uri={}", form_encoded(&root.uri)),
+        )
+        .await;
+        assert!(
+            thread.contains("ordinary thread reply remains visible"),
+            "{thread}"
+        );
+        assert!(
+            !thread.contains("future thread reply must stay hidden"),
+            "{thread}"
+        );
+    }
+
+    #[tokio::test]
+    async fn future_thread_ancestor_uses_the_unavailable_placeholder() {
+        let storage = Arc::new(MemoryStorage::default());
+        let viewer = "did:plc:future-ancestor-viewer";
+        let mut future_ancestor = test_web_post(
+            "did:plc:future-ancestor-author",
+            "future-ancestor",
+            1_800_000_000_000_000,
+            "future thread ancestor body must stay hidden",
+            None,
+        );
+        future_ancestor.record["createdAt"] = json!("2999-01-01T00:00:00Z");
+        let reply = test_web_post(
+            "did:plc:future-ancestor-replier",
+            "ordinary-reply",
+            1_800_000_000_000_001,
+            "ordinary focused reply remains visible",
+            Some(&future_ancestor.uri),
+        );
+        storage.put_record(&future_ancestor).unwrap();
+        storage.put_record(&reply).unwrap();
+
+        let thread = request_test_timeline_at(
+            storage,
+            viewer,
+            &format!("/app/thread?uri={}", form_encoded(&reply.uri)),
+        )
+        .await;
+
+        assert!(
+            thread.contains("ordinary focused reply remains visible"),
+            "{thread}"
+        );
+        assert!(thread.contains("Post unavailable"), "{thread}");
+        assert!(
+            !thread.contains("future thread ancestor body must stay hidden"),
+            "{thread}"
+        );
+    }
+
+    #[test]
+    fn thread_reply_collection_skips_future_children_and_keeps_near_children() {
+        let storage = MemoryStorage::default();
+        let (now_us, near_date, future_date) = fixed_visibility_test_dates();
+        let root = test_web_post(
+            "did:plc:reply-collector",
+            "root",
+            1_800_000_000_000_000,
+            "thread root",
+            None,
+        );
+        let mut future = test_web_post(
+            "did:plc:reply-collector",
+            "future-reply",
+            1_800_000_000_000_002,
+            "future collected reply must stay hidden",
+            Some(&root.uri),
+        );
+        future.record["createdAt"] = json!(future_date);
+        let mut near = test_web_post(
+            "did:plc:reply-collector",
+            "near-reply",
+            1_800_000_000_000_001,
+            "near collected reply remains visible",
+            Some(&root.uri),
+        );
+        near.record["createdAt"] = json!(near_date);
+        for reply in [&root, &future, &near] {
+            storage.put_record(reply).unwrap();
+        }
+
+        let mut budget = 10;
+        let mut collected = Vec::new();
+        collect_thread_reply_records(&storage, &root, 2, now_us, &mut budget, &mut collected)
+            .unwrap();
+
+        assert_eq!(
+            collected
+                .iter()
+                .map(|record| record.uri.as_str())
+                .collect::<Vec<_>>(),
+            [near.uri.as_str()]
+        );
+        assert!(budget < 10, "the visible child consumes the reply budget");
+    }
+
+    #[test]
     fn case33_nested_quote_link_keeps_its_label_and_adds_the_known_author_handle() {
         let storage = MemoryStorage::default();
         let did = "did:plc:nested-author";
@@ -20212,6 +21039,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fetch_error.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn parent_fragment_hides_a_future_record_even_in_thread_view() {
+        let storage = Arc::new(MemoryStorage::default());
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let viewer = "did:plc:parent-fragment-future-viewer";
+        let mut future = test_web_post(
+            "did:plc:parent-fragment-future-author",
+            "future-parent",
+            1_800_000_000_000_000,
+            "future parent fragment body must stay hidden",
+            None,
+        );
+        future.record["createdAt"] = json!("2999-01-01T00:00:00Z");
+        storage.put_record(&future).unwrap();
+        let cookie = recent_posts_session(&storage, &public, viewer);
+        let app = public.router_with_flow(DisabledOAuthFlow, storage);
+
+        let (status, html) = recent_posts_get(
+            &app,
+            format!(
+                "/parent-fragment?view=thread&uri={}",
+                form_encoded(&future.uri)
+            ),
+            &format!("{SESSION_COOKIE}={cookie}"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(html.contains("Post unavailable"), "{html}");
+        assert!(
+            !html.contains("future parent fragment body must stay hidden"),
+            "{html}"
+        );
     }
 
     #[tokio::test]
@@ -22180,6 +23042,61 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn grouped_future_timeline_ancestor_uses_the_unavailable_placeholder() {
+        let storage = MemoryStorage::default();
+        let group_time_us = (OffsetDateTime::parse("2026-10-29T12:00:00Z", &Rfc3339)
+            .unwrap()
+            .unix_timestamp_nanos()
+            / 1_000) as u64;
+        let mut future_ancestor = test_web_post(
+            "did:plc:group-future-parent",
+            "future-parent",
+            group_time_us,
+            "future grouped ancestor body must stay hidden",
+            None,
+        );
+        future_ancestor.record["createdAt"] = json!("2999-01-01T00:00:00Z");
+        let first = test_web_post(
+            "did:plc:group-first-reply",
+            "first",
+            group_time_us + 1,
+            "first page reply",
+            Some(&future_ancestor.uri),
+        );
+        let newest = test_web_post(
+            "did:plc:group-newest-reply",
+            "newest",
+            group_time_us + 2,
+            "newest page reply",
+            Some(&first.uri),
+        );
+        let records = [&first, &newest];
+        let parents = HashMap::from([(future_ancestor.uri.clone(), Some(future_ancestor))]);
+        let html = render_timeline_post_items(
+            &storage,
+            &records,
+            &[String::new(), String::new()],
+            &parents,
+            &TimelineRenderContext {
+                viewer_did: "did:plc:group-viewer",
+                rights: FormRights::default(),
+                quote_index: &QuoteRenderIndex::default(),
+                page_interactions: &PageInteractionIndex::new(),
+                list_blocks: &HashMap::new(),
+                render: &WebRenderContext::default(),
+            },
+        );
+
+        assert!(html.contains("class=\"post-item thread-group\""), "{html}");
+        assert!(html.contains("Post unavailable"), "{html}");
+        assert!(
+            !html.contains("future grouped ancestor body must stay hidden"),
+            "{html}"
+        );
+        assert!(html.contains("newest page reply"), "{html}");
+    }
+
     #[tokio::test]
     async fn timeline_caps_mixed_author_thread_and_links_to_skipped_replies() {
         let storage = Arc::new(MemoryStorage::default());
@@ -23556,6 +24473,133 @@ mod tests {
             time_us,
             record,
         }
+    }
+
+    #[test]
+    fn pending_home_timeline_overlay_hides_future_posts_and_keeps_pages_contiguous() {
+        let (now_us, _, future_created_at) = fixed_visibility_test_dates();
+        let viewer = "did:plc:av83-test-viewer";
+        let ordinary = (1..=4)
+            .map(|number| {
+                test_web_post(
+                    "did:plc:av83-test-author",
+                    &format!("ordinary-{number}"),
+                    500 - number,
+                    &format!("ordinary {number}"),
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut indexed_future = test_web_post(
+            "did:plc:av83-test-author",
+            "indexed-future",
+            495,
+            "indexed future post",
+            None,
+        );
+        indexed_future.record["createdAt"] = json!(future_created_at);
+        let indexed_posts = [
+            ordinary[0].clone(),
+            indexed_future.clone(),
+            ordinary[1].clone(),
+            ordinary[2].clone(),
+            ordinary[3].clone(),
+        ];
+        let mut fetch_page = |cursor: Option<&(u64, String)>, batch_limit: usize| {
+            let start = match cursor {
+                Some(cursor) => {
+                    indexed_posts
+                        .iter()
+                        .position(|record| record.time_us == cursor.0 && record.uri == cursor.1)
+                        .expect("the cursor must identify an indexed record")
+                        + 1
+                }
+                None => 0,
+            };
+            Ok(indexed_posts
+                .iter()
+                .skip(start)
+                .take(batch_limit)
+                .cloned()
+                .collect::<Vec<_>>())
+        };
+        let mut cursor_after = |record: &IndexedRecord| (record.time_us, record.uri.clone());
+        let (first_indexed, first_has_more, next_cursor) =
+            crate::ingest::filtered_post_page(None, 2, now_us, &mut fetch_page, &mut cursor_after)
+                .unwrap();
+        assert!(first_has_more);
+
+        let pending_post = test_web_post(viewer, "pending", 600, "pending post", None);
+        let mut pending_future =
+            test_web_post(viewer, "pending-future", 700, "pending future post", None);
+        pending_future.record["createdAt"] = json!(future_created_at);
+        let first_page = home_timeline_page_records(
+            first_indexed,
+            Some(vec![pending_post.clone(), pending_future.clone()]),
+            2,
+            now_us,
+        );
+
+        assert_eq!(
+            first_page
+                .iter()
+                .map(|record| record.uri.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                pending_post.uri.as_str(),
+                ordinary[0].uri.as_str(),
+                ordinary[1].uri.as_str()
+            ]
+        );
+        assert!(!first_page.iter().any(|record| {
+            record.uri == indexed_future.uri || record.uri == pending_future.uri
+        }));
+        assert_eq!(
+            next_cursor.as_ref().map(|cursor| cursor.1.as_str()),
+            Some(ordinary[1].uri.as_str()),
+            "the next cursor must come from the last indexed post shown"
+        );
+
+        let (second_indexed, second_has_more, second_cursor) = crate::ingest::filtered_post_page(
+            next_cursor,
+            2,
+            now_us,
+            &mut fetch_page,
+            &mut cursor_after,
+        )
+        .unwrap();
+        assert!(!second_has_more);
+        assert!(second_cursor.is_none());
+        let second_page = home_timeline_page_records(second_indexed, None, 2, now_us);
+        assert_eq!(
+            second_page
+                .iter()
+                .map(|record| record.uri.as_str())
+                .collect::<Vec<_>>(),
+            vec![ordinary[2].uri.as_str(), ordinary[3].uri.as_str()]
+        );
+        let ordinary_across_pages = first_page
+            .iter()
+            .chain(&second_page)
+            .filter(|record| record.uri != pending_post.uri)
+            .map(|record| record.uri.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordinary_across_pages,
+            ordinary
+                .iter()
+                .map(|record| record.uri.as_str())
+                .collect::<Vec<_>>(),
+            "pages must cover each ordinary indexed post once and in order"
+        );
+    }
+
+    fn fixed_visibility_test_dates() -> (u64, String, String) {
+        let now = OffsetDateTime::parse("2026-11-05T00:00:00Z", &Rfc3339).unwrap();
+        let now_us = (now.unix_timestamp_nanos() / 1_000) as u64;
+        let near = (now + time::Duration::days(29)).format(&Rfc3339).unwrap();
+        let future = (now + time::Duration::days(31)).format(&Rfc3339).unwrap();
+        (now_us, near, future)
     }
 
     fn put_test_profile(storage: &MemoryStorage, did: &str, display_name: &str) {
@@ -26959,6 +28003,275 @@ mod tests {
                 post: false,
             },
         )
+    }
+
+    #[derive(Clone)]
+    struct StaticFutureFeedFlow {
+        pages: Vec<crate::feeds::FeedTimeline>,
+        calls: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    impl StaticFutureFeedFlow {
+        fn new(pages: Vec<crate::feeds::FeedTimeline>) -> Self {
+            Self {
+                pages,
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl OAuthFlow for StaticFutureFeedFlow {
+        fn authorize<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: Vec<String>,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async { Err("test flow does not authorize".to_owned()) })
+        }
+
+        fn callback<'a>(
+            &'a self,
+            _: OAuthCallback,
+        ) -> Pin<Box<dyn Future<Output = Result<OAuthAccount, String>> + Send + 'a>> {
+            Box::pin(async { Err("test flow does not callback".to_owned()) })
+        }
+
+        fn logout<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn feed_timeline<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            cursor: Option<&'a str>,
+            _: Arc<dyn Storage>,
+        ) -> Pin<Box<dyn Future<Output = Result<crate::feeds::FeedTimeline, String>> + Send + 'a>>
+        {
+            self.calls.lock().unwrap().push(cursor.map(str::to_owned));
+            let page_index = cursor
+                .and_then(|cursor| cursor.strip_prefix("feed-page-"))
+                .and_then(|index| index.parse::<usize>().ok())
+                .unwrap_or_else(|| usize::from(cursor.is_some()));
+            let page = self
+                .pages
+                .get(page_index)
+                .or_else(|| self.pages.last())
+                .cloned()
+                .expect("test flow has at least one page");
+            Box::pin(async move { Ok(page) })
+        }
+    }
+
+    #[tokio::test]
+    async fn future_posts_are_removed_from_custom_feed_skeletons() {
+        let storage = Arc::new(MemoryStorage::default());
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let viewer = "did:plc:future-feed-viewer";
+        let mut future = test_web_post(
+            "did:plc:future-feed-author",
+            "future-feed",
+            1_800_000_000_000_002,
+            "future custom feed post must stay hidden",
+            None,
+        );
+        future.record["createdAt"] = json!("2999-01-01T00:00:00Z");
+        let ordinary = test_web_post(
+            "did:plc:future-feed-author",
+            "ordinary-feed",
+            1_800_000_000_000_001,
+            "ordinary custom feed post remains visible",
+            None,
+        );
+        let feed_uri = "at://did:plc:future-feed-maker/app.bsky.feed.generator/example";
+        let flow = StaticFutureFeedFlow::new(vec![crate::feeds::FeedTimeline {
+            generator: ResolvedFeed {
+                uri: feed_uri.to_owned(),
+                display_name: "Fixture feed".to_owned(),
+                description: None,
+                avatar: None,
+                service_did: "did:plc:future-feed-service".to_owned(),
+                endpoint: "https://feed.example/xrpc".to_owned(),
+                unavailable: false,
+            },
+            timeline: crate::feeds::HydratedFeedPage {
+                feed: vec![
+                    crate::feeds::HydratedFeedPost {
+                        record: future,
+                        reposted_by: None,
+                    },
+                    crate::feeds::HydratedFeedPost {
+                        record: ordinary,
+                        reposted_by: None,
+                    },
+                ],
+                cursor: None,
+                dropped_count: 0,
+                posts_local: 2,
+                post_routes: crate::feeds::PostRouteStats::default(),
+            },
+            timing: crate::feeds::FeedTimelineTiming::default(),
+        }]);
+        let cookie = recent_posts_session(&storage, &public, viewer);
+        let app = public.router_with_flow(flow, storage);
+
+        let (status, html) = recent_posts_get(
+            &app,
+            format!("/app/feed?uri={}", form_encoded(feed_uri)),
+            &format!("{SESSION_COOKIE}={cookie}"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            html.contains("ordinary custom feed post remains visible"),
+            "{html}"
+        );
+        assert!(
+            !html.contains("future custom feed post must stay hidden"),
+            "{html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn future_custom_feed_posts_refill_the_page_from_the_next_cursor() {
+        let storage = Arc::new(MemoryStorage::default());
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let viewer = "did:plc:future-feed-refill-viewer";
+        let mut future_posts = Vec::new();
+        let mut ordinary_posts = Vec::new();
+        for index in 0..30 {
+            let mut future = test_web_post(
+                "did:plc:future-feed-refill-author",
+                &format!("future-{index:02}"),
+                1_800_000_000_000_100 + index,
+                &format!("future custom feed row {index:02}"),
+                None,
+            );
+            future.record["createdAt"] = json!("2999-01-01T00:00:00Z");
+            future_posts.push(crate::feeds::HydratedFeedPost {
+                record: future,
+                reposted_by: None,
+            });
+            ordinary_posts.push(crate::feeds::HydratedFeedPost {
+                record: test_web_post(
+                    "did:plc:future-feed-refill-author",
+                    &format!("ordinary-{index:02}"),
+                    1_800_000_000_000_000 + index,
+                    &format!("ordinary custom feed refill row {index:02}"),
+                    None,
+                ),
+                reposted_by: None,
+            });
+        }
+        let feed = ResolvedFeed {
+            uri: "at://did:plc:future-feed-refill-maker/app.bsky.feed.generator/example".to_owned(),
+            display_name: "Fixture feed".to_owned(),
+            description: None,
+            avatar: None,
+            service_did: "did:plc:future-feed-refill-service".to_owned(),
+            endpoint: "https://feed.example/xrpc".to_owned(),
+            unavailable: false,
+        };
+        let make_page = |posts: Vec<crate::feeds::HydratedFeedPost>, cursor: Option<&str>| {
+            crate::feeds::FeedTimeline {
+                generator: feed.clone(),
+                timeline: crate::feeds::HydratedFeedPage {
+                    feed: posts,
+                    cursor: cursor.map(str::to_owned),
+                    dropped_count: 0,
+                    posts_local: 30,
+                    post_routes: crate::feeds::PostRouteStats::default(),
+                },
+                timing: crate::feeds::FeedTimelineTiming::default(),
+            }
+        };
+        let flow = StaticFutureFeedFlow::new(vec![
+            make_page(future_posts, Some("feed-next")),
+            make_page(ordinary_posts, None),
+        ]);
+        let cookie = recent_posts_session(&storage, &public, viewer);
+        let app = public.router_with_flow(flow, storage);
+
+        let (status, html) = recent_posts_get(
+            &app,
+            format!("/app/feed?uri={}", form_encoded(&feed.uri)),
+            &format!("{SESSION_COOKIE}={cookie}"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(html.matches("ordinary custom feed refill row").count(), 30);
+        assert!(!html.contains("future custom feed row"), "{html}");
+    }
+
+    #[tokio::test]
+    async fn future_only_custom_feed_refill_stops_after_eight_pages_and_keeps_the_cursor() {
+        let storage = Arc::new(MemoryStorage::default());
+        let public = OAuthPublic::new_loopback("127.0.0.1:3000".parse().unwrap()).unwrap();
+        let viewer = "did:plc:future-feed-cap-viewer";
+        let feed = ResolvedFeed {
+            uri: "at://did:plc:future-feed-cap-maker/app.bsky.feed.generator/example".to_owned(),
+            display_name: "Fixture feed".to_owned(),
+            description: None,
+            avatar: None,
+            service_did: "did:plc:future-feed-cap-service".to_owned(),
+            endpoint: "https://feed.example/xrpc".to_owned(),
+            unavailable: false,
+        };
+        let pages = (0..8)
+            .map(|index| {
+                let mut future = test_web_post(
+                    "did:plc:future-feed-cap-author",
+                    &format!("future-{index}"),
+                    1_800_000_000_000_100 + index,
+                    "hidden future-only custom feed row",
+                    None,
+                );
+                future.record["createdAt"] = json!("2999-01-01T00:00:00Z");
+                crate::feeds::FeedTimeline {
+                    generator: feed.clone(),
+                    timeline: crate::feeds::HydratedFeedPage {
+                        feed: vec![crate::feeds::HydratedFeedPost {
+                            record: future,
+                            reposted_by: None,
+                        }],
+                        cursor: Some(if index == 7 {
+                            "feed-resume".to_owned()
+                        } else {
+                            format!("feed-page-{}", index + 1)
+                        }),
+                        dropped_count: 0,
+                        posts_local: 1,
+                        post_routes: crate::feeds::PostRouteStats::default(),
+                    },
+                    timing: crate::feeds::FeedTimelineTiming::default(),
+                }
+            })
+            .collect();
+        let flow = StaticFutureFeedFlow::new(pages);
+        let calls = Arc::clone(&flow.calls);
+        let cookie = recent_posts_session(&storage, &public, viewer);
+        let app = public.router_with_flow(flow, storage);
+
+        let (status, html) = recent_posts_get(
+            &app,
+            format!("/app/feed?uri={}", form_encoded(&feed.uri)),
+            &format!("{SESSION_COOKIE}={cookie}"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert_eq!(calls.lock().unwrap().len(), 8, "{html}");
+        assert!(
+            !html.contains("hidden future-only custom feed row"),
+            "{html}"
+        );
+        assert!(html.contains("cursor=feed-resume"), "{html}");
     }
 
     #[tokio::test]

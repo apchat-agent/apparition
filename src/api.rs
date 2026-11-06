@@ -2,7 +2,8 @@ use crate::{
     http_security,
     identity::IdentityBackend,
     ingest::{
-        IndexedRecord, NotificationCursor, RecordCursor, Storage, StorageError, web_storage_call,
+        IndexedRecord, NotificationCursor, RecordCursor, Storage, StorageError, filtered_post_page,
+        post_is_too_far_in_future, visibility_now_us, web_storage_call,
     },
     jwt::{ServiceClaims, ServiceJwtVerifier},
     profile_counts::{ProfileCountsClient, apply_profile_counts},
@@ -329,29 +330,34 @@ async fn get_author_feed<S: Storage + 'static, B: IdentityBackend>(
         .get("filter")
         .is_none_or(|filter| filter != "posts_no_replies");
     let viewer = claims.map(|claims| claims.iss);
+    let now_us = visibility_now_us();
     let (feed, next_cursor) = api_storage_call(
         Arc::clone(&state.storage),
         "author_feed_page",
         move |storage| {
-            let page_records =
-                storage.author_posts(&actor, cursor.as_ref(), limit + 1, include_replies)?;
-            let feed_records = page_records.iter().take(limit).cloned().collect::<Vec<_>>();
-            let feed = post_views_for_page(storage, &feed_records, viewer.as_deref())?
+            let (feed_records, has_more, next_cursor) = filtered_post_page(
+                cursor.clone(),
+                limit,
+                now_us,
+                |cursor, batch_limit| {
+                    storage.author_posts(&actor, cursor, batch_limit, include_replies)
+                },
+                |record| RecordCursor {
+                    time_us: record.time_us,
+                    uri: record.uri.clone(),
+                },
+            )?;
+            let feed_records = &feed_records[..feed_records.len().min(limit)];
+            let feed = post_views_for_page(storage, feed_records, viewer.as_deref())?
                 .into_iter()
                 .map(|post| json!({"post":post}))
                 .collect::<Vec<_>>();
-            let next_cursor = if page_records.len() > limit {
-                page_records.get(limit - 1).map(|last| {
-                    RecordCursor {
-                        time_us: last.time_us,
-                        uri: last.uri.clone(),
-                    }
-                    .encode()
-                })
-            } else {
-                None
-            };
-            Ok((feed, next_cursor))
+            Ok((
+                feed,
+                has_more
+                    .then(|| next_cursor.map(|cursor| cursor.encode()))
+                    .flatten(),
+            ))
         },
     )
     .await?;
@@ -405,19 +411,23 @@ async fn get_post_thread<S: Storage + 'static, B: IdentityBackend>(
         .unwrap_or(80)
         .min(20);
     let viewer_did = claims.map(|claims| claims.iss);
+    let now_us = visibility_now_us();
     let thread = api_storage_call(Arc::clone(&state.storage), "post_thread", move |storage| {
         let Some(post) = storage.record_by_uri(POST, &uri)? else {
             return Ok(None);
         };
-        let mut budget = 100;
+        let mut context = ThreadViewContext {
+            now_us,
+            visited: HashSet::new(),
+            budget: 100,
+        };
         thread_view(
             storage,
             &post,
             depth,
             parent_height,
             viewer_did.as_deref(),
-            &mut HashSet::new(),
-            &mut budget,
+            &mut context,
         )
         .map(Some)
     })
@@ -426,20 +436,25 @@ async fn get_post_thread<S: Storage + 'static, B: IdentityBackend>(
     Ok(Json(json!({"thread":thread})))
 }
 
+struct ThreadViewContext {
+    now_us: u64,
+    visited: HashSet<String>,
+    budget: usize,
+}
+
 fn thread_view<S: Storage>(
     storage: &S,
     record: &IndexedRecord,
     depth: usize,
     parent_height: usize,
     viewer_did: Option<&str>,
-    visited: &mut HashSet<String>,
-    budget: &mut usize,
+    context: &mut ThreadViewContext,
 ) -> Result<Value, StorageError> {
-    if *budget == 0 {
+    if context.budget == 0 {
         return Ok(Value::Null);
     }
-    *budget -= 1;
-    if !visited.insert(record.uri.clone()) {
+    context.budget -= 1;
+    if !context.visited.insert(record.uri.clone()) {
         return Ok(json!({
             "$type":"app.bsky.feed.defs#threadViewPost",
             "post":post_view(storage, record, viewer_did)?,
@@ -454,15 +469,11 @@ fn thread_view<S: Storage>(
         {
             let parent = storage.record_by_uri(POST, parent_uri)?;
             if let Some(parent) = parent {
-                Some(thread_view(
-                    storage,
-                    &parent,
-                    0,
-                    parent_height - 1,
-                    viewer_did,
-                    visited,
-                    budget,
-                )?)
+                Some(if post_is_too_far_in_future(&parent, context.now_us) {
+                    json!({"$type":"app.bsky.feed.defs#notFoundPost","uri":parent.uri})
+                } else {
+                    thread_view(storage, &parent, 0, parent_height - 1, viewer_did, context)?
+                })
             } else {
                 None
             }
@@ -473,12 +484,15 @@ fn thread_view<S: Storage>(
         None
     }
     .unwrap_or(Value::Null);
-    let replies = if depth > 0 && *budget > 0 {
-        let candidates = storage.replies_to(&record.uri, (*budget).min(MAX_XRPC_PAGE_SIZE))?;
+    let replies = if depth > 0 && context.budget > 0 {
+        let candidates = storage.replies_to(&record.uri, context.budget.min(MAX_XRPC_PAGE_SIZE))?;
         let mut replies = Vec::new();
         for reply in candidates {
-            if *budget == 0 {
+            if context.budget == 0 {
                 break;
+            }
+            if post_is_too_far_in_future(&reply, context.now_us) {
+                continue;
             }
             replies.push(thread_view(
                 storage,
@@ -486,15 +500,14 @@ fn thread_view<S: Storage>(
                 depth - 1,
                 0,
                 viewer_did,
-                visited,
-                budget,
+                context,
             )?);
         }
         replies
     } else {
         Vec::new()
     };
-    visited.remove(&record.uri);
+    context.visited.remove(&record.uri);
     Ok(json!({
         "$type":"app.bsky.feed.defs#threadViewPost",
         "post":post_view(storage, record, viewer_did)?,
@@ -517,28 +530,32 @@ async fn get_timeline<S: Storage + 'static, B: IdentityBackend>(
     let cursor = query
         .get("cursor")
         .and_then(|cursor| RecordCursor::parse(cursor));
+    let now_us = visibility_now_us();
     let (feed, next_cursor) = api_storage_call(
         Arc::clone(&state.storage),
         "timeline_page",
         move |storage| {
-            let page_records = storage.timeline_posts(&actor, cursor.as_ref(), limit + 1)?;
-            let feed_records = page_records.iter().take(limit).cloned().collect::<Vec<_>>();
-            let feed = post_views_for_page(storage, &feed_records, Some(&actor))?
+            let (feed_records, has_more, next_cursor) = filtered_post_page(
+                cursor.clone(),
+                limit,
+                now_us,
+                |cursor, batch_limit| storage.timeline_posts(&actor, cursor, batch_limit),
+                |record| RecordCursor {
+                    time_us: record.time_us,
+                    uri: record.uri.clone(),
+                },
+            )?;
+            let feed_records = &feed_records[..feed_records.len().min(limit)];
+            let feed = post_views_for_page(storage, feed_records, Some(&actor))?
                 .into_iter()
                 .map(|post| json!({"post":post}))
                 .collect::<Vec<_>>();
-            let next_cursor = if page_records.len() > limit {
-                page_records.get(limit - 1).map(|last| {
-                    RecordCursor {
-                        time_us: last.time_us,
-                        uri: last.uri.clone(),
-                    }
-                    .encode()
-                })
-            } else {
-                None
-            };
-            Ok((feed, next_cursor))
+            Ok((
+                feed,
+                has_more
+                    .then(|| next_cursor.map(|cursor| cursor.encode()))
+                    .flatten(),
+            ))
         },
     )
     .await?;
@@ -703,12 +720,46 @@ async fn list_notifications<S: Storage + 'static, B: IdentityBackend>(
     let before = query
         .get("cursor")
         .and_then(|cursor| NotificationCursor::parse(cursor));
+    let now_us = visibility_now_us();
     let (notifications, next_cursor) = api_storage_call(
         Arc::clone(&state.storage),
         "notifications_page",
         move |storage| {
-            let page = storage.notifications_for(&actor, before.as_ref(), limit + 1)?;
-            let notifications = page.iter().take(limit).map(|notice| {
+            let batch_limit = (limit + 1).min(100);
+            let mut scan_cursor = before.clone();
+            let mut visible = Vec::new();
+            loop {
+                let page = storage.notifications_for(&actor, scan_cursor.as_ref(), batch_limit)?;
+                if page.is_empty() {
+                    break;
+                }
+                let page_len = page.len();
+                for notice in page {
+                    scan_cursor = Some(NotificationCursor {
+                        time_us: notice.record.time_us,
+                        uri: notice.record.uri.clone(),
+                        reason: notice.reason.clone(),
+                    });
+                    let mut hidden = post_is_too_far_in_future(&notice.record, now_us);
+                    if !hidden
+                        && let Some(subject_uri) = notice.reason_subject.as_deref()
+                        && let Some(subject) = storage.record_by_uri(POST, subject_uri)?
+                    {
+                        hidden = post_is_too_far_in_future(&subject, now_us);
+                    }
+                    if hidden {
+                        continue;
+                    }
+                    visible.push(notice);
+                    if visible.len() > limit {
+                        break;
+                    }
+                }
+                if visible.len() > limit || page_len < batch_limit {
+                    break;
+                }
+            }
+            let notifications = visible.iter().take(limit).map(|notice| {
                 let record = &notice.record;
                 json!({
                 "$type":"app.bsky.notification.listNotifications#notification",
@@ -716,8 +767,8 @@ async fn list_notifications<S: Storage + 'static, B: IdentityBackend>(
                 "reason":notice.reason,"reasonSubject":notice.reason_subject,"record":record.record,"isRead":false,
                 "indexedAt":record.record.get("createdAt").cloned().unwrap_or_else(|| json!(timestamp_us_to_rfc3339(record.time_us)))
             })}).collect::<Vec<_>>();
-            let next_cursor = if page.len() > limit {
-                page.get(limit - 1).map(|last| NotificationCursor {
+            let next_cursor = if visible.len() > limit {
+                visible.get(limit - 1).map(|last| NotificationCursor {
                     time_us: last.record.time_us,
                     uri: last.record.uri.clone(),
                     reason: last.reason.clone(),
