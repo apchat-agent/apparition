@@ -1419,6 +1419,8 @@ pub struct MemoryStorage {
     #[cfg(test)]
     apply_jetstream_busy_failures: AtomicUsize,
     #[cfg(test)]
+    apply_jetstream_nonlock_failures: AtomicUsize,
+    #[cfg(test)]
     apply_jetstream_attempts: AtomicUsize,
     #[cfg(test)]
     jetstream_lock_retries: AtomicUsize,
@@ -1428,6 +1430,12 @@ impl MemoryStorage {
     #[cfg(test)]
     fn set_apply_jetstream_busy_failures(&self, failures: usize) {
         self.apply_jetstream_busy_failures
+            .store(failures, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn set_apply_jetstream_nonlock_failures(&self, failures: usize) {
+        self.apply_jetstream_nonlock_failures
             .store(failures, Ordering::SeqCst);
     }
 
@@ -1649,6 +1657,11 @@ impl Storage for MemoryStorage {
                     rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
                     Some("database is locked".to_owned()),
                 )));
+            }
+            if self.apply_jetstream_nonlock_failures.load(Ordering::SeqCst) > 0 {
+                self.apply_jetstream_nonlock_failures
+                    .fetch_sub(1, Ordering::SeqCst);
+                return Err(StorageError::Poisoned);
             }
         }
         let started = Instant::now();
@@ -3102,9 +3115,46 @@ struct WalMetrics {
     ckpt_passive_max_ns: AtomicU64,
     ckpt_truncate_max_ns: AtomicU64,
     active_checkpoint: AtomicUsize,
+    passive_checkpoint_generation: AtomicU64,
+    truncate_checkpoint_generation: AtomicU64,
+}
+
+#[derive(Clone, Copy)]
+struct CheckpointObservation {
+    active_checkpoint: usize,
+    passive_generation: u64,
+    truncate_generation: u64,
+}
+
+struct CheckpointActivity<'a> {
+    metrics: &'a WalMetrics,
 }
 
 impl WalMetrics {
+    fn checkpoint_observation(&self) -> CheckpointObservation {
+        CheckpointObservation {
+            active_checkpoint: self.active_checkpoint.load(Ordering::Acquire),
+            passive_generation: self.passive_checkpoint_generation.load(Ordering::Acquire),
+            truncate_generation: self.truncate_checkpoint_generation.load(Ordering::Acquire),
+        }
+    }
+
+    fn checkpoint_activity(&self, kind: usize) -> CheckpointActivity<'_> {
+        match kind {
+            CHECKPOINT_PASSIVE => {
+                self.passive_checkpoint_generation
+                    .fetch_add(1, Ordering::Release);
+            }
+            CHECKPOINT_TRUNCATE => {
+                self.truncate_checkpoint_generation
+                    .fetch_add(1, Ordering::Release);
+            }
+            _ => unreachable!("unknown checkpoint kind"),
+        }
+        self.active_checkpoint.store(kind, Ordering::Release);
+        CheckpointActivity { metrics: self }
+    }
+
     fn record_checkpoint(&self, file_bytes: u64, frames: u64, checkpointed: u64, reset: bool) {
         self.file_bytes.store(file_bytes, Ordering::Relaxed);
         self.frames.store(frames, Ordering::Relaxed);
@@ -3115,6 +3165,14 @@ impl WalMetrics {
     fn record_skipped_checkpoint(&self, file_bytes: u64) {
         self.file_bytes.store(file_bytes, Ordering::Relaxed);
         self.reset.store(false, Ordering::Relaxed);
+    }
+}
+
+impl Drop for CheckpointActivity<'_> {
+    fn drop(&mut self) {
+        self.metrics
+            .active_checkpoint
+            .store(CHECKPOINT_NONE, Ordering::Release);
     }
 }
 
@@ -3311,11 +3369,13 @@ impl SqliteWriter {
         operation: impl FnOnce(&mut Connection) -> Result<R, StorageError> + Send + 'static,
     ) -> Result<R, StorageError> {
         let kind = current_sqlite_operation_kind("writer_call");
+        let wal_metrics = Arc::clone(&self.wal_metrics);
         let (reply, result) = mpsc::sync_channel(1);
         let command = SqliteWriterMessage::Blocking(
             kind,
             Box::new(move |connection| {
-                let _ = reply.send(operation(connection));
+                let observed = wal_metrics.checkpoint_observation();
+                let _ = reply.send((operation(connection), observed));
             }),
         );
         self.metrics.queued();
@@ -3327,12 +3387,15 @@ impl SqliteWriter {
             self.metrics.dequeued();
             return Err(StorageError::WriterStopped);
         }
-        let result = result.recv().map_err(|_| StorageError::WriterStopped)?;
+        let (result, observed) = result.recv().map_err(|_| StorageError::WriterStopped)?;
         if let Err(error) = &result
             && is_sqlite_busy_error(error)
         {
-            self.metrics
-                .record_busy(kind, error, checkpoint_lock_holder(&self.wal_metrics));
+            self.metrics.record_busy(
+                kind,
+                error,
+                checkpoint_lock_holder_since(&self.wal_metrics, observed),
+            );
         }
         result
     }
@@ -3342,11 +3405,13 @@ impl SqliteWriter {
         operation: impl FnOnce(&mut Connection) -> Result<R, StorageError> + Send + 'static,
     ) -> Result<R, StorageError> {
         let kind = current_sqlite_operation_kind("ingest_batch");
+        let wal_metrics = Arc::clone(&self.wal_metrics);
         let (reply, result) = mpsc::sync_channel(1);
         let command = SqliteWriterMessage::Urgent(
             kind,
             Box::new(move |connection| {
-                let _ = reply.send(operation(connection));
+                let observed = wal_metrics.checkpoint_observation();
+                let _ = reply.send((operation(connection), observed));
             }),
         );
         self.metrics.queued();
@@ -3367,12 +3432,15 @@ impl SqliteWriter {
                 .fetch_sub(1, Ordering::Relaxed);
             return Err(StorageError::WriterStopped);
         }
-        let result = result.recv().map_err(|_| StorageError::WriterStopped)?;
+        let (result, observed) = result.recv().map_err(|_| StorageError::WriterStopped)?;
         if let Err(error) = &result
             && is_sqlite_busy_error(error)
         {
-            self.metrics
-                .record_busy(kind, error, checkpoint_lock_holder(&self.wal_metrics));
+            self.metrics.record_busy(
+                kind,
+                error,
+                checkpoint_lock_holder_since(&self.wal_metrics, observed),
+            );
         }
         result
     }
@@ -3438,10 +3506,29 @@ fn is_sqlite_busy_error(error: &StorageError) -> bool {
         || message.contains("database table is locked")
 }
 
-fn checkpoint_lock_holder(wal_metrics: &WalMetrics) -> &'static str {
-    match wal_metrics.active_checkpoint.load(Ordering::Relaxed) {
+fn checkpoint_lock_holder_since(
+    wal_metrics: &WalMetrics,
+    observed: CheckpointObservation,
+) -> &'static str {
+    match wal_metrics.active_checkpoint.load(Ordering::Acquire) {
         CHECKPOINT_PASSIVE => "checkpoint_PASSIVE",
         CHECKPOINT_TRUNCATE => "checkpoint_TRUNCATE",
+        _ if observed.active_checkpoint == CHECKPOINT_PASSIVE => "checkpoint_PASSIVE",
+        _ if observed.active_checkpoint == CHECKPOINT_TRUNCATE => "checkpoint_TRUNCATE",
+        _ if wal_metrics
+            .truncate_checkpoint_generation
+            .load(Ordering::Acquire)
+            != observed.truncate_generation =>
+        {
+            "checkpoint_TRUNCATE"
+        }
+        _ if wal_metrics
+            .passive_checkpoint_generation
+            .load(Ordering::Acquire)
+            != observed.passive_generation =>
+        {
+            "checkpoint_PASSIVE"
+        }
         _ => "unknown_or_external_writer",
     }
 }
@@ -3522,6 +3609,7 @@ fn sqlite_writer_loop(
                         Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
                     }
                 }
+                let checkpoint_observed = wal_metrics.checkpoint_observation();
                 let started = Instant::now();
                 let mut completions = Vec::new();
                 let mut batch_error = None;
@@ -3553,7 +3641,10 @@ fn sqlite_writer_loop(
                                         metrics.record_busy(
                                             batch_kind,
                                             &error,
-                                            checkpoint_lock_holder(&wal_metrics),
+                                            checkpoint_lock_holder_since(
+                                                &wal_metrics,
+                                                checkpoint_observed,
+                                            ),
                                         );
                                     }
                                     tracing::warn!(%error, "SQLite queued write failed");
@@ -3575,7 +3666,7 @@ fn sqlite_writer_loop(
                                 metrics.record_busy(
                                     batch_kind,
                                     &error,
-                                    checkpoint_lock_holder(&wal_metrics),
+                                    checkpoint_lock_holder_since(&wal_metrics, checkpoint_observed),
                                 );
                             }
                             tracing::warn!(%error, "SQLite queued write batch commit failed");
@@ -3588,7 +3679,7 @@ fn sqlite_writer_loop(
                             metrics.record_busy(
                                 batch_kind,
                                 &error,
-                                checkpoint_lock_holder(&wal_metrics),
+                                checkpoint_lock_holder_since(&wal_metrics, checkpoint_observed),
                             );
                         }
                         tracing::warn!(%error, "SQLite queued write batch could not start");
@@ -4061,21 +4152,21 @@ fn checkpoint_wal(
     path: &Path,
     metrics: &WalMetrics,
 ) -> rusqlite::Result<CheckpointResult> {
-    metrics
-        .active_checkpoint
-        .store(CHECKPOINT_PASSIVE, Ordering::Relaxed);
+    checkpoint_wal_with(connection, path, metrics, run_checkpoint_pragma)
+}
+
+fn checkpoint_wal_with(
+    connection: &Connection,
+    path: &Path,
+    metrics: &WalMetrics,
+    mut run_checkpoint: impl FnMut(&Connection, usize) -> rusqlite::Result<(i64, i64, i64)>,
+) -> rusqlite::Result<CheckpointResult> {
     let passive_started = Instant::now();
-    let passive_result = connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, i64>(2)?,
-        ))
-    });
+    let passive_result = {
+        let _checkpoint = metrics.checkpoint_activity(CHECKPOINT_PASSIVE);
+        run_checkpoint(connection, CHECKPOINT_PASSIVE)
+    };
     let passive_elapsed = passive_started.elapsed();
-    metrics
-        .active_checkpoint
-        .store(CHECKPOINT_NONE, Ordering::Relaxed);
     let (busy, frames, checkpointed) = passive_result?;
     metrics
         .ckpt_passive_max_ns
@@ -4090,15 +4181,7 @@ fn checkpoint_wal(
         );
     }
     if busy != 0 {
-        metrics.sqlite_busy.fetch_add(1, Ordering::Relaxed);
-        tracing::warn!(
-            kind = "checkpoint_PASSIVE",
-            busy,
-            lock_holder = "active_reader_or_writer",
-            wal_frames = frames,
-            ckpt_frames = checkpointed,
-            "SQLite checkpoint could not advance"
-        );
+        record_checkpoint_busy(metrics, "checkpoint_PASSIVE", busy, frames, checkpointed);
     }
     let mut result = CheckpointResult {
         busy,
@@ -4115,21 +4198,12 @@ fn checkpoint_wal(
         // Keep the ordinary 40 MiB production WAL in its reusable size. Only
         // acquire TRUNCATE's exclusive checkpoint lock to enforce the configured
         // 64 MiB cap when PASSIVE has already caught up.
-        metrics
-            .active_checkpoint
-            .store(CHECKPOINT_TRUNCATE, Ordering::Relaxed);
         let truncate_started = Instant::now();
-        let truncate_result = connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        });
+        let truncate_result = {
+            let _checkpoint = metrics.checkpoint_activity(CHECKPOINT_TRUNCATE);
+            run_checkpoint(connection, CHECKPOINT_TRUNCATE)
+        };
         result.truncate_elapsed = truncate_started.elapsed();
-        metrics
-            .active_checkpoint
-            .store(CHECKPOINT_NONE, Ordering::Relaxed);
         let (truncate_busy, truncate_frames, truncate_checkpointed) = truncate_result?;
         metrics
             .ckpt_truncate_max_ns
@@ -4144,14 +4218,12 @@ fn checkpoint_wal(
             );
         }
         if truncate_busy != 0 {
-            metrics.sqlite_busy.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                kind = "checkpoint_TRUNCATE",
-                busy = truncate_busy,
-                lock_holder = "active_reader_or_writer",
-                wal_frames = truncate_frames,
-                ckpt_frames = truncate_checkpointed,
-                "SQLite checkpoint truncate could not finish"
+            record_checkpoint_busy(
+                metrics,
+                "checkpoint_TRUNCATE",
+                truncate_busy,
+                truncate_frames,
+                truncate_checkpointed,
             );
         }
         result.reset = truncate_busy == 0 && truncate_frames == 0 && truncate_checkpointed == 0;
@@ -4159,8 +4231,44 @@ fn checkpoint_wal(
     Ok(result)
 }
 
+fn run_checkpoint_pragma(
+    connection: &Connection,
+    kind: usize,
+) -> rusqlite::Result<(i64, i64, i64)> {
+    let mode = match kind {
+        CHECKPOINT_PASSIVE => "PASSIVE",
+        CHECKPOINT_TRUNCATE => "TRUNCATE",
+        _ => unreachable!("unknown checkpoint kind"),
+    };
+    connection.query_row(&format!("PRAGMA wal_checkpoint({mode})"), [], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })
+}
+
 fn duration_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn record_checkpoint_busy(
+    metrics: &WalMetrics,
+    kind: &'static str,
+    busy: i64,
+    frames: i64,
+    checkpointed: i64,
+) {
+    metrics.sqlite_busy.fetch_add(1, Ordering::Relaxed);
+    tracing::warn!(
+        kind,
+        busy,
+        lock_holder = "active_reader_or_writer",
+        wal_frames = frames,
+        ckpt_frames = checkpointed,
+        "SQLite checkpoint could not advance"
+    );
 }
 
 fn wal_file_bytes(path: &Path) -> u64 {
@@ -8663,6 +8771,9 @@ impl<S: Storage + 'static> JetstreamConsumer<S> {
             .to_owned();
         let mut attempt = 0_u32;
         let mut backoff = JETSTREAM_LOCK_RETRY_FIRST_BACKOFF;
+        // Keep lock retries unbounded: this batch is the next cursor position,
+        // so dropping it or reconnecting cannot make progress and would only
+        // replay the same event. The failed batch remains intact while backing off.
         loop {
             let ingestor = self.ingestor.clone();
             let batch = events.clone();
@@ -9040,6 +9151,30 @@ mod jetstream_catchup_tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_non_lock_apply_error_returns_without_retrying() {
+        let storage = Arc::new(MemoryStorage::default());
+        storage.set_apply_jetstream_nonlock_failures(1);
+        let consumer = JetstreamConsumer::new(
+            Ingestor::new(storage.clone(), ScopeMode::Full),
+            Duration::from_millis(1),
+        );
+        let event = r#"{"did":"did:plc:av85-ingest-error","time_us":1235,"kind":"commit","commit":{"operation":"create","collection":"app.bsky.feed.post","rkey":"post-error-r1","cid":"cid-error-r1","record":{"$type":"app.bsky.feed.post","text":"fail once"}}}"#;
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            consumer.process_event_batch(vec![event.to_owned()]),
+        )
+        .await
+        .expect("a non-lock failure must return instead of retrying indefinitely");
+        assert!(matches!(
+            result,
+            Err(IngestError::Storage(StorageError::Poisoned))
+        ));
+        assert_eq!(storage.apply_jetstream_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(storage.jetstream_lock_retries.load(Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn stale_saved_cursor_starts_recently_and_records_the_skipped_window() {
         let storage = Arc::new(SqliteStorage::open(":memory:").unwrap());
@@ -9114,9 +9249,16 @@ mod sqlite_writer_tests {
     }
 
     static CHECKPOINT_BUSY_CALLS: AtomicU64 = AtomicU64::new(0);
+    static WRITER_BUSY_WAIT_STARTED: AtomicBool = AtomicBool::new(false);
 
     fn count_busy_call(_attempt: i32) -> bool {
         CHECKPOINT_BUSY_CALLS.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+
+    fn hold_writer_busy_for_test(_attempt: i32) -> bool {
+        WRITER_BUSY_WAIT_STARTED.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
         false
     }
 
@@ -9153,13 +9295,86 @@ mod sqlite_writer_tests {
             1
         );
         assert_eq!(
-            checkpoint_lock_holder(&storage.wal_metrics),
+            checkpoint_lock_holder_since(
+                &storage.wal_metrics,
+                storage.wal_metrics.checkpoint_observation(),
+            ),
             "unknown_or_external_writer"
         );
 
         holder.execute_batch("COMMIT;").unwrap();
         drop(holder);
         drop(storage);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn checkpoint_busy_results_increment_the_running_busy_counter() {
+        let connection = Connection::open_in_memory().unwrap();
+        let metrics = WalMetrics::default();
+        let checkpoint =
+            checkpoint_wal_with(&connection, Path::new(":memory:"), &metrics, |_, kind| {
+                assert_eq!(kind, CHECKPOINT_PASSIVE);
+                Ok((1, 9, 8))
+            })
+            .unwrap();
+        assert_eq!(checkpoint.busy, 1);
+        assert_eq!(metrics.sqlite_busy.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_checkpoint_ending_before_a_busy_writer_returns_is_still_attributed() {
+        let path = test_path("checkpoint-holder-window");
+        remove_database(&path);
+        let storage = Arc::new(SqliteStorage::open(&path).unwrap());
+        WRITER_BUSY_WAIT_STARTED.store(false, Ordering::SeqCst);
+        storage
+            .writer
+            .call(move |connection| {
+                connection.busy_handler(Some(hold_writer_busy_for_test))?;
+                Ok(())
+            })
+            .unwrap();
+        let holder = Connection::open(&path).unwrap();
+        holder
+            .execute_batch("PRAGMA busy_timeout=5000; BEGIN IMMEDIATE;")
+            .unwrap();
+
+        let observed = storage.wal_metrics.checkpoint_observation();
+        let record = IndexedRecord {
+            did: "did:plc:av85-checkpoint-window".to_owned(),
+            collection: "app.bsky.feed.post".to_owned(),
+            rkey: "checkpoint-window-r1".to_owned(),
+            uri: "at://did:plc:av85-checkpoint-window/app.bsky.feed.post/checkpoint-window-r1"
+                .to_owned(),
+            cid: Some("checkpoint-window-cid-r1".to_owned()),
+            time_us: 1,
+            record: serde_json::json!({"$type":"app.bsky.feed.post","text":"busy"}),
+        };
+        let writer_storage = Arc::clone(&storage);
+        let writer = std::thread::spawn(move || writer_storage.put_record(&record));
+        let wait_started = Instant::now();
+        while !WRITER_BUSY_WAIT_STARTED.load(Ordering::SeqCst) {
+            assert!(
+                wait_started.elapsed() < Duration::from_secs(1),
+                "the write reached SQLite's busy wait"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let checkpoint = storage.wal_metrics.checkpoint_activity(CHECKPOINT_TRUNCATE);
+        std::thread::sleep(Duration::from_millis(20));
+        drop(checkpoint);
+        let error = writer.join().unwrap().unwrap_err();
+        assert!(is_sqlite_busy_error(&error), "unexpected error: {error}");
+        assert_eq!(
+            checkpoint_lock_holder_since(&storage.wal_metrics, observed),
+            "checkpoint_TRUNCATE",
+            "the checkpoint ended before the writer gave up but overlapped its wait"
+        );
+
+        holder.execute_batch("COMMIT;").unwrap();
+        drop((holder, storage));
         remove_database(&path);
     }
 
