@@ -7,6 +7,7 @@ use std::{
     cmp::Reverse,
     collections::{HashMap, HashSet, VecDeque},
     fs,
+    io::Read,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, RwLock,
@@ -3008,9 +3009,12 @@ struct SqliteWriterMetrics {
 #[derive(Default)]
 struct WalMetrics {
     file_bytes: AtomicU64,
+    file_bytes_max: AtomicU64,
+    wal_generation: AtomicU64,
     frames: AtomicU64,
     checkpointed: AtomicU64,
     reset: AtomicBool,
+    resets: AtomicU64,
     backfill_wait_ns: AtomicU64,
     sqlite_busy: AtomicU64,
     slow_txn: AtomicU64,
@@ -3057,16 +3061,42 @@ impl WalMetrics {
         CheckpointActivity { metrics: self }
     }
 
-    fn record_checkpoint(&self, file_bytes: u64, frames: u64, checkpointed: u64, reset: bool) {
-        self.file_bytes.store(file_bytes, Ordering::Relaxed);
+    fn record_checkpoint(
+        &self,
+        path: &Path,
+        file_bytes: u64,
+        frames: u64,
+        checkpointed: u64,
+        reset: bool,
+    ) {
+        let size_reset_observed = self.observe_file(path, file_bytes);
+        if reset && !size_reset_observed {
+            self.resets.fetch_add(1, Ordering::Relaxed);
+        }
+        let reset_observed = size_reset_observed || reset;
         self.frames.store(frames, Ordering::Relaxed);
         self.checkpointed.store(checkpointed, Ordering::Relaxed);
-        self.reset.store(reset, Ordering::Relaxed);
+        self.reset.store(reset_observed, Ordering::Relaxed);
     }
 
-    fn record_skipped_checkpoint(&self, file_bytes: u64) {
-        self.file_bytes.store(file_bytes, Ordering::Relaxed);
-        self.reset.store(false, Ordering::Relaxed);
+    fn record_skipped_checkpoint(&self, path: &Path, file_bytes: u64) {
+        let reset_observed = self.observe_file(path, file_bytes);
+        self.reset.store(reset_observed, Ordering::Relaxed);
+    }
+
+    fn observe_file(&self, path: &Path, file_bytes: u64) -> bool {
+        let previous = self.file_bytes.swap(file_bytes, Ordering::Relaxed);
+        self.file_bytes_max.fetch_max(file_bytes, Ordering::Relaxed);
+        let size_reset = previous > file_bytes;
+        let generation_reset = wal_file_generation(path).is_some_and(|generation| {
+            let old = self.wal_generation.swap(generation, Ordering::Relaxed);
+            old != 0 && old != generation
+        });
+        let reset_observed = size_reset || generation_reset;
+        if reset_observed {
+            self.resets.fetch_add(1, Ordering::Relaxed);
+        }
+        reset_observed
     }
 }
 
@@ -3169,9 +3199,11 @@ impl SqliteWriterMetrics {
             read_wait_max_ms =
                 read_metrics.wait_max_ns.swap(0, Ordering::Relaxed) as f64 / 1_000_000.0,
             wal_bytes = wal_metrics.file_bytes.load(Ordering::Relaxed),
+            wal_file_bytes_max = wal_metrics.file_bytes_max.swap(0, Ordering::Relaxed),
             wal_frames = wal_metrics.frames.load(Ordering::Relaxed),
             ckpt_frames = wal_metrics.checkpointed.load(Ordering::Relaxed),
             wal_reset = wal_metrics.reset.load(Ordering::Relaxed),
+            wal_resets = wal_metrics.resets.swap(0, Ordering::Relaxed),
             backfill_wait_ms =
                 wal_metrics.backfill_wait_ns.swap(0, Ordering::Relaxed) as f64 / 1_000_000.0,
             recent_posts_queued,
@@ -3851,6 +3883,7 @@ impl Drop for SqliteStorage {
                 connection.busy_timeout(CHECKPOINT_BUSY_TIMEOUT)?;
                 let result = checkpoint_wal(connection, &database_path, &wal_metrics)?;
                 wal_metrics.record_checkpoint(
+                    &database_path,
                     wal_file_bytes(&database_path),
                     result.frames.max(0) as u64,
                     result.checkpointed.max(0) as u64,
@@ -4045,7 +4078,6 @@ struct CheckpointResult {
     frames: i64,
     checkpointed: i64,
     reset: bool,
-    truncate_elapsed: Duration,
 }
 
 fn checkpoint_wal(
@@ -4062,6 +4094,11 @@ fn checkpoint_wal_with(
     metrics: &WalMetrics,
     mut run_checkpoint: impl FnMut(&Connection, usize) -> rusqlite::Result<(i64, i64, i64)>,
 ) -> rusqlite::Result<CheckpointResult> {
+    // PASSIVE never waits for writers. Avoid TRUNCATE in the steady-state
+    // loop: its exclusive checkpoint window can overlap new frames and hold
+    // every writer out while it copies pages and fsyncs. journal_size_limit
+    // bounds WAL reuse after a completed checkpoint.
+    let wal_bytes_before = wal_file_bytes(path);
     let passive_started = Instant::now();
     let passive_result = {
         let _checkpoint = metrics.checkpoint_activity(CHECKPOINT_PASSIVE);
@@ -4084,51 +4121,12 @@ fn checkpoint_wal_with(
     if busy != 0 {
         record_checkpoint_busy(metrics, "checkpoint_PASSIVE", busy, frames, checkpointed);
     }
-    let mut result = CheckpointResult {
+    let result = CheckpointResult {
         busy,
         frames,
         checkpointed,
-        reset: false,
-        truncate_elapsed: Duration::ZERO,
+        reset: wal_file_bytes(path) < wal_bytes_before,
     };
-    if busy == 0
-        && frames >= 0
-        && frames == checkpointed
-        && wal_file_bytes(path) > WAL_JOURNAL_SIZE_LIMIT_BYTES
-    {
-        // Keep the ordinary 40 MiB production WAL in its reusable size. Only
-        // acquire TRUNCATE's exclusive checkpoint lock to enforce the configured
-        // 64 MiB cap when PASSIVE has already caught up.
-        let truncate_started = Instant::now();
-        let truncate_result = {
-            let _checkpoint = metrics.checkpoint_activity(CHECKPOINT_TRUNCATE);
-            run_checkpoint(connection, CHECKPOINT_TRUNCATE)
-        };
-        result.truncate_elapsed = truncate_started.elapsed();
-        let (truncate_busy, truncate_frames, truncate_checkpointed) = truncate_result?;
-        metrics
-            .ckpt_truncate_max_ns
-            .fetch_max(duration_ns(result.truncate_elapsed), Ordering::Relaxed);
-        if result.truncate_elapsed >= SQLITE_SLOW_WRITE_THRESHOLD {
-            metrics.slow_txn.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                kind = "checkpoint_TRUNCATE",
-                duration_ms = result.truncate_elapsed.as_millis() as u64,
-                wal_bytes = wal_file_bytes(path),
-                "slow SQLite checkpoint"
-            );
-        }
-        if truncate_busy != 0 {
-            record_checkpoint_busy(
-                metrics,
-                "checkpoint_TRUNCATE",
-                truncate_busy,
-                truncate_frames,
-                truncate_checkpointed,
-            );
-        }
-        result.reset = truncate_busy == 0 && truncate_frames == 0 && truncate_checkpointed == 0;
-    }
     Ok(result)
 }
 
@@ -4178,6 +4176,14 @@ fn wal_file_bytes(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+fn wal_file_generation(path: &Path) -> Option<u64> {
+    let mut file = fs::File::open(format!("{}-wal", path.display())).ok()?;
+    let mut header = [0_u8; 24];
+    file.read_exact(&mut header).ok()?;
+    let generation = u64::from_be_bytes(header[16..24].try_into().ok()?);
+    Some(generation.max(1))
+}
+
 fn should_skip_checkpoint_for_pressure(pressure_active: bool, file_bytes: u64) -> bool {
     pressure_active && file_bytes < WAL_PRESSURE_CHECKPOINT_BYTES
 }
@@ -4209,13 +4215,14 @@ fn spawn_checkpointer(
                 if should_skip_checkpoint_for_pressure(pressure.is_active(), file_bytes) {
                     // PASSIVE has no page-count budget. Skip while interactive work is
                     // queued, then run every round after the WAL reaches 3x the limit.
-                    wal_metrics.record_skipped_checkpoint(file_bytes);
+                    wal_metrics.record_skipped_checkpoint(&path, file_bytes);
                     continue;
                 }
                 match checkpoint_wal(&connection, &path, &wal_metrics) {
                     Ok(result) => {
                         let file_bytes = wal_file_bytes(&path);
                         wal_metrics.record_checkpoint(
+                            &path,
                             file_bytes,
                             result.frames.max(0) as u64,
                             result.checkpointed.max(0) as u64,
@@ -9210,6 +9217,23 @@ mod sqlite_writer_tests {
     }
 
     #[test]
+    fn production_writer_keeps_the_configured_wal_journal_size_limit() {
+        let path = test_path("writer-journal-size-limit");
+        remove_database(&path);
+        let storage = SqliteStorage::open(&path).unwrap();
+        let limit = storage
+            .writer
+            .call(|connection| {
+                Ok(connection
+                    .query_row("PRAGMA journal_size_limit", [], |row| row.get::<_, i64>(0))?)
+            })
+            .unwrap();
+        assert_eq!(limit, WAL_JOURNAL_SIZE_LIMIT_BYTES as i64);
+        drop(storage);
+        remove_database(&path);
+    }
+
+    #[test]
     fn checkpoint_busy_results_increment_the_running_busy_counter() {
         let connection = Connection::open_in_memory().unwrap();
         let metrics = WalMetrics::default();
@@ -9221,6 +9245,26 @@ mod sqlite_writer_tests {
             .unwrap();
         assert_eq!(checkpoint.busy, 1);
         assert_eq!(metrics.sqlite_busy.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn wal_generation_changes_count_resets_even_when_file_size_is_reused() {
+        let path = test_path("wal-generation-reset");
+        remove_database(&path);
+        let wal_path = PathBuf::from(format!("{}-wal", path.display()));
+        let metrics = WalMetrics::default();
+        let mut header = [0_u8; 24];
+        header[16..24].copy_from_slice(&1_u64.to_be_bytes());
+        fs::write(&wal_path, header).unwrap();
+        metrics.record_checkpoint(&path, 65_536, 10, 10, false);
+
+        header[16..24].copy_from_slice(&2_u64.to_be_bytes());
+        fs::write(&wal_path, header).unwrap();
+        metrics.record_checkpoint(&path, 65_536, 2, 2, false);
+
+        assert_eq!(metrics.file_bytes_max.load(Ordering::Relaxed), 65_536);
+        assert_eq!(metrics.resets.load(Ordering::Relaxed), 1);
+        remove_database(&path);
     }
 
     #[test]
@@ -9326,6 +9370,91 @@ mod sqlite_writer_tests {
     }
 
     #[test]
+    fn a_truncate_after_passive_caught_up_blocks_a_writer_past_its_busy_timeout() {
+        let path = test_path("truncate-writer-stall");
+        let wal_path = PathBuf::from(format!("{}-wal", path.display()));
+        let lock_path = test_path("truncate-writer-stall-lock");
+        remove_database(&path);
+        remove_database(&lock_path);
+        fs::File::create(&wal_path)
+            .unwrap()
+            .set_len(WAL_JOURNAL_SIZE_LIMIT_BYTES + 4096)
+            .unwrap();
+
+        // A synthetic WAL path keeps this regression test quick. The injected
+        // checkpoint returns a caught-up PASSIVE result, appends frames before
+        // the next decision, and models TRUNCATE's writer exclusion with a real
+        // SQLite write reservation held longer than the writer's busy timeout.
+        let lock_setup = Connection::open(&lock_path).unwrap();
+        lock_setup
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; CREATE TABLE t(value INTEGER); INSERT INTO t VALUES (0);",
+            )
+            .unwrap();
+        drop(lock_setup);
+
+        let connection = Connection::open_in_memory().unwrap();
+        let metrics = WalMetrics::default();
+        let kinds = Arc::new(Mutex::new(Vec::new()));
+        let captured_kinds = Arc::clone(&kinds);
+        let callback_wal_path = wal_path.clone();
+        let callback_lock_path = lock_path.clone();
+        let truncate_writer = Arc::new(Mutex::new(None));
+        let captured_writer = Arc::clone(&truncate_writer);
+        let busy_timeout = Duration::from_millis(60);
+        let checkpoint = checkpoint_wal_with(&connection, &path, &metrics, move |_, kind| {
+            captured_kinds.lock().unwrap().push(kind);
+            if kind == CHECKPOINT_PASSIVE {
+                fs::File::options()
+                    .write(true)
+                    .open(&callback_wal_path)
+                    .unwrap()
+                    .set_len(WAL_JOURNAL_SIZE_LIMIT_BYTES + 12_288)
+                    .unwrap();
+                return Ok((0, 100, 100));
+            }
+
+            assert_eq!(kind, CHECKPOINT_TRUNCATE);
+            let holder = Connection::open(&callback_lock_path).unwrap();
+            holder.execute_batch("BEGIN IMMEDIATE;").unwrap();
+            let (started_tx, started_rx) = mpsc::channel();
+            let writer_path = callback_lock_path.clone();
+            let writer = std::thread::spawn(move || {
+                let writer = Connection::open(writer_path).unwrap();
+                writer.busy_timeout(busy_timeout).unwrap();
+                let started = Instant::now();
+                started_tx.send(()).unwrap();
+                let error = writer
+                    .execute("INSERT INTO t VALUES (1)", [])
+                    .unwrap_err()
+                    .to_string();
+                (started.elapsed(), error)
+            });
+            started_rx.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(220));
+            let observation = writer.join().unwrap();
+            holder.execute_batch("COMMIT;").unwrap();
+            *captured_writer.lock().unwrap() = Some(observation);
+            Ok((0, 100, 100))
+        })
+        .unwrap();
+
+        let blocked = truncate_writer.lock().unwrap().clone();
+        assert!(
+            blocked.is_none(),
+            "writer was blocked by the injected TRUNCATE path: observation={blocked:?}, busy_timeout={busy_timeout:?}, checkpoint={checkpoint:?}, calls={:?}",
+            *kinds.lock().unwrap()
+        );
+        assert_eq!(*kinds.lock().unwrap(), [CHECKPOINT_PASSIVE]);
+        assert_eq!(metrics.ckpt_truncate_max_ns.load(Ordering::Relaxed), 0);
+
+        drop(connection);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&wal_path);
+        remove_database(&lock_path);
+    }
+
+    #[test]
     fn a_40_mib_reusable_wal_does_not_take_truncate_lock_during_a_writer() {
         let path = test_path("large-wal-concurrent-writer");
         remove_database(&path);
@@ -9368,21 +9497,24 @@ mod sqlite_writer_tests {
         let during_started = Instant::now();
         let during_writer = checkpoint_wal(&checkpointer, &path, &metrics).unwrap();
         let during_elapsed = during_started.elapsed();
-        assert_eq!(during_writer.truncate_elapsed, Duration::ZERO);
+        assert!(
+            !during_writer.reset,
+            "a concurrent writer reset the WAL: {during_writer:?}"
+        );
         assert_eq!(metrics.ckpt_truncate_max_ns.load(Ordering::Relaxed), 0);
         competing_writer.execute_batch("COMMIT;").unwrap();
         let caught_up_started = Instant::now();
         let caught_up = checkpoint_wal(&checkpointer, &path, &metrics).unwrap();
         let caught_up_elapsed = caught_up_started.elapsed();
         assert_eq!(caught_up.frames, caught_up.checkpointed, "{caught_up:?}");
-        assert_eq!(caught_up.truncate_elapsed, Duration::ZERO);
+        assert_eq!(metrics.ckpt_truncate_max_ns.load(Ordering::Relaxed), 0);
         assert!(!caught_up.reset);
 
         eprintln!(
-            "WAL repro: bytes={before} passive_during_writer_ms={} passive_after_ms={} truncate_ms={}",
+            "WAL repro: bytes={before} passive_during_writer_ms={} passive_after_ms={} ckpt_truncate_ms_max={}",
             during_elapsed.as_micros() as f64 / 1_000.0,
             caught_up_elapsed.as_micros() as f64 / 1_000.0,
-            caught_up.truncate_elapsed.as_micros() as f64 / 1_000.0,
+            metrics.ckpt_truncate_max_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0,
         );
         drop((competing_writer, checkpointer, writer));
         remove_database(&path);
@@ -9422,7 +9554,7 @@ mod sqlite_writer_tests {
         read_metrics.record_wait(Duration::from_millis(7));
         read_metrics.record_wait(Duration::from_millis(3));
         let wal_metrics = WalMetrics::default();
-        wal_metrics.record_checkpoint(8_192, 3, 2, true);
+        wal_metrics.record_checkpoint(Path::new(":memory:"), 8_192, 3, 2, true);
         wal_metrics.sqlite_busy.store(1, Ordering::Relaxed);
         wal_metrics.slow_txn.store(2, Ordering::Relaxed);
         wal_metrics
@@ -9446,6 +9578,7 @@ mod sqlite_writer_tests {
         assert!(text.contains("read_wait_max_ms=7"), "{text}");
         assert!(text.contains("web_read_timeout_count="), "{text}");
         assert!(text.contains("wal_bytes=8192"), "{text}");
+        assert!(text.contains("wal_file_bytes_max=8192"), "{text}");
         assert!(text.contains("wal_frames=3"), "{text}");
         assert!(text.contains("ckpt_frames=2"), "{text}");
         assert!(text.contains("sqlite_busy=3"), "{text}");
@@ -9454,6 +9587,7 @@ mod sqlite_writer_tests {
         assert!(text.contains("ckpt_truncate_ms_max=250"), "{text}");
         assert!(text.contains("jetstream_lock_retries=7"), "{text}");
         assert!(text.contains("wal_reset=true"), "{text}");
+        assert!(text.contains("wal_resets=1"), "{text}");
         assert!(text.contains("backfill_wait_ms=1.5"), "{text}");
     }
 
