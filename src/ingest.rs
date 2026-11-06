@@ -4053,16 +4053,19 @@ fn checkpoint_wal(
     path: &Path,
     metrics: &WalMetrics,
 ) -> rusqlite::Result<CheckpointResult> {
+    checkpoint_wal_with(connection, path, metrics, run_checkpoint_pragma)
+}
+
+fn checkpoint_wal_with(
+    connection: &Connection,
+    path: &Path,
+    metrics: &WalMetrics,
+    mut run_checkpoint: impl FnMut(&Connection, usize) -> rusqlite::Result<(i64, i64, i64)>,
+) -> rusqlite::Result<CheckpointResult> {
     let passive_started = Instant::now();
     let passive_result = {
         let _checkpoint = metrics.checkpoint_activity(CHECKPOINT_PASSIVE);
-        connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })
+        run_checkpoint(connection, CHECKPOINT_PASSIVE)
     };
     let passive_elapsed = passive_started.elapsed();
     let (busy, frames, checkpointed) = passive_result?;
@@ -4099,13 +4102,7 @@ fn checkpoint_wal(
         let truncate_started = Instant::now();
         let truncate_result = {
             let _checkpoint = metrics.checkpoint_activity(CHECKPOINT_TRUNCATE);
-            connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })
+            run_checkpoint(connection, CHECKPOINT_TRUNCATE)
         };
         result.truncate_elapsed = truncate_started.elapsed();
         let (truncate_busy, truncate_frames, truncate_checkpointed) = truncate_result?;
@@ -4133,6 +4130,24 @@ fn checkpoint_wal(
         result.reset = truncate_busy == 0 && truncate_frames == 0 && truncate_checkpointed == 0;
     }
     Ok(result)
+}
+
+fn run_checkpoint_pragma(
+    connection: &Connection,
+    kind: usize,
+) -> rusqlite::Result<(i64, i64, i64)> {
+    let mode = match kind {
+        CHECKPOINT_PASSIVE => "PASSIVE",
+        CHECKPOINT_TRUNCATE => "TRUNCATE",
+        _ => unreachable!("unknown checkpoint kind"),
+    };
+    connection.query_row(&format!("PRAGMA wal_checkpoint({mode})"), [], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })
 }
 
 fn duration_ns(duration: Duration) -> u64 {
@@ -9196,8 +9211,15 @@ mod sqlite_writer_tests {
 
     #[test]
     fn checkpoint_busy_results_increment_the_running_busy_counter() {
+        let connection = Connection::open_in_memory().unwrap();
         let metrics = WalMetrics::default();
-        record_checkpoint_busy(&metrics, "checkpoint_PASSIVE", 1, 9, 8);
+        let checkpoint =
+            checkpoint_wal_with(&connection, Path::new(":memory:"), &metrics, |_, kind| {
+                assert_eq!(kind, CHECKPOINT_PASSIVE);
+                Ok((1, 9, 8))
+            })
+            .unwrap();
+        assert_eq!(checkpoint.busy, 1);
         assert_eq!(metrics.sqlite_busy.load(Ordering::Relaxed), 1);
     }
 
