@@ -29657,6 +29657,68 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retried_follow_must_not_resurrect_after_unfollow() {
+        // The follow write backs off on a lock while Jetstream indexes the
+        // record. The user then unfollows and its delete lands immediately.
+        // The late follow retry must not restore either the row or follow state.
+        let storage = Arc::new(FlakyPutStorage {
+            inner: MemoryStorage::default(),
+            lock_failures: AtomicUsize::new(3),
+            delete_lock_failures: AtomicUsize::new(0),
+        });
+        let flow = AnswerFlow::default();
+        let public = OAuthPublic::new("https://appview.example").unwrap();
+        let app = public.router_with_flow(flow, storage.clone());
+        let cookie = answer_session_cookie(&public, storage.as_ref(), ANSWER_VIEWER);
+        let subject = "did:plc:av85-subject";
+        let follow_uri = format!("at://{ANSWER_VIEWER}/app.bsky.graph.follow/answer-graph-1");
+
+        let response = post_web_form(
+            &app,
+            &cookie,
+            "/profile/action",
+            format!("subject={}&action=follow", form_encoded(subject)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+        // Jetstream may index the follow before the delayed web write retries.
+        storage
+            .inner
+            .put_record(&IndexedRecord {
+                did: ANSWER_VIEWER.to_owned(),
+                collection: "app.bsky.graph.follow".to_owned(),
+                rkey: "answer-graph-1".to_owned(),
+                uri: follow_uri.clone(),
+                cid: Some("answer-graph-cid-1".to_owned()),
+                time_us: 1,
+                record: json!({"$type":"app.bsky.graph.follow","subject":subject}),
+            })
+            .unwrap();
+        storage.inner.set_follow(ANSWER_VIEWER, subject, true).unwrap();
+
+        let response = post_web_form(
+            &app,
+            &cookie,
+            "/profile/action",
+            format!("subject={}&action=unfollow", form_encoded(subject)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let rows = storage
+            .records_for_actor_collection(ANSWER_VIEWER, "app.bsky.graph.follow", 10)
+            .unwrap();
+        let following = storage.is_following(ANSWER_VIEWER, subject).unwrap();
+        assert!(
+            rows.is_empty() && !following,
+            "unfollowed relationship came back: row={} following={following}",
+            !rows.is_empty()
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_landed_like_skips_the_pds_on_a_repeat_click_and_unlike_counts_down() {
         let storage = Arc::new(FlakyPutStorage {
